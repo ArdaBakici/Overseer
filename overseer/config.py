@@ -14,8 +14,6 @@ from typing import Any
 
 import yaml
 
-LOCAL_TMP = "/tmp"
-
 
 class ConfigError(ValueError):
     pass
@@ -23,27 +21,68 @@ class ConfigError(ValueError):
 
 @dataclass
 class LocalConfig:
-    # Everything Overseer writes on the machine it runs on (state DB, audit log, SSH control
-    # socket, backups of files the agent edits) lives here. Must be inside /tmp.
-    root: str = "/tmp/overseer"
+    """Where Overseer may write on the machine it runs on.
 
-    def path(self, *parts: str) -> Path:
-        p = Path(self.root, *parts).resolve()
-        if not _path_within(p, Path(self.root).resolve()):
-            raise ConfigError(f"{p} is outside the local root {self.root}")
+    Relative paths are resolved against the folder containing config.yaml (Overseer's own
+    folder), so "." means "next to the config file".
+    """
+
+    # Overseer never writes outside these folders on this machine.
+    allowed_roots: list[str] = field(default_factory=lambda: [".", "/tmp"])
+    # Persistent state: SQLite DB (jobs, proposals, folder grants), audit log, backups of
+    # HPC files the agent edits. Keep it out of /tmp if grants/backups should survive reboots.
+    state_dir: str = "./state"
+    # Scratch: SSH control socket and other throwaway files.
+    tmp_dir: str = "/tmp/overseer"
+    # Set by load_config to the config file's folder; relative paths resolve against it.
+    base_dir: str = ""
+
+    def _resolve(self, p: str) -> Path:
+        path = Path(p).expanduser()
+        if not path.is_absolute():
+            path = Path(self.base_dir or os.getcwd()) / path
+        return path.resolve()
+
+    @property
+    def roots(self) -> list[Path]:
+        return [self._resolve(r) for r in self.allowed_roots]
+
+    def check(self, path: Path) -> Path:
+        """Raise unless ``path`` is inside one of the allowed local folders."""
+        p = path.resolve()
+        if not any(_path_within(p, r) for r in self.roots):
+            raise ConfigError(f"{p} is outside the allowed local folders ({', '.join(map(str, self.roots))})")
+        return p
+
+    def state(self, *parts: str) -> Path:
+        base = self._resolve(self.state_dir)
+        p = self.check(base.joinpath(*parts))
+        if not _path_within(p, base):
+            raise ConfigError(f"{p} escapes the state dir {base}")
+        return p
+
+    def tmp(self, *parts: str) -> Path:
+        base = self._resolve(self.tmp_dir)
+        p = self.check(base.joinpath(*parts))
+        if not _path_within(p, base):
+            raise ConfigError(f"{p} escapes the tmp dir {base}")
         return p
 
     @property
     def db_path(self) -> Path:
-        return self.path("overseer.db")
+        return self.state("overseer.db")
 
     @property
     def audit_log(self) -> Path:
-        return self.path("audit.log")
+        return self.state("audit.log")
 
     @property
     def control_path(self) -> str:
-        return str(self.path("ssh")) + "/cm-%C"
+        # Unix socket paths are limited to ~100 chars, so keep the socket in the (short) tmp dir.
+        return str(self.tmp("ssh")) + "/cm-%C"
+
+    def sessions_dir(self, sid: str) -> Path:
+        return self.state("sessions", sid)
 
 
 @dataclass
@@ -150,9 +189,13 @@ class Config:
     def validate(self) -> None:
         if not self.ssh.host:
             raise ConfigError("ssh.host is required")
-        local = Path(self.local.root).resolve()
-        if not _path_within(local, Path(LOCAL_TMP).resolve()) or local == Path(LOCAL_TMP).resolve():
-            raise ConfigError(f"local.root must be a directory inside {LOCAL_TMP} (got {self.local.root!r})")
+        if not self.local.allowed_roots:
+            raise ConfigError("local.allowed_roots must list at least one folder")
+        for r in self.local.roots:
+            if r == Path("/") or r == Path.home():
+                raise ConfigError(f"local.allowed_roots entry {r} is too broad; use specific folders")
+        self.local.state("x")  # both dirs must sit inside an allowed root
+        self.local.tmp("x")
         for r in self.hpc.write_roots:
             check_root_spec(r)
         for r in self.hpc.read_roots:
@@ -201,5 +244,6 @@ def load_config(path: str | os.PathLike) -> Config:
     with open(path) as fh:
         raw = yaml.safe_load(fh) or {}
     cfg = _build(Config, raw, "")
+    cfg.local.base_dir = str(Path(path).resolve().parent)
     cfg.validate()
     return cfg

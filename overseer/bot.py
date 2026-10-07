@@ -263,7 +263,7 @@ class Bot:
     async def cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         last = f"{int(time.time() - self.monitor.last_ok)}s ago" if self.monitor.last_ok else "never"
         err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
-        await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · local state {code(self.cfg.local.path())}\n"
+        await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · local state {code(self.cfg.local.state())}\n"
                                  f"last successful poll: {last}{err}\n"
                                  f"active agent sessions: {len(self.agent.sessions)}")
 

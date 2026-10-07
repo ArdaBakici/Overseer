@@ -11,13 +11,13 @@ import sys
 from .config import Config, ConfigError, load_config
 
 
-def prepare_local_root(cfg: Config) -> None:
-    """All local state lives in local.root (inside /tmp), private to this user."""
-    root = cfg.local.path()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if root.is_symlink() or root.stat().st_uid != os.getuid():
-        raise ConfigError(f"{root} must be a real directory owned by you")
-    os.chmod(root, 0o700)
+def prepare_local_dirs(cfg: Config) -> None:
+    """Create the local state and tmp dirs (inside local.allowed_roots), private to this user."""
+    for d in (cfg.local.state(), cfg.local.tmp()):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if d.is_symlink() or d.stat().st_uid != os.getuid():
+            raise ConfigError(f"{d} must be a real directory owned by you")
+        os.chmod(d, 0o700)
 
 
 def build(cfg: Config):
@@ -33,7 +33,7 @@ def build(cfg: Config):
     from .ssh import SSHRunner
     from .store import Store
 
-    prepare_local_root(cfg)
+    prepare_local_dirs(cfg)
     store = Store(cfg.local.db_path)
     runner = SSHRunner(cfg.ssh, lambda: hpc.write_roots, cfg.local.control_path, cfg.local.audit_log)
     hpc = HPC(cfg, runner)
@@ -87,8 +87,9 @@ async def check(cfg: Config) -> int:
         ok &= good
         print(f"[{'ok' if good else 'FAIL'}] {name}{': ' + detail if detail else ''}")
 
-    prepare_local_root(cfg)
-    report("local state dir", True, str(cfg.local.path()))
+    prepare_local_dirs(cfg)
+    report("local folders", True, f"state={cfg.local.state()} tmp={cfg.local.tmp()} "
+                                   f"(writes limited to {', '.join(map(str, cfg.local.roots))})")
     hpc = HPC(cfg, SSHRunner(cfg.ssh, lambda: hpc.write_roots, cfg.local.control_path, cfg.local.audit_log))
     hpc.grants = Store(cfg.local.db_path).grants()
     try:

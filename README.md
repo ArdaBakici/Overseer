@@ -12,21 +12,19 @@ Overseer is a Telegram bot that keeps an eye on your SLURM jobs. It runs on your
 │ Telegram bot  ◄──► you            │ ──────► │ squeue / sacct / scontrol (read)         │
 │ Monitor (polls every 60 s)        │         │ read_roots      → read only              │
 │ Claude agent (no shell)           │         │ write_roots     → create/modify/submit   │
-│ /tmp/overseer: state DB, audit    │         │ + folders you grant from Telegram        │
-│   log, ssh socket, file backups   │         │ everything else → untouched              │
+│ ./state: DB, audit log, backups   │         │ + folders you grant from Telegram        │
+│ /tmp/overseer: ssh socket         │         │ everything else → untouched              │
 └───────────────────────────────────┘         └──────────────────────────────────────────┘
 ```
 
 ## Where Overseer writes
 
-**On the machine it runs on:** only inside `local.root`, which must be inside `/tmp` (default `/tmp/overseer`; checked when the config loads). That covers:
+**On the machine it runs on:** only inside `local.allowed_roots`. By default that is Overseer's own folder (the one containing `config.yaml`) and `/tmp`. Both working directories must sit inside those roots, which is checked when the config loads:
 
-- the SQLite state (jobs, proposals, folder grants)
-- the audit log of every remote command
-- the SSH control socket
-- local backups of every HPC file the agent modifies
+- `local.state_dir` (default `./state`): the SQLite database (jobs, proposals, folder grants), the audit log, and local backups of every HPC file the agent modifies. It lives in Overseer's folder, so grants and backups survive reboots.
+- `local.tmp_dir` (default `/tmp/overseer`): the SSH control socket and other scratch files.
 
-The directory is created with mode `700`, and Overseer refuses to start if someone else owns it. `/tmp` is usually wiped on reboot. After a reboot Overseer re-adopts your running jobs without spamming you, but folders granted from Telegram are forgotten. Put folders you always want in `config.yaml`.
+Both are created with mode `700`, and Overseer refuses to start if someone else owns them.
 
 **On the HPC:** only inside the folders in `hpc.write_roots` (config file), plus folders you grant at runtime. When the agent needs another folder, it calls `request_access`:
 
@@ -51,13 +49,13 @@ Every layer below is covered by tests.
    - Secrets (`~/.ssh`, `~/.netrc`, `*.pem`, `.env`, cloud credentials, HF token) are never readable.
    - Files that would make something *run* later (`~/.bashrc` and other login scripts, `.git/hooks`, autostart/systemd files) are never writable, even inside a granted folder.
    - `/` and your whole home directory can't be granted for writing.
-5. **Backup before every modification.** The first time the agent changes a file, its original is saved locally (mode `600`). This drives the exact diff in proposals and a **↩️ Revert all changes** button: restore the originals, delete new files, remove copies. Files over 2 MB or non-text files can't be modified.
+5. **Backup before every modification.** The first time the agent changes a file, its original is saved in `state_dir` on the homelab (mode `600`). This drives the exact diff in proposals and a **↩️ Revert all changes** button: restore the originals, delete new files, remove copies. Files over 2 MB or non-text files can't be modified.
 6. **Batch script policy** (`policy.check_script`), checked when a job is proposed and again at approval:
    - **Resource limits**: GPUs, nodes, `--time` (required), partitions, and array size.
    - **Blocked outright**: writes outside the write roots (`>`/`>>` redirects, `rm`/`mv`/`cp`/`tee`/… targets, `#SBATCH --output/--error/--chdir`), wiping an entire write root, `sudo`, `curl | sh`, and jobs that call `sbatch`/`scancel`.
    - **Shown as warnings**: references to other paths (for example a dataset path), `pip install`, and `cd` outside the write roots.
 7. **Human approval** for every `sbatch` and `scancel`. The proposal shows the script, its sha256, resources, warnings and the diff. The script is re-read at approval, and the submission is refused if it changed. Each proposal can be approved only once. Only jobs Overseer submitted can be cancelled.
-8. **Audit log.** Every remote command, with its exit code, goes to `/tmp/overseer/audit.log`. After each request the agent's actions (read, copied, edited, blocked, requested access) are posted to Telegram.
+8. **Audit log.** Every remote command, with its exit code, goes to `state/audit.log`. After each request the agent's actions (read, copied, edited, blocked, requested access) are posted to Telegram.
 
 **What these layers don't cover.** An approved job runs as *you* on a compute node, and Python code inside it can do anything your account can do. The static check can't fully analyse that code. The approval step and the diff are what protect you there, so read the diff.
 
@@ -117,7 +115,7 @@ A job submitted from a session stays linked to that conversation. When it finish
 - `llm.enabled: false` turns Overseer into a pure monitor with heuristic failure analysis (no API key needed).
 - `llm.model` defaults to `claude-opus-5-5` with adaptive thinking. Set `adaptive_thinking: false` and `*_effort: null` for models that don't support those parameters. `fallbacks: true` enables the API's server-side refusal fallback.
 - Anything the agent reads (logs, code inside `read_roots`) is sent to the Anthropic API. Narrow `read_roots` if that matters.
-- Agent conversations live in memory and are lost on restart. Job state, proposals, grants and message links are kept in SQLite under `local.root`.
+- Agent conversations live in memory and are lost on restart. Job state, proposals, grants and message links are kept in SQLite in `local.state_dir`.
 - The HPC login shell should be bash or zsh, since commands are quoted for a POSIX shell.
 
 ## Development
@@ -132,7 +130,7 @@ pytest
 | module | role |
 |---|---|
 | `policy.py` | command allowlist, path rules, batch-script analysis (pure, heavily tested) |
-| `config.py` | config schema; enforces `local.root` inside `/tmp` |
+| `config.py` | config schema; keeps local writes inside `local.allowed_roots` |
 | `ssh.py` | multiplexed `ssh` transport, output caps, audit log |
 | `hpc.py` | policy-enforcing file ops, write/read roots and grants, SLURM calls |
 | `changes.py` | local backups of modified files → diff and revert |

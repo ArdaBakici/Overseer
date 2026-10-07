@@ -147,7 +147,7 @@ class Agent:
         return f"<access home='{self.hpc.home}'>\nwritable:\n{w}\nreadable:\n{r}\n</access>"
 
     def changeset(self, sid: str) -> ChangeSet:
-        return ChangeSet(self.cfg.local.path("sessions", sid))
+        return ChangeSet(self.cfg.local.sessions_dir(sid))
 
     def _new_session(self, job_id: str | None) -> Session:
         sid = (f"j{job_id}-" if job_id else "chat-") + uuid.uuid4().hex[:6]

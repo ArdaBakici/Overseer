@@ -1,8 +1,7 @@
 """Per-session record of what the agent changed on the HPC, with local backups for diff/revert.
 
 Before the agent first modifies a file, its original content is saved on the local machine
-(under ``local.root``, i.e. /tmp). That gives the user an exact diff of every change and a
-one-tap revert. Copies are recorded so revert can remove them.
+(in ``local.state_dir``). That gives the user an exact diff of every change and a one-tap revert. Copies are recorded so revert can remove them.
 """
 
 from __future__ import annotations

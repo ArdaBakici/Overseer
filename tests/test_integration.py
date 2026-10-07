@@ -61,7 +61,10 @@ def make_env(tmp_path, monkeypatch):
 
     cfg = Config()
     cfg.ssh.host = "local"
-    cfg.local.root = str(tmp_path / "local")
+    app = tmp_path / "app"  # stands in for Overseer's own folder (where config.yaml lives)
+    app.mkdir()
+    cfg.local.base_dir = str(app)
+    cfg.local.tmp_dir = str(tmp_path / "tmp-overseer")
     cfg.hpc.write_roots = [str(scratch)]
     cfg.hpc.read_roots = ["~"]
     cfg.telegram.allowed_chat_ids = [1]
@@ -91,14 +94,36 @@ def env(tmp_path, monkeypatch):
     return make_env(tmp_path, monkeypatch)
 
 
-def test_config_validation():
-    cfg = Config()
-    cfg.ssh.host = "h"
-    cfg.telegram.allowed_chat_ids = [1]
-    cfg.local.root = "/var/lib/overseer"
-    with pytest.raises(ConfigError, match="inside /tmp"):
+def test_config_validation(tmp_path):
+    def fresh():
+        cfg = Config()
+        cfg.ssh.host = "h"
+        cfg.telegram.allowed_chat_ids = [1]
+        cfg.local.base_dir = str(tmp_path / "app")
+        return cfg
+
+    cfg = fresh()
+    cfg.validate()  # defaults: ./state next to the config, /tmp/overseer for scratch
+    assert cfg.local.db_path == (tmp_path / "app" / "state" / "overseer.db").resolve()
+    assert cfg.local.control_path.startswith("/tmp/overseer/ssh/")
+
+    cfg = fresh()
+    cfg.local.state_dir = "/var/lib/overseer"  # not in "." or /tmp
+    with pytest.raises(ConfigError, match="outside the allowed local folders"):
         cfg.validate()
-    cfg.local.root = "/tmp/overseer"
+    cfg = fresh()
+    cfg.local.allowed_roots = ["/"]
+    with pytest.raises(ConfigError, match="too broad"):
+        cfg.validate()
+    cfg = fresh()
+    cfg.local.allowed_roots = ["."]  # /tmp removed -> default tmp_dir no longer allowed
+    with pytest.raises(ConfigError):
+        cfg.validate()
+    cfg = fresh()
+    with pytest.raises(ConfigError):
+        cfg.local.state("..", "..", "etc")
+
+    cfg = fresh()
     cfg.hpc.write_roots = ["/"]
     with pytest.raises(ConfigError):
         cfg.validate()
@@ -107,8 +132,14 @@ def test_config_validation():
         cfg.validate()
     cfg.hpc.write_roots = ["~/projects", "/scratch/$USER/exp"]
     cfg.validate()
-    with pytest.raises(ConfigError):
-        cfg.local.path("..", "etc")
+
+
+def test_load_config_resolves_relative_to_config_file(tmp_path):
+    from overseer.config import load_config
+
+    (tmp_path / "config.yaml").write_text("ssh: {host: h}\ntelegram: {allowed_chat_ids: [1]}\n")
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.local.state() == (tmp_path / "state").resolve()
 
 
 async def test_nothing_writable_before_connect(env):
@@ -182,8 +213,8 @@ async def test_access_request_backup_and_revert(env):
     assert not err, out
     assert (env.home / "proj" / "train.py").read_text().startswith("BATCH = 64")
 
-    # Originals are backed up on the local machine, inside local.root (/tmp/...).
-    backups = list((Path(env.cfg.local.root) / "sessions" / s.id).glob("*.orig"))
+    # Originals are backed up on the local machine, in the state dir.
+    backups = list(env.cfg.local.sessions_dir(s.id).glob("*.orig"))
     assert len(backups) == 1 and backups[0].read_text().startswith("BATCH = 512")
     assert oct(backups[0].stat().st_mode & 0o777) == "0o600"
 
@@ -405,4 +436,5 @@ def test_build_app(env, monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST")
     app = build(env.cfg)
     assert app.handlers
-    assert (Path(env.cfg.local.root).stat().st_mode & 0o777) == 0o700
+    assert (env.cfg.local.state().stat().st_mode & 0o777) == 0o700
+    assert (env.cfg.local.tmp().stat().st_mode & 0o777) == 0o700

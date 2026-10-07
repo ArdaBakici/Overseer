@@ -4,10 +4,11 @@
 #   ANTHROPIC_API_KEY    - for job reports and the fixing agent
 
 local:
-  # Everything Overseer writes on THIS machine (state DB, audit log, SSH control socket,
-  # backups of files the agent edits on the HPC) goes here. Must be inside /tmp.
-  # Note: /tmp is usually wiped on reboot, which also clears folder grants made from Telegram.
-  root: /tmp/overseer
+  # On THIS machine Overseer only writes inside these folders.
+  # Relative paths are relative to the folder containing this config file (Overseer's folder).
+  allowed_roots: [".", "/tmp"]
+  state_dir: ./state        # SQLite DB (jobs, proposals, folder grants), audit log, backups of edited HPC files
+  tmp_dir: /tmp/overseer    # SSH control socket and other scratch files
 
 ssh:
   # Host alias from ~/.ssh/config on the homelab (recommended) or user@login.cluster.edu.
@@ -31,7 +32,7 @@ hpc:
     - "~"
     # - /scratch/$USER
   max_copy_mb: 200          # max size of a single copy_path (code, not data)
-  max_edit_mb: 2            # larger files can't be modified (every edited file is backed up locally first)
+  max_edit_mb: 2            # larger files can't be modified (every edited file is backed up in state_dir first)
   # deny_read_globs: [...]  # defaults block ~/.ssh, ~/.netrc, *.pem, .env, cloud credentials, HF tokens, ...
   # deny_write_globs: [...] # defaults additionally block ~/.bashrc & other login scripts, .git/hooks, ...
 
