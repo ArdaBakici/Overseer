@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "overseer"
+version = "0.1.0"
+description = "Telegram-driven SLURM job monitor and fixer that runs on your homelab and talks to the HPC over SSH"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=1.0",
+    "python-telegram-bot>=21.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+overseer = "overseer.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["overseer*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

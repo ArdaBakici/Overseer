@@ -1,0 +1,151 @@
+"""Turning raw job data (state, sacct, logs) into human reports.
+
+Heuristics work without any LLM and are always included; the LLM adds a narrative
+summary / root-cause analysis on top when enabled.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+
+from .llm import LLM
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Finding:
+    category: str
+    hint: str
+    evidence: str = ""
+
+
+PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
+    ("GPU out of memory", re.compile(r"CUDA out of memory|torch\.(cuda\.)?OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation|RESOURCE_EXHAUSTED", re.I),
+     "Reduce batch size / sequence length, enable gradient checkpointing or mixed precision, or request a larger GPU."),
+    ("Host out of memory", re.compile(r"oom[-_ ]kill|Out Of Memory|Killed\s*$|MemoryError|exceeded memory limit", re.I | re.M),
+     "Request more --mem, fewer DataLoader workers, or avoid loading the full dataset into RAM."),
+    ("Time limit", re.compile(r"DUE TO TIME LIMIT|TIME LIMIT|time limit exceeded", re.I),
+     "Increase --time, resume from the last checkpoint, or make checkpointing more frequent."),
+    ("Missing Python module", re.compile(r"ModuleNotFoundError: No module named '([^']+)'|ImportError: .*"),
+     "Activate the right environment/module in the batch script or install the package."),
+    ("File not found", re.compile(r"FileNotFoundError: .*|No such file or directory", re.I),
+     "Check paths relative to the job's working directory; data paths may differ on compute nodes."),
+    ("NCCL / distributed error", re.compile(r"NCCL (error|WARN)|ProcessGroupNCCL|Watchdog caught collective operation timeout|torch\.distributed\.\w+Error", re.I),
+     "Check world size vs allocated GPUs, NCCL env vars, and that all ranks run the same code path."),
+    ("CUDA error", re.compile(r"CUDA error: .*|device-side assert triggered|illegal memory access|no CUDA-capable device", re.I),
+     "Run with CUDA_LAUNCH_BLOCKING=1 to localise; often an index out of range in an embedding/loss."),
+    ("Disk quota / space", re.compile(r"Disk quota exceeded|No space left on device", re.I),
+     "Clean up old checkpoints or write outputs to scratch space."),
+    ("NaN / divergence", re.compile(r"\bloss[^\n]{0,20}\bnan\b|\bnan loss\b|Loss is NaN|inf or nan", re.I),
+     "Lower the learning rate, add gradient clipping, check for bad data / fp16 overflow."),
+    ("Segfault", re.compile(r"Segmentation fault|SIGSEGV|core dumped", re.I),
+     "Often a library/driver mismatch or a DataLoader worker crash; try num_workers=0 to isolate."),
+    ("Command not found", re.compile(r"command not found", re.I),
+     "Load the needed module (module load ...) or activate the environment before calling it."),
+    ("Permission denied", re.compile(r"Permission denied", re.I),
+     "The job tried to read/write a path it has no access to."),
+    ("Preempted / node failure", re.compile(r"PREEMPT|NODE_FAIL|node failure", re.I),
+     "Not your code's fault; resubmit (consider --requeue and checkpointing)."),
+]
+
+STATE_FINDINGS = {
+    "TIMEOUT": Finding("Time limit", "The job hit its --time limit. Increase it or resume from a checkpoint."),
+    "OUT_OF_MEMORY": Finding("Host out of memory", "SLURM killed the job for exceeding its memory request (--mem)."),
+    "NODE_FAIL": Finding("Preempted / node failure", "The node failed. Resubmitting usually works."),
+    "PREEMPTED": Finding("Preempted / node failure", "The job was preempted by a higher-priority job."),
+    "BOOT_FAIL": Finding("Preempted / node failure", "The node failed to boot. Resubmit."),
+}
+
+
+def find_issues(log_text: str, state: str = "") -> list[Finding]:
+    found: dict[str, Finding] = {}
+    if state in STATE_FINDINGS:
+        f = STATE_FINDINGS[state]
+        found[f.category] = f
+    for category, rx, hint in PATTERNS:
+        if category in found:
+            continue
+        m = None
+        for m in rx.finditer(log_text):
+            pass  # keep the last occurrence; it's usually the fatal one
+        if m:
+            found[category] = Finding(category, hint, m.group(0).strip()[:200])
+    return list(found.values())
+
+
+def extract_traceback(log_text: str, max_lines: int = 40) -> str:
+    idx = log_text.rfind("Traceback (most recent call last):")
+    if idx < 0:
+        return ""
+    lines = log_text[idx:].splitlines()
+    out = [lines[0]]
+    for ln in lines[1:]:
+        out.append(ln)
+        # The exception line is the first non-indented line after the frames.
+        if ln and not ln.startswith((" ", "\t")):
+            break
+    if len(out) > max_lines:
+        out = out[:3] + ["  ..."] + out[-(max_lines - 4):]
+    return "\n".join(out)
+
+
+METRIC_RE = re.compile(
+    r"\b(epoch|step|iter(?:ation)?|loss|train_loss|val_loss|eval_loss|acc(?:uracy)?|val_acc|lr|ppl|perplexity|f1|bleu|reward)\b"
+    r"\s*[:=]?\s*\[?\s*(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?:\s*/\s*(\d+))?",
+    re.I,
+)
+
+
+def extract_metrics(log_text: str) -> dict[str, str]:
+    """Last seen value of common training metrics, e.g. {'epoch': '3/10', 'loss': '0.412'}."""
+    metrics: dict[str, str] = {}
+    for m in METRIC_RE.finditer(log_text[-50_000:]):
+        key = m.group(1).lower()
+        metrics[key] = m.group(2) + (f"/{m.group(3)}" if m.group(3) else "")
+    return metrics
+
+
+def tqdm_cleanup(text: str) -> str:
+    """Keep only the final frame of carriage-return progress bars."""
+    return "\n".join(line.rstrip("\r").rsplit("\r", 1)[-1] for line in text.split("\n"))
+
+
+REPORT_SYSTEM = """You write short job reports for an ML researcher, delivered as Telegram messages.
+You are given SLURM accounting data and the tail of the job's logs for a job on a university HPC cluster.
+
+Write plain text (no Markdown headings, no tables), at most ~12 lines:
+- First line: one-sentence verdict.
+- If it succeeded: the key final metrics you can find (loss/accuracy/etc.), runtime and resource efficiency if notable.
+- If it failed: the root cause, quoting the decisive log line, then 1-3 concrete next steps (exact flags/code changes when you can tell).
+Only state facts supported by the data; say when the logs are inconclusive."""
+
+STATUS_SYSTEM = """Summarise the progress of a running ML training job in ONE short line for a Telegram status update
+(e.g. "epoch 3/10, loss 0.41 ↓, ~2h left at current pace"). Use only what the log shows; if nothing useful, say "no progress info in log"."""
+
+
+class Reporter:
+    def __init__(self, llm: LLM, report_effort: str | None, llm_status: bool):
+        self.llm = llm
+        self.report_effort = report_effort
+        self.llm_status = llm_status
+
+    async def final_analysis(self, context: str) -> str:
+        if not self.llm.enabled:
+            return ""
+        try:
+            return await self.llm.text(system=REPORT_SYSTEM, prompt=context, effort=self.report_effort)
+        except Exception as e:  # never let the LLM break monitoring
+            log.exception("LLM report failed")
+            return f"(LLM analysis unavailable: {type(e).__name__})"
+
+    async def status_line(self, log_tail: str) -> str:
+        if not (self.llm.enabled and self.llm_status and log_tail.strip()):
+            return ""
+        try:
+            return await self.llm.text(system=STATUS_SYSTEM, prompt=log_tail[-8000:], effort="low", max_tokens=1000)
+        except Exception:
+            log.exception("LLM status failed")
+            return ""

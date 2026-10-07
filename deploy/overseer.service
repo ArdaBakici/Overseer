@@ -1,0 +1,20 @@
+# systemd user service. Install:
+#   mkdir -p ~/.config/systemd/user && cp deploy/overseer.service ~/.config/systemd/user/
+#   # put TELEGRAM_BOT_TOKEN=... and ANTHROPIC_API_KEY=... in ~/.config/overseer.env (chmod 600)
+#   systemctl --user daemon-reload && systemctl --user enable --now overseer
+#   loginctl enable-linger $USER    # keep running when you're logged out
+[Unit]
+Description=Overseer - SLURM job monitor and Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Overseer
+EnvironmentFile=%h/.config/overseer.env
+ExecStart=%h/Overseer/.venv/bin/python -m overseer run -c %h/Overseer/config.yaml
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
