@@ -14,6 +14,7 @@ WorkingDirectory=%h/Overseer
 EnvironmentFile=%h/.config/overseer.env
 # Overseer only writes inside local.allowed_roots (its own folder and /tmp).
 Environment=PYTHONDONTWRITEBYTECODE=1
+# `uv sync` (or pip install -e .) creates .venv; running its python directly avoids uv re-syncing on every start.
 ExecStart=%h/Overseer/.venv/bin/python -m overseer run -c %h/Overseer/config.yaml
 Restart=on-failure
 RestartSec=30

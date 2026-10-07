@@ -68,7 +68,7 @@ Every layer below is covered by tests.
 
 ```bash
 git clone <this repo> ~/Overseer && cd ~/Overseer
-python3 -m venv .venv && .venv/bin/pip install -e .
+uv sync                     # or: python3 -m venv .venv && .venv/bin/pip install -e .
 
 # 1. SSH must work non-interactively. Put the host in ~/.ssh/config:
 #      Host hpc
@@ -84,8 +84,8 @@ ssh -o BatchMode=yes hpc true        # must succeed without any prompt
 cp config.example.yaml config.yaml   # set ssh.host, telegram.allowed_chat_ids, hpc.write_roots
 export TELEGRAM_BOT_TOKEN=...  ANTHROPIC_API_KEY=...   # or use codex/opencode, see below
 
-.venv/bin/python -m overseer check -c config.yaml   # verifies ssh, slurm, folder access, credentials
-.venv/bin/python -m overseer run   -c config.yaml
+uv run overseer check -c config.yaml   # verifies ssh, slurm, folder access, credentials
+uv run overseer run   -c config.yaml
 ```
 
 To run it permanently, use `deploy/overseer.service` (systemd user unit; instructions are inside the file).
@@ -104,8 +104,8 @@ Set `llm.backend` in `config.yaml`. The backend runs both the fixing agent and t
 
 ```bash
 npm i -g @openai/codex        # or: npm i -g opencode-ai
-python -m overseer login codex -c config.yaml     # one-time; stored in ./state/codex
-python -m overseer check -c config.yaml           # makes a real test call through the CLI
+uv run overseer login codex -c config.yaml     # one-time; stored in ./state/codex
+uv run overseer check -c config.yaml           # makes a real test call through the CLI
 ```
 
 **How the CLIs are locked down.** Codex and opencode normally come with their own shell and file-editing tools. On the homelab those tools could use your SSH key to reach the HPC, or write anywhere. Overseer runs them so that **the only tools they have are Overseer's**:
@@ -164,8 +164,7 @@ A job submitted from a session stays linked to that conversation. When it finish
 ## Development
 
 ```bash
-pip install -e '.[dev]'
-pytest
+uv sync --extra dev && uv run pytest      # or: pip install -e '.[dev]' && pytest
 ```
 
 `tests/test_integration.py` runs the real HPC layer, grants, backups/revert, monitor, agent tools and approval flow against a local shell, with fake `squeue`/`sacct`/`scontrol`/`sbatch`/`scancel` scripts (`tests/fake_slurm/`).
