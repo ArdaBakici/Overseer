@@ -14,9 +14,36 @@ from typing import Any
 
 import yaml
 
+LOCAL_TMP = "/tmp"
+
 
 class ConfigError(ValueError):
     pass
+
+
+@dataclass
+class LocalConfig:
+    # Everything Overseer writes on the machine it runs on (state DB, audit log, SSH control
+    # socket, backups of files the agent edits) lives here. Must be inside /tmp.
+    root: str = "/tmp/overseer"
+
+    def path(self, *parts: str) -> Path:
+        p = Path(self.root, *parts).resolve()
+        if not _path_within(p, Path(self.root).resolve()):
+            raise ConfigError(f"{p} is outside the local root {self.root}")
+        return p
+
+    @property
+    def db_path(self) -> Path:
+        return self.path("overseer.db")
+
+    @property
+    def audit_log(self) -> Path:
+        return self.path("audit.log")
+
+    @property
+    def control_path(self) -> str:
+        return str(self.path("ssh")) + "/cm-%C"
 
 
 @dataclass
@@ -26,30 +53,37 @@ class SSHConfig:
     extra_args: list[str] = field(default_factory=list)  # e.g. ["-J", "jumphost"]
     connect_timeout: int = 15
     command_timeout: int = 90
-    # Local path for the multiplexed connection socket. %C is a hash of the connection.
-    control_path: str = "~/.ssh/overseer-%C"
     control_persist: int = 600
     max_concurrent: int = 4
 
 
+DEFAULT_DENY_READ = [
+    "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.netrc", "*/.git-credentials",
+    "*/.pgpass", "*/.aws", "*/.aws/*", "*/.kube", "*/.kube/*", "*/.docker/config.json",
+    "*/.config/gcloud", "*/.config/gcloud/*", "*/.cache/huggingface/token",
+    "*/.huggingface/token", "*/.env", "*.pem", "*.key", "*/id_rsa*", "*/id_ed25519*",
+    "*/id_ecdsa*", "*/.bash_history", "*/.zsh_history",
+]
+# Files that would make something *run* later (login scripts, cron...) are never writable,
+# even inside a write root.
+DEFAULT_DENY_WRITE_EXTRA = [
+    "*/.bashrc", "*/.bash_profile", "*/.bash_login", "*/.bash_logout", "*/.profile", "*/.zshrc",
+    "*/.zprofile", "*/.zshenv", "*/.zlogin", "*/.login", "*/.cshrc", "*/.tcshrc", "*/.config/autostart",
+    "*/.config/autostart/*", "*/.config/systemd", "*/.config/systemd/*", "*/.forward", "*/.git/hooks/*",
+]
+
+
 @dataclass
-class SandboxConfig:
-    # The ONLY directory on the HPC that Overseer may create, modify, delete or run from.
-    root: str = "/tmp/overseer"
-    # Directories the agent may *read* (to diagnose failures and stage code). "~" is the HPC home.
+class HPCAccessConfig:
+    # Directories on the HPC Overseer may create/modify/delete files in and submit jobs from.
+    # More can be granted at runtime from Telegram (the agent asks; you tap Grant).
+    write_roots: list[str] = field(default_factory=list)
+    # Directories the agent may read (to diagnose failures). Write roots are readable too.
     read_roots: list[str] = field(default_factory=lambda: ["~"])
-    # Never readable, even inside read_roots (fnmatch, '*' also matches '/').
-    deny_read_globs: list[str] = field(
-        default_factory=lambda: [
-            "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.netrc", "*/.git-credentials",
-            "*/.pgpass", "*/.aws", "*/.aws/*", "*/.kube", "*/.kube/*", "*/.docker/config.json",
-            "*/.config/gcloud", "*/.config/gcloud/*", "*/.cache/huggingface/token",
-            "*/.huggingface/token", "*/.env", "*.pem", "*.key", "*/id_rsa*", "*/id_ed25519*",
-            "*/id_ecdsa*", "*/.bash_history", "*/.zsh_history",
-        ]
-    )
-    # Max size of code copied into the sandbox per staging call.
-    max_stage_mb: int = 200
+    deny_read_globs: list[str] = field(default_factory=lambda: list(DEFAULT_DENY_READ))
+    deny_write_globs: list[str] = field(default_factory=lambda: list(DEFAULT_DENY_READ + DEFAULT_DENY_WRITE_EXTRA))
+    max_copy_mb: int = 200  # max size of a copy_path call
+    max_edit_mb: int = 2  # files larger than this can't be modified (they're backed up locally first)
 
 
 @dataclass
@@ -104,44 +138,44 @@ class LLMConfig:
 
 
 @dataclass
-class StateConfig:
-    dir: str = "./state"
-
-    @property
-    def db_path(self) -> Path:
-        return Path(self.dir).expanduser() / "overseer.db"
-
-    @property
-    def audit_log(self) -> Path:
-        return Path(self.dir).expanduser() / "audit.log"
-
-
-@dataclass
 class Config:
+    local: LocalConfig = field(default_factory=LocalConfig)
     ssh: SSHConfig = field(default_factory=SSHConfig)
-    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    hpc: HPCAccessConfig = field(default_factory=HPCAccessConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
-    state: StateConfig = field(default_factory=StateConfig)
 
     def validate(self) -> None:
         if not self.ssh.host:
             raise ConfigError("ssh.host is required")
-        root = self.sandbox.root
-        if not root.startswith("/") or posixpath.normpath(root) in ("/", "/tmp", "/home", "/scratch"):
-            raise ConfigError(
-                "sandbox.root must be an absolute, dedicated directory (e.g. /tmp/overseer), "
-                f"not {root!r}"
-            )
-        if "," in root or any(c.isspace() for c in root):
-            raise ConfigError("sandbox.root must not contain commas or whitespace")
+        local = Path(self.local.root).resolve()
+        if not _path_within(local, Path(LOCAL_TMP).resolve()) or local == Path(LOCAL_TMP).resolve():
+            raise ConfigError(f"local.root must be a directory inside {LOCAL_TMP} (got {self.local.root!r})")
+        for r in self.hpc.write_roots:
+            check_root_spec(r)
+        for r in self.hpc.read_roots:
+            if not (r.startswith("/") or r.startswith("~")):
+                raise ConfigError(f"read root {r!r} must be absolute or start with ~")
         if self.slurm.track not in ("all", "overseer"):
             raise ConfigError("slurm.track must be 'all' or 'overseer'")
         if not self.telegram.allowed_chat_ids:
             raise ConfigError("telegram.allowed_chat_ids must list at least one chat id")
-        self.sandbox.root = posixpath.normpath(root)
+
+
+def check_root_spec(r: str) -> None:
+    """Validate a write-root as written in config or a grant request (before ~ expansion)."""
+    if not isinstance(r, str) or not (r.startswith("/") or r.startswith("~")):
+        raise ConfigError(f"write root {r!r} must be absolute or start with ~")
+    if "\n" in r or "\x00" in r:
+        raise ConfigError("write root contains control characters")
+    if posixpath.normpath(r) in ("/", "~"):
+        raise ConfigError(f"write root {r!r} is too broad")
+
+
+def _path_within(p: Path, root: Path) -> bool:
+    return p == root or root in p.parents
 
 
 def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:

@@ -71,9 +71,10 @@ elif prog == "sbatch":
     script_path = args[-1]
     with open(script_path) as fh:
         script = fh.read()
+    out = (opt("--output") or f"{opt('--chdir')}/slurm-%j.out").replace("%j", jid)
+    err = (opt("--error") or out).replace("%j", jid)
     jobs[jid] = {"name": "submitted", "state": "PENDING", "workdir": opt("--chdir"),
-                 "stdout": opt("--output").replace("%j", jid), "stderr": opt("--error").replace("%j", jid),
-                 "script": script}
+                 "stdout": out, "stderr": err, "script": script}
     st.setdefault("submissions", []).append(args)
     save(st)
     print(jid)

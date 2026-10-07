@@ -41,10 +41,14 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /new — start a fresh agent conversation
 /pending — proposals waiting for your approval
 /cancel &lt;id&gt; — cancel a job Overseer submitted (asks to confirm)
+/access — folders Overseer may read / write on the HPC
+/grant &lt;path&gt; [write|read] — allow a folder (default: write)
+/revoke &lt;path&gt; — remove a folder granted here
 /health — connection status
 
 Reply to any job message to talk to the agent about that job.
-The agent can only write inside the sandbox on the HPC and every sbatch/scancel needs your approval."""
+The agent only writes inside allowed folders (it asks you for new ones), backs up every file it changes,
+and every sbatch/scancel needs your approval."""
 
 
 class TelegramNotifier:
@@ -115,6 +119,9 @@ class Bot:
         add(CommandHandler("pending", self.cmd_pending, filters=allowed))
         add(CommandHandler("cancel", self.cmd_cancel, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
+        add(CommandHandler("access", self.cmd_access, filters=allowed))
+        add(CommandHandler("grant", self.cmd_grant, filters=allowed))
+        add(CommandHandler("revoke", self.cmd_revoke, filters=allowed))
         add(CallbackQueryHandler(self.on_button))
         add(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_text))
         add(MessageHandler(~allowed, self.on_stranger))
@@ -212,7 +219,7 @@ class Bot:
             await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
             return
         session = self.agent.session_for_job(job_id)
-        text = instr or ("Diagnose why this job failed. Then fix it in the sandbox and propose a resubmission. "
+        text = instr or ("Diagnose why this job failed. Then fix it and propose a resubmission. "
                          "If the fix needs something outside your reach, explain what I should do instead.")
         await self.notifier.send(Outgoing(f"🔧 Working on job {code(job_id)}…", job_id=job_id, session_id=session.id, silent=True))
         self._spawn(self._run_agent(chat_id, session, text))
@@ -256,9 +263,36 @@ class Bot:
     async def cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         last = f"{int(time.time() - self.monitor.last_ok)}s ago" if self.monitor.last_ok else "never"
         err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
-        await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · sandbox {code(self.hpc.root)}\n"
+        await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · local state {code(self.cfg.local.path())}\n"
                                  f"last successful poll: {last}{err}\n"
                                  f"active agent sessions: {len(self.agent.sessions)}")
+
+    async def cmd_access(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        def fmt(paths: list[str]) -> str:
+            return "\n".join(f"• {code(p)}" + (" (granted here)" if p in self.hpc.grants else "") for p in paths) or "• (none)"
+        await self.reply(update, f"✏️ <b>Writable</b>\n{fmt(self.hpc.write_roots)}\n\n📖 <b>Readable</b>\n{fmt(self.hpc.read_roots)}\n\n"
+                                 "Config-file folders can only be changed in config.yaml.")
+
+    async def cmd_grant(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        args = ctx.args or []
+        mode = args[1] if len(args) > 1 else "write"
+        if not args or mode not in ("read", "write"):
+            await self.reply(update, "Usage: /grant &lt;path&gt; [write|read]")
+            return
+        try:
+            await self.hpc.ensure_connected()
+            await self.reply(update, esc(await self.submitter.grant(args[0], mode, "granted via /grant")))
+        except (PolicyError, SSHError) as e:
+            await self.reply(update, f"⛔ {esc(e)}")
+
+    async def cmd_revoke(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not ctx.args:
+            await self.reply(update, "Usage: /revoke &lt;path&gt;")
+            return
+        try:
+            await self.reply(update, esc(await self.submitter.revoke(ctx.args[0])))
+        except (PolicyError, SSHError) as e:
+            await self.reply(update, f"⛔ {esc(e)}")
 
     # ------------------------------------------------------------------ free text & buttons
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -291,13 +325,31 @@ class Bot:
                 await q.edit_message_reply_markup(None)
                 p = self.store.get_proposal(arg)
                 result = await (self.submitter.approve(arg) if action == "approve" else self.submitter.reject(arg))
+                p2 = self.store.get_proposal(arg)
                 await self.notifier.send(Outgoing(esc(result), session_id=p.session_id if p else None,
-                                                  job_id=(p.job_id or None) if p else None))
+                                                  job_id=(p2.job_id or None) if p2 else None))
                 if p:
-                    p2 = self.store.get_proposal(arg)
                     if p2 and p2.job_id:
                         self.store.link_message(chat.id, q.message.message_id, p2.job_id, p.session_id)
-                    self.agent.note(p.session_id, f"User {'approved' if action == 'approve' else 'rejected'} proposal {arg}: {result}")
+                    verdict = "approved" if action == "approve" else "rejected"
+                    session = self.agent.get(p.session_id)
+                    if p.kind == "access" and session and p2 and p2.status in ("done", "rejected"):
+                        # The agent ended its turn waiting for this decision: resume it.
+                        self._spawn(self._run_agent(chat.id, session,
+                                                    f"(automatic) The user {verdict} your access request: {result} Continue."))
+                    else:
+                        self.agent.note(p.session_id, f"User {verdict} proposal {arg}: {result}")
+            elif action == "revert":
+                s = self.agent.get(arg)
+                lines = s.changes.summary_lines() if s else []
+                await self.notifier.send(Outgoing(
+                    "↩️ Revert these changes?\n" + "\n".join(f"• {esc(x)}" for x in lines[:30]),
+                    session_id=arg, buttons=[[("↩️ Yes, revert", f"revertok:{arg}"), ("Keep", "noop:")]]))
+            elif action == "revertok":
+                await q.edit_message_reply_markup(None)
+                await self.notifier.send(Outgoing(esc(await self.agent.revert(arg)), session_id=arg))
+            elif action == "noop":
+                await q.edit_message_reply_markup(None)
             elif action == "fix":
                 await self._start_fix(chat.id, arg)
             elif action == "log":

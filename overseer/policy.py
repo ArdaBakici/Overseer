@@ -1,18 +1,22 @@
-"""Safety policy: the rules that keep Overseer from touching anything outside its sandbox.
+"""Safety policy: the rules that keep Overseer from touching anything it wasn't allowed to.
 
 Everything here is pure (no I/O) so it can be unit-tested exhaustively.
+
+On the HPC, Overseer may only modify files inside *write roots*: the directories listed in
+``hpc.write_roots`` in the config plus folders you grant from Telegram at runtime.
 
 Layers of protection, from the inside out:
 
 1. ``check_remote_argv`` - every command sent over SSH passes through this guard. Only an
    allowlist of binaries can run; binaries that modify anything (mkdir, cp, rm, dd, sbatch,
-   scancel, ...) are only accepted with absolute target paths inside the sandbox and with a
+   scancel) are only accepted with absolute target paths inside a write root and with a
    fixed set of options. There is no way to send a raw shell string.
-2. ``HPC`` (hpc.py) additionally resolves every path with ``realpath`` on the cluster before
-   use, so symlinks cannot be used to escape the sandbox.
+2. ``HPC`` (hpc.py) resolves every path with ``realpath`` on the cluster before use, so
+   symlinks cannot be used to escape a write root, and applies the deny lists.
 3. ``check_script`` - static analysis of batch scripts the agent wants to submit: resource
-   limits, plus heuristic detection of writes outside the sandbox.
-4. Human approval in Telegram before any ``sbatch``/``scancel`` (on by default).
+   limits, plus heuristic detection of writes outside the write roots.
+4. Human approval in Telegram before any ``sbatch``/``scancel`` and before any new folder
+   becomes writable.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from .config import LimitsConfig
 
 
 class PolicyError(Exception):
-    """Raised when an operation would violate the sandbox policy."""
+    """Raised when an operation would violate the access policy."""
 
 
 # --------------------------------------------------------------------------------------
@@ -51,16 +55,18 @@ def is_within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def require_in_sandbox(path: str, sandbox_root: str, *, allow_root: bool = True) -> str:
+def require_in_roots(path: str, roots: list[str], *, allow_root: bool = True) -> str:
+    """Return the normalised path if it is inside one of ``roots`` (lexically), else raise."""
     path = _clean(path)
     if not path.startswith("/"):
         raise PolicyError(f"path must be absolute: {path!r}")
     norm = posixpath.normpath(path)
-    if not is_within(norm, sandbox_root):
-        raise PolicyError(f"{path!r} is outside the sandbox {sandbox_root}")
-    if not allow_root and norm == posixpath.normpath(sandbox_root):
-        raise PolicyError("refusing to operate on the sandbox root itself")
-    return norm
+    for root in roots:
+        if is_within(norm, root):
+            if not allow_root and norm == posixpath.normpath(root):
+                raise PolicyError(f"refusing to operate on the write root {root} itself")
+            return norm
+    raise PolicyError(f"{path!r} is outside the writable folders ({', '.join(roots) or 'none configured'})")
 
 
 def is_denied(path: str, deny_globs: list[str]) -> bool:
@@ -105,7 +111,7 @@ def _only_opts(opts: list[str], allowed: set[str], binary: str) -> None:
             raise PolicyError(f"option {o!r} is not allowed for {binary}")
 
 
-def check_remote_argv(argv: list[str], sandbox_root: str) -> None:
+def check_remote_argv(argv: list[str], write_roots: list[str]) -> None:
     """Raise PolicyError unless ``argv`` is an allowed remote command."""
     if not argv:
         raise PolicyError("empty command")
@@ -146,30 +152,31 @@ def check_remote_argv(argv: list[str], sandbox_root: str) -> None:
         raise PolicyError("srun is only allowed for the nvidia-smi probe")
     if binary == "sbatch":
         opts, pos = _positionals(args)
-        _only_opts(opts, {"--parsable", "--chdir", "--output", "--error", "--export"}, binary)
+        _only_opts(opts, {"--parsable", "--chdir", "--output", "--error"}, binary)
         if len(pos) != 1:
             raise PolicyError("sbatch takes exactly one script path")
-        require_in_sandbox(pos[0], sandbox_root)
+        require_in_roots(pos[0], write_roots)
         given = {o.split("=", 1)[0]: o.split("=", 1)[1] for o in opts if "=" in o}
+        if "--chdir" not in given:
+            raise PolicyError("sbatch requires --chdir inside a write root")
         for key in ("--chdir", "--output", "--error"):
-            if key not in given:
-                raise PolicyError(f"sbatch requires {key} inside the sandbox")
-            require_in_sandbox(given[key], sandbox_root)
+            if key in given:
+                require_in_roots(given[key], write_roots)
         return
     if binary == "mkdir":
         opts, pos = _positionals(args)
-        _only_opts(opts, {"-p", "--mode"}, binary)
+        _only_opts(opts, {"-p"}, binary)
         if not pos:
             raise PolicyError("mkdir needs a path")
         for p in pos:
-            require_in_sandbox(p, sandbox_root)
+            require_in_roots(p, write_roots)
         return
     if binary == "cp":
         opts, pos = _positionals(args)
-        _only_opts(opts, {"-r", "-R", "-P", "--no-preserve", "--preserve", "-T"}, binary)
+        _only_opts(opts, {"-r", "-R", "-P", "-T", "-n"}, binary)
         if len(pos) < 2:
             raise PolicyError("cp needs a source and a destination")
-        require_in_sandbox(pos[-1], sandbox_root, allow_root=False)
+        require_in_roots(pos[-1], write_roots)
         return
     if binary == "rm":
         opts, pos = _positionals(args)
@@ -177,13 +184,13 @@ def check_remote_argv(argv: list[str], sandbox_root: str) -> None:
         if not pos:
             raise PolicyError("rm needs a path")
         for p in pos:
-            require_in_sandbox(p, sandbox_root, allow_root=False)
+            require_in_roots(p, write_roots, allow_root=False)
         return
     if binary == "dd":
         targets = [a[3:] for a in args if a.startswith("of=")]
         if len(targets) != 1 or any(not (a.startswith("of=") or a == "status=none") for a in args):
-            raise PolicyError("dd is only allowed as 'dd of=<sandbox path> status=none'")
-        require_in_sandbox(targets[0], sandbox_root, allow_root=False)
+            raise PolicyError("dd is only allowed as 'dd of=<path in a write root> status=none'")
+        require_in_roots(targets[0], write_roots, allow_root=False)
         return
     raise PolicyError(f"command {binary!r} is not on the allowlist")
 
@@ -339,8 +346,6 @@ def _int_or(v: str, default: int) -> int:
 
 
 SAFE_DEV = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
-SAFE_VARS = ("$OVERSEER_", "${OVERSEER_", "$TMPDIR", "${TMPDIR", "$SLURM_TMPDIR", "${SLURM_TMPDIR", "$PWD", "${PWD")
-HOME_PREFIXES = ("~", "$HOME", "${HOME")
 
 WRITE_ALL_TARGETS = {"rm", "rmdir", "touch", "mkdir", "chmod", "chown", "truncate", "tee", "mv", "unlink", "shred"}
 WRITE_LAST_TARGET = {"cp", "rsync", "ln", "install", "scp"}
@@ -366,17 +371,22 @@ class ScriptReport:
         return f"partition={part} nodes={self.nodes} gpus={self.gpus} time={t}"
 
 
-def _classify_target(target: str, sandbox_root: str) -> str | None:
-    """Return a problem description if writing to ``target`` would leave the sandbox."""
-    t = target.strip("'\"")
+def expand_home(path: str, home: str) -> str:
+    for prefix in ("${HOME}", "$HOME", "~"):
+        if path == prefix or path.startswith(prefix + "/"):
+            return home + path[len(prefix):]
+    return path
+
+
+def _classify_target(target: str, roots: list[str], home: str) -> str | None:
+    """Return a problem description if writing to ``target`` would leave the write roots."""
+    t = expand_home(target.strip("'\""), home)
     if not t or t.startswith("-"):
         return None
-    if t.startswith(HOME_PREFIXES):
-        return f"writes into your home directory ({t})"
     if t.startswith("/"):
-        if t in SAFE_DEV or t.startswith("/dev/fd/") or is_within(t, sandbox_root):
+        if t in SAFE_DEV or t.startswith("/dev/fd/") or any(is_within(t, r) for r in roots):
             return None
-        return f"writes outside the sandbox ({t})"
+        return f"writes outside the writable folders ({target.strip(chr(39) + chr(34))})"
     return None
 
 
@@ -387,7 +397,7 @@ def _strip_comment(line: str) -> str:
     return re.split(r"\s+#", s, maxsplit=1)[0]
 
 
-def check_script(script: str, sandbox_root: str, limits: LimitsConfig) -> ScriptReport:
+def check_script(script: str, roots: list[str], home: str, limits: LimitsConfig) -> ScriptReport:
     rep = ScriptReport()
     if not script.startswith("#!"):
         rep.errors.append("script must start with a shebang line (e.g. #!/bin/bash)")
@@ -423,8 +433,8 @@ def check_script(script: str, sandbox_root: str, limits: LimitsConfig) -> Script
         if n > limits.max_array_tasks:
             rep.errors.append(f"job array with {n} tasks exceeds max_array_tasks={limits.max_array_tasks}")
     for k in ("output", "error", "chdir"):
-        if k in opts:
-            rep.warnings.append(f"#SBATCH --{k} is ignored; Overseer sets it inside the sandbox")
+        if k in opts and _classify_target(opts[k], roots, home):
+            rep.errors.append(f"#SBATCH --{k}={opts[k]} is outside the writable folders")
     if "wrap" in opts:
         rep.errors.append("--wrap is not allowed")
 
@@ -442,16 +452,16 @@ def check_script(script: str, sandbox_root: str, limits: LimitsConfig) -> Script
             rep.errors.append(f"{where}: jobs may not submit or cancel other jobs")
         if re.search(r"(^|[;&|\s])(pip|pip3|conda|mamba|micromamba)\s+(install|create|update|remove|uninstall)\b", line) or re.search(r"-m\s+pip\s+install", line):
             if "--target" not in line and "--prefix" not in line:
-                rep.warnings.append(f"{where}: package install modifies an environment outside the sandbox")
+                rep.warnings.append(f"{where}: package install modifies an environment outside the writable folders")
         if re.search(r"\bgit\s+(push|commit|reset|checkout|clean)\b", line):
             rep.warnings.append(f"{where}: git command may modify a repository")
         if re.search(r"(^|[;&|\s])(ssh|scp)\s", line):
             rep.warnings.append(f"{where}: opens an SSH connection")
         m = re.match(r"^cd\s+(\S+)", line)
-        if m and _classify_target(m.group(1), sandbox_root):
-            rep.warnings.append(f"{where}: cd to {m.group(1)} — later relative writes land outside the sandbox")
+        if m and _classify_target(m.group(1), roots, home):
+            rep.warnings.append(f"{where}: cd to {m.group(1)} — later relative writes land outside the writable folders")
         for target in REDIRECT_RE.findall(line):
-            prob = _classify_target(target, sandbox_root)
+            prob = _classify_target(target, roots, home)
             if prob:
                 rep.errors.append(f"{where}: redirect {prob}")
         for segment in re.split(r"[;&|]+", line):
@@ -473,15 +483,20 @@ def check_script(script: str, sandbox_root: str, limits: LimitsConfig) -> Script
             elif cmd == "dd":
                 targets = [t[3:] for t in toks if t.startswith("of=")]
             for t in targets:
-                prob = _classify_target(t, sandbox_root)
+                prob = _classify_target(t, roots, home)
                 if prob:
                     rep.errors.append(f"{where}: {cmd} {prob}")
             if cmd in ("rm", "chmod", "chown") and any(t in ("/", "/*", "~", "~/", "$HOME") for t in pos):
                 rep.errors.append(f"{where}: destructive {cmd} on a root/home path")
+            if cmd in ("rm", "rmdir", "mv", "shred", "unlink"):
+                for t in pos:
+                    base = posixpath.normpath(expand_home(t.strip("'\""), home).rstrip("*").rstrip("/") or "/")
+                    if any(base == posixpath.normpath(r) for r in roots):
+                        rep.errors.append(f"{where}: {cmd} would wipe the whole writable folder {base}")
             for t in toks[1:]:
                 ref = t.split("=", 1)[1] if t.startswith("-") and "=" in t else t
-                if ref.startswith(("/", "~", "$HOME", "${HOME")) and _classify_target(ref, sandbox_root):
-                    rep.warnings.append(f"{where}: references {ref} outside the sandbox (OK only if read-only)")
+                if ref.startswith(("/", "~", "$HOME", "${HOME")) and _classify_target(ref, roots, home):
+                    rep.warnings.append(f"{where}: references {ref} outside the writable folders (OK only if read-only)")
     rep.errors = list(dict.fromkeys(rep.errors))
     rep.warnings = list(dict.fromkeys(rep.warnings))
     return rep
@@ -490,15 +505,15 @@ def check_script(script: str, sandbox_root: str, limits: LimitsConfig) -> Script
 ABS_PATH_LITERAL_RE = re.compile(r"""["'](/[^"'\s]+)["']""")
 
 
-def scan_diff(diff: str, sandbox_root: str) -> list[str]:
-    """Warnings for added lines in a unified diff that reference locations outside the sandbox."""
+def scan_diff(diff: str, roots: list[str], home: str) -> list[str]:
+    """Warnings for added lines in a unified diff that reference locations outside the write roots."""
     warnings: list[str] = []
     for line in diff.splitlines():
         if not line.startswith("+") or line.startswith("+++"):
             continue
         for path in ABS_PATH_LITERAL_RE.findall(line):
-            if not is_within(path, sandbox_root) and not path.startswith("/dev/"):
-                warnings.append(f"added code references {path} (outside sandbox; fine if read-only)")
+            if _classify_target(path, roots, home) and not path.startswith("/dev/"):
+                warnings.append(f"added code references {path} (outside writable folders; fine if read-only)")
         if "expanduser(" in line or "Path.home()" in line:
             warnings.append("added code uses the home directory")
     return list(dict.fromkeys(warnings))

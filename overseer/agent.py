@@ -1,19 +1,20 @@
-"""The fixing agent: Claude with a small, sandboxed tool set.
+"""The fixing agent: Claude with a small, policy-checked tool set.
 
-The agent has no shell. Its only tools are: read/list/search files (within read roots),
-copy code into its sandbox workspace, write/edit/delete files *inside the sandbox*, and
-*propose* a job submission or cancellation, which the user approves in Telegram.
+The agent has no shell. Its only tools are: read/list/search files (readable folders only),
+copy/write/edit/delete files (writable folders only; originals are backed up locally first),
+and *propose* a job submission, cancellation or access to a new folder - each of which the
+user approves in Telegram.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import posixpath
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from .changes import ChangeSet
 from .config import Config
 from .hpc import HPC
 from .llm import LLM, response_text
@@ -31,36 +32,38 @@ SYSTEM_PROMPT = """You are Overseer, an assistant that manages a researcher's ML
 The researcher talks to you through Telegram. They will ask you to diagnose failed jobs, fix them, and resubmit,
 or ask for guidance on next steps.
 
-## Hard rules (enforced by the system — violating them just produces errors)
-- You can READ files under: {read_roots} (secrets such as ~/.ssh are blocked).
-- You can only CREATE, MODIFY or DELETE files inside the sandbox: {sandbox}. The researcher's original code is never modified.
-- You cannot run commands. The only way to run anything is `propose_submission`: the researcher sees the full script and
-  the diff of your code changes in Telegram and must approve it before it is passed to sbatch.
+## Access rules (enforced by the system — violating them just produces errors)
+- Each request starts with an <access> block listing the folders you may READ and the folders you may WRITE
+  (create/modify/delete files in, and submit jobs from). Secrets (~/.ssh, keys, tokens) are never readable, and
+  login scripts (~/.bashrc etc.) are never writable.
+- If you need a folder that isn't listed, call `request_access` with the narrowest folder that will do and a one-line
+  reason, then END YOUR TURN. You'll be resumed with the user's decision. Don't ask for broad folders like the whole home.
+- You cannot run commands. The only way to run anything is `propose_submission`: the researcher sees the full script
+  and a diff of every file you changed, and must approve it before it is passed to sbatch.
 - Limits for jobs you propose: max {max_gpus} GPUs, {max_nodes} node(s), max --time {max_time}{partitions}.
   Every script must set `#SBATCH --time`. Job arrays allowed up to {max_array} tasks.
+- Batch scripts must not write outside the writable folders (redirects, cp/mv/rm targets, #SBATCH --output/--error).
+  Reading datasets and pretrained weights from anywhere readable is fine.
 
-## Workspace
-Each conversation has a workspace directory. Relative paths in tools resolve against `work/` of the workspace.
-- `stage` copies a file or directory from the researcher's project into BOTH `orig/` (pristine) and `work/` (yours to edit).
-  The diff between them is what the researcher reviews, so stage before you edit, and edit only in `work/`.
-- Write the batch script into `work/` too (e.g. work/run.sbatch).
-- When the job runs: cwd = `work/`; these env vars are set:
-  `$OVERSEER_RUN_DIR` (empty per-run output dir), `$OVERSEER_WORKSPACE` (= work/), `$TMPDIR` (inside the run dir).
-  stdout/stderr are captured by Overseer automatically — do not set #SBATCH --output/--error/--chdir.
-- All outputs the job WRITES (checkpoints, logs, results, wandb dirs, caches you control) must go under $OVERSEER_RUN_DIR
-  or relative paths. Reading datasets/pretrained weights from their original locations is fine.
-  Never redirect output to, or rm/mv/cp into, paths outside the sandbox — the policy check will reject the script.
-- Staged code runs from `work/`, not from the original project directory: relative paths to data or checkpoints in the
-  original project won't resolve. Pass absolute paths for inputs (reading them in place is fine).
+## How to change things
+- Every file you modify is backed up first; the researcher gets an exact diff and can revert all your changes with one tap.
+  Still, prefer the least invasive option: when the original project isn't in a writable folder, or when you're trying
+  a variant, `copy_path` the code into a new directory inside a writable folder and edit the copy.
+- Edit with `edit_file` (exact snippet replacement); use `write_file` for new files such as a batch script.
+- `propose_submission` runs the script with sbatch from `workdir` (default: the script's directory). Unless the script
+  sets #SBATCH --output, the log goes to workdir/slurm-<jobid>.out.
+- Copied code runs from its new location: relative paths to data/checkpoints in the original project may no longer
+  resolve, so pass absolute paths for inputs.
 - Reproduce the original job's environment setup (module loads, conda/venv activation, partition/account/gres) from
-  its batch script unless that setup is the bug.
+  its batch script unless that setup is the bug. Make outputs (checkpoints, logs, results) go to a writable folder.
 
 ## Working style
 - Diagnose from evidence: read the job's logs and batch script first, then the relevant source. Quote the decisive log line.
 - Make the smallest change that fixes the problem; don't refactor unrelated code.
-- If the researcher only asks a question or for guidance, answer it — don't propose a job unless asked or clearly implied.
-- If a fix needs something you can't do (installing packages into their env, changing data outside the sandbox),
-  explain exactly what the researcher should run themselves.
+- If the researcher only asks a question or for guidance, answer it — don't change files or propose jobs unless asked
+  or clearly implied.
+- If a fix needs something you can't do (installing packages into their env, changing data you can't write),
+  explain exactly what the researcher should do themselves.
 - Your final message is sent to Telegram: keep it short and concrete (what was wrong, what you changed, what's pending).
   Plain text, no Markdown tables or headings."""
 
@@ -71,6 +74,7 @@ def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 S = {"type": "string"}
 I = {"type": "integer"}
+PATH = {"type": "string", "description": "absolute path or ~/..."}
 
 TOOLS: list[dict[str, Any]] = [
     {"name": "list_jobs", "description": "List recently seen SLURM jobs (active and finished) with state and log paths.",
@@ -79,22 +83,27 @@ TOOLS: list[dict[str, Any]] = [
      "input_schema": _schema({"job_id": S}, ["job_id"])},
     {"name": "job_log", "description": "Tail of a job's stdout or stderr log.",
      "input_schema": _schema({"job_id": S, "stream": {"type": "string", "enum": ["stdout", "stderr"]}, "lines": I}, ["job_id"])},
-    {"name": "read_file", "description": "Read a text file (readable roots or sandbox). Use tail_lines for the end of large logs.",
-     "input_schema": _schema({"path": S, "tail_lines": I}, ["path"])},
-    {"name": "list_dir", "description": "List a directory (ls -la).", "input_schema": _schema({"path": S}, ["path"])},
+    {"name": "read_file", "description": "Read a text file in a readable folder. Use tail_lines for the end of large logs.",
+     "input_schema": _schema({"path": PATH, "tail_lines": I}, ["path"])},
+    {"name": "list_dir", "description": "List a directory (ls -la).", "input_schema": _schema({"path": PATH}, ["path"])},
     {"name": "search", "description": "Recursive grep -E for a regex under a directory. Optional include glob like '*.py'.",
-     "input_schema": _schema({"pattern": S, "path": S, "include": S}, ["pattern", "path"])},
-    {"name": "stage", "description": "Copy a file or directory from the researcher's project into the workspace (orig/ and work/). Returns the path in work/. Code only — no datasets/checkpoints (size-limited).",
-     "input_schema": _schema({"src": S, "subdir": {"type": "string", "description": "optional subdirectory of work/ to copy into"}}, ["src"])},
-    {"name": "write_file", "description": "Create or overwrite a file in the sandbox (relative paths are under work/).",
-     "input_schema": _schema({"path": S, "content": S}, ["path", "content"])},
-    {"name": "edit_file", "description": "Replace an exact, unique snippet in a sandbox file.",
-     "input_schema": _schema({"path": S, "old_string": S, "new_string": S}, ["path", "old_string", "new_string"])},
-    {"name": "delete_path", "description": "Delete a file or directory inside the sandbox.",
-     "input_schema": _schema({"path": S}, ["path"])},
-    {"name": "show_diff", "description": "Unified diff of work/ against the staged originals.", "input_schema": _schema({}, [])},
-    {"name": "propose_submission", "description": "Ask the researcher to approve submitting a batch script from the sandbox with sbatch. They will see the script and the diff.",
-     "input_schema": _schema({"script_path": S, "summary": {"type": "string", "description": "1-3 sentences: what changed and why, what to expect"}}, ["script_path", "summary"])},
+     "input_schema": _schema({"pattern": S, "path": PATH, "include": S}, ["pattern", "path"])},
+    {"name": "list_access", "description": "Show the folders you can currently read and write.", "input_schema": _schema({}, [])},
+    {"name": "request_access", "description": "Ask the user (via Telegram) for read or write access to a folder. End your turn after calling this.",
+     "input_schema": _schema({"path": PATH, "mode": {"type": "string", "enum": ["read", "write"]}, "reason": S}, ["path", "mode", "reason"])},
+    {"name": "copy_path", "description": "Copy a readable file or directory to a NEW path inside a writable folder (code only; size-limited).",
+     "input_schema": _schema({"src": PATH, "dest": PATH}, ["src", "dest"])},
+    {"name": "write_file", "description": "Create or overwrite a text file inside a writable folder.",
+     "input_schema": _schema({"path": PATH, "content": S}, ["path", "content"])},
+    {"name": "edit_file", "description": "Replace an exact, unique snippet in a text file inside a writable folder.",
+     "input_schema": _schema({"path": PATH, "old_string": S, "new_string": S}, ["path", "old_string", "new_string"])},
+    {"name": "delete_path", "description": "Delete a file inside a writable folder (directories only if you created them in this conversation).",
+     "input_schema": _schema({"path": PATH}, ["path"])},
+    {"name": "show_changes", "description": "Diff of every file you changed in this conversation.", "input_schema": _schema({}, [])},
+    {"name": "propose_submission", "description": "Ask the researcher to approve submitting a batch script with sbatch. They will see the script and the diff of your changes.",
+     "input_schema": _schema({"script_path": PATH, "summary": {"type": "string", "description": "1-3 sentences: what changed and why, what to expect"},
+                              "workdir": {"type": "string", "description": "optional working directory (default: the script's directory)"}},
+                             ["script_path", "summary"])},
     {"name": "propose_cancel", "description": "Ask the researcher to approve cancelling a job that Overseer submitted.",
      "input_schema": _schema({"job_id": S, "reason": S}, ["job_id", "reason"])},
 ]
@@ -103,20 +112,12 @@ TOOLS: list[dict[str, Any]] = [
 @dataclass
 class Session:
     id: str
-    root: str
+    changes: ChangeSet
     job_id: str | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)  # system events to tell the agent next turn
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     initialized: bool = False
-
-    @property
-    def work(self) -> str:
-        return posixpath.join(self.root, "work")
-
-    @property
-    def orig(self) -> str:
-        return posixpath.join(self.root, "orig")
 
 
 class Agent:
@@ -135,15 +136,22 @@ class Agent:
     def system_prompt(self) -> str:
         lim = self.cfg.limits
         return SYSTEM_PROMPT.format(
-            read_roots=", ".join(self.cfg.sandbox.read_roots), sandbox=self.hpc.root,
             max_gpus=lim.max_gpus_per_job, max_nodes=lim.max_nodes_per_job, max_time=lim.max_time,
             partitions=f", partitions {', '.join(lim.allowed_partitions)}" if lim.allowed_partitions else "",
             max_array=lim.max_array_tasks,
         )
 
+    def access_block(self) -> str:
+        w = "\n".join(f"  {r}" for r in self.hpc.write_roots) or "  (none — use request_access)"
+        r = "\n".join(f"  {p}" for p in self.hpc.read_roots) or "  (none)"
+        return f"<access home='{self.hpc.home}'>\nwritable:\n{w}\nreadable:\n{r}\n</access>"
+
+    def changeset(self, sid: str) -> ChangeSet:
+        return ChangeSet(self.cfg.local.path("sessions", sid))
+
     def _new_session(self, job_id: str | None) -> Session:
         sid = (f"j{job_id}-" if job_id else "chat-") + uuid.uuid4().hex[:6]
-        s = Session(id=sid, root=posixpath.join(self.hpc.root, "sessions", sid), job_id=job_id)
+        s = Session(id=sid, changes=self.changeset(sid), job_id=job_id)
         self.sessions[sid] = s
         return s
 
@@ -204,9 +212,10 @@ class Agent:
                                                   session_id=s.id, job_id=s.job_id))
             finally:
                 if actions:
+                    buttons = [[("↩️ Revert all changes", f"revert:{s.id}")]] if s.changes else []
                     await self.notifier.send(Outgoing(
                         "🛠 <b>Agent actions</b>\n" + "\n".join(f"• {a}" for a in actions[-40:]),
-                        session_id=s.id, job_id=s.job_id, silent=True))
+                        session_id=s.id, job_id=s.job_id, silent=True, buttons=buttons))
 
     def _append_user(self, s: Session, blocks: list[dict[str, Any]]) -> None:
         if s.messages and s.messages[-1]["role"] == "user":
@@ -218,13 +227,9 @@ class Agent:
             s.messages.append({"role": "user", "content": blocks})
 
     async def _turn(self, s: Session, user_text: str, actions: list[str]) -> None:
-        text_parts = []
+        text_parts = [self.access_block()]
         if not s.initialized:
-            await self.hpc.mkdir(s.work)
-            await self.hpc.mkdir(s.orig)
-            await self.hpc.mkdir(posixpath.join(s.root, "runs"))
             s.initialized = True
-            text_parts.append(f"<workspace root='{s.root}' work='{s.work}' orig='{s.orig}'/>")
             if s.job_id:
                 text_parts.append(await self._job_context(s.job_id))
         if s.notes:
@@ -278,6 +283,17 @@ class Agent:
             raise ValueError(f"'{key}' must be a non-empty string")
         return v
 
+    async def _backup(self, s: Session, real: str) -> None:
+        """Save the original of a file locally before its first modification in this session."""
+        if real in s.changes.entries:
+            return
+        if not await self.hpc.exists(real):
+            s.changes.record_file(real, None)
+            return
+        if await self.hpc.is_dir(real):
+            raise PolicyError(f"{real} is a directory; only files (or directories you created) can be changed")
+        s.changes.record_file(real, await self.hpc.read_for_edit(real))
+
     async def _dispatch(self, s: Session, name: str, a: dict[str, Any], actions: list[str]) -> str:
         h = self.hpc
         if name == "list_jobs":
@@ -296,52 +312,63 @@ class Agent:
             return (await h.read_file(path, tail_lines=lines)).text
         if name == "read_file":
             tl = a.get("tail_lines")
-            ft = await h.read_file(self._str(a, "path"), base=s.work, tail_lines=int(tl) if tl else None)
+            ft = await h.read_file(self._str(a, "path"), tail_lines=int(tl) if tl else None)
             actions.append(f"📖 read {code(ft.path)}")
             return ft.text + ("\n<truncated: file is larger; use tail_lines or search>" if ft.truncated else "")
         if name == "list_dir":
-            return await h.list_dir(self._str(a, "path"), base=s.work)
+            return await h.list_dir(self._str(a, "path"))
         if name == "search":
-            return await h.search(self._str(a, "pattern"), self._str(a, "path"), base=s.work,
+            return await h.search(self._str(a, "pattern"), self._str(a, "path"),
                                   include=self._str(a, "include", required=False) or None)
-        if name == "stage":
-            sub = self._str(a, "subdir", required=False).strip("/")
-            if ".." in sub.split("/"):
-                raise PolicyError("subdir may not contain '..'")
-            src = self._str(a, "src")
-            dest_work = posixpath.join(s.work, sub) if sub else s.work
-            dest_orig = posixpath.join(s.orig, sub) if sub else s.orig
-            await h.stage(src, dest_orig, base=s.work)
-            path = await h.stage(src, dest_work, base=s.work)
-            actions.append(f"📦 staged {code(src)} → {code(path)}")
-            return f"staged to {path} (pristine copy under {dest_orig})"
+        if name == "list_access":
+            return self.access_block()
+        if name == "request_access":
+            path, mode = self._str(a, "path"), self._str(a, "mode")
+            result = await self.submitter.propose_access(s, path, mode, self._str(a, "reason"))
+            actions.append(f"🔐 requested {esc(mode)} access to {code(path)}")
+            return result
+        if name == "copy_path":
+            src, dest = self._str(a, "src"), self._str(a, "dest")
+            real_dest = await h.check_write(dest)
+            path = await h.copy(src, real_dest)
+            s.changes.record_copy(path, src)
+            actions.append(f"📦 copied {code(src)} → {code(path)}")
+            return f"copied to {path}"
         if name == "write_file":
             content = a.get("content")
             if not isinstance(content, str):
                 raise ValueError("'content' must be a string")
-            path = await h.write_file(self._str(a, "path"), content, base=s.work)
-            actions.append(f"✏️ wrote {code(path)} ({len(content.splitlines())} lines)")
-            return f"wrote {path}"
+            real = await h.check_write(self._str(a, "path"))
+            await self._backup(s, real)
+            await h.write_file(real, content)
+            actions.append(f"✏️ wrote {code(real)} ({len(content.splitlines())} lines)")
+            return f"wrote {real}"
         if name == "edit_file":
-            path = await h.check_write(self._str(a, "path"), base=s.work)
+            real = await h.check_write(self._str(a, "path"))
             old, new = self._str(a, "old_string"), a.get("new_string")
             if not isinstance(new, str):
                 raise ValueError("'new_string' must be a string")
-            text = (await h.read_file(path, max_bytes=2_000_000)).text
+            text = await h.read_for_edit(real)
             n = text.count(old)
             if n != 1:
-                raise ValueError(f"old_string found {n} times in {path}; it must match exactly once")
-            await h.write_file(path, text.replace(old, new, 1))
-            actions.append(f"✏️ edited {code(path)} (−{len(old.splitlines())}/+{len(new.splitlines())} lines)")
-            return f"edited {path}"
+                raise ValueError(f"old_string found {n} times in {real}; it must match exactly once")
+            await self._backup(s, real)
+            await h.write_file(real, text.replace(old, new, 1))
+            actions.append(f"✏️ edited {code(real)} (−{len(old.splitlines())}/+{len(new.splitlines())} lines)")
+            return f"edited {real}"
         if name == "delete_path":
-            path = await h.delete(self._str(a, "path"), base=s.work)
-            actions.append(f"🗑 deleted {code(path)}")
-            return f"deleted {path}"
-        if name == "show_diff":
-            return await h.diff(s.orig, s.work) or "no differences"
+            real = await h.check_write(self._str(a, "path"))
+            if await h.is_dir(real) and not s.changes.covered(real):
+                raise PolicyError("only directories created in this conversation can be deleted")
+            await self._backup(s, real)
+            await h.delete(real)
+            actions.append(f"🗑 deleted {code(real)}")
+            return f"deleted {real}"
+        if name == "show_changes":
+            return await s.changes.diff(h) or "no changes"
         if name == "propose_submission":
-            result = await self.submitter.propose_submit(s, self._str(a, "script_path"), self._str(a, "summary"))
+            result = await self.submitter.propose_submit(s, self._str(a, "script_path"), self._str(a, "summary"),
+                                                         self._str(a, "workdir", required=False))
             actions.append(f"📝 proposed submission of {code(a['script_path'])}")
             return result
         if name == "propose_cancel":
@@ -349,3 +376,15 @@ class Agent:
             actions.append(f"🛑 proposed cancelling job {code(a['job_id'])}")
             return result
         raise ValueError(f"unknown tool {name}")
+
+    async def revert(self, sid: str) -> str:
+        s = self.sessions.get(sid)
+        changes = s.changes if s else self.changeset(sid)
+        if not changes:
+            return "Nothing to revert."
+        lock = s.lock if s else asyncio.Lock()
+        async with lock:
+            done = await changes.revert(self.hpc)
+        if s:
+            s.notes.append("The user reverted all your file changes: " + "; ".join(done))
+        return "↩️ Reverted:\n" + "\n".join(f"• {d}" for d in done)

@@ -3,6 +3,12 @@
 #   TELEGRAM_BOT_TOKEN   - from @BotFather
 #   ANTHROPIC_API_KEY    - for job reports and the fixing agent
 
+local:
+  # Everything Overseer writes on THIS machine (state DB, audit log, SSH control socket,
+  # backups of files the agent edits on the HPC) goes here. Must be inside /tmp.
+  # Note: /tmp is usually wiped on reboot, which also clears folder grants made from Telegram.
+  root: /tmp/overseer
+
 ssh:
   # Host alias from ~/.ssh/config on the homelab (recommended) or user@login.cluster.edu.
   # Must work non-interactively: `ssh <host> true` should succeed with no prompt.
@@ -12,20 +18,22 @@ ssh:
   command_timeout: 90
   max_concurrent: 4         # parallel commands over the multiplexed connection
 
-sandbox:
-  # The ONLY directory on the HPC that Overseer may create/modify/delete files in or run jobs from.
-  # It is created with mode 700 and Overseer refuses to start if someone else owns it.
-  # NOTE: on most clusters /tmp is local to each node, so compute nodes can't see a login node's
-  # /tmp. If that's the case on yours, use a directory on shared scratch instead, e.g.
-  # /scratch/<netid>/overseer — see the README.
-  root: /tmp/overseer
-  # Where the agent may READ (to diagnose failures and copy code into the sandbox).
-  # Narrow this to your project / scratch directories if you can; anything read may be sent to the LLM.
+hpc:
+  # Folders on the HPC where Overseer may create/modify/delete files and submit jobs from.
+  # Nothing else is writable. When the agent needs another folder it asks you in Telegram
+  # (Grant / Deny); you can also use /grant and /revoke.
+  write_roots:
+    - /scratch/$USER/overseer
+    # - ~/projects/my-model
+  # Folders the agent may READ (logs, code) to diagnose failures. Writable folders are readable too.
+  # Anything read may be sent to the LLM, so narrow this if that matters.
   read_roots:
     - "~"
     # - /scratch/$USER
-  max_stage_mb: 200         # max size of code copied into the sandbox per staging call
-  # deny_read_globs: [...]  # defaults block ~/.ssh, ~/.netrc, *.pem, .env, cloud credentials, ...
+  max_copy_mb: 200          # max size of a single copy_path (code, not data)
+  max_edit_mb: 2            # larger files can't be modified (every edited file is backed up locally first)
+  # deny_read_globs: [...]  # defaults block ~/.ssh, ~/.netrc, *.pem, .env, cloud credentials, HF tokens, ...
+  # deny_write_globs: [...] # defaults additionally block ~/.bashrc & other login scripts, .git/hooks, ...
 
 slurm:
   poll_interval: 60             # seconds
@@ -59,6 +67,3 @@ llm:
   fallbacks: true               # server-side refusal fallback (Claude API)
   max_agent_steps: 40           # tool calls per request before the agent pauses
   llm_status_updates: false     # add a one-line LLM progress summary to periodic status messages
-
-state:
-  dir: ./state                  # SQLite DB + audit.log (every remote command) on the homelab

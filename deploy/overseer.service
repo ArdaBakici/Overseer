@@ -12,6 +12,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/Overseer
 EnvironmentFile=%h/.config/overseer.env
+# Overseer itself only writes under local.root (/tmp/overseer); don't let Python write .pyc files elsewhere.
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=%h/Overseer/.venv/bin/python -m overseer run -c %h/Overseer/config.yaml
 Restart=on-failure
 RestartSec=30

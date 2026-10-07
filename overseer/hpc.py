@@ -1,9 +1,13 @@
 """High-level, policy-enforcing operations on the HPC.
 
-Everything that touches the cluster goes through this class. Reads are limited to
-``sandbox.read_roots`` (+ files of jobs being monitored) minus a secret denylist; writes,
-deletes and submissions are limited to ``sandbox.root``. Paths are resolved with
-``realpath`` on the cluster so a symlink can't point a write outside the sandbox.
+Everything that touches the cluster goes through this class.
+
+* Writes, deletes, copies and job submissions are limited to the *write roots*: the
+  folders in ``hpc.write_roots`` plus folders granted from Telegram at runtime.
+* Reads are limited to ``hpc.read_roots`` + write roots + files of monitored jobs.
+* Secret files are never readable; login scripts/cron/ssh files are never writable.
+* Every path is resolved with ``realpath`` *on the cluster* and the resolved path is what
+  gets checked and used, so symlinks can't redirect a write.
 """
 
 from __future__ import annotations
@@ -14,8 +18,8 @@ import posixpath
 import re
 from dataclasses import dataclass
 
-from .config import Config
-from .policy import PolicyError, is_denied, is_within, require_in_sandbox
+from .config import Config, ConfigError, check_root_spec
+from .policy import PolicyError, expand_home, is_denied, is_within, require_in_roots
 from .slurm import (
     SACCT_LIST_FORMAT,
     SACCT_STEP_FORMAT,
@@ -31,6 +35,7 @@ from .ssh import SSHError, SSHRunner
 log = logging.getLogger(__name__)
 
 TEXT_LIMIT = 200_000
+SECRET_NAMES = [".ssh", ".gnupg", "*.pem", "id_rsa*", "id_ed25519*", "id_ecdsa*", ".netrc", ".env", ".git-credentials"]
 
 
 @dataclass
@@ -40,84 +45,128 @@ class FileText:
     truncated: bool
 
 
+def _dedupe(paths: list[str]) -> list[str]:
+    return list(dict.fromkeys(p for p in paths if p))
+
+
 class HPC:
     def __init__(self, cfg: Config, runner: SSHRunner):
         self.cfg = cfg
         self.run = runner.run
-        self.root = cfg.sandbox.root
         self.user = ""
         self.home = ""
-        self._read_roots: list[str] = []
+        self.grants: dict[str, str] = {}  # absolute path -> "read" | "write" (granted at runtime)
+        self.write_roots: list[str] = []  # resolved; empty until connected => all writes refused
+        self.read_roots: list[str] = []  # resolved, includes write roots
+        self.missing_roots: list[str] = []
         self.extra_read_paths: set[str] = set()  # files/dirs of monitored jobs
 
     # ------------------------------------------------------------------ setup
     async def connect(self) -> None:
         self.user = (await self.run(["whoami"], check=True)).stdout.strip()
         self.home = (await self.run(["printenv", "HOME"], check=True)).stdout.strip() or f"/home/{self.user}"
-        roots = []
-        for r in self.cfg.sandbox.read_roots:
-            r = r.replace("$USER", self.user)
-            roots.append(posixpath.normpath(self.home + r[1:] if r.startswith("~") else r))
-        self._read_roots = roots
-        await self.ensure_sandbox()
+        await self.refresh_roots()
 
     async def ensure_connected(self) -> None:
         if not self.user:
             await self.connect()
 
-    async def ensure_sandbox(self) -> None:
-        """Create the sandbox root with mode 700 and verify we own it (guards against squatting in /tmp)."""
-        await self.run(["mkdir", "-p", "--mode=700", self.root], check=True)
-        st = await self.run(["stat", "-c", "%U %a %F", self.root], check=True)
-        owner, mode, *kind = st.stdout.split()
-        if owner != self.user:
-            raise PolicyError(f"{self.root} is owned by {owner!r}, not {self.user!r}; refusing to use it")
-        if " ".join(kind) != "directory":
-            raise PolicyError(f"{self.root} is not a directory")
-        if mode[-2:] != "00":
-            raise PolicyError(f"{self.root} has mode {mode}; it must not be accessible to other users (chmod 700)")
-        real = (await self.run(["realpath", "-e", "--", self.root], check=True)).stdout.strip()
-        if posixpath.normpath(real) != self.root:
-            raise PolicyError(f"{self.root} resolves to {real}; the sandbox root must not be a symlink")
-
-    # ------------------------------------------------------------------ path policy
-    def expand(self, path: str, base: str | None = None) -> str:
-        path = path.strip()
-        if path.startswith("~"):
-            path = self.home + path[1:]
-        elif not path.startswith("/"):
-            if not base:
-                raise PolicyError(f"relative path {path!r} needs a base directory")
-            path = posixpath.join(base, path)
+    def expand(self, path: str) -> str:
+        path = path.strip().replace("$USER", self.user or "$USER")
+        path = expand_home(path, self.home)
+        if not path.startswith("/"):
+            raise PolicyError(f"use an absolute path or ~/...: {path!r}")
         return posixpath.normpath(path)
 
     async def realpath(self, path: str) -> str:
         res = await self.run(["realpath", "-m", "--", path], check=True)
         return posixpath.normpath(res.stdout.strip())
 
-    async def check_write(self, path: str, base: str | None = None) -> str:
-        p = require_in_sandbox(self.expand(path, base), self.root, allow_root=False)
-        real = await self.realpath(p)
-        if not is_within(real, self.root):
-            raise PolicyError(f"{path!r} resolves to {real}, outside the sandbox")
+    async def exists(self, path: str) -> bool:
+        return (await self.run(["test", "-e", path])).returncode == 0
+
+    async def is_dir(self, path: str) -> bool:
+        return (await self.run(["test", "-d", path])).returncode == 0
+
+    async def refresh_roots(self) -> None:
+        write_specs = list(self.cfg.hpc.write_roots) + [p for p, m in self.grants.items() if m == "write"]
+        read_specs = list(self.cfg.hpc.read_roots) + [p for p, m in self.grants.items() if m == "read"]
+        write, read, missing = [], [], []
+        for spec in write_specs:
+            real = await self.realpath(self.expand(spec))
+            if real == "/" or real == self.home:
+                log.warning("ignoring overly broad write root %s", spec)
+                continue
+            write.append(real)
+            if not await self.exists(real):
+                missing.append(real)
+        for spec in read_specs:
+            read.append(await self.realpath(self.expand(spec)))
+        self.write_roots = _dedupe(write)
+        self.read_roots = _dedupe(read + write)
+        self.missing_roots = _dedupe(missing)
+
+    async def resolve_root_request(self, path: str, mode: str) -> str:
+        """Validate a folder the agent/user wants access to; returns the resolved path."""
+        if mode not in ("read", "write"):
+            raise PolicyError("mode must be 'read' or 'write'")
+        try:
+            if mode == "write":
+                check_root_spec(path)
+            elif not path.startswith(("/", "~")):
+                raise ConfigError(f"{path!r} must be absolute or start with ~")
+        except ConfigError as e:
+            raise PolicyError(str(e)) from None
+        real = await self.realpath(self.expand(path))
+        if real == "/" or (mode == "write" and real == self.home):
+            raise PolicyError(f"{real} is too broad to grant {mode} access to")
+        globs = self.cfg.hpc.deny_write_globs if mode == "write" else self.cfg.hpc.deny_read_globs
+        if is_denied(real, globs):
+            raise PolicyError(f"{real} matches the deny list")
         return real
 
+    def has_access(self, real: str, mode: str) -> bool:
+        roots = self.write_roots if mode == "write" else self.read_roots
+        return any(is_within(real, r) for r in roots)
+
+    async def grant(self, path: str, mode: str) -> None:
+        self.grants[path] = mode
+        await self.refresh_roots()
+
+    async def revoke(self, path: str) -> bool:
+        if self.grants.pop(path, None) is None:
+            return False
+        await self.refresh_roots()
+        return True
+
+    # ------------------------------------------------------------------ path policy
+    async def check_write(self, path: str, *, allow_root: bool = False) -> str:
+        p = self.expand(path)
+        real = await self.realpath(p)
+        for candidate in (p, real):
+            if is_denied(candidate, self.cfg.hpc.deny_write_globs):
+                raise PolicyError(f"{path!r} is on the never-writable list (login scripts, keys, ...)")
+        try:
+            return require_in_roots(real, self.write_roots, allow_root=allow_root)
+        except PolicyError as e:
+            raise PolicyError(f"{e}. Use request_access to ask the user for this folder.") from None
+
     def readable_lexically(self, path: str) -> bool:
-        roots = [self.root, *self._read_roots]
-        if any(is_within(path, r) for r in roots):
+        if any(is_within(path, r) for r in self.read_roots):
             return True
         return any(path == p or is_within(path, p) for p in self.extra_read_paths)
 
-    async def check_read(self, path: str, base: str | None = None) -> str:
-        p = self.expand(path, base)
-        if is_denied(p, self.cfg.sandbox.deny_read_globs):
+    async def check_read(self, path: str) -> str:
+        p = self.expand(path)
+        if is_denied(p, self.cfg.hpc.deny_read_globs):
             raise PolicyError(f"{path!r} matches the secret denylist")
         real = await self.realpath(p)
-        if is_denied(real, self.cfg.sandbox.deny_read_globs):
+        if is_denied(real, self.cfg.hpc.deny_read_globs):
             raise PolicyError(f"{path!r} matches the secret denylist")
-        if not (self.readable_lexically(real)):
+        if not self.readable_lexically(real):
             raise PolicyError(
-                f"{path!r} is outside the readable roots ({', '.join([self.root, *self._read_roots])})"
+                f"{path!r} is outside the readable folders ({', '.join(self.read_roots)}). "
+                "Use request_access with mode 'read' to ask the user."
             )
         return real
 
@@ -127,17 +176,27 @@ class HPC:
                 self.extra_read_paths.add(posixpath.normpath(p))
 
     # ------------------------------------------------------------------ file ops
-    async def read_file(self, path: str, *, base: str | None = None, max_bytes: int = TEXT_LIMIT, tail_lines: int | None = None) -> FileText:
-        real = await self.check_read(path, base)
+    async def read_file(self, path: str, *, max_bytes: int = TEXT_LIMIT, tail_lines: int | None = None) -> FileText:
+        real = await self.check_read(path)
         if tail_lines:
             res = await self.run(["tail", "-n", str(int(tail_lines)), "--", real], max_output=max_bytes)
         else:
-            res = await self.run(["head", "-c", str(int(max_bytes) + 1), "--", real], max_output=max_bytes)
+            res = await self.run(["head", "-c", str(int(max_bytes) + 1), "--", real], max_output=max_bytes + 1)
         if not res.ok:
             raise PolicyError(res.stderr.strip() or f"cannot read {real}")
         text = res.stdout
-        truncated = res.truncated or len(text) > max_bytes
+        truncated = res.truncated or len(text.encode()) > max_bytes
         return FileText(real, text[:max_bytes], truncated)
+
+    async def read_for_edit(self, real: str) -> str:
+        """Full text of a file that is about to be modified (so it can be backed up and restored)."""
+        limit = self.cfg.hpc.max_edit_mb * 1024 * 1024
+        ft = await self.read_file(real, max_bytes=limit)
+        if ft.truncated:
+            raise PolicyError(f"{real} is larger than {self.cfg.hpc.max_edit_mb} MB; refusing to modify it")
+        if "\x00" in ft.text or "�" in ft.text:
+            raise PolicyError(f"{real} is not a UTF-8 text file; refusing to modify it")
+        return ft.text
 
     async def try_tail(self, path: str, lines: int) -> str:
         if not path:
@@ -147,15 +206,15 @@ class HPC:
         except (PolicyError, SSHError) as e:
             return f"<could not read {path}: {e}>"
 
-    async def list_dir(self, path: str, base: str | None = None) -> str:
-        real = await self.check_read(path, base)
+    async def list_dir(self, path: str) -> str:
+        real = await self.check_read(path)
         res = await self.run(["ls", "-la", "--", real], max_output=50_000)
         if not res.ok:
             raise PolicyError(res.stderr.strip())
         return res.stdout
 
-    async def search(self, pattern: str, path: str, base: str | None = None, include: str | None = None) -> str:
-        real = await self.check_read(path, base)
+    async def search(self, pattern: str, path: str, include: str | None = None) -> str:
+        real = await self.check_read(path)
         argv = ["grep", "-rnIE", "--max-count=20"]
         for d in (".ssh", ".gnupg", ".aws", ".kube", ".git", "__pycache__", ".cache", "node_modules", "wandb"):
             argv.append(f"--exclude-dir={d}")
@@ -163,68 +222,61 @@ class HPC:
             argv.append(f"--include={include}")
         argv += ["-e", pattern, "--", real]
         res = await self.run(argv, max_output=40_000, timeout=60)
-        lines = [ln for ln in res.stdout.splitlines() if not is_denied(ln.split(":", 1)[0], self.cfg.sandbox.deny_read_globs)]
+        lines = [ln for ln in res.stdout.splitlines() if not is_denied(ln.split(":", 1)[0], self.cfg.hpc.deny_read_globs)]
         out = "\n".join(lines[:300])
         if res.truncated or len(lines) > 300:
             out += "\n<output truncated>"
         return out or "<no matches>"
 
-    async def write_file(self, path: str, content: str, base: str | None = None) -> str:
-        real = await self.check_write(path, base)
-        await self.run(["mkdir", "-p", "--mode=700", posixpath.dirname(real)], check=True)
+    async def write_file(self, path: str, content: str) -> str:
+        real = await self.check_write(path)
+        parent = posixpath.dirname(real)
+        if not await self.is_dir(parent):
+            await self.run(["mkdir", "-p", require_in_roots(parent, self.write_roots)], check=True)
         await self.run(["dd", f"of={real}", "status=none"], stdin=content.encode(), check=True)
         return real
 
-    async def delete(self, path: str, base: str | None = None) -> str:
-        real = await self.check_write(path, base)
+    async def delete(self, path: str) -> str:
+        real = await self.check_write(path)
         await self.run(["rm", "-rf", "--", real], check=True)
         return real
 
     async def mkdir(self, path: str) -> str:
-        real = await self.check_write(path)
-        await self.run(["mkdir", "-p", "--mode=700", real], check=True)
+        real = await self.check_write(path, allow_root=True)
+        await self.run(["mkdir", "-p", real], check=True)
         return real
 
-    async def stage(self, src: str, dest_dir: str, base: str | None = None) -> str:
-        """Copy code from a readable location into the sandbox (the original is never modified)."""
-        src_real = await self.check_read(src, base)
-        if src_real in self._read_roots or src_real == self.home:
-            raise PolicyError("refusing to stage an entire read root; pick a project directory or file")
+    async def copy(self, src: str, dest: str) -> str:
+        """Copy a readable file/directory to a new path inside a write root."""
+        src_real = await self.check_read(src)
+        if src_real in self.read_roots or src_real == self.home:
+            raise PolicyError("refusing to copy an entire root folder; pick a project directory or file")
+        dest_real = await self.check_write(dest)
+        if await self.exists(dest_real):
+            raise PolicyError(f"{dest_real} already exists; copy to a new path")
         size = await self.run(["du", "-sk", "--", src_real], timeout=120)
         try:
             kb = int(size.stdout.split()[0])
         except (IndexError, ValueError):
             raise PolicyError(f"cannot determine size of {src_real}: {size.stderr.strip()}")
-        if kb > self.cfg.sandbox.max_stage_mb * 1024:
+        if kb > self.cfg.hpc.max_copy_mb * 1024:
             raise PolicyError(
-                f"{src_real} is {kb // 1024} MB (> {self.cfg.sandbox.max_stage_mb} MB). "
-                "Stage only the code you need (individual files or subdirectories), not data/checkpoints."
+                f"{src_real} is {kb // 1024} MB (> {self.cfg.hpc.max_copy_mb} MB). "
+                "Copy only the code you need, not data/checkpoints."
             )
-        # Never copy secrets into the sandbox.
-        probe = await self.run(
-            ["find", src_real, "(", "-name", ".ssh", "-o", "-name", ".gnupg", "-o", "-name", "*.pem",
-             "-o", "-name", "id_rsa*", "-o", "-name", "id_ed25519*", "-o", "-name", ".netrc",
-             "-o", "-name", ".env", ")", "-print", "-quit"],
-            timeout=120,
-        )
-        if probe.stdout.strip():
-            raise PolicyError(f"{src_real} contains sensitive files ({probe.stdout.strip()}); stage a narrower path")
-        dest_real = await self.check_write(dest_dir)
-        await self.run(["mkdir", "-p", "--mode=700", dest_real], check=True)
-        res = await self.run(["cp", "-r", "-P", "--", src_real, dest_real + "/"], timeout=300)
+        probe = ["find", src_real, "("]
+        for i, name in enumerate(SECRET_NAMES):
+            probe += (["-o"] if i else []) + ["-name", name]
+        res = await self.run(probe + [")", "-print", "-quit"], timeout=120)
+        if res.stdout.strip():
+            raise PolicyError(f"{src_real} contains sensitive files ({res.stdout.strip()}); copy a narrower path")
+        parent = posixpath.dirname(dest_real)
+        if not await self.is_dir(parent):
+            await self.run(["mkdir", "-p", require_in_roots(parent, self.write_roots)], check=True)
+        res = await self.run(["cp", "-r", "-P", "-T", "--", src_real, dest_real], timeout=300)
         if not res.ok:
             raise PolicyError(f"copy failed: {res.stderr.strip()[:500]}")
-        return posixpath.join(dest_real, posixpath.basename(src_real))
-
-    async def diff(self, a: str, b: str) -> str:
-        ra, rb = await self.check_read(a), await self.check_read(b)
-        res = await self.run(["diff", "-ruN", "--exclude=__pycache__", "--", ra, rb], max_output=400_000)
-        return res.stdout
-
-    async def sha256(self, path: str) -> str:
-        real = await self.check_read(path)
-        res = await self.run(["sha256sum", "--", real], check=True)
-        return res.stdout.split()[0]
+        return dest_real
 
     # ------------------------------------------------------------------ SLURM
     async def squeue(self) -> list[Job]:
@@ -274,18 +326,10 @@ class HPC:
             return ""
         return res.stdout.strip() if res.ok else ""
 
-    async def sbatch(self, script: str, workdir: str, logdir: str, env: dict[str, str]) -> str:
+    async def sbatch(self, script: str, workdir: str) -> str:
         script = await self.check_write(script)
-        workdir = await self.check_write(workdir)
-        logdir = await self.check_write(logdir)
-        for k, v in env.items():
-            if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", k) or "," in v or "\n" in v:
-                raise PolicyError(f"bad environment variable {k}")
-        export = ",".join(["ALL", *(f"{k}={v}" for k, v in env.items())])
-        res = await self.run(
-            ["sbatch", "--parsable", f"--chdir={workdir}", f"--output={logdir}/slurm-%j.out",
-             f"--error={logdir}/slurm-%j.err", f"--export={export}", script],
-        )
+        workdir = await self.check_write(workdir, allow_root=True)
+        res = await self.run(["sbatch", "--parsable", f"--chdir={workdir}", script])
         if not res.ok:
             raise SSHError(f"sbatch failed: {(res.stderr or res.stdout).strip()[:1000]}")
         job_id = res.stdout.strip().split(";")[0]

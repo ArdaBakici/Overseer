@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS proposals (
     session_id TEXT, kind TEXT,
     script_path TEXT, script_sha TEXT, workdir TEXT, run_dir TEXT,
     target_job TEXT, parent_job TEXT,
+    target_path TEXT, mode TEXT,
     summary TEXT, warnings TEXT, created REAL,
     status TEXT, job_id TEXT
 );
@@ -34,6 +36,9 @@ CREATE TABLE IF NOT EXISTS messages (
     chat_id INTEGER, message_id INTEGER,
     job_id TEXT, session_id TEXT,
     PRIMARY KEY (chat_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS grants (
+    path TEXT PRIMARY KEY, mode TEXT, reason TEXT, granted_at REAL
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -72,13 +77,15 @@ class JobRecord:
 class Proposal:
     id: str
     session_id: str
-    kind: str  # "submit" | "cancel"
+    kind: str  # "submit" | "cancel" | "access"
     script_path: str = ""
     script_sha: str = ""
     workdir: str = ""
     run_dir: str = ""
     target_job: str = ""
     parent_job: str = ""
+    target_path: str = ""
+    mode: str = ""
     summary: str = ""
     warnings: str = ""
     created: float = 0.0
@@ -88,8 +95,9 @@ class Proposal:
 
 class Store:
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path))
+        os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self.db.commit()
@@ -158,6 +166,18 @@ class Store:
             "SELECT job_id, session_id FROM messages WHERE chat_id=? AND message_id=?", (chat_id, message_id)
         ).fetchone()
         return (row["job_id"], row["session_id"]) if row else (None, None)
+
+    # ---------------------------------------------------------------- access grants
+    def add_grant(self, path: str, mode: str, reason: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO grants VALUES (?,?,?,?)", (path, mode, reason, time.time()))
+        self.db.commit()
+
+    def remove_grant(self, path: str) -> None:
+        self.db.execute("DELETE FROM grants WHERE path=?", (path,))
+        self.db.commit()
+
+    def grants(self) -> dict[str, str]:
+        return {r["path"]: r["mode"] for r in self.db.execute("SELECT path, mode FROM grants")}
 
     # ---------------------------------------------------------------- kv
     def get(self, key: str, default: str | None = None) -> str | None:

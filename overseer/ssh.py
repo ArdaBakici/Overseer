@@ -12,11 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .config import SSHConfig
 from .policy import check_remote_argv
@@ -42,15 +42,19 @@ class Result:
 
 
 class SSHRunner:
-    def __init__(self, cfg: SSHConfig, sandbox_root: str, audit_path: Path | None = None):
+    def __init__(self, cfg: SSHConfig, write_roots: Callable[[], list[str]], control_path: str,
+                 audit_path: Path | None = None):
         self.cfg = cfg
-        self.sandbox_root = sandbox_root
+        # Called on every command, so roots granted at runtime take effect immediately.
+        # Before the roots are resolved it returns [] and every modifying command is refused.
+        self.write_roots = write_roots
+        self.control_path = control_path
         self.audit_path = audit_path
         self._sem = asyncio.Semaphore(cfg.max_concurrent)
 
     def ssh_base(self) -> list[str]:
-        cp = os.path.expanduser(self.cfg.control_path)
-        Path(cp).parent.mkdir(parents=True, exist_ok=True)
+        cp = self.control_path
+        Path(cp).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         return [
             "ssh",
             "-o", "BatchMode=yes",
@@ -80,7 +84,7 @@ class SSHRunner:
         max_output: int = 2_000_000,
         check: bool = False,
     ) -> Result:
-        check_remote_argv(argv, self.sandbox_root)
+        check_remote_argv(argv, self.write_roots())
         cmd = self.build_command(argv)
         timeout = timeout or self.cfg.command_timeout
         started = time.time()
