@@ -15,7 +15,8 @@ log = logging.getLogger(__name__)
 class LLM:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
-        self.client = anthropic.AsyncAnthropic() if cfg.enabled else None
+        # Only the claude backend talks to the Anthropic API directly.
+        self.client = anthropic.AsyncAnthropic() if cfg.enabled and cfg.backend == "claude" else None
 
     @property
     def enabled(self) -> bool:

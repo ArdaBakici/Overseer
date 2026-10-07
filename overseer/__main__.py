@@ -6,6 +6,8 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
+import subprocess
 import sys
 
 from .config import Config, ConfigError, load_config
@@ -27,6 +29,7 @@ def build(cfg: Config):
     from .bot import Bot, TelegramNotifier
     from .diagnose import Reporter
     from .hpc import HPC
+    from .cli_agents import make_cli_agent
     from .llm import LLM
     from .monitor import Monitor
     from .proposals import Submitter
@@ -39,6 +42,7 @@ def build(cfg: Config):
     hpc = HPC(cfg, runner)
     hpc.grants = store.grants()  # folders granted from Telegram earlier
     llm = LLM(cfg.llm)
+    cli = make_cli_agent(cfg)
     tasks: list[asyncio.Task] = []
 
     async def post_init(app: Application) -> None:
@@ -54,6 +58,8 @@ def build(cfg: Config):
     async def post_shutdown(app: Application) -> None:
         for t in tasks:
             t.cancel()
+        if agent.bridge:
+            await agent.bridge.stop()
 
     app = (
         Application.builder()
@@ -64,12 +70,12 @@ def build(cfg: Config):
         .build()
     )
     notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store)
-    reporter = Reporter(llm, cfg.llm.report_effort, cfg.llm.llm_status_updates)
+    reporter = Reporter(cli or llm, cfg.llm.report_effort, cfg.llm.llm_status_updates)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     monitor.restore_read_paths()
     submitter = Submitter(cfg, hpc, store, notifier)
     submitter.monitor = monitor
-    agent = Agent(cfg, hpc, store, llm, notifier, submitter)
+    agent = Agent(cfg, hpc, store, llm, notifier, submitter, cli=cli)
     Bot(cfg, app, store, hpc, monitor, agent, submitter, notifier).register()
     return app
 
@@ -113,17 +119,54 @@ async def check(cfg: Config) -> int:
         report("telegram token", True)
     except ConfigError as e:
         report("telegram token", False, str(e))
-    if cfg.llm.enabled:
+    if cfg.llm.enabled and cfg.llm.backend == "claude":
         report("anthropic credentials", bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
                "set ANTHROPIC_API_KEY (or disable llm)")
+    elif cfg.llm.enabled:
+        from .cli_agents import make_cli_agent
+
+        cli = make_cli_agent(cfg)
+        cmd = getattr(cfg.llm, cfg.llm.backend).command
+        report(f"{cfg.llm.backend} CLI", bool(shutil.which(cmd)), shutil.which(cmd) or f"{cmd!r} not on PATH")
+        try:
+            reply = await cli.text(system="You are a connectivity check.", prompt="Reply with exactly: OK")
+            report(f"{cfg.llm.backend} model call", "OK" in reply, reply[:200])
+        except Exception as e:
+            report(f"{cfg.llm.backend} model call", False,
+                   f"{e}\n  (log in with: python -m overseer login {cfg.llm.backend} -c <config>)")
     return 0 if ok else 1
 
 
+def login(cfg: Config, backend: str, extra: list[str]) -> int:
+    from .cli_agents import CodexAgent, OpencodeAgent
+
+    if backend not in ("codex", "opencode"):
+        print("usage: overseer login codex|opencode", file=sys.stderr)
+        return 2
+    prepare_local_dirs(cfg)
+    agent = CodexAgent(cfg) if backend == "codex" else OpencodeAgent(cfg)
+    argv, env = agent.login_command(extra)
+    if not shutil.which(argv[0], path=env.get("PATH")):
+        print(f"{argv[0]!r} not found on PATH (install it, or set llm.{backend}.command)", file=sys.stderr)
+        return 1
+    print(f"Running {' '.join(argv)} with its home in {cfg.local.resolve(getattr(cfg.llm, backend).home)}")
+    return subprocess.call(argv, env=env)
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="overseer")
-    ap.add_argument("command", choices=["run", "check"])
+    ap = argparse.ArgumentParser(
+        prog="overseer",
+        epilog="login: `overseer login codex|opencode [-- extra args]` logs the CLI in using the isolated "
+               "home Overseer runs it with (inside local.state_dir).")
+    ap.add_argument("command", choices=["run", "check", "login"])
+    ap.add_argument("backend", nargs="?", choices=["codex", "opencode"], help="for login")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("-v", "--verbose", action="store_true")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extra: list[str] = []
+    if "--" in argv:  # everything after `--` goes to the CLI's login command
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -137,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "check":
             return asyncio.run(check(cfg))
+        if args.command == "login":
+            return login(cfg, args.backend or cfg.llm.backend, extra)
         app = build(cfg)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)

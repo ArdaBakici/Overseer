@@ -265,7 +265,7 @@ class Bot:
         err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
         await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · local state {code(self.cfg.local.state())}\n"
                                  f"last successful poll: {last}{err}\n"
-                                 f"active agent sessions: {len(self.agent.sessions)}")
+                                 f"agent backend: {code(self.cfg.llm.backend)} · active sessions: {len(self.agent.sessions)}")
 
     async def cmd_access(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         def fmt(paths: list[str]) -> str:

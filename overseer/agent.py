@@ -14,7 +14,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from .bridge import ToolBridge
 from .changes import ChangeSet
+from .cli_agents import CLIAgent
 from .config import Config
 from .hpc import HPC
 from .llm import LLM, response_text
@@ -68,6 +70,13 @@ or ask for guidance on next steps.
   Plain text, no Markdown tables or headings."""
 
 
+CLI_NOTE = """
+## Tools in this environment
+Your only tools are the ones from the `overseer` MCP server (their names may carry a prefix such as
+`overseer__read_file` or `overseer_read_file`). Any other built-in tool is disabled and must not be used:
+this machine is not the HPC, and everything on the HPC goes through the overseer tools."""
+
+
 def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
     return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
 
@@ -118,16 +127,21 @@ class Session:
     notes: list[str] = field(default_factory=list)  # system events to tell the agent next turn
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     initialized: bool = False
+    cli_session_id: str | None = None  # codex thread id / opencode session id
 
 
 class Agent:
-    def __init__(self, cfg: Config, hpc: HPC, store: Store, llm: LLM, notifier: Notifier, submitter: Submitter):
+    def __init__(self, cfg: Config, hpc: HPC, store: Store, llm: LLM, notifier: Notifier, submitter: Submitter,
+                 cli: CLIAgent | None = None):
         self.cfg = cfg
         self.hpc = hpc
         self.store = store
         self.llm = llm
         self.notifier = notifier
         self.submitter = submitter
+        # codex / opencode backend: the CLI drives the conversation, tools come through the bridge.
+        self.cli = cli
+        self.bridge = ToolBridge(self, cfg.local.tmp("bridge.sock")) if cli else None
         self.sessions: dict[str, Session] = {}
         self.by_job: dict[str, str] = {}
         self.general_id: str | None = None
@@ -197,7 +211,7 @@ class Agent:
 
     # ------------------------------------------------------------------ main loop
     async def handle(self, s: Session, user_text: str) -> None:
-        if not self.llm.enabled:
+        if not (self.cli.enabled if self.cli else self.llm.enabled):
             await self.notifier.send(Outgoing("LLM is disabled in the config; the agent is unavailable."))
             return
         async with s.lock:
@@ -236,6 +250,9 @@ class Agent:
             text_parts.append("<events>\n" + "\n".join(s.notes) + "\n</events>")
             s.notes.clear()
         text_parts.append(f"<request>\n{user_text}\n</request>")
+        if self.cli:
+            await self._cli_turn(s, "\n\n".join(text_parts), actions)
+            return
         self._append_user(s, [{"type": "text", "text": "\n\n".join(text_parts)}])
 
         for _ in range(self.cfg.llm.max_agent_steps):
@@ -259,6 +276,17 @@ class Agent:
             s.messages.append({"role": "user", "content": results})
         await self.notifier.send(Outgoing(
             f"⏸ Agent stopped after {self.cfg.llm.max_agent_steps} steps. Reply to continue.", session_id=s.id, job_id=s.job_id))
+
+    async def _cli_turn(self, s: Session, text: str, actions: list[str]) -> None:
+        assert self.cli and self.bridge
+        if s.cli_session_id is None:
+            text = f"<overseer_instructions>\n{self.system_prompt()}\n{CLI_NOTE}\n</overseer_instructions>\n\n{text}"
+        async with self.bridge.run(s, actions) as bridge_env:
+            res = await self.cli.run(text, session_id=s.cli_session_id, session_key=s.id,
+                                     actions=actions, bridge_env=bridge_env)
+        s.cli_session_id = res.session_id or s.cli_session_id
+        actions.extend(res.native_actions)
+        await self.notifier.send(Outgoing(f"🤖 {esc(res.text or '(no answer)')}", session_id=s.id, job_id=s.job_id))
 
     async def _run_tool(self, s: Session, name: str, args: Any, actions: list[str]) -> tuple[str, bool]:
         if not isinstance(args, dict):

@@ -3,15 +3,16 @@
 Overseer is a Telegram bot that keeps an eye on your SLURM jobs. It runs on your homelab and reaches the HPC login node over SSH (pubkey auth).
 
 - Tells you when a job is **queued**, **starts** (which node), and sends **status updates** while it runs (elapsed time, latest metrics, log tail, and optionally GPU utilisation).
-- When a job **ends**, it sends a **report**: final state, exit code, runtime against the limit, peak memory, and the last metrics it found. For a failed job it also says **why it failed**, using built-in heuristics (CUDA OOM, host OOM, time limit, NCCL, missing modules, NaNs, …) plus a Claude analysis.
-- You can then say *"fix it"* or reply with instructions. A Claude agent reads the logs and code and changes files only in folders you allowed. It then **proposes** a resubmission. You get the full script and a diff of every changed file in Telegram, and nothing reaches `sbatch` until you tap **Approve**.
+- When a job **ends**, it sends a **report**: final state, exit code, runtime against the limit, peak memory, and the last metrics it found. For a failed job it also says **why it failed**, using built-in heuristics (CUDA OOM, host OOM, time limit, NCCL, missing modules, NaNs, …) plus an LLM analysis.
+- You can then say *"fix it"* or reply with instructions. An agent reads the logs and code and changes files only in folders you allowed. It then **proposes** a resubmission. You get the full script and a diff of every changed file in Telegram, and nothing reaches `sbatch` until you tap **Approve**.
+- The agent can be **Claude** (Anthropic API), **OpenAI Codex** or **opencode**; see [Choosing the agent](#choosing-the-agent-claude-codex-or-opencode).
 
 ```
  homelab                                         HPC login node
 ┌───────────────────────────────────┐   ssh   ┌──────────────────────────────────────────┐
 │ Telegram bot  ◄──► you            │ ──────► │ squeue / sacct / scontrol (read)         │
 │ Monitor (polls every 60 s)        │         │ read_roots      → read only              │
-│ Claude agent (no shell)           │         │ write_roots     → create/modify/submit   │
+│ Agent: Claude / Codex / opencode  │         │ write_roots     → create/modify/submit   │
 │ ./state: DB, audit log, backups   │         │ + folders you grant from Telegram        │
 │ /tmp/overseer: ssh socket         │         │ everything else → untouched              │
 └───────────────────────────────────┘         └──────────────────────────────────────────┘
@@ -81,7 +82,7 @@ ssh -o BatchMode=yes hpc true        # must succeed without any prompt
 #    (e.g. via @userinfobot).
 # 3. Configure
 cp config.example.yaml config.yaml   # set ssh.host, telegram.allowed_chat_ids, hpc.write_roots
-export TELEGRAM_BOT_TOKEN=...  ANTHROPIC_API_KEY=...
+export TELEGRAM_BOT_TOKEN=...  ANTHROPIC_API_KEY=...   # or use codex/opencode, see below
 
 .venv/bin/python -m overseer check -c config.yaml   # verifies ssh, slurm, folder access, credentials
 .venv/bin/python -m overseer run   -c config.yaml
@@ -90,6 +91,47 @@ export TELEGRAM_BOT_TOKEN=...  ANTHROPIC_API_KEY=...
 To run it permanently, use `deploy/overseer.service` (systemd user unit; instructions are inside the file).
 
 If your cluster needs 2FA/Duo on every login, keep a multiplexed connection open: Overseer uses `ControlMaster`/`ControlPersist`, so approving one login can keep the socket alive. Some sites forbid automated logins entirely, so check your cluster's acceptable-use policy. Overseer polls once a minute over a single multiplexed connection, which is light on the login node.
+
+## Choosing the agent: Claude, Codex or opencode
+
+Set `llm.backend` in `config.yaml`. The backend runs both the fixing agent and the job reports.
+
+| backend | runs | credentials |
+|---|---|---|
+| `claude` (default) | Anthropic API directly | `ANTHROPIC_API_KEY` |
+| `codex` | `codex exec` (OpenAI Codex CLI) | `python -m overseer login codex` (ChatGPT login or API key), or `OPENAI_API_KEY` / `CODEX_API_KEY` |
+| `opencode` | `opencode run` | the provider's API key in the environment (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`), or `python -m overseer login opencode` |
+
+```bash
+npm i -g @openai/codex        # or: npm i -g opencode-ai
+python -m overseer login codex -c config.yaml     # one-time; stored in ./state/codex
+python -m overseer check -c config.yaml           # makes a real test call through the CLI
+```
+
+**How the CLIs are locked down.** Codex and opencode normally come with their own shell and file-editing tools. On the homelab those tools could use your SSH key to reach the HPC, or write anywhere. Overseer runs them so that **the only tools they have are Overseer's**:
+
+- **Tools come through MCP.** Overseer's tools (read, search, copy, edit, request_access, propose_submission, …) are provided by a small MCP server, `python -m overseer.mcp_server`, which the CLI starts. That process holds no state or credentials. It forwards each call over a private Unix socket (mode `600`, with a token that is only valid during the run) to the running Overseer. Every call therefore gets the same policy checks, backups, approvals and Telegram action reports as the Claude backend.
+- **codex:**
+  - its shell, exec, browser, computer-use, image, plugin, apps, multi-agent and other built-in tool features are switched off
+  - read-only sandbox, `approval_policy=never`, web search disabled
+  - `AGENTS.md` files are ignored
+  - only Overseer's MCP tools are auto-approved
+- **opencode:**
+  - every built-in tool is disabled (`"tools": {"*": false, "overseer_*": true}`), with edit/bash/webfetch also denied in the permissions
+  - project config, Claude Code and external skills are ignored
+  - `extra_config` cannot turn any of this back on
+- **Scrubbed environment.** The CLI gets only `PATH`, locale, the API-key variables you list in `pass_env` and proxy settings. It never sees the Telegram token or your SSH agent.
+- **Contained files.** It runs in a scratch dir under `local.tmp_dir`, with its own `HOME` / `CODEX_HOME` / XDG dirs under `local.state_dir`. Its logins, sessions and caches stay inside the allowed local folders, and your real `~/.codex` or `~/.config/opencode` are untouched.
+- **Reported if it slips.** If a built-in tool still shows up in the CLI's event stream, it is reported to Telegram as ⚠️.
+
+`tests/test_cli_backends.py` checks all of this with the **real** codex and opencode binaries against a fake model server:
+
+- the model is offered only Overseer's tools
+- a tool call travels CLI → MCP server → Overseer → back to the model
+- sessions resume across messages
+- nothing is written to `$HOME`
+
+The tests are skipped when the CLIs aren't installed. Set `OVERSEER_TEST_CLI_DIR` to point at them. They were verified with codex 0.160 and opencode 1.18. CLI flags change between versions, so run `overseer check` after upgrading.
 
 ## Using it
 
@@ -113,9 +155,10 @@ A job submitted from a session stays linked to that conversation. When it finish
 
 - `slurm.track: overseer` reports only on jobs Overseer submitted. The default `all` reports on every job of your user.
 - `llm.enabled: false` turns Overseer into a pure monitor with heuristic failure analysis (no API key needed).
-- `llm.model` defaults to `claude-opus-5-5` with adaptive thinking. Set `adaptive_thinking: false` and `*_effort: null` for models that don't support those parameters. `fallbacks: true` enables the API's server-side refusal fallback.
-- Anything the agent reads (logs, code inside `read_roots`) is sent to the Anthropic API. Narrow `read_roots` if that matters.
-- Agent conversations live in memory and are lost on restart. Job state, proposals, grants and message links are kept in SQLite in `local.state_dir`.
+- With `backend: claude`, `llm.model` defaults to `claude-opus-5-5` with adaptive thinking. Set `adaptive_thinking: false` and `*_effort: null` for models that don't support those parameters. `fallbacks: true` enables the API's server-side refusal fallback.
+- Anything the agent reads (logs, code inside `read_roots`) is sent to the model provider of the chosen backend. Narrow `read_roots` if that matters.
+- Agent conversations: with `claude` they live in memory. With codex/opencode, the CLI's own session is resumed for follow-up messages, but the link is kept in memory, so a restart starts a fresh conversation.
+- Job state, proposals, grants and message links are kept in SQLite in `local.state_dir`.
 - The HPC login shell should be bash or zsh, since commands are quoted for a POSIX shell.
 
 ## Development
@@ -137,6 +180,8 @@ pytest
 | `slurm.py` | `squeue`/`sacct`/`scontrol` parsing |
 | `monitor.py` | polling loop → queued/started/status/final-report events |
 | `diagnose.py` | failure heuristics, traceback/metric extraction, LLM reports |
-| `agent.py` | Claude tool-use loop with the policy-checked tool set |
+| `agent.py` | the policy-checked tool set, Claude tool-use loop, session handling |
+| `cli_agents.py` | codex / opencode runners (locked-down flags, isolated env, event parsing) |
+| `bridge.py`, `mcp_server.py` | exposes the tools to the CLIs over MCP → private socket → Overseer |
 | `proposals.py` | proposal → approval → `sbatch` / `scancel` / folder grant |
 | `bot.py` | Telegram commands, buttons, message → job routing |

@@ -84,6 +84,10 @@ class LocalConfig:
     def sessions_dir(self, sid: str) -> Path:
         return self.state("sessions", sid)
 
+    def resolve(self, p: str) -> Path:
+        """Resolve a configured local path and make sure it is inside allowed_roots."""
+        return self.check(self._resolve(p))
+
 
 @dataclass
 class SSHConfig:
@@ -163,9 +167,53 @@ class TelegramConfig:
         return tok
 
 
+PROXY_ENV = ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+             "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"]
+
+
+@dataclass
+class CodexConfig:
+    command: str = "codex"
+    model: str | None = None  # e.g. "gpt-5.5-codex"; None = codex's default
+    reasoning_effort: str | None = None  # model_reasoning_effort: low | medium | high | xhigh
+    # CODEX_HOME for Overseer's runs (auth, sessions, config). Must be inside local.allowed_roots.
+    # Log in once with: python -m overseer login codex
+    home: str = "./state/codex"
+    # Environment variables passed through to codex (everything else is stripped).
+    pass_env: list[str] = field(default_factory=lambda: ["OPENAI_API_KEY", "CODEX_API_KEY", *PROXY_ENV])
+    # Extra `-c key=value` overrides, e.g. a custom model provider.
+    extra_config: list[str] = field(default_factory=list)
+
+
+@dataclass
+class OpencodeConfig:
+    command: str = "opencode"
+    model: str | None = None  # "provider/model", e.g. "anthropic/claude-opus-5-5"; None = opencode's default
+    variant: str | None = None  # provider-specific reasoning effort (e.g. "high")
+    # HOME + XDG dirs for Overseer's runs (auth, sessions, caches). Must be inside local.allowed_roots.
+    # Log in once with: python -m overseer login opencode   (or just pass provider API keys below)
+    home: str = "./state/opencode"
+    pass_env: list[str] = field(default_factory=lambda: [
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY", "MISTRAL_API_KEY", *PROXY_ENV])
+    # Deep-merged into the generated opencode config (e.g. {"provider": {...}} for custom providers).
+    # Can't re-enable built-in tools or change the overseer MCP server.
+    extra_config: dict = field(default_factory=dict)
+
+
 @dataclass
 class LLMConfig:
     enabled: bool = True
+    # Which model runner does the agent and the job reports:
+    #   claude   - Anthropic API directly (needs ANTHROPIC_API_KEY)
+    #   codex    - OpenAI Codex CLI (`codex exec`), with its own shell/file tools disabled
+    #   opencode - opencode CLI (`opencode run`), with all built-in tools disabled
+    # With codex/opencode the agent only gets Overseer's tools, via a local MCP server.
+    backend: str = "claude"
+    cli_timeout_minutes: int = 30  # max duration of one codex/opencode run
+    codex: CodexConfig = field(default_factory=CodexConfig)
+    opencode: OpencodeConfig = field(default_factory=OpencodeConfig)
+    # ---- claude backend settings
     model: str = "claude-opus-5-5"
     report_effort: str | None = "medium"  # effort for job reports/diagnoses
     agent_effort: str | None = "high"  # effort for the fixing agent
@@ -201,6 +249,10 @@ class Config:
         for r in self.hpc.read_roots:
             if not (r.startswith("/") or r.startswith("~")):
                 raise ConfigError(f"read root {r!r} must be absolute or start with ~")
+        if self.llm.backend not in ("claude", "codex", "opencode"):
+            raise ConfigError("llm.backend must be 'claude', 'codex' or 'opencode'")
+        self.local.resolve(self.llm.codex.home)
+        self.local.resolve(self.llm.opencode.home)
         if self.slurm.track not in ("all", "overseer"):
             raise ConfigError("slurm.track must be 'all' or 'overseer'")
         if not self.telegram.allowed_chat_ids:
