@@ -4,6 +4,8 @@
     overseer ssh connect                open the SSH connection interactively (for 2FA clusters)
     overseer ssh test                   check the connection works
     overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
+    overseer sessions                   list agent conversations
+    overseer open [conversation]        open a conversation in Claude Code / Codex (default: latest)
     overseer check                      verify everything without starting the bot
     overseer run                        start the bot
 All take -c/--config (default: config.yaml).
@@ -199,10 +201,68 @@ def login(cfg: Config, backend: str, extra: list[str]) -> int:
     return subprocess.call(argv, env=env)
 
 
+def _ago(ts: float) -> str:
+    import time
+
+    d = max(0, int(time.time() - (ts or 0)))
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= n:
+            return f"{d // n}{unit} ago"
+    return f"{d}s ago"
+
+
+def sessions_command(cfg: Config, limit: int = 20) -> int:
+    from .store import Store
+
+    rows = Store(cfg.local.db_path).list_sessions(limit)
+    if not rows:
+        print("No agent conversations yet.")
+        return 0
+    print(f"{'conversation':<20} {'backend':<12} {'job':<10} {'last used':<10} cli session")
+    for r in rows:
+        print(f"{r.id:<20} {r.backend or '-':<12} {r.job_id or '-':<10} {_ago(r.updated):<10} {r.cli_session_id or '(none yet)'}")
+    print("\nOpen one with: overseer open <conversation>   (no argument = the most recent)")
+    return 0
+
+
+def open_command(cfg: Config, target: str | None) -> int:
+    from .runners import make_runner
+    from .sshlink import ensure_master, write_configs
+    from .store import Store
+
+    prepare_local_dirs(cfg)
+    rows = [r for r in Store(cfg.local.db_path).list_sessions(500) if r.cli_session_id]
+    if target:
+        rows = [r for r in rows if r.id == target] or [r for r in rows if r.id.startswith(target)
+                                                        or (r.cli_session_id or "").startswith(target)]
+    if not rows:
+        print("No matching conversation with a CLI session (see: overseer sessions).", file=sys.stderr)
+        return 1
+    if target and len(rows) > 1 and rows[0].id != target:
+        print(f"{target!r} matches several conversations: {', '.join(r.id for r in rows)}", file=sys.stderr)
+        return 1
+    rec = rows[0]
+    write_configs(cfg)
+    try:
+        asyncio.run(ensure_master(cfg))
+    except ConfigError as e:
+        print(f"note: SSH connection to the HPC is not available, `ssh hpc` won't work in this session: {e}")
+    runner = make_runner(cfg, rec.backend)
+    argv, env, cwd = runner.interactive_command(rec.cli_session_id, rec.id)
+    if not shutil.which(argv[0], path=env.get("PATH")):
+        print(f"{argv[0]!r} not found on PATH (install it, or set agent.{rec.backend}.command)", file=sys.stderr)
+        return 1
+    print(f"Opening {rec.id} in {rec.backend} (session {rec.cli_session_id}), in {cwd}.")
+    print("Same sandbox and `ssh hpc` access as the bot. Anything you add here becomes part of the conversation,")
+    print("so don't type while the bot is working on it.\n")
+    return subprocess.call(argv, env=env, cwd=str(cwd))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["run", "check", "login", "ssh"])
-    ap.add_argument("target", nargs="?", help="login: claude_code|codex; ssh: setup|connect|test")
+    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open"])
+    ap.add_argument("target", nargs="?",
+                    help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest)")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("--import", dest="import_key", help="ssh setup: copy this existing private key instead of generating one")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -227,6 +287,10 @@ def main(argv: list[str] | None = None) -> int:
             return login(cfg, args.target or cfg.agent.backend, extra)
         if args.command == "ssh":
             return ssh_command(cfg, args.target or "", args.import_key)
+        if args.command == "sessions":
+            return sessions_command(cfg)
+        if args.command == "open":
+            return open_command(cfg, args.target)
         app = build(cfg)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)

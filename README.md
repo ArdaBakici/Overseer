@@ -116,6 +116,18 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
 - **Model:** Claude Code reports the model it actually used. Codex doesn't, so its footer shows the configured model (or "default model").
 - **Cost:** only Claude Code reports it.
 
+**Opening a conversation in the CLI itself.** To read the full log (every message, command and output) or keep working in the terminal:
+
+```bash
+uv run overseer sessions              # conversations, backend, job, last used
+uv run overseer open                  # open the most recent one
+uv run overseer open chat-b920aa      # or a specific one (a unique prefix is enough)
+```
+
+- **What it does:** this resumes the session in Codex's or Claude Code's normal interactive UI, with the same sandbox, the same `ssh hpc` access through Overseer's connection, and Overseer's isolated config. Your own `~/.codex` and `~/.claude` aren't touched.
+- **First use of Claude Code:** it shows its one-time welcome and theme setup the first time Overseer's config is opened interactively.
+- **Shared history:** anything you add there becomes part of the conversation, so avoid typing while the bot is working on it.
+
 Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's session ID), so they survive restarts. A job the agent submits stays linked to the conversation that submitted it.
 
 ## Configuration notes

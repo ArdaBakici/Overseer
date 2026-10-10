@@ -129,6 +129,10 @@ class Store:
         s.updated = time.time()
         self._upsert("sessions", "id", s)
 
+    def list_sessions(self, limit: int = 20) -> list[SessionRecord]:
+        rows = self.db.execute("SELECT * FROM sessions ORDER BY updated DESC LIMIT ?", (limit,)).fetchall()
+        return [_row(SessionRecord, r) for r in rows]
+
     def session_for_job(self, job_id: str) -> SessionRecord | None:
         row = self.db.execute("SELECT * FROM sessions WHERE job_id=? ORDER BY updated DESC LIMIT 1", (job_id,)).fetchone()
         return _row(SessionRecord, row) if row else None

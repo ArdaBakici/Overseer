@@ -55,6 +55,10 @@ if prog == "claude":
                                  "cacheCreationInputTokens": 0, "costUSD": 0.0312}}})
     sys.exit(0)
 
+if prog == "codex" and args[:1] == ["resume"]:  # interactive `overseer open`
+    print("codex TUI would open here")
+    sys.exit(0)
+
 if prog == "codex":
     out_file = args[args.index("-o") + 1]
     resumed = len(args) > 1 and args[1] == "resume"

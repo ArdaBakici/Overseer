@@ -269,6 +269,11 @@ class Runner:
     def login_command(self, extra: list[str]) -> tuple[list[str], dict[str, str]]:
         raise NotImplementedError
 
+    def interactive_command(self, session_id: str, key: str) -> tuple[list[str], dict[str, str], Path]:
+        """argv, env and cwd to open an agent session in the CLI's own interactive UI, with the same
+        sandbox, ssh wrappers and isolated home as Overseer's runs (`overseer open`)."""
+        raise NotImplementedError
+
 
 # ============================================================================ Claude Code
 
@@ -391,6 +396,35 @@ class ClaudeCodeRunner(Runner):
 
     def login_command(self, extra: list[str]) -> tuple[list[str], dict[str, str]]:
         return [self.c.command, *(extra or ["auth", "login"])], self.env(None)
+
+    def trust_folder(self, folder: Path) -> None:
+        """Mark one of Overseer's own scratch folders as trusted in Overseer's Claude config, so the
+        interactive UI doesn't stop at "Do you trust this folder?" (its default answer exits)."""
+        cfg_file = self.home() / ".claude.json"
+        try:
+            data = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            return  # never break the user's Claude config; they'll just see the question
+        project = data.setdefault("projects", {}).setdefault(str(folder), {})
+        if project.get("hasTrustDialogAccepted"):
+            return
+        project["hasTrustDialogAccepted"] = True
+        tmp = cfg_file.with_name(f".claude.json.overseer-{uuid.uuid4().hex[:6]}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, cfg_file)
+
+    def interactive_command(self, session_id: str, key: str) -> tuple[list[str], dict[str, str], Path]:
+        workdir = self.workdir(key)  # Claude Code finds sessions by the folder they ran in
+        self.trust_folder(workdir)
+        argv = [self.c.command, "--resume", session_id, "--settings", json.dumps(self.settings(workdir)),
+                "--strict-mcp-config"]
+        if self.model:
+            argv += ["--model", self.model]
+        if self.effort:
+            argv += ["--effort", self.effort]
+        return argv, self.env(workdir), workdir
 
 
 # ============================================================================ Codex
@@ -519,6 +553,15 @@ class CodexRunner(Runner):
         # Overseer usually runs on a headless server, where codex's browser login can't work:
         # default to the device-code flow (open the printed URL on any device, enter the code).
         return [self.c.command, "login", *(extra or ["--device-auth"])], self.env(None)
+
+    def interactive_command(self, session_id: str, key: str) -> tuple[list[str], dict[str, str], Path]:
+        workdir = self.workdir(key)
+        argv = [self.c.command, "resume"]
+        if self.model:
+            argv += ["-c", f"model={_toml(self.model)}"]
+        for o in self.overrides(workdir, system=None, writable=True, network=True):
+            argv += ["-c", o]
+        return argv + [session_id], self.env(workdir), workdir
 
 
 def _claude_usage(ev: dict[str, Any], result: RunResult) -> None:

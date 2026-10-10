@@ -407,6 +407,50 @@ async def test_model_effort_and_footer(env):
     assert env.agent.runner("claude_code").model == "opus"  # untouched
 
 
+def test_sessions_and_open_commands(env, monkeypatch, capsys):
+    from overseer.__main__ import open_command, sessions_command
+
+    async def no_master(_cfg):
+        return None
+
+    monkeypatch.setattr("overseer.sshlink.ensure_master", no_master)
+    assert open_command(env.cfg, None) == 1  # nothing yet
+
+    claude_s = env.agent.general_session()
+    asyncio.run(env.agent.handle(claude_s, "hi"))
+    env.agent.set_backend("codex")
+    codex_s = env.agent.general_session(reset=True)
+    asyncio.run(env.agent.handle(codex_s, "hi"))
+
+    capsys.readouterr()
+    sessions_command(env.cfg)
+    listing = capsys.readouterr().out
+    assert claude_s.id in listing and codex_s.id in listing and "claude_code" in listing and "codex" in listing
+
+    # Latest = the codex conversation, resumed in codex's interactive UI with Overseer's settings.
+    assert open_command(env.cfg, None) == 0
+    call = env.cli_log()[-1]
+    codex_id = env.store.get_session(codex_s.id).cli_session_id
+    assert call["prog"] == "codex" and call["argv"][0] == "resume" and call["argv"][-1] == codex_id
+    assert 'default_permissions="overseer"' in call["argv"] and "exec" not in call["argv"]
+    assert call["env"]["CODEX_HOME"].endswith("state/codex")
+    assert call["env"]["PATH"].split(":")[0] == str(env.cfg.local.tmp("agent-bin"))  # `ssh hpc` works
+    assert "TELEGRAM_BOT_TOKEN" not in call["env"]
+
+    # By name (prefix works too): Claude Code, started in the folder its session ran in.
+    assert open_command(env.cfg, "chat-") == 1  # ambiguous prefix
+    assert open_command(env.cfg, claude_s.id) == 0
+    call = env.cli_log()[-1]
+    claude_id = env.store.get_session(claude_s.id).cli_session_id
+    assert call["prog"] == "claude" and call["argv"][:2] == ["--resume", claude_id] and "-p" not in call["argv"]
+    assert call["cwd"] == str(env.cfg.local.tmp("agents", claude_s.id))
+    settings = json.loads(call["argv"][call["argv"].index("--settings") + 1])
+    assert settings["sandbox"]["failIfUnavailable"] and settings["sandbox"]["allowUnsandboxedCommands"] is False
+    claude_json = json.loads((env.cfg.local.resolve(env.cfg.agent.claude_code.home) / ".claude.json").read_text())
+    assert claude_json["projects"][call["cwd"]]["hasTrustDialogAccepted"] is True  # no "trust this folder?" stop
+    assert open_command(env.cfg, "nope") == 1
+
+
 async def test_job_context_and_report_modes(env):
     env.set_jobs(**{"77": {"name": "train", "state": "FAILED", "exit": "1:0", "workdir": str(env.home / "proj"),
                            "stdout": str(env.home / "proj" / "slurm-77.out"), "script": "#!/bin/bash\npython t.py\n"}})
