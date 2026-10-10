@@ -455,8 +455,13 @@ def test_sessions_and_open_commands(env, monkeypatch, capsys):
     assert claude_s.id in listing and codex_s.id in listing and "claude_code" in listing and "codex" in listing
 
     # Latest = the codex conversation, resumed in codex's interactive UI with Overseer's settings.
+    monkeypatch.setenv("TERM", "xterm-kitty")
+    monkeypatch.setenv("COLORTERM", "truecolor")
     assert open_command(env.cfg, None) == 0
     call = env.cli_log()[-1]
+    # The user's terminal, not the bot's TERM=dumb (codex refuses to start its TUI with that).
+    assert call["env"]["TERM"] == "xterm-kitty" and call["env"]["COLORTERM"] == "truecolor"
+    assert "NO_COLOR" not in call["env"]
     codex_id = env.store.get_session(codex_s.id).cli_session_id
     assert call["prog"] == "codex" and call["argv"][0] == "resume" and call["argv"][-1] == codex_id
     assert 'default_permissions="overseer"' in call["argv"] and "exec" not in call["argv"]

@@ -225,6 +225,9 @@ def sessions_command(cfg: Config, limit: int = 20) -> int:
     return 0
 
 
+INTERACTIVE_TERM_ENV = ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLUMNS", "LINES"]
+
+
 def open_command(cfg: Config, target: str | None) -> int:
     from .runners import make_runner
     from .sshlink import ensure_master, write_configs
@@ -249,6 +252,10 @@ def open_command(cfg: Config, target: str | None) -> int:
         print(f"note: SSH connection to the HPC is not available, `ssh hpc` won't work in this session: {e}")
     runner = make_runner(cfg, rec.backend)
     argv, env, cwd = runner.interactive_command(rec.cli_session_id, rec.id)
+    # The bot runs the CLIs without a terminal (TERM=dumb, NO_COLOR); here they get the user's terminal.
+    env.pop("NO_COLOR", None)
+    env["TERM"] = os.environ.get("TERM") or "xterm-256color"
+    env.update({k: os.environ[k] for k in INTERACTIVE_TERM_ENV if k in os.environ})
     if not shutil.which(argv[0], path=env.get("PATH")):
         print(f"{argv[0]!r} not found on PATH (install it, or set agent.{rec.backend}.command)", file=sys.stderr)
         return 1
