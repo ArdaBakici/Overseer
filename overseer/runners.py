@@ -58,6 +58,10 @@ class RunResult:
     text: str
     session_id: str | None
     is_error: bool = False
+    model: str | None = None  # the model that actually ran, when the CLI reports it
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None  # Claude Code reports it; Codex doesn't
 
 
 @dataclass
@@ -126,12 +130,31 @@ def _toml(value: Any) -> str:
     raise TypeError(type(value))
 
 
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
 class Runner:
     name = ""
+    efforts: tuple[str, ...] = ()
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.timeout = cfg.agent.timeout_minutes * 60
+        # Set from Telegram (/model, /effort); None = use config.yaml (where null = the CLI's default).
+        self.model_override: str | None = None
+        self.effort_override: str | None = None
+
+    @property
+    def model(self) -> str | None:
+        return self.model_override or self.c.model
+
+    @property
+    def effort(self) -> str | None:
+        return self.effort_override or self._configured_effort()
+
+    def _configured_effort(self) -> str | None:
+        raise NotImplementedError
 
     # ------------------------------------------------------------------ sandbox inputs
     def workdir(self, key: str) -> Path:
@@ -244,6 +267,10 @@ class Runner:
 
 class ClaudeCodeRunner(Runner):
     name = "claude_code"
+    efforts = CLAUDE_EFFORTS
+
+    def _configured_effort(self) -> str | None:
+        return self.c.effort
 
     @property
     def c(self):
@@ -284,10 +311,10 @@ class ClaudeCodeRunner(Runner):
 
     def _common(self, workdir: Path) -> list[str]:
         argv = [self.c.command, "-p", "--settings", json.dumps(self.settings(workdir)), "--strict-mcp-config"]
-        if self.c.model:
-            argv += ["--model", self.c.model]
-        if self.c.effort:
-            argv += ["--effort", self.c.effort]
+        if self.model:
+            argv += ["--model", self.model]
+        if self.effort:
+            argv += ["--effort", self.effort]
         return argv
 
     async def run(self, prompt: str, *, system: str, session_id: str | None, key: str,
@@ -304,6 +331,8 @@ class ClaudeCodeRunner(Runner):
             t = ev.get("type")
             if ev.get("session_id"):
                 result.session_id = ev["session_id"]
+            if t == "system" and ev.get("subtype") == "init" and ev.get("model"):
+                result.model = ev["model"]
             if t == "assistant":
                 for block in (ev.get("message") or {}).get("content") or []:
                     if block.get("type") == "text" and block.get("text"):
@@ -326,6 +355,7 @@ class ClaudeCodeRunner(Runner):
                 result.is_error = bool(ev.get("is_error"))
                 if ev.get("result"):
                     result.text = str(ev["result"])
+                _claude_usage(ev, result)
 
         stderr = await self._exec(argv, self.env(workdir), workdir, prompt[:MAX_PROMPT], on_event)
         if not result.text:
@@ -353,6 +383,10 @@ class ClaudeCodeRunner(Runner):
 
 class CodexRunner(Runner):
     name = "codex"
+    efforts = CODEX_EFFORTS
+
+    def _configured_effort(self) -> str | None:
+        return self.c.reasoning_effort
 
     @property
     def c(self):
@@ -393,8 +427,8 @@ class CodexRunner(Runner):
             out.append('web_search="disabled"')
         if system:
             out.append(f"developer_instructions={_toml(system)}")
-        if self.c.reasoning_effort:
-            out.append(f"model_reasoning_effort={_toml(self.c.reasoning_effort)}")
+        if self.effort:
+            out.append(f"model_reasoning_effort={_toml(self.effort)}")
         return out + list(self.c.extra_config)
 
     def _argv(self, *, session_id: str | None, out_file: Path, overrides: list[str], ephemeral: bool) -> list[str]:
@@ -404,8 +438,8 @@ class CodexRunner(Runner):
         argv += ["--json", "--skip-git-repo-check", "-o", str(out_file)]
         if ephemeral:
             argv.append("--ephemeral")
-        if self.c.model:
-            argv += ["-m", self.c.model]
+        if self.model:
+            argv += ["-m", self.model]
         for o in overrides:
             argv += ["-c", o]
         if session_id:
@@ -418,7 +452,7 @@ class CodexRunner(Runner):
         out_file = workdir / f".last-{uuid.uuid4().hex[:8]}.txt"
         argv = self._argv(session_id=session_id, out_file=out_file, ephemeral=ephemeral,
                           overrides=self.overrides(workdir, system=system, writable=writable, network=network))
-        result = RunResult(text="", session_id=session_id)
+        result = RunResult(text="", session_id=session_id, model=self.model)  # codex doesn't report its model
         messages: list[str] = []
         errors: list[str] = []
 
@@ -439,6 +473,10 @@ class CodexRunner(Runner):
                         activity.file(ch.get("path", ""))
                 elif kind == "agent_message" and t == "item.completed":
                     messages.append(item.get("text", ""))
+            elif t == "turn.completed":
+                usage = ev.get("usage") or {}
+                result.input_tokens += int(usage.get("input_tokens") or 0)
+                result.output_tokens += int(usage.get("output_tokens") or 0)
             elif t in ("turn.failed", "error"):
                 err = ev.get("error") or {}
                 errors.append(err.get("message") if isinstance(err, dict) else str(ev.get("message", err)))
@@ -466,6 +504,28 @@ class CodexRunner(Runner):
         # Overseer usually runs on a headless server, where codex's browser login can't work:
         # default to the device-code flow (open the printed URL on any device, enter the code).
         return [self.c.command, "login", *(extra or ["--device-auth"])], self.env(None)
+
+
+def _claude_usage(ev: dict[str, Any], result: RunResult) -> None:
+    """Token counts and cost from Claude Code's final `result` event."""
+    per_model = ev.get("modelUsage") or {}
+    if per_model:
+        for name, u in per_model.items():
+            result.input_tokens += int(u.get("inputTokens", 0)) + int(u.get("cacheReadInputTokens", 0)) \
+                + int(u.get("cacheCreationInputTokens", 0))
+            result.output_tokens += int(u.get("outputTokens", 0))
+        if not result.model:
+            result.model = max(per_model, key=lambda n: per_model[n].get("outputTokens", 0))
+    elif isinstance(ev.get("usage"), dict):
+        u = ev["usage"]
+        result.input_tokens += int(u.get("input_tokens", 0)) + int(u.get("cache_read_input_tokens", 0)) \
+            + int(u.get("cache_creation_input_tokens", 0))
+        result.output_tokens += int(u.get("output_tokens", 0))
+    cost = ev.get("total_cost_usd")
+    if cost is None and per_model:
+        cost = sum(float(u.get("costUSD", 0)) for u in per_model.values())
+    if cost is not None:
+        result.cost_usd = float(cost)
 
 
 def make_runner(cfg: Config, backend: str) -> Runner:

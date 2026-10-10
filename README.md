@@ -104,9 +104,15 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
 | `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
-| `/backend [claude_code\|codex]` | show or switch the agent; conversations continue on the new one with a fresh session |
+| `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
+| `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
 | `/stop` | stop the agent's current run (kills the whole process group) |
-| `/health` | SSH connection, last poll, which agent is active |
+| `/health` | SSH connection, last poll, agents with their model and effort |
+
+Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens · $0.04`.
+
+- **Model:** Claude Code reports the model it actually used. Codex doesn't, so its footer shows the configured model (or "default model").
+- **Cost:** only Claude Code reports it.
 
 Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's session ID), so they survive restarts. A job the agent submits stays linked to the conversation that submitted it.
 

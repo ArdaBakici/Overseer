@@ -368,6 +368,45 @@ async def test_agent_turn_reports_and_tracks_jobs(env, backend, job):
     assert after.backend == other and after.cli_session_id != first.cli_session_id
 
 
+async def test_model_effort_and_footer(env):
+    s = env.agent.general_session()
+    await env.agent.handle(s, "hi")
+    reply = env.notifier.sent[-1].text
+    assert "<i>claude_code · claude-fake-default · effort default · 1.6k tokens · $0.03</i>" in reply
+    assert "last run used claude-fake-default" in env.agent.describe("claude_code")
+
+    env.agent.set_model("opus")
+    env.agent.set_effort("xhigh")
+    await env.agent.handle(s, "again")
+    argv = env.cli_log()[-1]["argv"]
+    assert argv[argv.index("--model") + 1] == "opus" and argv[argv.index("--effort") + 1] == "xhigh"
+    assert "claude_code · opus · effort xhigh" in env.notifier.sent[-1].text
+    assert "opus (set via /model)" in env.agent.describe("claude_code")
+    with pytest.raises(ValueError, match="must be one of"):
+        env.agent.set_effort("minimal")  # a codex level, not a Claude Code one
+    with pytest.raises(ValueError):
+        env.agent.set_model("two words")
+
+    # Overrides are per backend.
+    env.agent.set_backend("codex")
+    env.agent.set_effort("minimal")
+    env.agent.set_model("gpt-x")
+    await env.agent.handle(s, "go")
+    argv = env.cli_log()[-1]["argv"]
+    assert argv[argv.index("-m") + 1] == "gpt-x" and 'model_reasoning_effort="minimal"' in argv
+    assert "<i>codex · gpt-x · effort minimal · 5.7k tokens</i>" in env.notifier.sent[-1].text  # no cost from codex
+
+    env.agent.set_model("default")
+    env.agent.set_effort("default")
+    await env.agent.handle(s, "go")
+    argv = env.cli_log()[-1]["argv"]
+    assert "-m" not in argv and not any(a.startswith("model_reasoning_effort") for a in argv)
+    assert "codex · default model · effort default" in env.notifier.sent[-1].text
+    env.cfg.agent.codex.model = "from-config"
+    assert "model from-config ·" in env.agent.describe("codex")
+    assert env.agent.runner("claude_code").model == "opus"  # untouched
+
+
 async def test_job_context_and_report_modes(env):
     env.set_jobs(**{"77": {"name": "train", "state": "FAILED", "exit": "1:0", "workdir": str(env.home / "proj"),
                            "stdout": str(env.home / "proj" / "slurm-77.out"), "script": "#!/bin/bash\npython t.py\n"}})
@@ -515,8 +554,18 @@ async def test_bot_routing_and_commands(env, monkeypatch):
     await drain()
     assert started[-1] == (env.agent.session_for_job("55").id, "use lr 1e-4")
 
+    await bot.cmd_model(None, NS(args=["sonnet"]))
+    assert "claude_code: model sonnet (set via /model)" in replies[-1]
+    await bot.cmd_effort(None, NS(args=["turbo"]))
+    assert "must be one of" in replies[-1]
+    await bot.cmd_effort(None, NS(args=["high"]))
+    assert "effort high (set via /effort)" in replies[-1]
+    await bot.cmd_backend(None, NS(args=[]))
+    assert "▶️ claude_code: model sonnet" in replies[-1] and "▫️ codex: model CLI default" in replies[-1]
     await bot.cmd_backend(None, NS(args=["codex"]))
     assert env.agent.backend == "codex" and "codex" in replies[-1]
+    await bot.cmd_effort(None, NS(args=[]))
+    assert "minimal | low | medium | high | xhigh" in replies[-1]
     await bot.cmd_backend(None, NS(args=["gpt"]))
     assert "must be one of" in replies[-1] and env.agent.backend == "codex"
 

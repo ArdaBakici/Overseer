@@ -154,3 +154,7 @@ class Store:
     def set(self, key: str, value: str) -> None:
         self.db.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (key, value))
         self.db.commit()
+
+    def unset(self, key: str) -> None:
+        self.db.execute("DELETE FROM kv WHERE key=?", (key,))
+        self.db.commit()

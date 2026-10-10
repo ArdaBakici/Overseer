@@ -44,6 +44,8 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /ask &lt;text&gt; — talk to the agent (or just send a message)
 /new — start a fresh agent conversation
 /backend [claude_code|codex] — show or switch the agent
+/model [name|default] — show or set the active agent's model
+/effort [level|default] — show or set the active agent's effort
 /stop — stop the agent's current run
 /health — connection status
 
@@ -116,6 +118,8 @@ class Bot:
         add(CommandHandler("ask", self.cmd_ask, filters=allowed))
         add(CommandHandler("new", self.cmd_new, filters=allowed))
         add(CommandHandler("backend", self.cmd_backend, filters=allowed))
+        add(CommandHandler("model", self.cmd_model, filters=allowed))
+        add(CommandHandler("effort", self.cmd_effort, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CallbackQueryHandler(self.on_button))
@@ -233,10 +237,18 @@ class Bot:
         s = self.agent.general_session(reset=True)
         await self.reply(update, f"Started a fresh conversation ({code(s.id)}).")
 
+    def _agents_summary(self) -> str:
+        lines = []
+        for b in BACKENDS:
+            mark = "▶️" if b == self.agent.backend else "▫️"
+            lines.append(f"{mark} {esc(self.agent.describe(b))}")
+        return "\n".join(lines)
+
     async def cmd_backend(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not ctx.args:
-            others = ", ".join(code(b) for b in BACKENDS)
-            await self.reply(update, f"Agent backend: {code(self.agent.backend)}\nSwitch with /backend &lt;name&gt; ({others}).")
+            names = ", ".join(code(b) for b in BACKENDS)
+            await self.reply(update, f"{self._agents_summary()}\n\nSwitch with /backend &lt;name&gt; ({names}); "
+                                     "change the model / effort with /model and /effort.")
             return
         try:
             self.agent.set_backend(ctx.args[0])
@@ -244,7 +256,36 @@ class Bot:
             await self.reply(update, f"⛔ {esc(e)}")
             return
         await self.reply(update, f"Agent backend is now {code(self.agent.backend)}. Existing conversations continue "
-                                 "with a fresh session on this backend (the job context is re-sent).")
+                                 "with a fresh session on this backend (the job context is re-sent).\n\n"
+                                 + self._agents_summary())
+
+    async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        b = self.agent.backend
+        if not ctx.args:
+            examples = "opus, sonnet, claude-opus-5-5" if b == "claude_code" else "gpt-5.5-codex"
+            await self.reply(update, f"{esc(self.agent.describe(b))}\n\nSet with /model &lt;name&gt; (e.g. {examples}), "
+                                     "or /model default to use config.yaml / the CLI default.")
+            return
+        try:
+            self.agent.set_model(ctx.args[0])
+        except ValueError as e:
+            await self.reply(update, f"⛔ {esc(e)}")
+            return
+        await self.reply(update, f"✅ {esc(self.agent.describe(b))}\nApplies from the next message "
+                                 "(an unknown model name shows up as an error from the CLI).")
+
+    async def cmd_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        b = self.agent.backend
+        levels = " | ".join(self.agent.runner(b).efforts)
+        if not ctx.args:
+            await self.reply(update, f"{esc(self.agent.describe(b))}\n\nSet with /effort &lt;{levels}&gt; or /effort default.")
+            return
+        try:
+            self.agent.set_effort(ctx.args[0])
+        except ValueError as e:
+            await self.reply(update, f"⛔ {esc(e)}")
+            return
+        await self.reply(update, f"✅ {esc(self.agent.describe(b))}\nApplies from the next message.")
 
     async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         running = self.agent.running_sessions()
@@ -261,7 +302,7 @@ class Bot:
         running = len(self.agent.running_sessions())
         await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · SSH connection {conn}\n"
                                  f"last successful poll: {last}{err}\n"
-                                 f"agent: {code(self.agent.backend)} · running now: {running}")
+                                 f"agent runs in progress: {running}\n\n{self._agents_summary()}")
 
     # ------------------------------------------------------------------ free text & buttons
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

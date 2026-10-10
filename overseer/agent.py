@@ -49,6 +49,10 @@ track the job and report on it.
 changed (paths), the job ids you submitted, and what happens next."""
 
 
+def _human(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
 @dataclass
 class Session:
     rec: SessionRecord
@@ -89,7 +93,58 @@ class Agent:
         b = backend or self.backend
         if b not in self._runners:
             self._runners[b] = make_runner(self.cfg, b)
-        return self._runners[b]
+        r = self._runners[b]
+        # Overrides set from Telegram (/model, /effort) win over config.yaml.
+        r.model_override = self.store.get(f"model:{b}")
+        r.effort_override = self.store.get(f"effort:{b}")
+        return r
+
+    def set_model(self, name: str, backend: str | None = None) -> None:
+        """Set the model for a backend; "default" goes back to config.yaml."""
+        b = backend or self.backend
+        name = name.strip()
+        if not name or any(c.isspace() for c in name):
+            raise ValueError("model name must be a single word, e.g. opus or gpt-5.5-codex")
+        if name == "default":
+            self.store.unset(f"model:{b}")
+        else:
+            self.store.set(f"model:{b}", name)
+
+    def set_effort(self, level: str, backend: str | None = None) -> None:
+        b = backend or self.backend
+        level = level.strip().lower()
+        if level == "default":
+            self.store.unset(f"effort:{b}")
+            return
+        allowed = self.runner(b).efforts
+        if level not in allowed:
+            raise ValueError(f"{b} effort must be one of: {', '.join(allowed)} (or default)")
+        self.store.set(f"effort:{b}", level)
+
+    def describe(self, backend: str) -> str:
+        """e.g. 'claude_code: model opus · effort high (last run: claude-opus-5-5)'."""
+        r = self.runner(backend)
+        last = self.store.get(f"last_model:{backend}")
+        model = r.model or "CLI default"
+        if r.model_override:
+            model += " (set via /model)"
+        effort = r.effort or "CLI default"
+        if r.effort_override:
+            effort += " (set via /effort)"
+        out = f"{backend}: model {model} · effort {effort}"
+        if last and last != r.model:
+            out += f" · last run used {last}"
+        return out
+
+    def footer(self, backend: str, res) -> str:
+        r = self.runner(backend)
+        parts = [backend, res.model or r.model or "default model", f"effort {r.effort or 'default'}"]
+        tokens = res.input_tokens + res.output_tokens
+        if tokens:
+            parts.append(f"{_human(tokens)} tokens")
+        if res.cost_usd is not None:
+            parts.append(f"${res.cost_usd:.2f}")
+        return " · ".join(parts)
 
     # ------------------------------------------------------------------ sessions
     def _load(self, rec: SessionRecord) -> Session:
@@ -205,7 +260,11 @@ class Agent:
         if res.session_id:
             s.rec.backend, s.rec.cli_session_id = backend, res.session_id
             self.store.upsert_session(s.rec)
-        await self.notifier.send(Outgoing(f"🤖 {esc(res.text or '(no answer)')}", session_id=s.id, job_id=s.job_id))
+        if res.model:
+            self.store.set(f"last_model:{backend}", res.model)
+        await self.notifier.send(Outgoing(
+            f"🤖 {esc(res.text or '(no answer)')}\n\n<i>{esc(self.footer(backend, res))}</i>",
+            session_id=s.id, job_id=s.job_id))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
         activity = Activity()

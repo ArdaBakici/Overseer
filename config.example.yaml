@@ -49,8 +49,8 @@ agent:
 
   claude_code:
     command: claude
-    model: null                 # e.g. opus, sonnet; null = Claude Code's default
-    effort: null                # low | medium | high | xhigh | max
+    model: null                 # e.g. opus, sonnet; null = Claude Code's default (also: /model in Telegram)
+    effort: null                # low | medium | high | xhigh | max (also: /effort in Telegram)
     home: ./state/claude        # CLAUDE_CONFIG_DIR for Overseer's runs. Log in: overseer login claude_code
     # pass_env: [ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, HTTPS_PROXY, ...]
     extra_settings: {}          # merged into Claude Code settings (sandbox settings can't be loosened)
@@ -58,7 +58,7 @@ agent:
   codex:
     command: codex
     model: null                 # e.g. gpt-5.5-codex; null = codex default
-    reasoning_effort: null      # low | medium | high | xhigh
+    reasoning_effort: null      # minimal | low | medium | high | xhigh (also: /effort in Telegram)
     home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex (device code)
     # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
     web_search: true            # the model's own web search (runs on OpenAI's side)

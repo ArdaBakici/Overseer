@@ -36,7 +36,8 @@ if prog == "claude":
         emit({"type": "result", "subtype": "success", "result": "OK report", "is_error": False})
         sys.exit(0)
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
-    emit({"type": "system", "subtype": "init", "session_id": sid})
+    model = args[args.index("--model") + 1] if "--model" in args else "claude-fake-default"
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": model})
     emit({"type": "assistant", "session_id": sid, "message": {"content": [
         {"type": "text", "text": "Checking the job."},
         {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ssh hpc 'cd ~/proj && sbatch train.sh'"}},
@@ -44,7 +45,9 @@ if prog == "claude":
     emit({"type": "user", "session_id": sid, "message": {"content": [
         {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "Submitted batch job 4242\n"}]}]}})
     emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
-          "result": "Fixed the batch size and resubmitted as job 4242."})
+          "result": "Fixed the batch size and resubmitted as job 4242.", "total_cost_usd": 0.0312,
+          "modelUsage": {model: {"inputTokens": 1000, "outputTokens": 200, "cacheReadInputTokens": 400,
+                                 "cacheCreationInputTokens": 0, "costUSD": 0.0312}}})
     sys.exit(0)
 
 if prog == "codex":
@@ -63,5 +66,5 @@ if prog == "codex":
     emit({"type": "item.completed", "item": {"id": "i2", "type": "file_change", "changes": [{"path": "/tmp/x/a.py", "kind": "update"}]}})
     emit({"type": "item.completed", "item": {"id": "i3", "type": "agent_message", "text": "Resubmitted as job 4343."}})
     open(out_file, "w").write("Resubmitted as job 4343.")
-    emit({"type": "turn.completed"})
+    emit({"type": "turn.completed", "usage": {"input_tokens": 5000, "cached_input_tokens": 1000, "output_tokens": 700}})
     sys.exit(0)

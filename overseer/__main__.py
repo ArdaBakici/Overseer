@@ -54,7 +54,8 @@ def build(cfg: Config):
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
             ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
-            ("backend", "show/switch claude_code or codex"), ("stop", "stop the agent's current run"),
+            ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
+            ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("health", "connection status"), ("help", "help"),
         ])
 
