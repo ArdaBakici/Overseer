@@ -42,6 +42,11 @@ SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 # Claude Code's answer when a tool call needed an interactive approval that -p mode can't give.
 PERMISSION_DENIED_RE = re.compile(r"requires approval|permission to use .* (?:was|has been) denied|haven't granted", re.I)
 PARSABLE_RE = re.compile(r"^\s*(\d+)(?:;\S+)?\s*$", re.M)
+# `sbatch` run as a command - not a folder, a `train.sbatch` file or sacct's --parsable2.
+_SBATCH = r"(?:^|[\s;&|(`'\"/])sbatch(?![\w.-])"
+SBATCH_RE = re.compile(_SBATCH)
+SBATCH_PARSABLE_RE = re.compile(_SBATCH + r"[^;&|\n]*\s--parsable(?![\w-])")  # the flag of that same sbatch
+SLURM_QUERY_RE = re.compile(r"(?:^|[\s;&|(`'\"/])(?:sacct|squeue|scontrol|seff|sinfo)(?![\w.-])")
 
 # Codex features with tools that act outside the shell sandbox or aren't useful headless.
 CODEX_DISABLED_FEATURES = [
@@ -113,10 +118,7 @@ class Activity:
 
     def output(self, cmd: str, output: str, exit_code: int | None = None) -> None:
         self._emit("output", command=display_command(cmd), output=output or "", exit_code=exit_code)
-        ids = SUBMITTED_RE.findall(output or "")
-        if not ids and "sbatch" in cmd and "--parsable" in cmd:
-            ids = PARSABLE_RE.findall(output or "")[-1:]
-        for jid in ids:
+        for jid in submitted_jobs(cmd, output or ""):
             if all(jid != j for j, _ in self.jobs):
                 self.jobs.append((jid, display_command(cmd)))
                 if self.on_job:
@@ -131,6 +133,19 @@ class Activity:
 
     def block(self, cmd: str, reason: str) -> None:
         self.blocked.append((display_command(cmd), reason.strip()[:300]))
+
+
+def submitted_jobs(cmd: str, output: str) -> list[str]:
+    """Job ids a command submitted: only when it actually runs sbatch (reading a log that says
+    "Submitted batch job N", or sacct output, is not a submission)."""
+    if not SBATCH_RE.search(cmd):
+        return []
+    ids = SUBMITTED_RE.findall(output)
+    if not ids and SBATCH_PARSABLE_RE.search(cmd):
+        ids = PARSABLE_RE.findall(output)
+        if SLURM_QUERY_RE.search(cmd):  # other numbers in the output may be sacct/squeue job ids
+            ids = ids[:1]
+    return ids
 
 
 def display_command(cmd: str) -> str:

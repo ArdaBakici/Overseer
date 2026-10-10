@@ -228,6 +228,29 @@ def test_store_migrates_old_database(tmp_path):
 
 # ----------------------------------------------------------------------------- activity parsing
 
+def test_job_detection_ignores_lookalikes():
+    from overseer.runners import submitted_jobs
+    not_submissions = [
+        ("ssh hpc 'cd ~/rf-dreamer/sbatch && sacct -u $USER -n -X -o JobID --parsable2 -S now-2days'", "12345\n12346\n"),
+        ("ssh hpc 'bash -lc \"sacct -j 12345 --parsable2 -n -o JobID; cat scripts/train.sbatch\"'", "12345\n"),
+        ("ssh hpc 'sacct -j 12345 -X -n -o JobID --parsable2; head run.sbatch'", "12345\n#!/bin/bash\n"),
+        ("ssh hpc 'tail -5 logs/sweep.out'", "Submitted batch job 12345\n"),
+        ("ssh hpc 'cat ~/notes/sbatch-history.txt'", "Submitted batch job 12345\n"),
+        ("ssh hpc 'squeue -u $USER -h -o %i'", "12345\n"),
+    ]
+    for cmd, out in not_submissions:
+        assert submitted_jobs(cmd, out) == [], cmd
+    submissions = [
+        ("ssh hpc 'cd ~/proj && sbatch train.sh'", "Submitted batch job 1\n", ["1"]),
+        ("ssh hpc 'bash -lc \"cd ~/proj && sbatch -p gpu --gres=gpu:a100:1 train.sbatch\"'", "Submitted batch job 2\n", ["2"]),
+        ("ssh hpc 'JOB=$(sbatch --parsable run.sh); echo $JOB'", "3\n", ["3"]),
+        ("ssh hpc 'for s in 1 2; do /usr/bin/sbatch --parsable run.sh $s; done'", "4\n5;cl\n", ["4", "5"]),
+        ("ssh hpc 'sbatch --parsable run.sh; sacct -j 77 -n -X -o JobID --parsable2'", "6\n77\n", ["6"]),
+    ]
+    for cmd, out, ids in submissions:
+        assert submitted_jobs(cmd, out) == ids, cmd
+
+
 def test_activity_and_job_detection():
     seen = []
     a = Activity(on_job=lambda j, c: seen.append(j))
