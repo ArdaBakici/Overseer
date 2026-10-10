@@ -250,6 +250,25 @@ def test_deny_list_covers_secrets_without_nesting(env, monkeypatch):
     assert str(env.cfg.ssh_dir) in Runner(env.cfg).deny_read()
 
 
+def test_deny_list_uses_real_paths(env):
+    """A socket reachable as /var/run/x and /run/x (/var/run -> /run) is listed once, by its real
+    path: bubblewrap can't mask a path through a symlinked dir and the agent's shell wouldn't start."""
+    import socket
+    from overseer.runners import Runner
+
+    run = env.tmp / "run"
+    run.mkdir()
+    (env.tmp / "var-run").symlink_to(run)
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(run / "d.sock"))
+    try:
+        env.cfg.agent.deny_read = [str(env.tmp / "var-run" / "d.sock"), str(run / "d.sock")]
+        denied = Runner(env.cfg).deny_read()
+        assert str(run / "d.sock") in denied and not any("var-run" in d for d in denied)
+    finally:
+        sock.close()
+
+
 async def test_claude_runner_sandbox_and_parsing(env):
     r = ClaudeCodeRunner(env.cfg)
     act = Activity()

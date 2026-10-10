@@ -183,10 +183,12 @@ class Runner:
         if os.environ.get("SSH_AUTH_SOCK"):
             candidates.append(Path(os.environ["SSH_AUTH_SOCK"]).parent)
         candidates += [Path(p).expanduser() for p in self.cfg.agent.deny_read]
+        # Real paths only: the sandboxes can't mask a path through a symlinked dir (e.g. /var/run -> /run),
+        # and both names of the same socket must collapse into one entry.
         paths = []
         for p in candidates:
             if p.exists() or p.is_symlink():
-                paths.append(p if p.is_socket() else p.resolve())
+                paths.append(p.resolve())
         # Drop entries already covered by a denied parent (bubblewrap can't mount inside a masked dir).
         out = [p for p in paths if not any(q != p and q in p.parents for q in paths)]
         return list(dict.fromkeys(str(p) for p in out))
