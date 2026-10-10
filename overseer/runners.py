@@ -61,6 +61,7 @@ class RunResult:
     session_id: str | None
     is_error: bool = False
     model: str | None = None  # the model that actually ran, when the CLI reports it
+    effort: str | None = None  # the reasoning effort that actually applied, when known
     input_tokens: int = 0  # all input, including the cached part below
     cached_tokens: int = 0  # input served from the provider's prompt cache (much cheaper)
     output_tokens: int = 0
@@ -433,6 +434,10 @@ class CodexRunner(Runner):
     name = "codex"
     efforts = CODEX_EFFORTS
 
+    def __init__(self, cfg: Config):
+        super().__init__(cfg)
+        self._catalog: dict[str, str] | None = None  # model -> its default reasoning effort
+
     def _configured_effort(self) -> str | None:
         return self.c.reasoning_effort
 
@@ -500,7 +505,7 @@ class CodexRunner(Runner):
         out_file = workdir / f".last-{uuid.uuid4().hex[:8]}.txt"
         argv = self._argv(session_id=session_id, out_file=out_file, ephemeral=ephemeral,
                           overrides=self.overrides(workdir, system=system, writable=writable, network=network))
-        result = RunResult(text="", session_id=session_id, model=self.model)  # codex doesn't report its model
+        result = RunResult(text="", session_id=session_id, model=self.model, effort=self.effort)
         messages: list[str] = []
         errors: list[str] = []
 
@@ -537,7 +542,62 @@ class CodexRunner(Runner):
         if not result.text and (errors or stderr):
             detail = "; ".join(e for e in errors if e) or "\n".join(stderr.strip().splitlines()[-15:])
             raise AgentRunError("codex: " + detail[-1500:])
+        if not ephemeral and result.session_id:
+            await self._fill_actual_settings(result)
         return result
+
+    # codex's --json events don't say which model ran, but its session log does.
+    def session_settings(self, thread_id: str) -> tuple[str | None, str | None]:
+        """(model, effort) of the latest turn, from the session log in CODEX_HOME/sessions.
+
+        The effort is None when none was configured (the model's default applied)."""
+        logs = sorted(self.home().glob(f"sessions/*/*/*/rollout-*{thread_id}.jsonl"), key=lambda f: f.stat().st_mtime)
+        model = effort = None
+        if not logs:
+            return None, None
+        try:
+            with logs[-1].open(errors="replace") as fh:
+                for line in fh:
+                    if '"turn_context"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") != "turn_context":
+                        continue
+                    ctx = ev.get("payload") or {}
+                    settings = (ctx.get("collaboration_mode") or {}).get("settings") or {}
+                    model = ctx.get("model") or settings.get("model") or model
+                    effort = settings.get("reasoning_effort") or ctx.get("effort")
+        except OSError as e:
+            log.debug("codex session log %s: %s", logs[-1], e)
+        return model, effort
+
+    async def default_effort(self, model: str) -> str | None:
+        """The model's default reasoning effort, from codex's model catalog (`codex debug models`)."""
+        if self._catalog is None:
+            self._catalog = {}
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    self.c.command, "debug", "models", env=self.env(None), cwd=str(self.home()),
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                for m in json.loads(out or b"{}").get("models") or []:
+                    if m.get("slug") and m.get("default_reasoning_level"):
+                        self._catalog[m["slug"]] = m["default_reasoning_level"]
+            except (OSError, asyncio.TimeoutError, ValueError, AttributeError) as e:
+                log.debug("codex model catalog unavailable: %s", e)
+        return self._catalog.get(model)
+
+    async def _fill_actual_settings(self, result: RunResult) -> None:
+        model, effort = self.session_settings(result.session_id)
+        result.model = model or result.model
+        if effort:
+            result.effort = effort
+        elif not result.effort and result.model:
+            default = await self.default_effort(result.model)
+            result.effort = f"{default} (model default)" if default else None
 
     async def run(self, prompt: str, *, system: str, session_id: str | None, key: str,
                   activity: Activity) -> RunResult:

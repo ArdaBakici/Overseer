@@ -139,6 +139,7 @@ def configure_backend(cfg, backend, cli, fm):
         provider = {"name": "fake", "base_url": fm.url + "/v1", "wire_api": "responses", "env_key": "FAKE_KEY",
                     "request_max_retries": 0, "stream_max_retries": 0}
         c.extra_config = ['model_provider="fake"', 'model="fake-model"', f"model_providers.fake={_toml(provider)}"]
+        c.reasoning_effort = "high"
 
 
 @pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
@@ -192,6 +193,8 @@ async def test_agent_end_to_end(hpc, backend, cli_name):
         assert json.loads(state.read_text())["jobs"]["5001"]["state"] == "PENDING"
         assert "DONE" in notes.sent[-1].text, detail
         assert store.get_session(s.id).cli_session_id
+        if backend == "codex":  # read back from codex's own session log (its --json events don't say)
+            assert "codex · fake-model · effort high ·" in notes.sent[-1].text, detail
         # Overseer's instructions reached the model.
         tool_requests = [r for r in fm.requests if r["body"].get("tools")]
         assert "You are Overseer's agent" in json.dumps(tool_requests[0]["body"]), "system prompt missing"

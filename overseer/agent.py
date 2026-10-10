@@ -125,23 +125,25 @@ class Agent:
         self.store.set(f"effort:{b}", level)
 
     def describe(self, backend: str) -> str:
-        """e.g. 'claude_code: model opus · effort high (last run: claude-opus-5-5)'."""
+        """e.g. 'codex: model default (last run: gpt-5.5) · effort default (last run: medium (model default))'."""
         r = self.runner(backend)
-        last = self.store.get(f"last_model:{backend}")
+        last_model = self.store.get(f"last_model:{backend}")
+        last_effort = self.store.get(f"last_effort:{backend}")
         model = r.model or "CLI default"
         if r.model_override:
             model += " (set via /model)"
+        if last_model and last_model != r.model:
+            model += f" (last run: {last_model})"
         effort = r.effort or "CLI default"
         if r.effort_override:
             effort += " (set via /effort)"
-        out = f"{backend}: model {model} · effort {effort}"
-        if last and last != r.model:
-            out += f" · last run used {last}"
-        return out
+        if last_effort and last_effort != r.effort:
+            effort += f" (last run: {last_effort})"
+        return f"{backend}: model {model} · effort {effort}"
 
     def footer(self, backend: str, res) -> str:
         r = self.runner(backend)
-        parts = [backend, res.model or r.model or "default model", f"effort {r.effort or 'default'}"]
+        parts = [backend, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
         tokens = res.input_tokens + res.output_tokens
         if tokens:
             cached = f" ({_human(res.cached_tokens)} cached)" if res.cached_tokens else ""
@@ -266,6 +268,8 @@ class Agent:
             self.store.upsert_session(s.rec)
         if res.model:
             self.store.set(f"last_model:{backend}", res.model)
+        if res.effort:
+            self.store.set(f"last_effort:{backend}", res.effort)
         await self.notifier.send(Outgoing(
             f"🤖 {esc(res.text or '(no answer)')}\n\n<i>{esc(self.footer(backend, res))}</i>",
             session_id=s.id, job_id=s.job_id))

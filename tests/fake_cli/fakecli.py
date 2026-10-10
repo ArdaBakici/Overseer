@@ -59,6 +59,11 @@ if prog == "codex" and args[:1] == ["resume"]:  # interactive `overseer open`
     print("codex TUI would open here")
     sys.exit(0)
 
+if prog == "codex" and args[:2] == ["debug", "models"]:
+    emit({"models": [{"slug": "gpt-fake-default", "default_reasoning_level": "medium"},
+                     {"slug": "gpt-x", "default_reasoning_level": "low"}]})
+    sys.exit(0)
+
 if prog == "codex":
     out_file = args[args.index("-o") + 1]
     resumed = len(args) > 1 and args[1] == "resume"
@@ -68,6 +73,14 @@ if prog == "codex":
         emit({"type": "turn.completed"})
         sys.exit(0)
     emit({"type": "thread.started", "thread_id": tid})
+    # Session log, like codex's own: the model and effort are only recorded here.
+    model = args[args.index("-m") + 1] if "-m" in args else "gpt-fake-default"
+    effort = next((a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort=")), None)
+    log_dir = os.path.join(os.environ["CODEX_HOME"], "sessions", "2026", "10", "10")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, f"rollout-2026-10-10T00-00-00-{tid}.jsonl"), "a") as fh:
+        fh.write(json.dumps({"type": "turn_context", "payload": {"model": model, "collaboration_mode": {
+            "mode": "default", "settings": {"model": model, "reasoning_effort": effort}}}}) + "\n")
     cmd = "/bin/bash -lc 'ssh hpc sbatch --parsable ~/proj/train.sh'"
     emit({"type": "item.started", "item": {"id": "i1", "type": "command_execution", "command": cmd, "status": "in_progress"}})
     emit({"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": cmd,

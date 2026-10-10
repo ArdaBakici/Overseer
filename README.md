@@ -113,7 +113,10 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
 
 - **Tokens:** every model call re-sends the CLI's instructions, its tool definitions and the conversation so far, so the total grows with each command the agent runs. Most of that is served from the provider's prompt cache, which costs roughly a tenth of fresh input.
 
-- **Model:** Claude Code reports the model it actually used. Codex doesn't, so its footer shows the configured model (or "default model").
+- **Model and effort:** the footer shows what actually ran, even when nothing is configured.
+  - **Claude Code** reports the model it used.
+  - **Codex** doesn't report it in its output, so Overseer reads it from Codex's session log in `./state/codex/sessions`. If no effort was set, the model's default effort comes from Codex's built-in model catalog (`codex debug models`) and is shown as e.g. `effort medium (model default)`.
+  - `/backend` and `/health` show the configured values plus what the last run actually used, e.g. `model CLI default (last run: gpt-5.5)`.
 - **Cost:** only Claude Code reports it.
 
 **Opening a conversation in the CLI itself.** To read the full log (every message, command and output) or keep working in the terminal:

@@ -107,9 +107,11 @@ def env(tmp_path, monkeypatch, short_tmp):
         st["jobs"].update(jobs)
         state.write_text(json.dumps(st))
 
-    def cli_log():
+    def cli_log(lookups: bool = False):
+        """Calls to the fake CLIs; `codex debug models` lookups only with lookups=True."""
         p = tmp_path / "cli.jsonl"
-        return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+        calls = [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+        return calls if lookups else [c for c in calls if c["argv"][:1] != ["debug"]]
 
     return NS(cfg=cfg, home=home, store=store, hpc=hpc, notifier=notifier, agent=agent, monitor=monitor,
               tmp=tmp_path, set_jobs=set_jobs, cli_log=cli_log,
@@ -373,7 +375,7 @@ async def test_model_effort_and_footer(env):
     await env.agent.handle(s, "hi")
     reply = env.notifier.sent[-1].text
     assert "<i>claude_code · claude-fake-default · effort default · 1.6k tokens (400 cached) · $0.03</i>" in reply
-    assert "last run used claude-fake-default" in env.agent.describe("claude_code")
+    assert "model CLI default (last run: claude-fake-default) · effort CLI default" in env.agent.describe("claude_code")
 
     env.agent.set_model("opus")
     env.agent.set_effort("xhigh")
@@ -401,9 +403,15 @@ async def test_model_effort_and_footer(env):
     await env.agent.handle(s, "go")
     argv = env.cli_log()[-1]["argv"]
     assert "-m" not in argv and not any(a.startswith("model_reasoning_effort") for a in argv)
-    assert "codex · default model · effort default" in env.notifier.sent[-1].text
+    # Nothing configured: the model and effort codex actually used come from its session log
+    # and its model catalog.
+    assert "codex · gpt-fake-default · effort medium (model default)" in env.notifier.sent[-1].text
+    assert env.agent.describe("codex") == ("codex: model CLI default (last run: gpt-fake-default) · "
+                                           "effort CLI default (last run: medium (model default))")
+    await env.agent.handle(s, "go")  # the catalog is looked up once
+    assert sum(c["argv"][:2] == ["debug", "models"] for c in env.cli_log(lookups=True)) == 1
     env.cfg.agent.codex.model = "from-config"
-    assert "model from-config ·" in env.agent.describe("codex")
+    assert "model from-config (last run: gpt-fake-default) ·" in env.agent.describe("codex")
     assert env.agent.runner("claude_code").model == "opus"  # untouched
 
 
