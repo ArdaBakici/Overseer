@@ -70,7 +70,10 @@ class RunResult:
 
 @dataclass
 class Activity:
-    """What the agent did during one request (for Telegram reports and job tracking)."""
+    """What the agent did during one request (for Telegram reports, job tracking and the live view).
+
+    Every step is also passed to `on_progress` as a dict with a "kind": thought (reasoning summary),
+    message (text the agent wrote between steps), command, output, tool, file or session."""
 
     commands: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
@@ -78,14 +81,38 @@ class Activity:
     blocked: list[tuple[str, str]] = field(default_factory=list)  # (command, reason) refused by the CLI itself
     on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
+    on_progress: Callable[[dict[str, Any]], None] | None = None
+
+    def _emit(self, kind: str, **data: Any) -> None:
+        if self.on_progress:
+            try:
+                self.on_progress({"kind": kind, **data})
+            except Exception:
+                log.exception("progress handler failed")
+
+    def thought(self, text: str) -> None:
+        if text and text.strip():
+            self._emit("thought", text=text.strip())
+
+    def message(self, text: str) -> None:
+        if text and text.strip():
+            self._emit("message", text=text.strip())
+
+    def tool(self, name: str, detail: str = "") -> None:
+        self._emit("tool", name=name, detail=detail)
+
+    def session(self, session_id: str) -> None:
+        self._emit("session", id=session_id)
 
     def command(self, cmd: str) -> None:
         cmd = display_command(cmd)
         self.commands.append(cmd)
         if self.on_command:
             self.on_command(cmd)
+        self._emit("command", command=cmd)
 
-    def output(self, cmd: str, output: str) -> None:
+    def output(self, cmd: str, output: str, exit_code: int | None = None) -> None:
+        self._emit("output", command=display_command(cmd), output=output or "", exit_code=exit_code)
         ids = SUBMITTED_RE.findall(output or "")
         if not ids and "sbatch" in cmd and "--parsable" in cmd:
             ids = PARSABLE_RE.findall(output or "")[-1:]
@@ -96,7 +123,10 @@ class Activity:
                     self.on_job(jid, display_command(cmd))
 
     def file(self, path: str) -> None:
-        if path and path not in self.files:
+        if not path:
+            return
+        self._emit("file", path=path)
+        if path not in self.files:
             self.files.append(path)
 
     def block(self, cmd: str, reason: str) -> None:
@@ -347,21 +377,28 @@ class ClaudeCodeRunner(Runner):
 
         def on_event(ev: dict[str, Any]) -> None:
             t = ev.get("type")
-            if ev.get("session_id"):
+            if ev.get("session_id") and ev["session_id"] != result.session_id:
                 result.session_id = ev["session_id"]
+                activity.session(result.session_id)
             if t == "system" and ev.get("subtype") == "init" and ev.get("model"):
                 result.model = ev["model"]
             if t == "assistant":
                 for block in (ev.get("message") or {}).get("content") or []:
-                    if block.get("type") == "text" and block.get("text"):
+                    kind = block.get("type")
+                    if kind == "thinking":
+                        activity.thought(block.get("thinking") or "")
+                    elif kind == "text" and block.get("text"):
                         texts.append(block["text"])
-                    elif block.get("type") == "tool_use":
+                        activity.message(block["text"])
+                    elif kind == "tool_use":
                         name, inp = block.get("name"), block.get("input") or {}
                         if name == "Bash" and inp.get("command"):
                             pending[block.get("id")] = inp["command"]
                             activity.command(inp["command"])
                         elif name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
                             activity.file(inp.get("file_path") or inp.get("notebook_path") or "")
+                        elif name:
+                            activity.tool(name, _tool_detail(inp))
             elif t == "user":
                 for block in (ev.get("message") or {}).get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in pending:
@@ -515,6 +552,8 @@ class CodexRunner(Runner):
             t = ev.get("type", "")
             if t == "thread.started":
                 result.session_id = ev.get("thread_id") or result.session_id
+                if result.session_id:
+                    activity.session(result.session_id)
             elif t in ("item.started", "item.completed"):
                 item = ev.get("item") or {}
                 kind = item.get("type")
@@ -522,12 +561,21 @@ class CodexRunner(Runner):
                     if t == "item.started":
                         activity.command(item.get("command", ""))
                     else:
-                        activity.output(item.get("command", ""), item.get("aggregated_output", ""))
-                elif kind == "file_change" and t == "item.completed":
+                        activity.output(item.get("command", ""), item.get("aggregated_output", ""), item.get("exit_code"))
+                elif t != "item.completed":
+                    pass
+                elif kind == "file_change":
                     for ch in item.get("changes") or []:
                         activity.file(ch.get("path", ""))
-                elif kind == "agent_message" and t == "item.completed":
+                elif kind == "agent_message":
                     messages.append(item.get("text", ""))
+                    activity.message(item.get("text", ""))
+                elif kind == "reasoning":
+                    activity.thought(item.get("text", ""))
+                elif kind == "web_search":
+                    activity.tool("web_search", item.get("query", ""))
+                elif kind == "mcp_tool_call":
+                    activity.tool(f"{item.get('server', '')}.{item.get('tool', '')}".strip("."))
             elif t == "turn.completed":
                 usage = ev.get("usage") or {}
                 result.input_tokens += int(usage.get("input_tokens") or 0)  # includes the cached part
@@ -624,6 +672,14 @@ class CodexRunner(Runner):
         for o in self.overrides(workdir, system=None, writable=True, network=True):
             argv += ["-c", o]
         return argv + [session_id], self.env(workdir), workdir
+
+
+def _tool_detail(inp: dict[str, Any]) -> str:
+    """The interesting argument of a Claude Code tool call (Read path, Grep pattern, fetched URL...)."""
+    for key in ("file_path", "path", "pattern", "url", "query", "description", "prompt"):
+        if inp.get(key):
+            return str(inp[key])[:300]
+    return ""
 
 
 def _claude_usage(ev: dict[str, Any], result: RunResult) -> None:

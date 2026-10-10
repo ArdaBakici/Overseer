@@ -6,6 +6,8 @@
 `FakeModel(script=[cmd1, cmd2, ...])`: on each request that offers tools, the model calls
 the CLI's shell tool with the next command; once all commands ran it answers
 "DONE" plus the outputs. Requests without tools (titles, one-shot reports) get "OK".
+With `think=True` each tool call is preceded by a reasoning summary ("THOUGHT <n>") and a
+short message ("NOTE <n>"), like real models' thinking and progress updates.
 All tool outputs the CLI sends back are recorded in `.outputs` (in order).
 """
 
@@ -15,8 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class FakeModel:
-    def __init__(self, script):
+    def __init__(self, script, think: bool = False):
         self.script = list(script)
+        self.think = think
         self.requests = []
         self.outputs: list[str] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -121,18 +124,34 @@ class FakeModel:
             block = {"type": "text", "text": ""}
             delta = {"type": "text_delta", "text": decision[1]}
             stop = "end_turn"
+        blocks = [(block, [delta])]
+        if self.think and decision[0] == "call":
+            k = len(outputs) + 1
+            blocks = [({"type": "thinking", "thinking": "", "signature": ""},
+                       [{"type": "thinking_delta", "thinking": f"THOUGHT {k}: checking step {k}"},
+                        {"type": "signature_delta", "signature": "c2ln"}]),
+                      ({"type": "text", "text": ""}, [{"type": "text_delta", "text": f"NOTE {k}"}])] + blocks
         if not body.get("stream"):
-            full = dict(block)
-            if decision[0] == "call":
-                full["input"] = json.loads(delta["partial_json"])
-            else:
-                full["text"] = decision[1]
-            return {**msg, "content": [full], "stop_reason": stop}
-        return [
-            ("message_start", {"type": "message_start", "message": msg}),
-            ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": block}),
-            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
-            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            content = []
+            for b, deltas in blocks:
+                full = dict(b)
+                for d in deltas:
+                    if d["type"] == "input_json_delta":
+                        full["input"] = json.loads(d["partial_json"])
+                    elif d["type"] == "text_delta":
+                        full["text"] = d["text"]
+                    elif d["type"] == "thinking_delta":
+                        full["thinking"] = d["thinking"]
+                    elif d["type"] == "signature_delta":
+                        full["signature"] = d["signature"]
+                content.append(full)
+            return {**msg, "content": content, "stop_reason": stop}
+        events = [("message_start", {"type": "message_start", "message": msg})]
+        for i, (b, deltas) in enumerate(blocks):
+            events.append(("content_block_start", {"type": "content_block_start", "index": i, "content_block": b}))
+            events += [("content_block_delta", {"type": "content_block_delta", "index": i, "delta": d}) for d in deltas]
+            events.append(("content_block_stop", {"type": "content_block_stop", "index": i}))
+        return events + [
             ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
                                "usage": {"output_tokens": 1}}),
             ("message_stop", {"type": "message_stop"}),
@@ -170,11 +189,19 @@ class FakeModel:
         else:
             item = {"type": "message", "role": "assistant", "id": f"msg_{n}", "status": "completed",
                     "content": [{"type": "output_text", "text": decision[1], "annotations": []}]}
+        items = [item]
+        if self.think and decision[0] == "call":
+            k = len(outputs) + 1
+            items = [{"type": "reasoning", "id": f"rs_{n}", "encrypted_content": None,
+                      "summary": [{"type": "summary_text", "text": f"THOUGHT {k}: checking step {k}"}]},
+                     {"type": "message", "role": "assistant", "id": f"msg_{n}_note", "status": "completed",
+                      "content": [{"type": "output_text", "text": f"NOTE {k}", "annotations": []}]}] + items
         usage = {"input_tokens": 1, "input_tokens_details": None, "output_tokens": 1,
                  "output_tokens_details": None, "total_tokens": 2}
-        return [
-            ("response.created", {"type": "response.created", "response": {"id": f"resp_{n}"}}),
-            ("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": item}),
-            ("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item}),
+        events = [("response.created", {"type": "response.created", "response": {"id": f"resp_{n}"}})]
+        for i, it in enumerate(items):
+            events.append(("response.output_item.added", {"type": "response.output_item.added", "output_index": i, "item": it}))
+            events.append(("response.output_item.done", {"type": "response.output_item.done", "output_index": i, "item": it}))
+        return events + [
             ("response.completed", {"type": "response.completed", "response": {"id": f"resp_{n}", "usage": usage}}),
         ]

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from .config import BACKENDS, Config
 from .hpc import HPC
+from .live import Progress, Transcript
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
 from .sshlink import ensure_master
@@ -255,13 +256,38 @@ class Agent:
         parts.append(user_text)
         prompt = "\n\n".join(parts)
 
-        await ensure_master(self.cfg)
+        transcript = Transcript(self.cfg, s.id)
+        transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
+                          "text": user_text})
+        progress = Progress(self.notifier, backend, s.id, s.job_id) if self.cfg.agent.live_progress else None
         activity, live, buffer = self._activity(s)
+
+        def on_progress(ev: dict) -> None:
+            transcript.write(ev)
+            if progress:
+                progress.on_event(ev)
+            if ev["kind"] == "session" and (s.rec.backend, s.rec.cli_session_id) != (backend, ev["id"]):
+                # Saved right away, so `overseer open` finds a conversation that is still running.
+                s.rec.backend, s.rec.cli_session_id = backend, ev["id"]
+                self.store.upsert_session(s.rec)
+
+        activity.on_progress = on_progress
+        if progress:
+            progress.start()
         try:
+            await ensure_master(self.cfg)
             res = await runner.run(prompt, system=self.system_prompt(), session_id=resume, key=s.id, activity=activity)
+        except asyncio.CancelledError:
+            transcript.write({"kind": "end", "status": "stopped"})
+            raise
+        except Exception as e:
+            transcript.write({"kind": "end", "status": "error", "text": str(e)[:2000]})
+            raise
         finally:
             if live:
                 live.cancel()
+            if progress:
+                await progress.close()
             await self._report_activity(s, activity, buffer)
         if res.session_id:
             s.rec.backend, s.rec.cli_session_id = backend, res.session_id
@@ -270,8 +296,10 @@ class Agent:
             self.store.set(f"last_model:{backend}", res.model)
         if res.effort:
             self.store.set(f"last_effort:{backend}", res.effort)
+        footer = self.footer(backend, res)
+        transcript.write({"kind": "end", "status": "done", "text": res.text, "footer": footer})
         await self.notifier.send(Outgoing(
-            f"🤖 {esc(res.text or '(no answer)')}\n\n<i>{esc(self.footer(backend, res))}</i>",
+            f"🤖 {esc(res.text or '(no answer)')}\n\n<i>{esc(footer)}</i>",
             session_id=s.id, job_id=s.job_id))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:

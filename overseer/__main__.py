@@ -6,6 +6,8 @@
     overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
     overseer sessions                   list agent conversations
     overseer open [conversation]        open a conversation in Claude Code / Codex (default: latest)
+    overseer watch [conversation]       follow what the agent is doing live: reasoning, commands, output
+                                        (default: every conversation; --full for complete outputs)
     overseer check                      verify everything without starting the bot
     overseer run                        start the bot
 All take -c/--config (default: config.yaml).
@@ -222,6 +224,7 @@ def sessions_command(cfg: Config, limit: int = 20) -> int:
     for r in rows:
         print(f"{r.id:<20} {r.backend or '-':<12} {r.job_id or '-':<10} {_ago(r.updated):<10} {r.cli_session_id or '(none yet)'}")
     print("\nOpen one with: overseer open <conversation>   (no argument = the most recent)")
+    print("Follow one live: overseer watch <conversation>   (no argument = all of them)")
     return 0
 
 
@@ -267,11 +270,13 @@ def open_command(cfg: Config, target: str | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open"])
+    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch"])
     ap.add_argument("target", nargs="?",
-                    help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest)")
+                    help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest); "
+                         "watch: conversation (default: all)")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("--import", dest="import_key", help="ssh setup: copy this existing private key instead of generating one")
+    ap.add_argument("--full", action="store_true", help="watch: show complete command output")
     ap.add_argument("-v", "--verbose", action="store_true")
     argv = list(sys.argv[1:] if argv is None else argv)
     extra: list[str] = []
@@ -298,6 +303,9 @@ def main(argv: list[str] | None = None) -> int:
             return sessions_command(cfg)
         if args.command == "open":
             return open_command(cfg, args.target)
+        if args.command == "watch":
+            from .live import watch
+            return watch(cfg, args.target, full=args.full)
         app = build(cfg)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)

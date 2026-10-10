@@ -184,6 +184,9 @@ class AgentConfig:
     # How the commands the agent runs are reported in Telegram:
     #   summary - one message after each request; live - batched every few seconds; off
     report_commands: str = "summary"
+    # While the agent works, one Telegram message that updates itself every few seconds with its
+    # latest reasoning summary, the running command and the elapsed time (removed when it answers).
+    live_progress: bool = True
     # Internet hosts the agent's local shell may reach (it reaches the HPC through Overseer's
     # SSH connection, which needs no internet access). Empty = no internet from the shell.
     allowed_domains: list[str] = field(default_factory=list)

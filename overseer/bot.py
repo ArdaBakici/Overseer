@@ -27,7 +27,7 @@ from .agent import Agent, Session
 from .config import BACKENDS, Config
 from .hpc import HPC
 from .monitor import Monitor
-from .notify import Outgoing, code, esc, pre, split_message
+from .notify import TG_LIMIT, Outgoing, code, esc, pre, split_message
 from .slurm import STATE_EMOJI
 from .ssh import SSHError
 from .sshlink import master_alive
@@ -93,6 +93,35 @@ class TelegramNotifier:
             for name, data in msg.files:
                 sent = await self.app.bot.send_document(chat_id, document=data, filename=name, disable_notification=True)
                 self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+
+
+    async def post_live(self, msg: Outgoing) -> list[tuple[int, int]]:
+        handle = []
+        for chat_id in self.chat_ids:
+            try:
+                sent = await self.app.bot.send_message(chat_id, msg.text[:TG_LIMIT], parse_mode=ParseMode.HTML,
+                                                       disable_notification=True)
+            except Exception:
+                log.debug("live message failed", exc_info=True)
+                continue
+            handle.append((chat_id, sent.message_id))
+            self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+        return handle
+
+    async def edit_live(self, handle: list[tuple[int, int]], text: str) -> None:
+        for chat_id, message_id in handle:
+            try:
+                await self.app.bot.edit_message_text(text[:TG_LIMIT], chat_id=chat_id, message_id=message_id,
+                                                     parse_mode=ParseMode.HTML)
+            except Exception:  # "message is not modified", rate limits: the next update catches up
+                log.debug("live message edit failed", exc_info=True)
+
+    async def delete_live(self, handle: list[tuple[int, int]]) -> None:
+        for chat_id, message_id in handle:
+            try:
+                await self.app.bot.delete_message(chat_id, message_id)
+            except Exception:
+                log.debug("live message delete failed", exc_info=True)
 
 
 class Bot:

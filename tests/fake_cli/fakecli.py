@@ -3,7 +3,8 @@
 
 Logs argv/env/stdin to $FAKE_CLI_LOG (JSON lines) and emits a canned event stream:
 the agent runs `ssh hpc ...sbatch...`, sbatch answers with a job id, then a final message.
-A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL makes it exit with an error.
+A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL makes it exit with an error;
+FORCE_SLOW pauses between events (to watch the live progress).
 """
 import json
 import os
@@ -20,6 +21,8 @@ with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
 
 def emit(ev):
     print(json.dumps(ev), flush=True)
+    if "FORCE_SLOW" in stdin:
+        time.sleep(0.3)
 
 
 if "login" in args:
@@ -38,6 +41,8 @@ if prog == "claude":
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
     model = args[args.index("--model") + 1] if "--model" in args else "claude-fake-default"
     emit({"type": "system", "subtype": "init", "session_id": sid, "model": model})
+    emit({"type": "assistant", "session_id": sid, "message": {"content": [
+        {"type": "thinking", "thinking": "The batch size is probably too big for the GPU.", "signature": "x"}]}})
     emit({"type": "assistant", "session_id": sid, "message": {"content": [
         {"type": "text", "text": "Checking the job."},
         {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ssh hpc 'cd ~/proj && sbatch train.sh'"}},
@@ -82,6 +87,8 @@ if prog == "codex":
         fh.write(json.dumps({"type": "turn_context", "payload": {"model": model, "collaboration_mode": {
             "mode": "default", "settings": {"model": model, "reasoning_effort": effort}}}}) + "\n")
     cmd = "/bin/bash -lc 'ssh hpc sbatch --parsable ~/proj/train.sh'"
+    emit({"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "The batch size is probably too big for the GPU."}})
+    emit({"type": "item.completed", "item": {"id": "i0b", "type": "agent_message", "text": "Checking the job."}})
     emit({"type": "item.started", "item": {"id": "i1", "type": "command_execution", "command": cmd, "status": "in_progress"}})
     emit({"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": cmd,
                                               "aggregated_output": "4343\n", "exit_code": 0, "status": "completed"}})

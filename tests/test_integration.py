@@ -39,9 +39,22 @@ class LocalRunner(SSHRunner):
 class FakeNotifier:
     def __init__(self):
         self.sent = []
+        self.live = {}  # handle -> list of versions of a self-updating message
+        self.deleted = []
 
     async def send(self, msg):
         self.sent.append(msg)
+
+    async def post_live(self, msg):
+        handle = len(self.live) + 1
+        self.live[handle] = [msg.text]
+        return handle
+
+    async def edit_live(self, handle, text):
+        self.live[handle].append(text)
+
+    async def delete_live(self, handle):
+        self.deleted.append(handle)
 
     def texts(self):
         return "\n".join(m.text for m in self.sent)
@@ -517,6 +530,81 @@ async def test_stop_kills_the_run(env):
     assert await env.agent.stop(s.id)
     await asyncio.wait_for(task, 10)
     assert "Stopped" in env.notifier.sent[-1].text and not env.agent.is_running(s)
+    last = (env.cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()[-1]
+    assert json.loads(last)["status"] == "stopped"
+
+
+@pytest.mark.parametrize("backend", ["claude_code", "codex"])
+async def test_live_progress_and_transcript(env, monkeypatch, backend):
+    from overseer import live
+    monkeypatch.setattr(live, "PROGRESS_SECONDS", 0.1)
+    env.agent.set_backend(backend)
+    s = env.agent.general_session(reset=True)
+    task = asyncio.create_task(env.agent.handle(s, "FORCE_SLOW fix it"))
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if env.store.get_session(s.id).cli_session_id:
+            break
+    # The CLI's session id is saved while the run is still going (so `overseer open` finds it).
+    assert env.agent.is_running(s) and env.store.get_session(s.id).cli_session_id
+    await asyncio.wait_for(task, 20)
+
+    # One message that updated itself while the agent worked, removed once the answer arrived.
+    (handle, versions), = env.notifier.live.items()
+    assert handle in env.notifier.deleted and len(versions) > 1
+    seen = "\n".join(versions)
+    assert f"{backend} is working" in seen and "/stop cancels" in seen
+    assert "💭 <i>The batch size is probably too big for the GPU.</i>" in seen and "💬 Checking the job." in seen
+    assert "running for" in seen and "sbatch" in seen
+    assert env.notifier.sent[-1].text.startswith("🤖")
+
+    events = [json.loads(line) for line in
+              (env.cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()]
+    kinds = [e["kind"] for e in events]
+    assert kinds[0] == "turn" and events[0]["text"] == "FORCE_SLOW fix it" and events[0]["backend"] == backend
+    assert {"session", "thought", "message", "command", "output"} <= set(kinds)
+    assert kinds.index("thought") < kinds.index("command") < kinds.index("output")
+    assert kinds[-1] == "end" and events[-1]["status"] == "done" and events[-1]["footer"].startswith(backend)
+    assert oct((env.cfg.local.state("transcripts") / f"{s.id}.jsonl").stat().st_mode & 0o777) == "0o600"
+
+
+def test_watch(env):
+    import io
+    from overseer.live import Transcript, watch
+
+    s = env.agent.general_session()
+    asyncio.run(env.agent.handle(s, "hi"))
+
+    def run(conversation, **kw):
+        out = io.StringIO()
+        rc = watch(env.cfg, conversation, follow=False, color=False, out=out, **kw)
+        return rc, out.getvalue()
+
+    rc, text = run(s.id)
+    assert rc == 0
+    for part in ["new request · claude_code", "👤 hi", "💭 The batch size is probably too big", "💬 Checking the job.",
+                 "$ ssh hpc 'cd ~/proj && sbatch train.sh'", "  │ Submitted batch job 4242",
+                 "✏️  /tmp/x/notes.md", "🤖 Fixed the batch size", "claude_code · claude-fake-default", "· done"]:
+        assert part in text, part
+    assert run("nope")[0] == 1
+    t = Transcript(env.cfg, "chat-answer")
+    for ev in [{"kind": "turn", "text": "q"}, {"kind": "message", "text": "The answer."},
+               {"kind": "end", "status": "done", "text": "The answer.", "footer": "codex · m"}]:
+        t.write(ev)
+    assert run("chat-answer")[1].count("The answer.") == 1  # the final message isn't printed twice
+
+    # All conversations: only requests that are still running are replayed, then new events.
+    rc, text = run(None)
+    assert "Working on: nothing right now" in text and "👤" not in text
+    t = Transcript(env.cfg, "j77-abcdef")
+    t.write({"kind": "turn", "backend": "codex", "text": "still going"})
+    t.write({"kind": "command", "command": "ls"})
+    t.write({"kind": "output", "command": "ls", "output": "\n".join(f"line{i}" for i in range(30)), "exit_code": 2})
+    rc, text = run(None)
+    assert "Working on: j77-abcdef" in text and "▌ j77-abcdef" in text and "👤 still going" in text
+    assert "$ ls" in text and "line29" in text and "line5\n" not in text and "18 earlier lines" in text
+    assert "└ exit 2" in text
+    assert "line5\n" in run("j77", full=True)[1]  # a unique prefix is enough
 
 
 async def test_cli_refusals_are_reported_plainly(env):

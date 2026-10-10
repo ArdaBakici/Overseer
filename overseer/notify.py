@@ -22,6 +22,13 @@ class Outgoing:
 class Notifier(Protocol):
     async def send(self, msg: Outgoing) -> None: ...
 
+    # A message that is edited in place (the agent's live progress). The handle is opaque.
+    async def post_live(self, msg: Outgoing) -> object: ...
+
+    async def edit_live(self, handle: object, text: str) -> None: ...
+
+    async def delete_live(self, handle: object) -> None: ...
+
 
 def esc(s: object) -> str:
     return html.escape(str(s), quote=False)

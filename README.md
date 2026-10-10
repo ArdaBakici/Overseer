@@ -7,7 +7,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **Final report:** when a job ends you get ✅/❌, with the state, exit code, runtime against the limit and peak memory.
   - **Why it failed:** heuristics flag CUDA OOM, host OOM, time limits, NCCL errors, missing modules, NaNs and similar. An LLM root-cause summary is added on top.
 - **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
-  - **Visibility:** you see every command it ran, and you get a message the moment it submits a job.
+  - **Visibility:** while it works, one message updates itself with its latest reasoning and the command it is running. Afterwards you see every command it ran, and you get a message the moment it submits a job.
   - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
 - **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
 
@@ -106,6 +106,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
+| *(while the agent works)* | a ⏳ message that updates itself every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. It is removed when the answer arrives |
 | `/stop` | stop the agent's current run (kills the whole process group) |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
@@ -119,6 +120,18 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - `/backend` and `/health` show the configured values plus what the last run actually used, e.g. `model CLI default (last run: gpt-5.5)`.
 - **Cost:** only Claude Code reports it.
 
+**Watching the agent live from the homelab.** `overseer watch` follows what the agent is doing in the terminal: its reasoning summaries, what it writes between steps, every command with its output, and the final answer.
+
+```bash
+uv run overseer watch                 # every conversation: what is running now, then anything new
+uv run overseer watch chat-a7b233     # one conversation, from its first logged request (a unique prefix is enough)
+uv run overseer watch chat-a7 --full  # complete command output instead of the last 12 lines
+```
+
+- **Read-only:** unlike `overseer open`, it's safe to use while the bot is working.
+- **Where it reads from:** Overseer records every request in `./state/transcripts/<conversation>.jsonl`, starting with this version. Older conversations have no live log; `overseer open` still shows their history.
+- **Reasoning is a summary:** neither OpenAI nor Anthropic returns the model's raw chain of thought. Codex passes on OpenAI's reasoning summaries, and Claude Code passes on Claude's thinking summaries. How much you see depends on the model and the effort level.
+
 **Opening a conversation in the CLI itself.** To read the full log (every message, command and output) or keep working in the terminal:
 
 ```bash
@@ -131,12 +144,13 @@ uv run overseer open chat-b920aa      # or a specific one (a unique prefix is en
 - **First use of Claude Code:** it shows its one-time welcome and theme setup the first time Overseer's config is opened interactively.
 - **Shared history:** anything you add there becomes part of the conversation, so avoid typing while the bot is working on it.
 
-Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's session ID), so they survive restarts. A job the agent submits stays linked to the conversation that submitted it.
+Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's session ID, saved as soon as a run starts), so they survive restarts. A job the agent submits stays linked to the conversation that submitted it.
 
 ## Configuration notes
 
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
+- `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
 - `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
 - Anything the agent reads is sent to the model provider of the backend you use.
@@ -161,4 +175,5 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `monitor.py`, `slurm.py`, `diagnose.py` | polling → queued/started/status/final-report messages |
 | `runners.py` | Claude Code / Codex: sandbox settings, scrubbed env, event parsing, job detection |
 | `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
+| `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

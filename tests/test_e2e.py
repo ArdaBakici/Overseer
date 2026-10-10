@@ -50,9 +50,22 @@ pytestmark = pytest.mark.skipif(not all(needs), reason="needs sshd, ssh, ssh-key
 class Notes:
     def __init__(self):
         self.sent = []
+        self.live = {}  # handle -> list of versions of a self-updating message
+        self.deleted = []
 
     async def send(self, msg):
         self.sent.append(msg)
+
+    async def post_live(self, msg):
+        handle = len(self.live) + 1
+        self.live[handle] = [msg.text]
+        return handle
+
+    async def edit_live(self, handle, text):
+        self.live[handle].append(text)
+
+    async def delete_live(self, handle):
+        self.deleted.append(handle)
 
     def texts(self):
         return "\n".join(m.text for m in self.sent)
@@ -143,7 +156,7 @@ def configure_backend(cfg, backend, cli, fm):
 
 
 @pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
-async def test_agent_end_to_end(hpc, backend, cli_name):
+async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
     cli = find_cli(cli_name)
     if not cli:
         pytest.skip(f"{cli_name} not installed")
@@ -163,7 +176,9 @@ async def test_agent_end_to_end(hpc, backend, cli_name):
     ]
     (app / ".env").write_text("TELEGRAM_BOT_TOKEN=999:super-secret-token\n")
     (app / ".env").chmod(0o600)
-    with FakeModel(script) as fm:
+    from overseer import live
+    monkeypatch.setattr(live, "PROGRESS_SECONDS", 0.2)
+    with FakeModel(script, think=True) as fm:
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
@@ -193,6 +208,16 @@ async def test_agent_end_to_end(hpc, backend, cli_name):
         assert json.loads(state.read_text())["jobs"]["5001"]["state"] == "PENDING"
         assert "DONE" in notes.sent[-1].text, detail
         assert store.get_session(s.id).cli_session_id
+        # The model's reasoning summaries and in-between messages reach the live views.
+        events = [json.loads(line) for line in
+                  (cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()]
+        thoughts = [e["text"] for e in events if e["kind"] == "thought"]
+        notes_ = [e["text"] for e in events if e["kind"] == "message"]
+        assert "THOUGHT 1: checking step 1" in thoughts and "NOTE 1" in notes_, events
+        assert any(e["kind"] == "output" and "Submitted batch job 5001" in e["output"] for e in events)
+        assert events[-1]["kind"] == "end" and events[-1]["status"] == "done"
+        seen = "\n".join(v for versions in notes.live.values() for v in versions)
+        assert "THOUGHT" in seen and notes.deleted, seen
         if backend == "codex":  # read back from codex's own session log (its --json events don't say)
             assert "codex · fake-model · effort high ·" in notes.sent[-1].text, detail
         # Overseer's instructions reached the model.
