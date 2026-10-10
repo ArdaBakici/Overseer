@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     first_seen REAL, last_status_at REAL, ended_at REAL,
     missing_polls INTEGER DEFAULT 0,
     report TEXT,
-    info TEXT
+    info TEXT,
+    agent_reported INTEGER DEFAULT 0,
+    checkins INTEGER DEFAULT 0,
+    last_checkin REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -36,7 +39,23 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS autopilot (
+    session_id TEXT PRIMARY KEY,
+    active INTEGER DEFAULT 0,
+    goal TEXT,
+    max_rounds INTEGER DEFAULT 0,
+    rounds INTEGER DEFAULT 0,
+    checkin_every REAL DEFAULT 0,
+    status TEXT,
+    created REAL, updated REAL
+);
 """
+# Columns added after the first release: (table, column, definition).
+ADDED_COLUMNS = [
+    ("jobs", "agent_reported", "INTEGER DEFAULT 0"),
+    ("jobs", "checkins", "INTEGER DEFAULT 0"),
+    ("jobs", "last_checkin", "REAL DEFAULT 0"),
+]
 
 
 @dataclass
@@ -57,6 +76,9 @@ class JobRecord:
     missing_polls: int = 0
     report: str = ""
     info: str = "{}"
+    agent_reported: int = 0  # autopilot: the agent has been woken with this job's final report
+    checkins: int = 0  # autopilot: check-ins on this job while it ran
+    last_checkin: float = 0.0
 
     @property
     def info_dict(self) -> dict[str, Any]:
@@ -76,6 +98,19 @@ class SessionRecord:
     updated: float = 0.0
 
 
+@dataclass
+class AutopilotRecord:
+    session_id: str
+    active: int = 0
+    goal: str = ""
+    max_rounds: int = 0
+    rounds: int = 0  # wake-ups after jobs finished (check-ins don't count)
+    checkin_every: float = 0.0  # seconds between check-ins on running jobs; 0 = none
+    status: str = ""  # waiting | working | idle | need_help | done | limit | stopped | error | off
+    created: float = 0.0
+    updated: float = 0.0
+
+
 def _row(cls, row):
     names = {f.name for f in fields(cls)}
     return cls(**{k: row[k] for k in row.keys() if k in names})
@@ -91,6 +126,9 @@ class Store:
         if cols and "by_agent" not in cols:  # database from an older Overseer version: keep it aside
             self.db.execute(f"ALTER TABLE jobs RENAME TO jobs_old_{int(time.time())}")
         self.db.executescript(SCHEMA)
+        for table, col, definition in ADDED_COLUMNS:
+            if col not in {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
         self.db.commit()
 
     def _upsert(self, table: str, key: str, obj: Any) -> None:
@@ -119,6 +157,25 @@ class Store:
     def recent_jobs(self, limit: int = 15) -> list[JobRecord]:
         rows = self.db.execute("SELECT * FROM jobs ORDER BY first_seen DESC LIMIT ?", (limit,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
+
+    def session_jobs(self, session_id: str) -> list[JobRecord]:
+        """Jobs the agent submitted in a conversation."""
+        rows = self.db.execute("SELECT * FROM jobs WHERE session_id=? AND by_agent=1 ORDER BY first_seen",
+                               (session_id,)).fetchall()
+        return [_row(JobRecord, r) for r in rows]
+
+    # ---------------------------------------------------------------- autopilot
+    def get_autopilot(self, session_id: str) -> AutopilotRecord | None:
+        row = self.db.execute("SELECT * FROM autopilot WHERE session_id=?", (session_id,)).fetchone()
+        return _row(AutopilotRecord, row) if row else None
+
+    def upsert_autopilot(self, a: AutopilotRecord) -> None:
+        a.updated = time.time()
+        self._upsert("autopilot", "session_id", a)
+
+    def list_autopilots(self, active_only: bool = False) -> list[AutopilotRecord]:
+        q = "SELECT * FROM autopilot" + (" WHERE active=1" if active_only else "") + " ORDER BY updated DESC"
+        return [_row(AutopilotRecord, r) for r in self.db.execute(q).fetchall()]
 
     # ---------------------------------------------------------------- agent sessions
     def get_session(self, sid: str) -> SessionRecord | None:

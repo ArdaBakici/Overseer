@@ -176,6 +176,17 @@ class CodexConfig:
 
 
 @dataclass
+class AutopilotConfig:
+    """`/auto` in Telegram: the agent continues on its own when the jobs it submitted finish."""
+
+    default_rounds: int = 10  # /auto without a number
+    max_rounds: int = 50  # upper bound for /auto <rounds>
+    checkin_minutes: int = 0  # default check-in interval on running jobs (0 = none; /auto ... every 2h)
+    min_checkin_minutes: int = 15  # shortest interval /auto accepts
+    max_checkins_per_job: int = 12
+
+
+@dataclass
 class AgentConfig:
     enabled: bool = True
     # claude_code or codex. Can be switched at runtime from Telegram with /backend.
@@ -198,6 +209,7 @@ class AgentConfig:
     llm_status_updates: bool = False  # one-line LLM progress summary in periodic status messages
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
+    autopilot: AutopilotConfig = field(default_factory=AutopilotConfig)
 
 
 BACKENDS = ("claude_code", "codex")

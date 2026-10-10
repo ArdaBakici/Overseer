@@ -46,6 +46,7 @@ PARSABLE_RE = re.compile(r"^\s*(\d+)(?:;\S+)?\s*$", re.M)
 _SBATCH = r"(?:^|[\s;&|(`'\"/])sbatch(?![\w.-])"
 SBATCH_RE = re.compile(_SBATCH)
 SBATCH_PARSABLE_RE = re.compile(_SBATCH + r"[^;&|\n]*\s--parsable(?![\w-])")  # the flag of that same sbatch
+SCANCEL_RE = re.compile(r"(?:^|[\s;&|(`'\"/])scancel(?![\w.-])([^;&|\n]*)")
 SLURM_QUERY_RE = re.compile(r"(?:^|[\s;&|(`'\"/])(?:sacct|squeue|scontrol|seff|sinfo)(?![\w.-])")
 
 # Codex features with tools that act outside the shell sandbox or aren't useful headless.
@@ -84,6 +85,7 @@ class Activity:
     files: list[str] = field(default_factory=list)
     jobs: list[tuple[str, str]] = field(default_factory=list)  # (job_id, command)
     blocked: list[tuple[str, str]] = field(default_factory=list)  # (command, reason) refused by the CLI itself
+    cancelled: list[str] = field(default_factory=list)  # job ids the agent ran scancel on
     on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
     on_progress: Callable[[dict[str, Any]], None] | None = None
@@ -112,6 +114,10 @@ class Activity:
     def command(self, cmd: str) -> None:
         cmd = display_command(cmd)
         self.commands.append(cmd)
+        for args in SCANCEL_RE.findall(cmd):
+            for jid in re.findall(r"(?<![\w-])(\d+)(?:_\d+)?(?![\w.])", args):
+                if jid not in self.cancelled:
+                    self.cancelled.append(jid)
         if self.on_command:
             self.on_command(cmd)
         self._emit("command", command=cmd)

@@ -10,6 +10,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **Visibility:** while it works, one message updates itself with its latest reasoning and the command it is running. Afterwards you see every command it ran, and you get a message the moment it submits a job.
   - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
 - **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
+- **Autopilot.** `/auto 10 every 2h <goal>` lets the agent run experiments on its own. It is woken when its jobs finish, reads the results, keeps a research log and submits the next run, with optional check-ins while jobs run.
 
 ```
  homelab (your machine)                                                    HPC login node
@@ -108,6 +109,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
 | *(while the agent works)* | a ⏳ message that updates itself every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. It is removed when the answer arrives |
 | `/stop` | stop the agent's current run (kills the whole process group) |
+| `/auto [rounds] [every 2h] <goal>` | autopilot (below). As a reply to a message, it applies to that conversation. `/auto` shows progress, `/auto off` stops it |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
 Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens (11.8k cached) · $0.04`.
@@ -119,6 +121,28 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - **Codex** doesn't report it in its output, so Overseer reads it from Codex's session log in `./state/codex/sessions`. If no effort was set, the model's default effort comes from Codex's built-in model catalog (`codex debug models`) and is shown as e.g. `effort medium (model default)`.
   - `/backend` and `/health` show the configured values plus what the last run actually used, e.g. `model CLI default (last run: gpt-5.5)`.
 - **Cost:** only Claude Code reports it.
+
+**Autopilot: letting the agent iterate on its own.**
+
+```
+/auto 10 every 2h Get crafter seed 1 above score 5 in /scratch/me/rf-dreamer. One change per run, a100 or h100, whichever starts first.
+```
+
+1. **Kickoff:** the agent looks at the project, creates `RESEARCH_LOG.md` in the project folder on the HPC, submits the first experiment and stops. Nothing runs while the job waits in the queue.
+2. **Rounds:** when the job finishes, Overseer resumes the same conversation with its final report: state, exit code, runtime, peak memory, findings and the end of the log. The agent reads the results, updates the log and submits the next run. That is one round.
+   - **Batches:** jobs submitted together are reported together. The round starts when all of them have finished, or as soon as one fails.
+3. **Check-ins** (`every 2h`; off unless you ask): while its jobs run, the agent sees their progress (metrics and the end of the log). If a run is clearly broken or diverging, it cancels it, notes why in the log and resubmits. Healthy check-ins come silently and don't count as rounds. There are at most 12 per job.
+4. **Ending:** every reply ends with a status line, which Overseer removes from the message:
+   - **continue:** keep the loop going;
+   - **done:** 🏁 the goal is reached or nothing sensible is left, and autopilot turns off;
+   - **need help:** 🙋 you get pinged with the agent's question. Reply to answer; the loop continues once the agent submits again.
+
+Guardrails:
+- **Hard round limit:** the default is 10 and the maximum 50. The agent is told when it's on its last round and should wrap up.
+- **Pauses on any problem:** a round that fails or is `/stop`ped pauses the loop. Send `/auto <rounds>` as a reply to retry.
+- **Its own jobs only:** it only wakes for jobs the agent submitted in that conversation. Jobs it cancels itself don't trigger a new round.
+- **Visible at every step:** you see every round, command and submitted job in Telegram as usual. `overseer watch` shows the reasoning live.
+- **Cost:** each round re-sends the conversation so far. Rounds are usually hours apart, so the provider's prompt cache has expired and long autopilot runs get pricier per round. The research log keeps the important history in a file you can read any time.
 
 **Watching the agent live from the homelab.** `overseer watch` follows what the agent is doing in the terminal: its reasoning summaries, what it writes between steps, every command with its output, and the final answer.
 
@@ -151,6 +175,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).
+- `agent.autopilot`: default and maximum rounds, a default check-in interval (`checkin_minutes`, 0 = off), the shortest interval allowed, and the check-in cap per job.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
 - `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
 - Anything the agent reads is sent to the model provider of the backend you use.
@@ -176,4 +201,5 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `runners.py` | Claude Code / Codex: sandbox settings, scrubbed env, event parsing, job detection |
 | `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
+| `autopilot.py` | `/auto`: waking conversations when their jobs finish, check-ins, round limits, status lines |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

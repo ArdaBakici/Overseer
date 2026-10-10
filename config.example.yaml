@@ -64,3 +64,12 @@ agent:
     # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
     web_search: true            # the model's own web search (runs on OpenAI's side)
     extra_config: []            # extra `-c key=value` overrides
+
+  # /auto in Telegram: the agent runs experiments on its own. It is woken when the jobs it submitted finish
+  # (one round), and optionally for check-ins while they run.
+  autopilot:
+    default_rounds: 10          # /auto without a number
+    max_rounds: 50              # most rounds /auto accepts
+    checkin_minutes: 0          # default check-in interval for running jobs (0 = none; per conversation: /auto ... every 2h)
+    min_checkin_minutes: 15     # shortest check-in interval allowed
+    max_checkins_per_job: 12

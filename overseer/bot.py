@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 
 from .agent import Agent, Session
+from .autopilot import parse_duration
 from .config import BACKENDS, Config
 from .hpc import HPC
 from .monitor import Monitor
@@ -47,6 +48,8 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /model [name|default] — show or set the active agent's model
 /effort [level|default] — show or set the active agent's effort
 /stop — stop the agent's current run
+/auto [rounds] [every 2h] &lt;goal&gt; — autopilot: the agent keeps experimenting on its own, woken when its jobs finish (as a reply: in that conversation)
+/auto — autopilot progress · /auto off — stop it
 /health — connection status
 
 Reply to any job message to talk to the agent about that job.
@@ -151,6 +154,7 @@ class Bot:
         add(CommandHandler("effort", self.cmd_effort, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
+        add(CommandHandler("auto", self.cmd_auto, filters=allowed))
         add(CallbackQueryHandler(self.on_button))
         add(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_text))
         add(MessageHandler(~allowed, self.on_stranger))
@@ -329,23 +333,69 @@ class Bot:
         err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
         conn = "up" if await master_alive(self.cfg) else "down (reopens on the next poll)"
         running = len(self.agent.running_sessions())
+        auto = self.store.list_autopilots(active_only=True)
         await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · SSH connection {conn}\n"
                                  f"last successful poll: {last}{err}\n"
-                                 f"agent runs in progress: {running}\n\n{self._agents_summary()}")
+                                 f"agent runs in progress: {running} · autopilots on: {len(auto)}\n\n"
+                                 f"{self._agents_summary()}")
 
     # ------------------------------------------------------------------ free text & buttons
+    def _replied_session(self, update: Update | None) -> Session | None:
+        """The conversation of the message this one replies to (a job message counts as its job's)."""
+        msg = update.effective_message if update else None
+        if not msg or not msg.reply_to_message:
+            return None
+        job_id, sid = self.store.message_link(update.effective_chat.id, msg.reply_to_message.message_id)
+        session = self.agent.get(sid)
+        if session is None and job_id:
+            session = self.agent.session_for_job(job_id)
+        return session
+
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        chat_id = update.effective_chat.id
-        session = None
-        if msg.reply_to_message:
-            job_id, sid = self.store.message_link(chat_id, msg.reply_to_message.message_id)
-            session = self.agent.get(sid)
-            if session is None and job_id:
-                session = self.agent.session_for_job(job_id)
-        if session is None:
-            session = self.agent.general_session()
-        self._spawn(self._run_agent(chat_id, session, msg.text))
+        session = self._replied_session(update) or self.agent.general_session()
+        self._spawn(self._run_agent(update.effective_chat.id, session, update.effective_message.text))
+
+    async def cmd_auto(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        ap = self.agent.autopilot
+        if ap is None:
+            await self.reply(update, "Autopilot isn't available.")
+            return
+        args = list(ctx.args or [])
+        target = self._replied_session(update)
+        if not args or args[0].lower() in ("status", "list"):
+            await self.reply(update, ap.describe())
+            return
+        if args[0].lower() in ("off", "stop"):
+            stopped = ap.stop(target.id if target else None)
+            await self.reply(update, f"⏹ Autopilot off for {', '.join(code(x) for x in stopped)}. Jobs keep running "
+                                     "and are still reported." if stopped else "Autopilot wasn't on.")
+            return
+        rounds, every, i = None, None, 0
+        if args[0].isdigit():
+            rounds, i = int(args[0]), 1
+        while i < len(args):
+            word = args[i].lower()
+            if word.startswith(("every=", "checkin=")):
+                value, step = word.split("=", 1)[1], 1
+            elif word in ("every", "checkin") and i + 1 < len(args):
+                value, step = args[i + 1], 2
+            else:
+                break
+            every = parse_duration(value)
+            if every is None:
+                await self.reply(update, f"⛔ {code(value)} isn't a duration: use e.g. 30m, 2h, 1d or off.")
+                return
+            i += step
+        goal = " ".join(args[i:]).strip()
+        if rounds is None and every is None and not goal:
+            await self.reply(update, "Usage: /auto [rounds] [every 2h] &lt;goal&gt;, /auto off, or /auto for progress.")
+            return
+        session = target or self.agent.general_session()
+        if rounds is None and not goal and ap.active(session.id):  # only the check-in interval changes
+            await self.reply(update, ap.set_checkins(session.id, every))
+            return
+        text = await ap.start(session, rounds or self.cfg.agent.autopilot.default_rounds, goal, every)
+        await self.notifier.send(Outgoing(text, session_id=session.id, job_id=session.job_id))
 
     async def on_stranger(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat:

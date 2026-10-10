@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from .config import BACKENDS, Config
 from .hpc import HPC
+from .autopilot import parse_status
 from .live import Progress, Transcript
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
@@ -79,6 +80,7 @@ class Agent:
         self.notifier = notifier
         self.hpc = hpc
         self.monitor = None  # set by the app; poked when the agent submits a job
+        self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
 
@@ -203,14 +205,17 @@ class Agent:
         return [s for s in self.sessions.values() if self.is_running(s)]
 
     # ------------------------------------------------------------------ prompts
-    def system_prompt(self) -> str:
+    def system_prompt(self, session_id: str | None = None) -> str:
         domains = self.cfg.agent.allowed_domains
         setup = self.cfg.slurm.setup.strip()
-        return SYSTEM_PROMPT.format(
+        prompt = SYSTEM_PROMPT.format(
             host=self.cfg.ssh.host,
             setup=f"{setup}; " if setup else "",
             domains=f" (except {', '.join(domains)})" if domains else "",
         )
+        if self.autopilot and session_id:
+            prompt += self.autopilot.system_section(session_id)
+        return prompt
 
     async def _job_context(self, job_id: str) -> str:
         rec = self.store.get_job(job_id)
@@ -227,14 +232,18 @@ class Agent:
         ] if x)
 
     # ------------------------------------------------------------------ running a request
-    async def handle(self, s: Session, user_text: str) -> None:
+    async def handle(self, s: Session, user_text: str, quiet: bool = False) -> bool:
+        """Run one request in a conversation. True if the agent answered. `quiet`: send the answer
+        without a notification sound (autopilot check-ins) unless the autopilot needs attention."""
         if not self.cfg.agent.enabled:
             await self.notifier.send(Outgoing("The agent is disabled in the config."))
-            return
+            return False
+        ok = False
         async with s.lock:
             s.task = asyncio.current_task()
             try:
-                await self._turn(s, user_text)
+                await self._turn(s, user_text, quiet)
+                ok = True
             except asyncio.CancelledError:
                 await self.notifier.send(Outgoing("⏹ Stopped.", session_id=s.id, job_id=s.job_id))
             except AgentRunError as e:
@@ -245,8 +254,11 @@ class Agent:
                                                   session_id=s.id, job_id=s.job_id))
             finally:
                 s.task = None
+        if self.autopilot:
+            self.autopilot.turn_ended(s)
+        return ok
 
-    async def _turn(self, s: Session, user_text: str) -> None:
+    async def _turn(self, s: Session, user_text: str, quiet: bool = False) -> None:
         backend = self.backend
         runner = self.runner(backend)
         resume = s.rec.cli_session_id if s.rec.backend == backend else None
@@ -276,7 +288,8 @@ class Agent:
             progress.start()
         try:
             await ensure_master(self.cfg)
-            res = await runner.run(prompt, system=self.system_prompt(), session_id=resume, key=s.id, activity=activity)
+            res = await runner.run(prompt, system=self.system_prompt(s.id), session_id=resume, key=s.id,
+                                   activity=activity)
         except asyncio.CancelledError:
             transcript.write({"kind": "end", "status": "stopped"})
             raise
@@ -297,10 +310,16 @@ class Agent:
         if res.effort:
             self.store.set(f"last_effort:{backend}", res.effort)
         footer = self.footer(backend, res)
-        transcript.write({"kind": "end", "status": "done", "text": res.text, "footer": footer})
+        text, autopilot_line, status = res.text, "", None
+        if self.autopilot and self.autopilot.active(s.id):
+            text, status, detail = parse_status(res.text)
+            autopilot_line = self.autopilot.after_turn(s, status, detail, activity.cancelled)
+        transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer,
+                          **({"autopilot": status} if status else {})})
         await self.notifier.send(Outgoing(
-            f"🤖 {esc(res.text or '(no answer)')}\n\n<i>{esc(footer)}</i>",
-            session_id=s.id, job_id=s.job_id))
+            f"🤖 {esc(text or '(no answer)')}" + (f"\n\n{autopilot_line}" if autopilot_line else "")
+            + f"\n\n<i>{esc(footer)}</i>",
+            session_id=s.id, job_id=s.job_id, silent=quiet and status not in ("DONE", "NEED_HELP")))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
         activity = Activity()

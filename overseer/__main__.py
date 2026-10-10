@@ -39,6 +39,7 @@ def build(cfg: Config):
     from telegram.ext import Application
 
     from .agent import Agent
+    from .autopilot import Autopilot
     from .bot import Bot, TelegramNotifier
     from .diagnose import Reporter
     from .hpc import HPC
@@ -60,7 +61,7 @@ def build(cfg: Config):
             ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
             ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
-            ("health", "connection status"), ("help", "help"),
+            ("auto", "autopilot: keep experimenting on its own"), ("health", "connection status"), ("help", "help"),
         ])
 
     async def post_shutdown(app: Application) -> None:
@@ -84,6 +85,7 @@ def build(cfg: Config):
     reporter = Reporter(report_text, cfg.agent.enabled and cfg.agent.job_reports, cfg.agent.llm_status_updates)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     agent.monitor = monitor
+    monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
     Bot(cfg, app, store, hpc, monitor, agent, notifier).register()
     return app
 

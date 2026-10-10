@@ -225,6 +225,19 @@ def test_store_migrates_old_database(tmp_path):
     assert store.get_session("s1").id == "s1"
     assert store.get_job("x") is None
 
+    # A database from before autopilot: the new job columns are added in place.
+    db2 = tmp_path / "v4.db"
+    con = sqlite3.connect(db2)
+    con.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, name TEXT, state TEXT, partition TEXT, workdir TEXT, "
+                "stdout TEXT, stderr TEXT, batch_script TEXT, by_agent INTEGER DEFAULT 0, session_id TEXT, "
+                "first_seen REAL, last_status_at REAL, ended_at REAL, missing_polls INTEGER DEFAULT 0, report TEXT, "
+                "info TEXT)")
+    con.execute("INSERT INTO jobs (job_id, name, by_agent) VALUES ('7', 'old', 1)")
+    con.commit()
+    con.close()
+    rec = Store(db2).get_job("7")
+    assert rec.name == "old" and rec.agent_reported == 0 and rec.checkins == 0
+
 
 # ----------------------------------------------------------------------------- activity parsing
 
@@ -784,3 +797,242 @@ def test_build_app(env):
     app = build(env.cfg)
     assert app.handlers
     assert (env.cfg.local.state().stat().st_mode & 0o777) == 0o700
+
+
+# ----------------------------------------------------------------------------- autopilot
+
+def make_autopilot(env):
+    from overseer.autopilot import Autopilot
+    ap = Autopilot(env.cfg, env.store, env.agent, env.notifier, env.hpc)
+    env.monitor.autopilot = ap
+    return ap
+
+
+def agent_jobs(env, s):
+    return [j.job_id for j in env.store.session_jobs(s.id)]
+
+
+async def run_job(env, jid, state="COMPLETED", log_text="step 100 loss=0.50\n", finish=True):
+    proj = env.home / "proj"
+    log = proj / f"slurm-{jid}.out"
+    log.write_text(log_text)
+    job = {"name": f"run{jid}", "state": "RUNNING", "workdir": str(proj), "stdout": str(log)}
+    env.set_jobs(**{jid: job})
+    await env.monitor.poll()
+    if finish:
+        env.set_jobs(**{jid: {**job, "state": state, "exit": "0:0" if state == "COMPLETED" else "1:0"}})
+        await env.monitor.poll()
+    await env.monitor.autopilot.drain()
+
+
+def claude_calls(env):
+    return [c for c in env.cli_log() if c["prog"] == "claude"]
+
+
+async def test_autopilot_loop(env):
+    ap = make_autopilot(env)
+    s = env.agent.general_session()
+    text = await ap.start(s, 3, "find the best lr", None)
+    assert "Autopilot on" in text and "up to 3 rounds" in text and "planning the first experiment" in text
+    await ap.drain()
+
+    # Kickoff: the agent got the goal and the autopilot rules, and submitted a job.
+    call = claude_calls(env)[-1]
+    system = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    assert "Autopilot is ON" in system and "find the best lr" in system and "RESEARCH_LOG.md" in system
+    assert "Goal: find the best lr" in call["stdin"]
+    (j1,) = agent_jobs(env, s)
+    reply = env.notifier.sent[-1].text
+    assert "AUTOPILOT" not in reply and f"waiting for job(s) {j1}" in reply and "round 0/3" in reply
+
+    # Job 1 finishes: round 1 wakes the conversation with its report; no one-shot LLM summary.
+    await run_job(env, j1)
+    final = next(m.text for m in env.notifier.sent if f"Job {j1}" in m.text and "finished" in m.text)
+    assert "OK report" not in final
+    assert any("Autopilot round 1/3" in m.text for m in env.notifier.sent)
+    call = claude_calls(env)[-1]
+    assert "[Autopilot round 1 of 3]" in call["stdin"] and f"<job id='{j1}'" in call["stdin"]
+    assert "loss=0.50" in call["stdin"] and "final state COMPLETED" in call["stdin"]
+    assert call["argv"][call["argv"].index("--resume") + 1] == env.store.get_session(s.id).cli_session_id
+    j2 = agent_jobs(env, s)[-1]
+    assert j2 != j1 and env.store.get_autopilot(s.id).rounds == 1
+    assert call["argv"][call["argv"].index("--append-system-prompt") + 1] == system  # stays cacheable
+
+    # Job 2's results reach the goal: the agent says DONE and autopilot turns itself off.
+    n = len(claude_calls(env))
+    await run_job(env, j2, log_text="score 9.1 FAKE_DONE\n")
+    assert len(claude_calls(env)) == n + 1
+    reply = env.notifier.sent[-1].text
+    assert "Autopilot finished</b> after 2 round(s): best lr is 3e-4" in reply and "AUTOPILOT" not in reply
+    a = env.store.get_autopilot(s.id)
+    assert not a.active and a.status == "done"
+    last = (env.cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()[-1]
+    assert json.loads(last)["autopilot"] == "DONE"
+
+
+async def test_autopilot_batches_and_round_limit(env):
+    ap = make_autopilot(env)
+    s = env.agent.general_session()
+    await ap.start(s, 1, "sweep FAKE_TWO", None)
+    await ap.drain()
+    j1, j2 = agent_jobs(env, s)
+    n = len(claude_calls(env))
+
+    # The first of the two finishes: wait for the other one.
+    await run_job(env, j1)
+    assert len(claude_calls(env)) == n and f"waiting for {j2}" in env.notifier.sent[-1].text
+    # Both done: one round with both reports. It's the last round.
+    await run_job(env, j2)
+    stdin = claude_calls(env)[-1]["stdin"]
+    assert f"<job id='{j1}'" in stdin and f"<job id='{j2}'" in stdin and "LAST round" in stdin
+
+    # The agent submitted again anyway; when that finishes the round limit stops the loop.
+    j3 = agent_jobs(env, s)[-1]
+    n = len(claude_calls(env))
+    await run_job(env, j3)
+    assert len(claude_calls(env)) == n
+    assert "Autopilot stopped</b>: it used all 1 rounds" in env.notifier.sent[-1].text
+    assert env.store.get_autopilot(s.id).status == "limit"
+
+
+async def test_autopilot_wakes_early_on_failure(env):
+    ap = make_autopilot(env)
+    s = env.agent.general_session()
+    await ap.start(s, 5, "sweep FAKE_TWO", None)
+    await ap.drain()
+    j1, j2 = agent_jobs(env, s)
+    await run_job(env, j2, finish=False)  # still running
+    await run_job(env, j1, state="FAILED", log_text="CUDA out of memory\n")
+    stdin = claude_calls(env)[-1]["stdin"]
+    assert f"<job id='{j1}' name='run{j1}' state='FAILED'" in stdin and f"Still running: {j2}" in stdin
+
+
+async def test_autopilot_needs_help_and_idle(env):
+    ap = make_autopilot(env)
+    s = env.agent.general_session()
+    await ap.start(s, 5, "try things FAKE_NOJOB", None)
+    await ap.drain()
+    assert "no job is running, so nothing will wake the agent" in env.notifier.sent[-1].text
+    assert env.store.get_autopilot(s.id).status == "idle"
+
+    # The researcher replies; the agent submits; the loop continues on its own.
+    await env.agent.handle(s, "ok, start a baseline run")
+    (j1,) = agent_jobs(env, s)
+    await run_job(env, j1, log_text="FAKE_HELP\n")
+    reply = env.notifier.sent[-1]
+    assert "Autopilot needs you</b>: should I try a bigger model?" in reply.text and not reply.silent
+    a = env.store.get_autopilot(s.id)
+    assert a.active and a.status == "need_help"
+
+
+async def test_autopilot_checkins(env, monkeypatch):
+    env.cfg.agent.autopilot.min_checkin_minutes = 0
+    ap = make_autopilot(env)
+    s = env.agent.general_session()
+    await ap.start(s, 5, "train", 3600)
+    await ap.drain()
+    (j1,) = agent_jobs(env, s)
+    await run_job(env, j1, finish=False)
+    assert env.store.get_job(j1).last_checkin  # the clock starts when the job runs
+    n = len(claude_calls(env))
+    await env.monitor.poll()
+    await ap.drain()
+    assert len(claude_calls(env)) == n  # not due yet
+
+    def make_due():
+        rec = env.store.get_job(j1)
+        rec.last_checkin -= 3700
+        env.store.upsert_job(rec)
+
+    make_due()
+    await env.monitor.poll()
+    await ap.drain()
+    stdin = claude_calls(env)[-1]["stdin"]
+    assert "[Autopilot check-in" in stdin and f"<job id='{j1}'" in stdin and "loss=0.50" in stdin
+    assert env.store.get_autopilot(s.id).rounds == 0  # check-ins aren't rounds
+    reply = env.notifier.sent[-1]
+    assert "Looks healthy." in reply.text and reply.silent  # a routine check-in doesn't buzz
+    assert env.store.get_job(j1).checkins == 1
+
+    # The run diverges: the agent cancels it and resubmits; the cancelled job's end is not a new round.
+    (env.home / "proj" / f"slurm-{j1}.out").write_text("loss=nan FAKE_DIVERGE\n")
+    make_due()
+    await env.monitor.poll()
+    await ap.drain()
+    assert f"Job {j1} diverged: cancelled it and resubmitted" in env.notifier.sent[-1].text
+    assert any(f"scancel {j1}" in m.text for m in env.notifier.sent[-3:])  # in the command summary
+    j2 = agent_jobs(env, s)[-1]
+    assert j2 != j1 and env.store.get_job(j1).agent_reported
+    n = len(claude_calls(env))
+    env.set_jobs(**{j1: {"name": f"run{j1}", "state": "CANCELLED", "exit": "0:15", "workdir": str(env.home / "proj"),
+                         "stdout": str(env.home / "proj" / f"slurm-{j1}.out")}})
+    await env.monitor.poll()
+    await ap.drain()
+    assert len(claude_calls(env)) == n
+    a = env.store.get_autopilot(s.id)
+    assert a.active and a.rounds == 0
+
+
+async def test_autopilot_pauses_on_failure_and_retries(env):
+    ap = make_autopilot(env)
+    s = env.agent.general_session()
+    await ap.start(s, 5, "train", None)
+    await ap.drain()
+    (j1,) = agent_jobs(env, s)
+    fail = Path(os.environ["FAKE_CLI_LOG"] + ".fail")
+    fail.touch()  # the CLI crashes during the round
+    await run_job(env, j1)
+    assert "Autopilot paused" in env.notifier.sent[-1].text
+    a = env.store.get_autopilot(s.id)
+    assert not a.active and a.rounds == 0 and not env.store.get_job(j1).agent_reported
+
+    fail.unlink()
+    text = await ap.start(s, 5)  # /auto 5 as a reply: retries the round
+    assert "already finished: starting a round now" in text
+    await ap.drain()
+    assert "[Autopilot round 1 of 5]" in claude_calls(env)[-1]["stdin"]
+    assert env.store.get_autopilot(s.id).rounds == 1
+
+
+async def test_auto_command(env, monkeypatch):
+    from overseer.bot import Bot
+    ap = make_autopilot(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "reply", reply)
+    await bot.cmd_auto(None, NS(args=[]))
+    assert "Autopilot is off everywhere" in replies[-1]
+    await bot.cmd_auto(None, NS(args=["every", "soon"]))
+    assert "isn't a duration" in replies[-1]
+
+    env.cfg.agent.autopilot.min_checkin_minutes = 15
+    await bot.cmd_auto(None, NS(args=["4", "every", "5m", "tune", "the", "lr"]))
+    await ap.drain()
+    s = env.agent.general_session()
+    a = env.store.get_autopilot(s.id)
+    assert (a.active, a.max_rounds, a.goal, a.checkin_every) == (1, 4, "tune the lr", 15 * 60)  # raised to the minimum
+    assert any("Autopilot on" in m.text and m.session_id == s.id for m in env.notifier.sent)
+
+    await bot.cmd_auto(None, NS(args=["every", "2h"]))  # only changes the interval
+    a = env.store.get_autopilot(s.id)
+    assert a.checkin_every == 7200 and a.max_rounds == 4 and "every 2h" in replies[-1]
+    await bot.cmd_auto(None, NS(args=["status"]))
+    assert s.id in replies[-1] and "round 0/4" in replies[-1] and "tune the lr" in replies[-1]
+    await bot.cmd_auto(None, NS(args=["off"]))
+    assert "Autopilot off" in replies[-1] and not env.store.get_autopilot(s.id).active
+    assert "Autopilot is ON" not in env.agent.system_prompt(s.id)
+
+
+def test_status_line_and_durations():
+    from overseer.autopilot import parse_duration, parse_status
+    assert parse_status("Done.\n\nAUTOPILOT: CONTINUE") == ("Done.", "CONTINUE", "")
+    assert parse_status("x\n**AUTOPILOT: DONE — lr 3e-4 wins**") == ("x", "DONE", "lr 3e-4 wins")
+    assert parse_status("x\nautopilot: need help: which model?")[1:] == ("NEED_HELP", "which model?")
+    assert parse_status("no status here") == ("no status here", None, "")
+    assert parse_duration("2h") == 7200 and parse_duration("90m") == 5400 and parse_duration("1d") == 86400
+    assert parse_duration("1.5") == 5400 and parse_duration("off") == 0 and parse_duration("soon") is None

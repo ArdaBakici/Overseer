@@ -32,6 +32,7 @@ class Monitor:
         self.last_error: str = ""
         self._error_notified = False
         self._wake = asyncio.Event()
+        self.autopilot = None  # set by Autopilot's owner: told about the agent's jobs finishing / running
 
     def poke(self) -> None:
         """Poll right away (e.g. after a submission)."""
@@ -125,10 +126,19 @@ class Monitor:
                 if rec.missing_polls >= MISSING_POLLS_BEFORE_GIVING_UP:
                     rec.ended_at = time.time()
                     rec.state = final.state if final else "UNKNOWN"
+                    self.store.upsert_job(rec)
                     await self.notifier.send(Outgoing(
                         f"❔ Job {code(rec.job_id)} {esc(rec.name)} left the queue but SLURM accounting has no final state.",
                         job_id=rec.job_id))
+                    await self._tell_autopilot(rec, f"Job {rec.job_id} left the queue, but SLURM accounting has no "
+                                                    "final state for it. Check its log files.")
                 self.store.upsert_job(rec)
+
+        if self.autopilot:  # mid-job check-ins on the agent's running jobs
+            try:
+                await self.autopilot.poll_running(live_by_id)
+            except Exception:
+                log.exception("autopilot check-ins failed")
 
         # Finished jobs we never saw in the queue (short jobs between polls).
         if not first:
@@ -209,14 +219,27 @@ class Monitor:
         rec.state = final.state
         rec.ended_at = time.time()
         self.store.upsert_job(rec)  # mark ended first so a crash below can't cause duplicate reports
+        # An autopilot job is analysed by the agent itself right after: skip the one-shot LLM summary.
+        analyze = not (self.autopilot and self.autopilot.handles(rec))
         try:
-            msg = await self.final_report(rec, final)
+            msg, context = await self.final_report(rec, final, analyze=analyze)
         except (SSHError, OSError) as e:
             msg = Outgoing(f"{self._header(rec, STATE_EMOJI.get(final.state, '🏁'), final.state)}\n"
                            f"(could not build full report: {esc(e)})", job_id=rec.job_id)
+            context = (f"Job {rec.job_id} final state {final.state}, exit code {final.exit_code}, elapsed "
+                       f"{final.elapsed} of {final.time_limit}. (Overseer couldn't read its logs: {e})")
         await self.notifier.send(msg)
+        await self._tell_autopilot(rec, context)
 
-    async def final_report(self, rec: JobRecord, final: Job) -> Outgoing:
+    async def _tell_autopilot(self, rec: JobRecord, report: str) -> None:
+        if self.autopilot and rec.by_agent:
+            try:
+                await self.autopilot.job_finished(rec, report)
+            except Exception:
+                log.exception("autopilot wake-up failed")
+
+    async def final_report(self, rec: JobRecord, final: Job, analyze: bool = True) -> tuple[Outgoing, str]:
+        """The Telegram report, and the same facts as compact plain text (for the agent)."""
         steps = summarize_steps(await self.hpc.sacct_steps(rec.job_id))
         seff = await self.hpc.seff(rec.job_id)
         out_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 200))
@@ -238,7 +261,14 @@ class Monitor:
             f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-15000:]}",
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-10000:]}" if err_tail else "",
         ])
-        analysis = await self.reporter.final_analysis(context)
+        analysis = await self.reporter.final_analysis(context) if analyze else ""
+        # For the agent (autopilot): the facts first, then the end of the logs; it can read the rest itself.
+        for_agent = "\n".join(x for x in [
+            context.split("\nBatch script:")[0].split("\n--- stdout")[0],
+            f"Last metrics: {metrics}" if metrics else "",
+            f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-7000:]}",
+            f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-3000:]}" if err_tail.strip() else "",
+        ] if x)
         rec.report = analysis or "; ".join(f.category for f in findings)
         self.store.upsert_job(rec)
 
@@ -268,4 +298,4 @@ class Monitor:
         files = []
         if out_tail.strip() and not success:
             files.append((f"job-{rec.job_id}-stdout-tail.log", out_tail.encode()))
-        return Outgoing("\n".join(parts), job_id=rec.job_id, buttons=buttons, files=files)
+        return Outgoing("\n".join(parts), job_id=rec.job_id, buttons=buttons, files=files), for_agent

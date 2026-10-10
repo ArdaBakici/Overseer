@@ -185,7 +185,14 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
         agent.set_backend(backend)
         s = agent.general_session()
+        # With autopilot on, its instructions must reach the model through each CLI's own mechanism.
+        from overseer.autopilot import Autopilot
+        from overseer.store import AutopilotRecord
+        autopilot = Autopilot(cfg, store, agent, notes, agent.hpc)
+        store.upsert_autopilot(AutopilotRecord(session_id=s.id, active=1, goal="beat 'baseline' \"score\" 9.0",
+                                               max_rounds=3, status="waiting"))
         await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+        await autopilot.drain()
         texts = notes.texts()
         outs = fm.outputs
         detail = f"\n\nTELEGRAM:\n{texts}\n\nTOOL OUTPUTS:\n" + "\n====\n".join(outs)
@@ -223,3 +230,6 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         # Overseer's instructions reached the model.
         tool_requests = [r for r in fm.requests if r["body"].get("tools")]
         assert "You are Overseer's agent" in json.dumps(tool_requests[0]["body"]), "system prompt missing"
+        body = json.dumps(tool_requests[0]["body"])
+        assert "Autopilot is ON" in body and "beat 'baseline'" in body and "AUTOPILOT: NEED_HELP" in body
+        assert "waiting for job(s) 5001" in notes.sent[-1].text, notes.sent[-1].text

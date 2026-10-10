@@ -3,9 +3,15 @@
 
 Logs argv/env/stdin to $FAKE_CLI_LOG (JSON lines) and emits a canned event stream:
 the agent runs `ssh hpc ...sbatch...`, sbatch answers with a job id, then a final message.
-A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL makes it exit with an error;
+A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL (or a file $FAKE_CLI_LOG.fail) makes it exit with an error;
 FORCE_SLOW pauses between events (to watch the live progress).
+
+Autopilot (fake claude, when the system prompt says autopilot is on): every run submits a new job
+id and ends with a status line. Markers in the prompt (the goal, or job logs quoted in a round's
+report) steer it: FAKE_DONE, FAKE_HELP, FAKE_NOJOB (submit nothing), FAKE_TWO (submit two jobs);
+in a check-in, FAKE_DIVERGE makes it scancel the job and resubmit.
 """
+import re
 import json
 import os
 import sys
@@ -30,9 +36,41 @@ if "login" in args:
     sys.exit(0)
 if "FORCE_SLEEP" in stdin:
     time.sleep(60)
-if "FORCE_FAIL" in stdin:
+if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):
     print("boom: model unavailable", file=sys.stderr)
     sys.exit(3)
+
+def autopilot_run():
+    with open(os.environ["FAKE_CLI_LOG"]) as fh:
+        n = sum(1 for _ in fh)  # runs so far: makes job ids unique
+    sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
+    submit = ("ssh hpc 'cd ~/proj && sbatch train.sh'", lambda i: f"Submitted batch job {6000 + n * 10 + i}\n")
+    steps, final, status = [], "Submitted the next experiment.", "CONTINUE"
+    if "Autopilot check-in" in stdin:
+        final = "Looks healthy."
+        if "FAKE_DIVERGE" in stdin:
+            jid = re.search(r"<job id='(\d+)'", stdin).group(1)
+            steps = [(f"ssh hpc scancel {jid}", ""), (submit[0], submit[1](0))]
+            final = f"Job {jid} diverged: cancelled it and resubmitted with a lower lr."
+    elif "FAKE_DONE" in stdin:
+        final, status = "Reached the goal.", "DONE best lr is 3e-4"
+    elif "FAKE_HELP" in stdin:
+        final, status = "Not sure how to continue.", "NEED_HELP should I try a bigger model?"
+    elif "FAKE_NOJOB" not in stdin:
+        steps = [(submit[0], submit[1](i)) for i in range(2 if "FAKE_TWO" in stdin else 1)]
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake-default"})
+    for i, (cmd, out) in enumerate(steps):
+        emit({"type": "assistant", "session_id": sid, "message": {"content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": cmd}}]}})
+        emit({"type": "user", "session_id": sid, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "content": out}]}})
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
+          "result": f"{final}\n\n**AUTOPILOT: {status}**"})
+    sys.exit(0)
+
+
+if prog == "claude" and any("Autopilot is ON" in a for a in args):
+    autopilot_run()
 
 if prog == "claude":
     if "--output-format" in args and args[args.index("--output-format") + 1] == "json":
