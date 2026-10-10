@@ -1,4 +1,13 @@
-"""Entry point: ``python -m overseer run|check -c config.yaml``."""
+"""Entry point.
+
+    overseer ssh setup [--import KEY]   create Overseer's own SSH key/config in the Overseer folder
+    overseer ssh connect                open the SSH connection interactively (for 2FA clusters)
+    overseer ssh test                   check the connection works
+    overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
+    overseer check                      verify everything without starting the bot
+    overseer run                        start the bot
+All take -c/--config (default: config.yaml).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +19,7 @@ import shutil
 import subprocess
 import sys
 
-from .config import Config, ConfigError, load_config
+from .config import BACKENDS, Config, ConfigError, load_config
 
 
 def prepare_local_dirs(cfg: Config) -> None:
@@ -29,37 +38,29 @@ def build(cfg: Config):
     from .bot import Bot, TelegramNotifier
     from .diagnose import Reporter
     from .hpc import HPC
-    from .cli_agents import make_cli_agent
-    from .llm import LLM
     from .monitor import Monitor
-    from .proposals import Submitter
     from .ssh import SSHRunner
+    from .sshlink import write_configs
     from .store import Store
 
     prepare_local_dirs(cfg)
+    write_configs(cfg)
     store = Store(cfg.local.db_path)
-    runner = SSHRunner(cfg.ssh, lambda: hpc.write_roots, cfg.local.control_path, cfg.local.audit_log)
-    hpc = HPC(cfg, runner)
-    hpc.grants = store.grants()  # folders granted from Telegram earlier
-    llm = LLM(cfg.llm)
-    cli = make_cli_agent(cfg)
+    hpc = HPC(SSHRunner(cfg))
     tasks: list[asyncio.Task] = []
 
     async def post_init(app: Application) -> None:
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
-            ("fix", "diagnose & fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
-            ("pending", "proposals awaiting approval"), ("cancel", "cancel an Overseer job"),
-            ("access", "folders Overseer may read/write"), ("grant", "grant folder access"),
-            ("revoke", "revoke a granted folder"), ("health", "connection status"), ("help", "help"),
+            ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
+            ("backend", "show/switch claude_code or codex"), ("stop", "stop the agent's current run"),
+            ("health", "connection status"), ("help", "help"),
         ])
 
     async def post_shutdown(app: Application) -> None:
         for t in tasks:
             t.cancel()
-        if agent.bridge:
-            await agent.bridge.stop()
 
     app = (
         Application.builder()
@@ -70,20 +71,24 @@ def build(cfg: Config):
         .build()
     )
     notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store)
-    reporter = Reporter(cli or llm, cfg.llm.report_effort, cfg.llm.llm_status_updates)
+    agent = Agent(cfg, store, notifier, hpc)
+
+    async def report_text(system: str, prompt: str) -> str:
+        return await agent.runner().text(system=system, prompt=prompt)
+
+    reporter = Reporter(report_text, cfg.agent.enabled and cfg.agent.job_reports, cfg.agent.llm_status_updates)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
-    monitor.restore_read_paths()
-    submitter = Submitter(cfg, hpc, store, notifier)
-    submitter.monitor = monitor
-    agent = Agent(cfg, hpc, store, llm, notifier, submitter, cli=cli)
-    Bot(cfg, app, store, hpc, monitor, agent, submitter, notifier).register()
+    agent.monitor = monitor
+    Bot(cfg, app, store, hpc, monitor, agent, notifier).register()
     return app
 
 
 async def check(cfg: Config) -> int:
-    """Verify SSH, SLURM, folder access and credentials without starting the bot."""
+    """Verify SSH, SLURM, the agent CLI and credentials without starting the bot."""
+    from .agent import Agent
     from .hpc import HPC
     from .ssh import SSHRunner
+    from .sshlink import ensure_master, key_permissions_ok, write_configs
     from .store import Store
 
     ok = True
@@ -94,20 +99,18 @@ async def check(cfg: Config) -> int:
         print(f"[{'ok' if good else 'FAIL'}] {name}{': ' + detail if detail else ''}")
 
     prepare_local_dirs(cfg)
-    report("local folders", True, f"state={cfg.local.state()} tmp={cfg.local.tmp()} "
-                                   f"(writes limited to {', '.join(map(str, cfg.local.roots))})")
-    hpc = HPC(cfg, SSHRunner(cfg.ssh, lambda: hpc.write_roots, cfg.local.control_path, cfg.local.audit_log))
-    hpc.grants = Store(cfg.local.db_path).grants()
+    report("local folders", True, f"state={cfg.local.state()} tmp={cfg.local.tmp()}")
+    write_configs(cfg)
+    report("ssh key", key_permissions_ok(cfg), str(cfg.ssh_key) if key_permissions_ok(cfg)
+           else f"missing or group/world-readable: {cfg.ssh_key} (run: overseer ssh setup)")
     try:
+        await ensure_master(cfg)
+        hpc = HPC(SSHRunner(cfg))
         await hpc.connect()
-        report("ssh", True, f"user={hpc.user} home={hpc.home}")
+        report("ssh connection", True, f"{cfg.ssh.host} -> {hpc.user}@{cfg.ssh.hostname} (home {hpc.home})")
     except Exception as e:
-        report("ssh", False, str(e))
+        report("ssh connection", False, str(e))
         return 1
-    print("writable on HPC:\n  " + ("\n  ".join(hpc.write_roots) or "(none - the agent will have to ask)"))
-    print("readable on HPC:\n  " + "\n  ".join(hpc.read_roots))
-    for m in hpc.missing_roots:
-        print(f"note: write root {m} does not exist yet (Overseer may create it)")
     for name, coro in [("squeue", hpc.squeue()), ("sacct", hpc.sacct_recent(60))]:
         try:
             jobs = await coro
@@ -119,48 +122,82 @@ async def check(cfg: Config) -> int:
         report("telegram token", True)
     except ConfigError as e:
         report("telegram token", False, str(e))
-    if cfg.llm.enabled and cfg.llm.backend == "claude":
-        report("anthropic credentials", bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
-               "set ANTHROPIC_API_KEY (or disable llm)")
-    elif cfg.llm.enabled:
-        from .cli_agents import make_cli_agent
-
-        cli = make_cli_agent(cfg)
-        cmd = getattr(cfg.llm, cfg.llm.backend).command
-        report(f"{cfg.llm.backend} CLI", bool(shutil.which(cmd)), shutil.which(cmd) or f"{cmd!r} not on PATH")
-        try:
-            reply = await cli.text(system="You are a connectivity check.", prompt="Reply with exactly: OK")
-            report(f"{cfg.llm.backend} model call", "OK" in reply, reply[:200])
-        except Exception as e:
-            report(f"{cfg.llm.backend} model call", False,
-                   f"{e}\n  (log in with: python -m overseer login {cfg.llm.backend} -c <config>)")
+    if cfg.agent.enabled:
+        store = Store(cfg.local.db_path)
+        agent = Agent(cfg, store, None, hpc)  # type: ignore[arg-type]
+        for backend in BACKENDS:
+            runner = agent.runner(backend)
+            cmd = runner.c.command
+            if not shutil.which(cmd):
+                print(f"[skip] {backend}: {cmd!r} not installed")
+                continue
+            try:
+                reply = await asyncio.wait_for(
+                    runner.text(system="You are a connectivity check.", prompt="Reply with exactly: OK"), 120)
+                report(f"{backend} model call", "OK" in reply, reply[:200])
+            except asyncio.TimeoutError:
+                report(f"{backend} model call", False,
+                       f"no answer within 2 minutes (not logged in?)\n  (log in with: overseer login {backend} -c <config>)")
+            except Exception as e:
+                report(f"{backend} model call", False,
+                       f"{e}\n  (log in with: overseer login {backend} -c <config>)")
+        print(f"active agent backend: {agent.backend}")
     return 0 if ok else 1
 
 
-def login(cfg: Config, backend: str, extra: list[str]) -> int:
-    from .cli_agents import CodexAgent, OpencodeAgent
+def ssh_command(cfg: Config, action: str, import_from: str | None) -> int:
+    from .sshlink import connect_interactive, ensure_master, setup_key
 
-    if backend not in ("codex", "opencode"):
-        print("usage: overseer login codex|opencode", file=sys.stderr)
+    prepare_local_dirs(cfg)
+    if action == "setup":
+        pub = setup_key(cfg, import_from)
+        print(f"Overseer's SSH files are in {cfg.ssh_dir} (config, known_hosts, {cfg.ssh.key_name}).")
+        print("\nAdd this public key to ~/.ssh/authorized_keys on the HPC (one line):\n")
+        print(f"  {pub}\n")
+        print("For example, from a machine where you can already log in:")
+        print(f"  echo '{pub}' | ssh {cfg.ssh.user + '@' if cfg.ssh.user else ''}{cfg.ssh.hostname} "
+              "'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys'")
+        print("\nThen run: overseer ssh test")
+        return 0
+    if action == "connect":
+        return connect_interactive(cfg)
+    if action == "test":
+        try:
+            asyncio.run(ensure_master(cfg))
+        except ConfigError as e:
+            print(f"FAIL: {e}")
+            return 1
+        agent_ssh = cfg.local.tmp("agent-bin", "ssh")
+        out = subprocess.run([str(agent_ssh), cfg.ssh.host, "echo connected as $(whoami) on $(hostname)"],
+                             capture_output=True, text=True, timeout=60)
+        print(out.stdout.strip() or out.stderr.strip())
+        return out.returncode
+    print("usage: overseer ssh setup|connect|test", file=sys.stderr)
+    return 2
+
+
+def login(cfg: Config, backend: str, extra: list[str]) -> int:
+    from .runners import make_runner
+
+    if backend not in BACKENDS:
+        print(f"usage: overseer login {'|'.join(BACKENDS)}", file=sys.stderr)
         return 2
     prepare_local_dirs(cfg)
-    agent = CodexAgent(cfg) if backend == "codex" else OpencodeAgent(cfg)
-    argv, env = agent.login_command(extra)
+    runner = make_runner(cfg, backend)
+    argv, env = runner.login_command(extra)
     if not shutil.which(argv[0], path=env.get("PATH")):
-        print(f"{argv[0]!r} not found on PATH (install it, or set llm.{backend}.command)", file=sys.stderr)
+        print(f"{argv[0]!r} not found on PATH (install it, or set agent.{backend}.command)", file=sys.stderr)
         return 1
-    print(f"Running {' '.join(argv)} with its home in {cfg.local.resolve(getattr(cfg.llm, backend).home)}")
+    print(f"Running {' '.join(argv)} with its config in {runner.home()}")
     return subprocess.call(argv, env=env)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="overseer",
-        epilog="login: `overseer login codex|opencode [-- extra args]` logs the CLI in using the isolated "
-               "home Overseer runs it with (inside local.state_dir).")
-    ap.add_argument("command", choices=["run", "check", "login"])
-    ap.add_argument("backend", nargs="?", choices=["codex", "opencode"], help="for login")
+    ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["run", "check", "login", "ssh"])
+    ap.add_argument("target", nargs="?", help="login: claude_code|codex; ssh: setup|connect|test")
     ap.add_argument("-c", "--config", default="config.yaml")
+    ap.add_argument("--import", dest="import_key", help="ssh setup: copy this existing private key instead of generating one")
     ap.add_argument("-v", "--verbose", action="store_true")
     argv = list(sys.argv[1:] if argv is None else argv)
     extra: list[str] = []
@@ -171,7 +208,6 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpx2").setLevel(logging.WARNING)
     try:
         cfg = load_config(args.config)
     except (OSError, ConfigError) as e:
@@ -181,7 +217,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             return asyncio.run(check(cfg))
         if args.command == "login":
-            return login(cfg, args.backend or cfg.llm.backend, extra)
+            return login(cfg, args.target or cfg.agent.backend, extra)
+        if args.command == "ssh":
+            return ssh_command(cfg, args.target or "", args.import_key)
         app = build(cfg)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)

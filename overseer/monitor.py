@@ -65,9 +65,9 @@ class Monitor:
 
     # ------------------------------------------------------------------ polling
     def _ignored(self, job: Job, rec: JobRecord | None) -> bool:
-        if rec and rec.overseer:
+        if rec and rec.by_agent:
             return False
-        if self.cfg.slurm.track == "overseer":
+        if self.cfg.slurm.track == "agent":
             return True
         return any(fnmatch.fnmatch(job.name, g) for g in self.cfg.slurm.ignore_name_globs)
 
@@ -96,6 +96,8 @@ class Monitor:
                 elif self.cfg.slurm.notify_queued:
                     await self._on_queued(rec, job)
                 continue
+            if not rec.stdout:  # submitted by the agent: fill in details on first sight
+                await self._fill(rec, job)
             prev = rec.state
             rec.state = job.state
             rec.missing_polls = 0
@@ -115,6 +117,8 @@ class Monitor:
                 continue
             final = recent_by_id.get(rec.job_id) or await self.hpc.sacct_job(rec.job_id)
             if final and final.is_terminal:
+                if not rec.stdout:
+                    await self._fill(rec, final)
                 await self._on_finished(rec, final)
             else:
                 rec.missing_polls += 1
@@ -134,28 +138,25 @@ class Monitor:
                     await self._on_finished(rec, job)
 
     async def _register(self, job: Job) -> JobRecord:
-        info = await self.hpc.scontrol_job(job.job_id)
-        script = await self.hpc.batch_script(job.job_id)
-        workdir = info.get("WorkDir") or job.workdir
-        stdout = info.get("StdOut") or (f"{workdir}/slurm-{job.job_id}.out" if workdir else "")
-        stderr = info.get("StdErr") or stdout
-        self.hpc.allow_job_paths(workdir, stdout, stderr)
-        rec = JobRecord(
-            job_id=job.job_id, name=job.name, state=job.state, partition=job.partition,
-            workdir=workdir, stdout=stdout, stderr=stderr, batch_script=script,
-            first_seen=time.time(), last_status_at=time.time(),
-            info=json.dumps({k: info[k] for k in ("TimeLimit", "TRES", "NumNodes", "Command", "SubmitTime") if k in info}),
-        )
+        rec = JobRecord(job_id=job.job_id, state=job.state, first_seen=time.time(), last_status_at=time.time())
+        await self._fill(rec, job)
         self.store.upsert_job(rec)
         return rec
 
-    def restore_read_paths(self) -> None:
-        for rec in self.store.recent_jobs(200):
-            self.hpc.allow_job_paths(rec.workdir, rec.stdout, rec.stderr)
+    async def _fill(self, rec: JobRecord, job: Job) -> None:
+        """Look up a job's name, paths and batch script (scontrol only knows recent jobs)."""
+        info = await self.hpc.scontrol_job(job.job_id)
+        rec.name = rec.name or info.get("JobName") or job.name
+        rec.partition = rec.partition or job.partition or info.get("Partition", "")
+        rec.workdir = info.get("WorkDir") or job.workdir or rec.workdir
+        rec.stdout = info.get("StdOut") or (f"{rec.workdir}/slurm-{job.job_id}.out" if rec.workdir else "")
+        rec.stderr = info.get("StdErr") or rec.stdout
+        rec.batch_script = rec.batch_script or await self.hpc.batch_script(job.job_id)
+        rec.info = json.dumps({k: info[k] for k in ("TimeLimit", "TRES", "NumNodes", "Command", "SubmitTime") if k in info})
 
     # ------------------------------------------------------------------ events
     def _header(self, rec: JobRecord, emoji: str, verb: str) -> str:
-        origin = " (submitted by Overseer)" if rec.overseer else ""
+        origin = " (submitted by the agent)" if rec.by_agent else ""
         return f"{emoji} <b>Job {esc(rec.job_id)}</b> {esc(rec.name)} {verb}{origin}"
 
     async def _on_queued(self, rec: JobRecord, job: Job) -> None:
@@ -263,7 +264,7 @@ class Monitor:
             parts.append(pre(combined.strip(), 1200))
         buttons = [[("📜 Full log", f"log:{rec.job_id}")]]
         if not success:
-            buttons[0].insert(0, ("🔧 Diagnose & fix", f"fix:{rec.job_id}"))
+            buttons[0].insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
         files = []
         if out_tail.strip() and not success:
             files.append((f"job-{rec.job_id}-stdout-tail.log", out_tail.encode()))

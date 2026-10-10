@@ -1,418 +1,261 @@
-"""The fixing agent: Claude with a small, policy-checked tool set.
+"""Agent conversations: Telegram message -> Claude Code / Codex run -> Telegram reply.
 
-The agent has no shell. Its only tools are: read/list/search files (readable folders only),
-copy/write/edit/delete files (writable folders only; originals are backed up locally first),
-and *propose* a job submission, cancellation or access to a new folder - each of which the
-user approves in Telegram.
+The agent has full access to the HPC (`ssh hpc ...`) and is sandboxed on this machine
+(see runners.py). Overseer's job here is bookkeeping: which conversation belongs to which
+job, resuming the CLI's session, reporting the commands it ran, and noticing the jobs it
+submits so the monitor reports on them and replies continue the same conversation.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
 
-from .bridge import ToolBridge
-from .changes import ChangeSet
-from .cli_agents import CLIAgent
-from .config import Config
+from .config import BACKENDS, Config
 from .hpc import HPC
-from .llm import LLM, response_text
-from .notify import Notifier, Outgoing, code, esc
-from .policy import PolicyError
-from .proposals import Submitter
-from .ssh import SSHError
-from .store import Store
+from .notify import Notifier, Outgoing, code, esc, pre
+from .runners import Activity, AgentRunError, Runner, make_runner
+from .sshlink import ensure_master
+from .store import JobRecord, SessionRecord, Store
 
 log = logging.getLogger(__name__)
 
-TOOL_RESULT_LIMIT = 60_000
+LIVE_FLUSH_SECONDS = 5
 
-SYSTEM_PROMPT = """You are Overseer, an assistant that manages a researcher's ML training jobs on a university SLURM cluster.
-The researcher talks to you through Telegram. They will ask you to diagnose failed jobs, fix them, and resubmit,
-or ask for guidance on next steps.
+SYSTEM_PROMPT = """You are Overseer's agent. You help an ML researcher run, debug and fix SLURM jobs on their \
+university HPC cluster. They talk to you through Telegram.
 
-## Access rules (enforced by the system — violating them just produces errors)
-- Each request starts with an <access> block listing the folders you may READ and the folders you may WRITE
-  (create/modify/delete files in, and submit jobs from). Secrets (~/.ssh, keys, tokens) are never readable, and
-  login scripts (~/.bashrc etc.) are never writable.
-- If you need a folder that isn't listed, call `request_access` with the narrowest folder that will do and a one-line
-  reason, then END YOUR TURN. You'll be resumed with the user's decision. Don't ask for broad folders like the whole home.
-- You cannot run commands. The only way to run anything is `propose_submission`: the researcher sees the full script
-  and a diff of every file you changed, and must approve it before it is passed to sbatch.
-- Limits for jobs you propose: max {max_gpus} GPUs, {max_nodes} node(s), max --time {max_time}{partitions}.
-  Every script must set `#SBATCH --time`. Job arrays allowed up to {max_array} tasks.
-- Batch scripts must not write outside the writable folders (redirects, cp/mv/rm targets, #SBATCH --output/--error).
-  Reading datasets and pretrained weights from anywhere readable is fine.
+## Environment
+- You run on the researcher's homelab, NOT on the HPC. Your local working directory is a scratch folder; \
+you can't write anywhere else on this machine, and the local shell has no internet access{domains}.
+- The HPC is reachable as `{host}`: `ssh {host} '<command>'`, and `rsync`/`scp` with `{host}:<path>`. This goes \
+through a connection Overseer keeps open. On the HPC you have the researcher's full permissions.
+- Remote commands run in a non-interactive shell: load modules / activate environments explicitly \
+(e.g. `ssh {host} 'module load ...; source .../activate; ...'`), or use `bash -lc` when the login profile is needed.
 
-## How to change things
-- Every file you modify is backed up first; the researcher gets an exact diff and can revert all your changes with one tap.
-  Still, prefer the least invasive option: when the original project isn't in a writable folder, or when you're trying
-  a variant, `copy_path` the code into a new directory inside a writable folder and edit the copy.
-- Edit with `edit_file` (exact snippet replacement); use `write_file` for new files such as a batch script.
-- `propose_submission` runs the script with sbatch from `workdir` (default: the script's directory). Unless the script
-  sets #SBATCH --output, the log goes to workdir/slurm-<jobid>.out.
-- Copied code runs from its new location: relative paths to data/checkpoints in the original project may no longer
-  resolve, so pass absolute paths for inputs.
-- Reproduce the original job's environment setup (module loads, conda/venv activation, partition/account/gres) from
-  its batch script unless that setup is the bug. Make outputs (checkpoints, logs, results) go to a writable folder.
-
-## Working style
-- Diagnose from evidence: read the job's logs and batch script first, then the relevant source. Quote the decisive log line.
-- Make the smallest change that fixes the problem; don't refactor unrelated code.
-- If the researcher only asks a question or for guidance, answer it — don't change files or propose jobs unless asked
-  or clearly implied.
-- If a fix needs something you can't do (installing packages into their env, changing data you can't write),
-  explain exactly what the researcher should do themselves.
-- Your final message is sent to Telegram: keep it short and concrete (what was wrong, what you changed, what's pending).
-  Plain text, no Markdown tables or headings."""
-
-
-CLI_NOTE = """
-## Tools in this environment
-Your only tools are the ones from the `overseer` MCP server (their names may carry a prefix such as
-`overseer__read_file` or `overseer_read_file`). Any other built-in tool is disabled and must not be used:
-this machine is not the HPC, and everything on the HPC goes through the overseer tools."""
-
-
-def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
-
-
-S = {"type": "string"}
-I = {"type": "integer"}
-PATH = {"type": "string", "description": "absolute path or ~/..."}
-
-TOOLS: list[dict[str, Any]] = [
-    {"name": "list_jobs", "description": "List recently seen SLURM jobs (active and finished) with state and log paths.",
-     "input_schema": _schema({}, [])},
-    {"name": "job_info", "description": "Details of one job: state, workdir, log paths, batch script, previous analysis.",
-     "input_schema": _schema({"job_id": S}, ["job_id"])},
-    {"name": "job_log", "description": "Tail of a job's stdout or stderr log.",
-     "input_schema": _schema({"job_id": S, "stream": {"type": "string", "enum": ["stdout", "stderr"]}, "lines": I}, ["job_id"])},
-    {"name": "read_file", "description": "Read a text file in a readable folder. Use tail_lines for the end of large logs.",
-     "input_schema": _schema({"path": PATH, "tail_lines": I}, ["path"])},
-    {"name": "list_dir", "description": "List a directory (ls -la).", "input_schema": _schema({"path": PATH}, ["path"])},
-    {"name": "search", "description": "Recursive grep -E for a regex under a directory. Optional include glob like '*.py'.",
-     "input_schema": _schema({"pattern": S, "path": PATH, "include": S}, ["pattern", "path"])},
-    {"name": "list_access", "description": "Show the folders you can currently read and write.", "input_schema": _schema({}, [])},
-    {"name": "request_access", "description": "Ask the user (via Telegram) for read or write access to a folder. End your turn after calling this.",
-     "input_schema": _schema({"path": PATH, "mode": {"type": "string", "enum": ["read", "write"]}, "reason": S}, ["path", "mode", "reason"])},
-    {"name": "copy_path", "description": "Copy a readable file or directory to a NEW path inside a writable folder (code only; size-limited).",
-     "input_schema": _schema({"src": PATH, "dest": PATH}, ["src", "dest"])},
-    {"name": "write_file", "description": "Create or overwrite a text file inside a writable folder.",
-     "input_schema": _schema({"path": PATH, "content": S}, ["path", "content"])},
-    {"name": "edit_file", "description": "Replace an exact, unique snippet in a text file inside a writable folder.",
-     "input_schema": _schema({"path": PATH, "old_string": S, "new_string": S}, ["path", "old_string", "new_string"])},
-    {"name": "delete_path", "description": "Delete a file inside a writable folder (directories only if you created them in this conversation).",
-     "input_schema": _schema({"path": PATH}, ["path"])},
-    {"name": "show_changes", "description": "Diff of every file you changed in this conversation.", "input_schema": _schema({}, [])},
-    {"name": "propose_submission", "description": "Ask the researcher to approve submitting a batch script with sbatch. They will see the script and the diff of your changes.",
-     "input_schema": _schema({"script_path": PATH, "summary": {"type": "string", "description": "1-3 sentences: what changed and why, what to expect"},
-                              "workdir": {"type": "string", "description": "optional working directory (default: the script's directory)"}},
-                             ["script_path", "summary"])},
-    {"name": "propose_cancel", "description": "Ask the researcher to approve cancelling a job that Overseer submitted.",
-     "input_schema": _schema({"job_id": S, "reason": S}, ["job_id", "reason"])},
-]
+## How to work
+- Investigate with real commands: squeue, `sacct -j <id> --format=JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem`, \
+scontrol show job, the job's log files and batch script, the code, disk quota, module/env availability.
+- Never run heavy computation on the login node; use sbatch (or srun inside an allocation).
+- For non-trivial changes to the researcher's code, prefer a copy or a git branch, and say where it is.
+- When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \
+track the job and report on it.
+- Don't cancel or modify jobs you weren't asked about.
+- Your final message is sent to Telegram: short plain text (no tables or headings) - what you found, what you \
+changed (paths), the job ids you submitted, and what happens next."""
 
 
 @dataclass
 class Session:
-    id: str
-    changes: ChangeSet
-    job_id: str | None = None
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)  # system events to tell the agent next turn
+    rec: SessionRecord
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    initialized: bool = False
-    cli_session_id: str | None = None  # codex thread id / opencode session id
+    task: asyncio.Task | None = None
+
+    @property
+    def id(self) -> str:
+        return self.rec.id
+
+    @property
+    def job_id(self) -> str | None:
+        return self.rec.job_id
 
 
 class Agent:
-    def __init__(self, cfg: Config, hpc: HPC, store: Store, llm: LLM, notifier: Notifier, submitter: Submitter,
-                 cli: CLIAgent | None = None):
+    def __init__(self, cfg: Config, store: Store, notifier: Notifier, hpc: HPC):
         self.cfg = cfg
-        self.hpc = hpc
         self.store = store
-        self.llm = llm
         self.notifier = notifier
-        self.submitter = submitter
-        # codex / opencode backend: the CLI drives the conversation, tools come through the bridge.
-        self.cli = cli
-        self.bridge = ToolBridge(self, cfg.local.tmp("bridge.sock")) if cli else None
+        self.hpc = hpc
+        self.monitor = None  # set by the app; poked when the agent submits a job
         self.sessions: dict[str, Session] = {}
-        self.by_job: dict[str, str] = {}
-        self.general_id: str | None = None
+        self._runners: dict[str, Runner] = {}
+
+    # ------------------------------------------------------------------ backend
+    @property
+    def backend(self) -> str:
+        b = self.store.get("backend") or self.cfg.agent.backend
+        return b if b in BACKENDS else self.cfg.agent.backend
+
+    def set_backend(self, name: str) -> None:
+        if name not in BACKENDS:
+            raise ValueError(f"backend must be one of {', '.join(BACKENDS)}")
+        self.store.set("backend", name)
+
+    def runner(self, backend: str | None = None) -> Runner:
+        b = backend or self.backend
+        if b not in self._runners:
+            self._runners[b] = make_runner(self.cfg, b)
+        return self._runners[b]
 
     # ------------------------------------------------------------------ sessions
-    def system_prompt(self) -> str:
-        lim = self.cfg.limits
-        return SYSTEM_PROMPT.format(
-            max_gpus=lim.max_gpus_per_job, max_nodes=lim.max_nodes_per_job, max_time=lim.max_time,
-            partitions=f", partitions {', '.join(lim.allowed_partitions)}" if lim.allowed_partitions else "",
-            max_array=lim.max_array_tasks,
-        )
+    def _load(self, rec: SessionRecord) -> Session:
+        if rec.id not in self.sessions:
+            self.sessions[rec.id] = Session(rec)
+        return self.sessions[rec.id]
 
-    def access_block(self) -> str:
-        w = "\n".join(f"  {r}" for r in self.hpc.write_roots) or "  (none — use request_access)"
-        r = "\n".join(f"  {p}" for p in self.hpc.read_roots) or "  (none)"
-        return f"<access home='{self.hpc.home}'>\nwritable:\n{w}\nreadable:\n{r}\n</access>"
-
-    def changeset(self, sid: str) -> ChangeSet:
-        return ChangeSet(self.cfg.local.sessions_dir(sid))
-
-    def _new_session(self, job_id: str | None) -> Session:
-        sid = (f"j{job_id}-" if job_id else "chat-") + uuid.uuid4().hex[:6]
-        s = Session(id=sid, changes=self.changeset(sid), job_id=job_id)
-        self.sessions[sid] = s
-        return s
-
-    def session_for_job(self, job_id: str) -> Session:
-        rec = self.store.get_job(job_id)
-        # A follow-up job submitted by a session continues that session's conversation.
-        sid = self.by_job.get(job_id) or (rec.session_id if rec else None)
-        if sid and sid in self.sessions:
-            self.by_job[job_id] = sid
-            return self.sessions[sid]
-        s = self._new_session(job_id)
-        self.by_job[job_id] = s.id
-        return s
-
-    def general_session(self, reset: bool = False) -> Session:
-        if reset or not self.general_id or self.general_id not in self.sessions:
-            self.general_id = self._new_session(None).id
-        return self.sessions[self.general_id]
+    def _new(self, job_id: str | None) -> Session:
+        rec = SessionRecord(id=(f"j{job_id}-" if job_id else "chat-") + uuid.uuid4().hex[:6], job_id=job_id,
+                            created=time.time())
+        self.store.upsert_session(rec)
+        return self._load(rec)
 
     def get(self, sid: str | None) -> Session | None:
-        return self.sessions.get(sid) if sid else None
+        if not sid:
+            return None
+        if sid in self.sessions:
+            return self.sessions[sid]
+        rec = self.store.get_session(sid)
+        return self._load(rec) if rec else None
 
-    def note(self, sid: str, text: str) -> None:
+    def session_for_job(self, job_id: str) -> Session:
+        job = self.store.get_job(job_id)
+        # A job the agent submitted continues the conversation that submitted it.
+        if job and job.session_id and (s := self.get(job.session_id)):
+            return s
+        rec = self.store.session_for_job(job_id)
+        return self._load(rec) if rec else self._new(job_id)
+
+    def general_session(self, reset: bool = False) -> Session:
+        sid = None if reset else self.store.get("general_session")
+        s = self.get(sid)
+        if s is None:
+            s = self._new(None)
+            self.store.set("general_session", s.id)
+        return s
+
+    def is_running(self, s: Session) -> bool:
+        return s.task is not None and not s.task.done()
+
+    async def stop(self, sid: str) -> bool:
         s = self.sessions.get(sid)
-        if s:
-            s.notes.append(text)
+        if not s or not self.is_running(s):
+            return False
+        s.task.cancel()
+        return True
+
+    def running_sessions(self) -> list[Session]:
+        return [s for s in self.sessions.values() if self.is_running(s)]
+
+    # ------------------------------------------------------------------ prompts
+    def system_prompt(self) -> str:
+        domains = self.cfg.agent.allowed_domains
+        return SYSTEM_PROMPT.format(
+            host=self.cfg.ssh.host,
+            domains=f" (except {', '.join(domains)})" if domains else "",
+        )
 
     async def _job_context(self, job_id: str) -> str:
         rec = self.store.get_job(job_id)
         if not rec:
-            return f"(Job {job_id} is not known to Overseer.)"
-        tail = await self.hpc.try_tail(rec.stdout, 80)
-        err = await self.hpc.try_tail(rec.stderr, 60) if rec.stderr and rec.stderr != rec.stdout else ""
+            return f"(Job {job_id} is not known to Overseer; look it up with sacct.)"
+        tail = await self.hpc.try_tail(rec.stdout, 60) if rec.stdout else ""
         return "\n".join(x for x in [
             f"<job id='{rec.job_id}' name='{rec.name}' state='{rec.state}' workdir='{rec.workdir}' "
-            f"stdout='{rec.stdout}' stderr='{rec.stderr}' submitted_by_overseer='{bool(rec.overseer)}'>",
-            f"<previous_analysis>\n{rec.report}\n</previous_analysis>" if rec.report else "",
-            f"<batch_script>\n{rec.batch_script[:8000]}\n</batch_script>" if rec.batch_script else "<batch_script>unavailable</batch_script>",
-            f"<stdout_tail>\n{tail[-8000:]}\n</stdout_tail>",
-            f"<stderr_tail>\n{err[-6000:]}\n</stderr_tail>" if err else "",
+            f"stdout='{rec.stdout}' stderr='{rec.stderr}'>",
+            f"<overseer_analysis>\n{rec.report}\n</overseer_analysis>" if rec.report else "",
+            f"<batch_script>\n{rec.batch_script[:8000]}\n</batch_script>" if rec.batch_script else "",
+            f"<stdout_tail>\n{tail[-6000:]}\n</stdout_tail>" if tail else "",
             "</job>",
         ] if x)
 
-    # ------------------------------------------------------------------ main loop
+    # ------------------------------------------------------------------ running a request
     async def handle(self, s: Session, user_text: str) -> None:
-        if not (self.cli.enabled if self.cli else self.llm.enabled):
-            await self.notifier.send(Outgoing("LLM is disabled in the config; the agent is unavailable."))
+        if not self.cfg.agent.enabled:
+            await self.notifier.send(Outgoing("The agent is disabled in the config."))
             return
         async with s.lock:
-            actions: list[str] = []
+            s.task = asyncio.current_task()
             try:
-                await self._turn(s, user_text, actions)
-            except (SSHError, PolicyError) as e:
-                await self.notifier.send(Outgoing(f"⚠️ Agent stopped: {esc(e)}", session_id=s.id, job_id=s.job_id))
+                await self._turn(s, user_text)
+            except asyncio.CancelledError:
+                await self.notifier.send(Outgoing("⏹ Stopped.", session_id=s.id, job_id=s.job_id))
+            except AgentRunError as e:
+                await self.notifier.send(Outgoing(f"⚠️ {esc(e)}", session_id=s.id, job_id=s.job_id))
             except Exception as e:
-                log.exception("agent turn failed")
-                await self.notifier.send(Outgoing(f"⚠️ Agent error: {esc(type(e).__name__)}: {esc(str(e)[:500])}",
+                log.exception("agent run failed")
+                await self.notifier.send(Outgoing(f"⚠️ Agent error: {esc(type(e).__name__)}: {esc(str(e)[:800])}",
                                                   session_id=s.id, job_id=s.job_id))
             finally:
-                if actions:
-                    buttons = [[("↩️ Revert all changes", f"revert:{s.id}")]] if s.changes else []
-                    await self.notifier.send(Outgoing(
-                        "🛠 <b>Agent actions</b>\n" + "\n".join(f"• {a}" for a in actions[-40:]),
-                        session_id=s.id, job_id=s.job_id, silent=True, buttons=buttons))
+                s.task = None
 
-    def _append_user(self, s: Session, blocks: list[dict[str, Any]]) -> None:
-        if s.messages and s.messages[-1]["role"] == "user":
-            prev = s.messages[-1]["content"]
-            if isinstance(prev, str):
-                prev = [{"type": "text", "text": prev}]
-            s.messages[-1]["content"] = prev + blocks
-        else:
-            s.messages.append({"role": "user", "content": blocks})
+    async def _turn(self, s: Session, user_text: str) -> None:
+        backend = self.backend
+        runner = self.runner(backend)
+        resume = s.rec.cli_session_id if s.rec.backend == backend else None
+        parts = []
+        if resume is None and s.job_id:
+            parts.append(await self._job_context(s.job_id))
+        parts.append(user_text)
+        prompt = "\n\n".join(parts)
 
-    async def _turn(self, s: Session, user_text: str, actions: list[str]) -> None:
-        text_parts = [self.access_block()]
-        if not s.initialized:
-            s.initialized = True
-            if s.job_id:
-                text_parts.append(await self._job_context(s.job_id))
-        if s.notes:
-            text_parts.append("<events>\n" + "\n".join(s.notes) + "\n</events>")
-            s.notes.clear()
-        text_parts.append(f"<request>\n{user_text}\n</request>")
-        if self.cli:
-            await self._cli_turn(s, "\n\n".join(text_parts), actions)
-            return
-        self._append_user(s, [{"type": "text", "text": "\n\n".join(text_parts)}])
-
-        for _ in range(self.cfg.llm.max_agent_steps):
-            resp = await self.llm.create(system=self.system_prompt(), messages=s.messages,
-                                         tools=TOOLS, effort=self.cfg.llm.agent_effort)
-            s.messages.append({"role": "assistant", "content": resp.content})
-            if resp.stop_reason == "refusal":
-                await self.notifier.send(Outgoing("The model declined this request.", session_id=s.id))
-                return
-            tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
-            if resp.stop_reason != "tool_use" or not tool_uses:
-                final = response_text(resp)
-                if resp.stop_reason == "max_tokens":
-                    final += "\n(…output truncated)"
-                await self.notifier.send(Outgoing(f"🤖 {esc(final or '(no answer)')}", session_id=s.id, job_id=s.job_id))
-                return
-            results = []
-            for b in tool_uses:
-                content, is_error = await self._run_tool(s, b.name, b.input, actions)
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": content, "is_error": is_error})
-            s.messages.append({"role": "user", "content": results})
-        await self.notifier.send(Outgoing(
-            f"⏸ Agent stopped after {self.cfg.llm.max_agent_steps} steps. Reply to continue.", session_id=s.id, job_id=s.job_id))
-
-    async def _cli_turn(self, s: Session, text: str, actions: list[str]) -> None:
-        assert self.cli and self.bridge
-        if s.cli_session_id is None:
-            text = f"<overseer_instructions>\n{self.system_prompt()}\n{CLI_NOTE}\n</overseer_instructions>\n\n{text}"
-        async with self.bridge.run(s, actions) as bridge_env:
-            res = await self.cli.run(text, session_id=s.cli_session_id, session_key=s.id,
-                                     actions=actions, bridge_env=bridge_env)
-        s.cli_session_id = res.session_id or s.cli_session_id
-        actions.extend(res.native_actions)
+        await ensure_master(self.cfg)
+        activity, live, buffer = self._activity(s)
+        try:
+            res = await runner.run(prompt, system=self.system_prompt(), session_id=resume, key=s.id, activity=activity)
+        finally:
+            if live:
+                live.cancel()
+            await self._report_activity(s, activity, buffer)
+        if res.session_id:
+            s.rec.backend, s.rec.cli_session_id = backend, res.session_id
+            self.store.upsert_session(s.rec)
         await self.notifier.send(Outgoing(f"🤖 {esc(res.text or '(no answer)')}", session_id=s.id, job_id=s.job_id))
 
-    async def _run_tool(self, s: Session, name: str, args: Any, actions: list[str]) -> tuple[str, bool]:
-        if not isinstance(args, dict):
-            return "invalid tool input", True
-        try:
-            out = await self._dispatch(s, name, args, actions)
-            if len(out) > TOOL_RESULT_LIMIT:
-                out = out[:TOOL_RESULT_LIMIT] + "\n<truncated>"
-            return out or "(empty)", False
-        except PolicyError as e:
-            actions.append(f"⛔ blocked {esc(name)}: {esc(str(e)[:200])}")
-            return f"POLICY: {e}", True
-        except (SSHError, KeyError, ValueError, TypeError) as e:
-            return f"ERROR: {type(e).__name__}: {e}", True
+    def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
+        activity = Activity()
+        buffer: list[str] = []  # live mode: commands not yet sent
 
-    @staticmethod
-    def _str(args: dict[str, Any], key: str, required: bool = True) -> str:
-        v = args.get(key)
-        if v is None and not required:
-            return ""
-        if not isinstance(v, str) or (required and not v):
-            raise ValueError(f"'{key}' must be a non-empty string")
-        return v
+        def on_job(job_id: str, command: str) -> None:
+            self._record_job(s, job_id)
+            asyncio.get_running_loop().create_task(self.notifier.send(Outgoing(
+                f"🚀 <b>Agent submitted job {esc(job_id)}</b>\n{pre(command, 600)}", job_id=job_id, session_id=s.id)))
 
-    async def _backup(self, s: Session, real: str) -> None:
-        """Save the original of a file locally before its first modification in this session."""
-        if real in s.changes.entries:
+        activity.on_job = on_job
+        live = None
+        if self.cfg.agent.report_commands == "live":
+            activity.on_command = buffer.append
+
+            async def flush_loop():
+                while True:
+                    await asyncio.sleep(LIVE_FLUSH_SECONDS)
+                    if buffer:
+                        batch = buffer[:]
+                        buffer.clear()
+                        await self.notifier.send(Outgoing(
+                            "💻 " + "\n".join(pre(c, 400) for c in batch), session_id=s.id, job_id=s.job_id, silent=True))
+
+            live = asyncio.get_running_loop().create_task(flush_loop())
+        return activity, live, buffer
+
+    async def _report_activity(self, s: Session, activity: Activity, buffer: list[str]) -> None:
+        mode = self.cfg.agent.report_commands
+        if mode == "off":
             return
-        if not await self.hpc.exists(real):
-            s.changes.record_file(real, None)
+        if mode == "live":
+            if buffer:
+                await self.notifier.send(Outgoing("💻 " + "\n".join(pre(c, 400) for c in buffer),
+                                                  session_id=s.id, job_id=s.job_id, silent=True))
             return
-        if await self.hpc.is_dir(real):
-            raise PolicyError(f"{real} is a directory; only files (or directories you created) can be changed")
-        s.changes.record_file(real, await self.hpc.read_for_edit(real))
+        if not (activity.commands or activity.files):
+            return
+        lines = [f"🛠 <b>{len(activity.commands)} command(s)</b>"]
+        for c in activity.commands[-40:]:
+            lines.append(pre(c, 300))
+        if len(activity.commands) > 40:
+            lines.insert(1, f"(showing the last 40 of {len(activity.commands)})")
+        if activity.files:
+            lines.append("✏️ local files: " + ", ".join(code(f) for f in activity.files[:20]))
+        files = [("commands.txt", "\n\n".join(activity.commands).encode())] if len(activity.commands) > 15 else []
+        await self.notifier.send(Outgoing("\n".join(lines), session_id=s.id, job_id=s.job_id, silent=True, files=files))
 
-    async def _dispatch(self, s: Session, name: str, a: dict[str, Any], actions: list[str]) -> str:
-        h = self.hpc
-        if name == "list_jobs":
-            rows = self.store.recent_jobs(20)
-            return "\n".join(
-                f"{r.job_id}\t{r.name}\t{r.state}\toverseer={bool(r.overseer)}\tstdout={r.stdout}" for r in rows
-            ) or "no jobs seen yet"
-        if name == "job_info":
-            return await self._job_context(self._str(a, "job_id"))
-        if name == "job_log":
-            rec = self.store.get_job(self._str(a, "job_id"))
-            if not rec:
-                return "unknown job"
-            path = rec.stderr if a.get("stream") == "stderr" else rec.stdout
-            lines = min(int(a.get("lines") or 200), 2000)
-            return (await h.read_file(path, tail_lines=lines)).text
-        if name == "read_file":
-            tl = a.get("tail_lines")
-            ft = await h.read_file(self._str(a, "path"), tail_lines=int(tl) if tl else None)
-            actions.append(f"📖 read {code(ft.path)}")
-            return ft.text + ("\n<truncated: file is larger; use tail_lines or search>" if ft.truncated else "")
-        if name == "list_dir":
-            return await h.list_dir(self._str(a, "path"))
-        if name == "search":
-            return await h.search(self._str(a, "pattern"), self._str(a, "path"),
-                                  include=self._str(a, "include", required=False) or None)
-        if name == "list_access":
-            return self.access_block()
-        if name == "request_access":
-            path, mode = self._str(a, "path"), self._str(a, "mode")
-            result = await self.submitter.propose_access(s, path, mode, self._str(a, "reason"))
-            actions.append(f"🔐 requested {esc(mode)} access to {code(path)}")
-            return result
-        if name == "copy_path":
-            src, dest = self._str(a, "src"), self._str(a, "dest")
-            real_dest = await h.check_write(dest)
-            path = await h.copy(src, real_dest)
-            s.changes.record_copy(path, src)
-            actions.append(f"📦 copied {code(src)} → {code(path)}")
-            return f"copied to {path}"
-        if name == "write_file":
-            content = a.get("content")
-            if not isinstance(content, str):
-                raise ValueError("'content' must be a string")
-            real = await h.check_write(self._str(a, "path"))
-            await self._backup(s, real)
-            await h.write_file(real, content)
-            actions.append(f"✏️ wrote {code(real)} ({len(content.splitlines())} lines)")
-            return f"wrote {real}"
-        if name == "edit_file":
-            real = await h.check_write(self._str(a, "path"))
-            old, new = self._str(a, "old_string"), a.get("new_string")
-            if not isinstance(new, str):
-                raise ValueError("'new_string' must be a string")
-            text = await h.read_for_edit(real)
-            n = text.count(old)
-            if n != 1:
-                raise ValueError(f"old_string found {n} times in {real}; it must match exactly once")
-            await self._backup(s, real)
-            await h.write_file(real, text.replace(old, new, 1))
-            actions.append(f"✏️ edited {code(real)} (−{len(old.splitlines())}/+{len(new.splitlines())} lines)")
-            return f"edited {real}"
-        if name == "delete_path":
-            real = await h.check_write(self._str(a, "path"))
-            if await h.is_dir(real) and not s.changes.covered(real):
-                raise PolicyError("only directories created in this conversation can be deleted")
-            await self._backup(s, real)
-            await h.delete(real)
-            actions.append(f"🗑 deleted {code(real)}")
-            return f"deleted {real}"
-        if name == "show_changes":
-            return await s.changes.diff(h) or "no changes"
-        if name == "propose_submission":
-            result = await self.submitter.propose_submit(s, self._str(a, "script_path"), self._str(a, "summary"),
-                                                         self._str(a, "workdir", required=False))
-            actions.append(f"📝 proposed submission of {code(a['script_path'])}")
-            return result
-        if name == "propose_cancel":
-            result = await self.submitter.propose_cancel(s, self._str(a, "job_id"), self._str(a, "reason"))
-            actions.append(f"🛑 proposed cancelling job {code(a['job_id'])}")
-            return result
-        raise ValueError(f"unknown tool {name}")
-
-    async def revert(self, sid: str) -> str:
-        s = self.sessions.get(sid)
-        changes = s.changes if s else self.changeset(sid)
-        if not changes:
-            return "Nothing to revert."
-        lock = s.lock if s else asyncio.Lock()
-        async with lock:
-            done = await changes.revert(self.hpc)
-        if s:
-            s.notes.append("The user reverted all your file changes: " + "; ".join(done))
-        return "↩️ Reverted:\n" + "\n".join(f"• {d}" for d in done)
+    def _record_job(self, s: Session, job_id: str) -> None:
+        rec = self.store.get_job(job_id) or JobRecord(job_id=job_id, state="PENDING", first_seen=time.time(),
+                                                      last_status_at=time.time())
+        rec.by_agent = 1
+        rec.session_id = s.id
+        self.store.upsert_job(rec)
+        if self.monitor:
+            self.monitor.poke()

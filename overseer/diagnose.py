@@ -10,7 +10,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from .llm import LLM
+from typing import Awaitable, Callable
 
 log = logging.getLogger(__name__)
 
@@ -127,25 +127,27 @@ STATUS_SYSTEM = """Summarise the progress of a running ML training job in ONE sh
 
 
 class Reporter:
-    def __init__(self, llm: LLM, report_effort: str | None, llm_status: bool):
-        self.llm = llm
-        self.report_effort = report_effort
+    """LLM summaries for job reports, using the agent's current backend in one-shot mode (no tools)."""
+
+    def __init__(self, text_fn: Callable[[str, str], Awaitable[str]] | None, enabled: bool, llm_status: bool):
+        self.text_fn = text_fn  # async (system, prompt) -> str
+        self.enabled = enabled and text_fn is not None
         self.llm_status = llm_status
 
     async def final_analysis(self, context: str) -> str:
-        if not self.llm.enabled:
+        if not self.enabled:
             return ""
         try:
-            return await self.llm.text(system=REPORT_SYSTEM, prompt=context, effort=self.report_effort)
+            return (await self.text_fn(REPORT_SYSTEM, context)).strip()
         except Exception as e:  # never let the LLM break monitoring
             log.exception("LLM report failed")
             return f"(LLM analysis unavailable: {type(e).__name__})"
 
     async def status_line(self, log_tail: str) -> str:
-        if not (self.llm.enabled and self.llm_status and log_tail.strip()):
+        if not (self.enabled and self.llm_status and log_tail.strip()):
             return ""
         try:
-            return await self.llm.text(system=STATUS_SYSTEM, prompt=log_tail[-8000:], effort="low", max_tokens=1000)
+            return (await self.text_fn(STATUS_SYSTEM, log_tail[-8000:])).strip()
         except Exception:
             log.exception("LLM status failed")
             return ""

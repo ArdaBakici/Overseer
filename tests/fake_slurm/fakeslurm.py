@@ -69,15 +69,16 @@ elif prog == "sbatch":
     st["next_id"] += 1
     jid = str(st["next_id"])
     script_path = args[-1]
-    with open(script_path) as fh:
+    with open(os.path.join(os.getcwd(), script_path)) as fh:
         script = fh.read()
-    out = (opt("--output") or f"{opt('--chdir')}/slurm-%j.out").replace("%j", jid)
+    chdir = opt("--chdir") or os.getcwd()
+    out = (opt("--output") or f"{chdir}/slurm-%j.out").replace("%j", jid)
     err = (opt("--error") or out).replace("%j", jid)
-    jobs[jid] = {"name": "submitted", "state": "PENDING", "workdir": opt("--chdir"),
+    jobs[jid] = {"name": "submitted", "state": "PENDING", "workdir": chdir,
                  "stdout": out, "stderr": err, "script": script}
     st.setdefault("submissions", []).append(args)
     save(st)
-    print(jid)
+    print(jid if "--parsable" in args else f"Submitted batch job {jid}")
 elif prog == "scancel":
     jobs[args[0]]["state"] = "CANCELLED"
     save(st)

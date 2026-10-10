@@ -1,3 +1,3 @@
-"""Overseer: watch SLURM jobs on a remote HPC, report to Telegram, and fix failures with your approval."""
+"""Overseer: watch SLURM jobs on a remote HPC from Telegram, and let Claude Code or Codex fix them."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

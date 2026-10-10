@@ -1,9 +1,12 @@
-"""A scripted stand-in for the OpenAI Responses API (codex) and Chat Completions API (opencode).
+"""A scripted stand-in for the model APIs the agent CLIs talk to.
 
-Turn 1 (no tool output yet): call the tool whose name ends with `target_tool` with `target_args`.
-Turn 2 (tool output present): answer "DONE: <first 80 chars of the tool output>".
-Requests without tools (titles, one-shot reports) get a plain "OK" answer.
-Every request body is recorded in `requests`.
+* Anthropic Messages API (Claude Code):      POST /v1/messages        (SSE)
+* OpenAI Responses API (Codex):              POST /v1/responses       (SSE)
+
+`FakeModel(script=[cmd1, cmd2, ...])`: on each request that offers tools, the model calls
+the CLI's shell tool with the next command; once all commands ran it answers
+"DONE" plus the outputs. Requests without tools (titles, one-shot reports) get "OK".
+All tool outputs the CLI sends back are recorded in `.outputs` (in order).
 """
 
 import json
@@ -12,16 +15,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class FakeModel:
-    def __init__(self, target_tool="read_file", target_args=None):
-        self.target_tool = target_tool
-        self.target_args = target_args or {}
+    def __init__(self, script):
+        self.script = list(script)
         self.requests = []
+        self.outputs: list[str] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def __enter__(self):
         self.thread.start()
@@ -30,66 +33,112 @@ class FakeModel:
     def __exit__(self, *exc):
         self.server.shutdown()
 
-    def tool_names(self, body):
-        """Flat tool names; tools inside a Responses-API namespace are reported as 'namespace/tool'."""
-        names = []
-        for t in body.get("tools") or []:
-            if t.get("type") == "namespace":
-                names += [f"{t['name']}/{sub.get('name')}" for sub in t.get("tools") or []]
-            else:
-                names.append(t.get("name") or (t.get("function") or {}).get("name"))
-        return [n for n in names if n]
-
     def _handler(self):
         fake = self
 
         class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, *a):
                 pass
 
-            def do_GET(self):
-                body = json.dumps({"object": "list", "data": [{"id": "fake-model", "object": "model"}]}).encode()
-                self.send_response(200)
+            def _json(self, obj, code=200):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_GET(self):
+                self._json({"object": "list", "data": [{"id": "fake-model", "object": "model", "type": "model",
+                                                        "display_name": "Fake"}], "has_more": False})
+
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
             def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
-                fake.requests.append({"path": self.path, "body": body})
-                if self.path.endswith("/responses"):
+                raw = self.rfile.read(int(self.headers.get("content-length", 0)) or 0)
+                body = json.loads(raw or b"{}")
+                path = self.path.split("?")[0]
+                fake.requests.append({"path": path, "body": body})
+                if path.endswith("/count_tokens"):
+                    return self._json({"input_tokens": 10})
+                if path.endswith("/messages"):
+                    events = fake.anthropic(body)
+                elif path.endswith("/responses"):
                     events = fake.responses(body)
-                elif self.path.endswith("/chat/completions"):
-                    events = fake.chat(body)
                 else:
-                    self.send_response(404)
-                    self.end_headers()
-                    return
+                    return self._json({"error": "not found"}, 404)
+                if not body.get("stream"):
+                    return self._json(events)  # non-streaming fallback: a full message object
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("cache-control", "no-cache")
+                self.send_header("connection", "close")
                 self.end_headers()
                 for name, data in events:
-                    chunk = (f"event: {name}\n" if name else "") + f"data: {data if isinstance(data, str) else json.dumps(data)}\n\n"
-                    self.wfile.write(chunk.encode())
+                    self.wfile.write(f"event: {name}\ndata: {json.dumps(data)}\n\n".encode())
                     self.wfile.flush()
+                self.close_connection = True
 
         return H
 
-    def _decide(self, tools, outputs):
-        """Return ('call', name, args) or ('text', text)."""
-        if not tools:
+    def _next(self, n_outputs: int, has_tools: bool):
+        if not has_tools:
             return ("text", "OK")
-        if not outputs:
-            match = [t for t in tools if t.endswith(self.target_tool)]
-            if match:
-                return ("call", match[0], self.target_args)
-            return ("text", "OK")
-        out = outputs[-1].split("Output:", 1)[-1].lstrip()  # codex prefixes "Wall time: ...\nOutput:"
-        return ("text", "DONE: " + out[:80])
+        if n_outputs < len(self.script):
+            return ("call", self.script[n_outputs])
+        return ("text", "DONE\n" + "\n---\n".join(self.outputs[-len(self.script):]))
 
-    # ---- OpenAI Responses API (codex)
+    # ---------------------------------------------------------------- Anthropic Messages (Claude Code)
+    def anthropic(self, body):
+        outputs = []
+        for m in body.get("messages") or []:
+            if m.get("role") != "user" or not isinstance(m.get("content"), list):
+                continue
+            for b in m["content"]:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, list):
+                        c = "\n".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    outputs.append(str(c))
+        tools = [t.get("name") for t in body.get("tools") or []]
+        if outputs and len(outputs) > len(self.outputs):
+            self.outputs = outputs
+        decision = self._next(len(outputs), "Bash" in tools)
+        n = len(self.requests)
+        usage = {"input_tokens": 1, "output_tokens": 1}
+        msg = {"id": f"msg_{n}", "type": "message", "role": "assistant", "model": body.get("model", "fake"),
+               "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}
+        if decision[0] == "call":
+            block = {"type": "tool_use", "id": f"toolu_{n}", "name": "Bash", "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": json.dumps({"command": decision[1], "description": "step"})}
+            stop = "tool_use"
+        else:
+            block = {"type": "text", "text": ""}
+            delta = {"type": "text_delta", "text": decision[1]}
+            stop = "end_turn"
+        if not body.get("stream"):
+            full = dict(block)
+            if decision[0] == "call":
+                full["input"] = json.loads(delta["partial_json"])
+            else:
+                full["text"] = decision[1]
+            return {**msg, "content": [full], "stop_reason": stop}
+        return [
+            ("message_start", {"type": "message_start", "message": msg}),
+            ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": block}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                               "usage": {"output_tokens": 1}}),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+
+    # ---------------------------------------------------------------- OpenAI Responses (Codex)
     def responses(self, body):
         outputs = []
         for item in body.get("input") or []:
@@ -100,14 +149,24 @@ class FakeModel:
                 elif isinstance(out, dict):
                     out = out.get("content") or json.dumps(out)
                 outputs.append(str(out))
-        decision = self._decide(self.tool_names(body), outputs)
+        if outputs and len(outputs) > len(self.outputs):
+            self.outputs = outputs
+        tools = {}
+        for t in body.get("tools") or []:
+            if t.get("name"):
+                tools[t["name"]] = t
+        shell = next((n for n in ("exec_command", "shell_command", "shell") if n in tools), None)
+        decision = self._next(len(outputs), shell is not None)
         n = len(self.requests)
         if decision[0] == "call":
-            namespace, _, name = decision[1].rpartition("/")
-            item = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": name,
-                    "arguments": json.dumps(decision[2]), "status": "completed"}
-            if namespace:
-                item["namespace"] = namespace
+            if shell == "exec_command":
+                args = {"cmd": decision[1]}
+            elif shell == "shell_command":
+                args = {"command": decision[1]}
+            else:
+                args = {"command": ["bash", "-lc", decision[1]]}
+            item = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": shell,
+                    "arguments": json.dumps(args), "status": "completed"}
         else:
             item = {"type": "message", "role": "assistant", "id": f"msg_{n}", "status": "completed",
                     "content": [{"type": "output_text", "text": decision[1], "annotations": []}]}
@@ -118,24 +177,4 @@ class FakeModel:
             ("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": item}),
             ("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item}),
             ("response.completed", {"type": "response.completed", "response": {"id": f"resp_{n}", "usage": usage}}),
-        ]
-
-    # ---- Chat Completions API (opencode via @ai-sdk/openai-compatible)
-    def chat(self, body):
-        outputs = [str(m.get("content")) for m in body.get("messages") or [] if m.get("role") == "tool"]
-        decision = self._decide(self.tool_names(body), outputs)
-        n = len(self.requests)
-        base = {"id": f"chat_{n}", "object": "chat.completion.chunk", "created": 0, "model": "fake-model"}
-        if decision[0] == "call":
-            delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": f"call_{n}", "type": "function",
-                                                          "function": {"name": decision[1], "arguments": json.dumps(decision[2])}}]}
-            finish = "tool_calls"
-        else:
-            delta = {"role": "assistant", "content": decision[1]}
-            finish = "stop"
-        return [
-            (None, {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}),
-            (None, {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
-            (None, "[DONE]"),
         ]

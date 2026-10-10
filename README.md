@@ -1,186 +1,136 @@
 # Overseer
 
-Overseer is a Telegram bot that keeps an eye on your SLURM jobs. It runs on your homelab and reaches the HPC login node over SSH (pubkey auth).
+Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watches your jobs on the university HPC over SSH. When one fails, you hand it to **Claude Code** or **OpenAI Codex**: they get a real shell and full access to your HPC account, and fix and resubmit the job themselves.
 
-- Tells you when a job is **queued**, **starts** (which node), and sends **status updates** while it runs (elapsed time, latest metrics, log tail, and optionally GPU utilisation).
-- When a job **ends**, it sends a **report**: final state, exit code, runtime against the limit, peak memory, and the last metrics it found. For a failed job it also says **why it failed**, using built-in heuristics (CUDA OOM, host OOM, time limit, NCCL, missing modules, NaNs, …) plus an LLM analysis.
-- You can then say *"fix it"* or reply with instructions. An agent reads the logs and code and changes files only in folders you allowed. It then **proposes** a resubmission. You get the full script and a diff of every changed file in Telegram, and nothing reaches `sbatch` until you tap **Approve**.
-- The agent can be **Claude** (Anthropic API), **OpenAI Codex** or **opencode**; see [Choosing the agent](#choosing-the-agent-claude-codex-or-opencode).
+- **Monitoring.** No LLM is involved, and checks run every minute.
+  - **Job lifecycle:** you get messages when a job is 📥 **queued** and 🚀 **started** (which node), plus 📊 hourly **status** (elapsed time, latest metrics, log tail).
+  - **Final report:** when a job ends you get ✅/❌, with the state, exit code, runtime against the limit and peak memory.
+  - **Why it failed:** heuristics flag CUDA OOM, host OOM, time limits, NCCL errors, missing modules, NaNs and similar. An LLM root-cause summary is added on top.
+- **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
+  - **Visibility:** you see every command it ran, and you get a message the moment it submits a job.
+  - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
+- **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
 
 ```
- homelab                                         HPC login node
-┌───────────────────────────────────┐   ssh   ┌──────────────────────────────────────────┐
-│ Telegram bot  ◄──► you            │ ──────► │ squeue / sacct / scontrol (read)         │
-│ Monitor (polls every 60 s)        │         │ read_roots      → read only              │
-│ Agent: Claude / Codex / opencode  │         │ write_roots     → create/modify/submit   │
-│ ./state: DB, audit log, backups   │         │ + folders you grant from Telegram        │
-│ /tmp/overseer: ssh socket         │         │ everything else → untouched              │
-└───────────────────────────────────┘         └──────────────────────────────────────────┘
+ homelab (your machine)                                                    HPC login node
+┌───────────────────────────────────────────────────────────┐           ┌────────────────┐
+│ Telegram bot ◄──► you                                     │           │                │
+│ Monitor ── squeue/sacct ──┐                               │           │                │
+│                           ├─► Overseer's SSH master ──────┼── ssh ───►│ your account   │
+│ Claude Code / Codex       │   (key in ./state/ssh)        │           │ (full access)  │
+│  └─ sandboxed shell ──────┘   via /tmp/overseer/ssh/      │           │                │
+│     `ssh hpc …`               master.sock                 │           │                │
+└───────────────────────────────────────────────────────────┘           └────────────────┘
 ```
 
-## Where Overseer writes
+## What the agent can and can't do
 
-**On the machine it runs on:** only inside `local.allowed_roots`. By default that is Overseer's own folder (the one containing `config.yaml`) and `/tmp`. Both working directories must sit inside those roots, which is checked when the config loads:
+**On the HPC: everything your account can.** That includes editing files, `sbatch`, `scancel`, `pip install` and so on. Nothing is restricted there, by design. In return you see all of it:
+- **Commands:** after each request, Telegram gets the list of commands the agent ran. Set `report_commands: live` to see them while it works.
+- **Submissions:** any job it submits is announced right away (`🚀 Agent submitted job 1234` plus the command), then tracked by the monitor.
 
-- `local.state_dir` (default `./state`): the SQLite database (jobs, proposals, folder grants), the audit log, and local backups of every HPC file the agent modifies. It lives in Overseer's folder, so grants and backups survive reboots.
-- `local.tmp_dir` (default `/tmp/overseer`): the SSH control socket and other scratch files.
+**On your homelab: confined.** Claude Code and Codex each run their shell inside their own OS sandbox (bubblewrap on Linux), configured by Overseer:
 
-Both are created with mode `700`, and Overseer refuses to start if someone else owns them.
+| | agent's shell |
+|---|---|
+| write | only its own scratch dir, `/tmp/overseer/agents/<conversation>` |
+| read | the system, except Overseer's state dir (which includes the SSH key), `~/.ssh`, `~/.gnupg`, `~/.docker`, `~/.aws`, gcloud credentials, docker/podman sockets, `/run/user/<uid>` and your ssh-agent socket |
+| network | none, except `agent.allowed_domains`. The HPC is reached through the unix socket of Overseer's SSH connection |
+| environment | scrubbed. Only `PATH`, locale and the API-key variables in `pass_env` are passed; the Telegram token is never passed |
+| escape hatches | Claude Code: `failIfUnavailable` and `allowUnsandboxedCommands: false`, so it never runs a command unsandboxed. Codex: a named permission profile with approvals off |
 
-**On the HPC:** only inside the folders in `hpc.write_roots` (config file), plus folders you grant at runtime. When the agent needs another folder, it calls `request_access`:
+**Your SSH key never leaves the Overseer folder:**
+- **Overseer's own key setup:** `overseer ssh setup` creates (or imports) a key, an ssh config and known_hosts in `./state/ssh`. Your `~/.ssh` isn't used at all.
+- **One shared connection:** Overseer opens a single SSH master connection. The agent's `ssh`, `scp`, `sftp` and `rsync` are wrappers that only talk to that connection's socket, so the agent never needs the key and its sandbox can't read it.
+- **Clean shutdown:** if Overseer stops, the agent loses HPC access.
 
-> 🔐 **Access request**: the agent wants to write to (create/modify/delete files in) `/home/you/projects/llm-ft`
-> Why: fix the OOM by lowering the batch size in train.py
-> [✅ Grant write] [❌ Deny]
+**Since the agent is effectively a shell on your HPC account, so is your Telegram chat.** Keep `telegram.allowed_chat_ids` to your own chat and turn on 2FA for your Telegram account.
 
-The agent then pauses. Your tap resumes it with the answer. You can also manage access yourself with `/access`, `/grant <path> [write|read]` and `/revoke <path>`.
+All of this was tested end to end, using the real Claude Code (2.1) and Codex (0.160) binaries against a local sshd standing in for the HPC (`tests/test_e2e.py`):
 
-## Safeguards
-
-Every layer below is covered by tests.
-
-1. **No shell for the agent.** Claude only gets these tools: read/list/search, `copy_path`, `write_file`, `edit_file`, `delete_path`, `request_access`, `propose_submission` and `propose_cancel`. It cannot run commands.
-2. **Command allowlist on the wire** (`policy.check_remote_argv`). Every SSH command is an argv list, shell-quoted and checked before it leaves the homelab.
-   - Read-only tools (`squeue`, `sacct`, `cat`, `grep`, …) are allowed.
-   - Tools that change things (`mkdir`, `cp`, `rm`, `dd`, `sbatch`) only run with absolute targets inside a write root and a fixed set of options. `sbatch` also needs a `--chdir` inside a write root.
-   - `scancel` takes one job id, and `scontrol` is limited to `show` and printing a batch script.
-   - Anything else is refused, including `bash -c` and `python -c`. Until the write roots are resolved at startup, every modifying command is refused.
-3. **Symlink-proof paths.** Every path is resolved with `realpath` on the cluster, and the resolved path is what gets checked and used.
-4. **Deny lists that override access:**
-   - Secrets (`~/.ssh`, `~/.netrc`, `*.pem`, `.env`, cloud credentials, HF token) are never readable.
-   - Files that would make something *run* later (`~/.bashrc` and other login scripts, `.git/hooks`, autostart/systemd files) are never writable, even inside a granted folder.
-   - `/` and your whole home directory can't be granted for writing.
-5. **Backup before every modification.** The first time the agent changes a file, its original is saved in `state_dir` on the homelab (mode `600`). This drives the exact diff in proposals and a **↩️ Revert all changes** button: restore the originals, delete new files, remove copies. Files over 2 MB or non-text files can't be modified.
-6. **Batch script policy** (`policy.check_script`), checked when a job is proposed and again at approval:
-   - **Resource limits**: GPUs, nodes, `--time` (required), partitions, and array size.
-   - **Blocked outright**: writes outside the write roots (`>`/`>>` redirects, `rm`/`mv`/`cp`/`tee`/… targets, `#SBATCH --output/--error/--chdir`), wiping an entire write root, `sudo`, `curl | sh`, and jobs that call `sbatch`/`scancel`.
-   - **Shown as warnings**: references to other paths (for example a dataset path), `pip install`, and `cd` outside the write roots.
-7. **Human approval** for every `sbatch` and `scancel`. The proposal shows the script, its sha256, resources, warnings and the diff. The script is re-read at approval, and the submission is refused if it changed. Each proposal can be approved only once. Only jobs Overseer submitted can be cancelled.
-8. **Audit log.** Every remote command, with its exit code, goes to `state/audit.log`. After each request the agent's actions (read, copied, edited, blocked, requested access) are posted to Telegram.
-
-**What these layers don't cover.** An approved job runs as *you* on a compute node, and Python code inside it can do anything your account can do. The static check can't fully analyse that code. The approval step and the diff are what protect you there, so read the diff.
+- `ssh hpc` and `sbatch` work.
+- Reading the key and `~/.ssh` fails.
+- Writing outside the scratch dir fails.
+- `curl` to the internet fails.
 
 ## Setup
 
-**On the HPC:** nothing to install. Your login shell should be bash or zsh.
+**On the HPC:** nothing to install.
 
-**On the homelab:**
+**On the homelab** (Linux): Python 3.10+, OpenSSH client, `bubblewrap` and `socat` (for Claude Code's sandbox; Codex brings its own), and the CLIs.
 
 ```bash
+sudo apt install openssh-client bubblewrap socat
+npm i -g @anthropic-ai/claude-code @openai/codex      # either or both
+
 git clone <this repo> ~/Overseer && cd ~/Overseer
-uv sync                     # or: python3 -m venv .venv && .venv/bin/pip install -e .
+uv sync                                 # or: python3 -m venv .venv && .venv/bin/pip install -e .
+cp config.example.yaml config.yaml      # set ssh.hostname/user and telegram.allowed_chat_ids
 
-# 1. SSH must work non-interactively. Put the host in ~/.ssh/config:
-#      Host hpc
-#        HostName login.cluster.edu
-#        User <netid>
-#        IdentityFile ~/.ssh/id_ed25519
-#        # ProxyJump gateway.cluster.edu   (if needed)
-ssh -o BatchMode=yes hpc true        # must succeed without any prompt
+# 1. Overseer's own SSH key (kept in ./state/ssh)
+uv run overseer ssh setup               # or: ssh setup --import ~/.ssh/id_ed25519 to copy an existing key
+#    -> add the printed public key to ~/.ssh/authorized_keys on the HPC, then:
+uv run overseer ssh test
 
-# 2. Telegram: create a bot with @BotFather, then message it once and get your chat id
-#    (e.g. via @userinfobot).
-# 3. Configure
-cp config.example.yaml config.yaml   # set ssh.host, telegram.allowed_chat_ids, hpc.write_roots
-export TELEGRAM_BOT_TOKEN=...  ANTHROPIC_API_KEY=...   # or use codex/opencode, see below
+# 2. Log the agents in (stored in ./state/claude and ./state/codex; your normal logins are untouched)
+uv run overseer login claude_code       # or export ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+uv run overseer login codex             # or export OPENAI_API_KEY
 
-uv run overseer check -c config.yaml   # verifies ssh, slurm, folder access, credentials
-uv run overseer run   -c config.yaml
+# 3. Telegram: create a bot with @BotFather, get your chat id (e.g. via @userinfobot)
+export TELEGRAM_BOT_TOKEN=...
+uv run overseer check                   # ssh, slurm, a real test call to each installed agent
+uv run overseer run
 ```
 
-To run it permanently, use `deploy/overseer.service` (systemd user unit; instructions are inside the file).
+Everything after `--` is passed to the CLI's login, e.g. `overseer login codex -- --device-auth` on a headless machine. For Claude Code on a server, `overseer login claude_code -- setup-token` prints a long-lived token, which you then export as `CLAUDE_CODE_OAUTH_TOKEN`.
 
-If your cluster needs 2FA/Duo on every login, keep a multiplexed connection open: Overseer uses `ControlMaster`/`ControlPersist`, so approving one login can keep the socket alive. Some sites forbid automated logins entirely, so check your cluster's acceptable-use policy. Overseer polls once a minute over a single multiplexed connection, which is light on the login node.
+**Clusters with 2FA/Duo.** Run `overseer ssh connect` once. It opens the master connection interactively so you can approve the login, and the connection then stays up (`ControlPersist`). If the network drops, run it again; the bot tells you when it can't reach the HPC.
 
-## Choosing the agent: Claude, Codex or opencode
+**Ubuntu 24.04+.** bubblewrap may need user namespaces allowed by AppArmor; see Claude Code's sandboxing docs. `overseer check` and the first agent run will tell you if the sandbox can't start, and Overseer never falls back to running unsandboxed.
 
-Set `llm.backend` in `config.yaml`. The backend runs both the fixing agent and the job reports.
-
-| backend | runs | credentials |
-|---|---|---|
-| `claude` (default) | Anthropic API directly | `ANTHROPIC_API_KEY` |
-| `codex` | `codex exec` (OpenAI Codex CLI) | `python -m overseer login codex` (ChatGPT login or API key), or `OPENAI_API_KEY` / `CODEX_API_KEY` |
-| `opencode` | `opencode run` | the provider's API key in the environment (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`), or `python -m overseer login opencode` |
-
-```bash
-npm i -g @openai/codex        # or: npm i -g opencode-ai
-uv run overseer login codex -c config.yaml     # one-time; stored in ./state/codex
-uv run overseer check -c config.yaml           # makes a real test call through the CLI
-```
-
-**How the CLIs are locked down.** Codex and opencode normally come with their own shell and file-editing tools. On the homelab those tools could use your SSH key to reach the HPC, or write anywhere. Overseer runs them so that **the only tools they have are Overseer's**:
-
-- **Tools come through MCP.** Overseer's tools (read, search, copy, edit, request_access, propose_submission, …) are provided by a small MCP server, `python -m overseer.mcp_server`, which the CLI starts. That process holds no state or credentials. It forwards each call over a private Unix socket (mode `600`, with a token that is only valid during the run) to the running Overseer. Every call therefore gets the same policy checks, backups, approvals and Telegram action reports as the Claude backend.
-- **codex:**
-  - its shell, exec, browser, computer-use, image, plugin, apps, multi-agent and other built-in tool features are switched off
-  - read-only sandbox, `approval_policy=never`, web search disabled
-  - `AGENTS.md` files are ignored
-  - only Overseer's MCP tools are auto-approved
-- **opencode:**
-  - every built-in tool is disabled (`"tools": {"*": false, "overseer_*": true}`), with edit/bash/webfetch also denied in the permissions
-  - project config, Claude Code and external skills are ignored
-  - `extra_config` cannot turn any of this back on
-- **Scrubbed environment.** The CLI gets only `PATH`, locale, the API-key variables you list in `pass_env` and proxy settings. It never sees the Telegram token or your SSH agent.
-- **Contained files.** It runs in a scratch dir under `local.tmp_dir`, with its own `HOME` / `CODEX_HOME` / XDG dirs under `local.state_dir`. Its logins, sessions and caches stay inside the allowed local folders, and your real `~/.codex` or `~/.config/opencode` are untouched.
-- **Reported if it slips.** If a built-in tool still shows up in the CLI's event stream, it is reported to Telegram as ⚠️.
-
-`tests/test_cli_backends.py` checks all of this with the **real** codex and opencode binaries against a fake model server:
-
-- the model is offered only Overseer's tools
-- a tool call travels CLI → MCP server → Overseer → back to the model
-- sessions resume across messages
-- nothing is written to `$HOME`
-
-The tests are skipped when the CLIs aren't installed. Set `OVERSEER_TEST_CLI_DIR` to point at them. They were verified with codex 0.160 and opencode 1.18. CLI flags change between versions, so run `overseer check` after upgrading.
+To keep it running, use `deploy/overseer.service` (a systemd user unit; instructions are inside the file).
 
 ## Using it
 
 | | |
 |---|---|
 | *(automatic)* | 📥 queued · 🚀 started · 📊 hourly status · ✅/❌ final report with analysis |
-| **🔧 Diagnose & fix** button | the agent investigates the failed job and proposes a fixed resubmission |
+| **🔧 Ask agent to fix** button | the agent investigates the failed job, fixes it and resubmits |
 | *reply to any job message* | talk to the agent about that job ("lower the lr to 1e-4 and resubmit", "why is it slow?") |
-| *plain message* | general conversation with the agent ("what should I try next for job 1234?") |
-| `/jobs`, `/job <id>`, `/log <id> [n]` | status, log tails (long tails come as a file) |
+| *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
+| `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
-| `/pending`, `/cancel <id>`, `/health` | proposals, cancel an Overseer job, connection status |
-| `/access`, `/grant <path> [write\|read]`, `/revoke <path>` | see and manage which HPC folders Overseer may use |
-| **↩️ Revert all changes** button | undo every file change the agent made in that conversation |
+| `/backend [claude_code\|codex]` | show or switch the agent; conversations continue on the new one with a fresh session |
+| `/stop` | stop the agent's current run (kills the whole process group) |
+| `/health` | SSH connection, last poll, which agent is active |
 
-A typical fix goes like this. The agent reads the failed job's log and batch script, then works in a writable folder. It either edits the files in place (if their folder is writable or you grant it), or copies the project to a new folder (e.g. `/scratch/you/overseer/fix-oom`) and edits the copy. It writes a batch script there and proposes it. The job runs with `--chdir` set to that folder, and its log is `slurm-<jobid>.out` unless the script sets `--output` (which must also be inside a writable folder).
-
-A job submitted from a session stays linked to that conversation. When it finishes, replying to its report continues the same thread, so you can iterate: *fail → fix → resubmit → report → tweak*.
+Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's session ID), so they survive restarts. A job the agent submits stays linked to the conversation that submitted it.
 
 ## Configuration notes
 
-- `slurm.track: overseer` reports only on jobs Overseer submitted. The default `all` reports on every job of your user.
-- `llm.enabled: false` turns Overseer into a pure monitor with heuristic failure analysis (no API key needed).
-- With `backend: claude`, `llm.model` defaults to `claude-opus-5-5` with adaptive thinking. Set `adaptive_thinking: false` and `*_effort: null` for models that don't support those parameters. `fallbacks: true` enables the API's server-side refusal fallback.
-- Anything the agent reads (logs, code inside `read_roots`) is sent to the model provider of the chosen backend. Narrow `read_roots` if that matters.
-- Agent conversations: with `claude` they live in memory. With codex/opencode, the CLI's own session is resumed for follow-up messages, but the link is kept in memory, so a restart starts a fresh conversation.
-- Job state, proposals, grants and message links are kept in SQLite in `local.state_dir`.
-- The HPC login shell should be bash or zsh, since commands are quoted for a POSIX shell.
+- `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
+- `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
+- `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
+- `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
+- Anything the agent reads is sent to the model provider of the backend you use.
+- Overseer itself writes only to `./state` and `/tmp/overseer` (`local.allowed_roots`).
 
 ## Development
 
 ```bash
-uv sync --extra dev && uv run pytest      # or: pip install -e '.[dev]' && pytest
+uv sync --extra dev && uv run pytest
+OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py   # real CLIs + local sshd
 ```
 
-`tests/test_integration.py` runs the real HPC layer, grants, backups/revert, monitor, agent tools and approval flow against a local shell, with fake `squeue`/`sacct`/`scontrol`/`sbatch`/`scancel` scripts (`tests/fake_slurm/`).
+- `tests/test_integration.py` covers the monitor, agent sessions, job detection, the runners' sandbox settings and the bot. It uses fake SLURM (`tests/fake_slurm/`) and fake CLIs (`tests/fake_cli/`).
+- `tests/test_e2e.py` runs the real Claude Code and Codex against a scripted model (`tests/fake_model_server.py`) and a local sshd. It is skipped unless sshd, bubblewrap, socat and the CLIs are available.
 
 | module | role |
 |---|---|
-| `policy.py` | command allowlist, path rules, batch-script analysis (pure, heavily tested) |
 | `config.py` | config schema; keeps local writes inside `local.allowed_roots` |
-| `ssh.py` | multiplexed `ssh` transport, output caps, audit log |
-| `hpc.py` | policy-enforcing file ops, write/read roots and grants, SLURM calls |
-| `changes.py` | local backups of modified files → diff and revert |
-| `slurm.py` | `squeue`/`sacct`/`scontrol` parsing |
-| `monitor.py` | polling loop → queued/started/status/final-report events |
-| `diagnose.py` | failure heuristics, traceback/metric extraction, LLM reports |
-| `agent.py` | the policy-checked tool set, Claude tool-use loop, session handling |
-| `cli_agents.py` | codex / opencode runners (locked-down flags, isolated env, event parsing) |
-| `bridge.py`, `mcp_server.py` | exposes the tools to the CLIs over MCP → private socket → Overseer |
-| `proposals.py` | proposal → approval → `sbatch` / `scancel` / folder grant |
-| `bot.py` | Telegram commands, buttons, message → job routing |
+| `sshlink.py` | Overseer's own key/config/known_hosts, the master connection, the agent's ssh wrappers |
+| `ssh.py`, `hpc.py` | Overseer's own read-only queries (squeue/sacct/scontrol, log tails) |
+| `monitor.py`, `slurm.py`, `diagnose.py` | polling → queued/started/status/final-report messages |
+| `runners.py` | Claude Code / Codex: sandbox settings, scrubbed env, event parsing, job detection |
+| `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
+| `bot.py` | Telegram commands, buttons, message → conversation routing |

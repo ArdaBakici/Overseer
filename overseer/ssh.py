@@ -1,10 +1,10 @@
 """SSH transport to the HPC login node.
 
-Uses the system ``ssh`` binary so ~/.ssh/config (ProxyJump, IdentityFile, ...) just works,
-with connection multiplexing so polling does not open a new TCP/SSH session every time.
+Uses the system ``ssh`` with Overseer's own config (see sshlink.py), multiplexed over one
+master connection so polling does not open a new SSH session every time.
 
-Commands are always passed as argv lists, quoted with ``shlex.quote`` and checked by
-``policy.check_remote_argv`` *before* anything leaves this machine.
+Commands are always passed as argv lists and quoted with ``shlex.quote``. Every command is
+appended to the audit log.
 """
 
 from __future__ import annotations
@@ -15,11 +15,9 @@ import logging
 import shlex
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable
 
-from .config import SSHConfig
-from .policy import check_remote_argv
+from .config import Config
+from .sshlink import base_argv
 
 log = logging.getLogger(__name__)
 
@@ -42,34 +40,16 @@ class Result:
 
 
 class SSHRunner:
-    def __init__(self, cfg: SSHConfig, write_roots: Callable[[], list[str]], control_path: str,
-                 audit_path: Path | None = None):
-        self.cfg = cfg
-        # Called on every command, so roots granted at runtime take effect immediately.
-        # Before the roots are resolved it returns [] and every modifying command is refused.
-        self.write_roots = write_roots
-        self.control_path = control_path
-        self.audit_path = audit_path
-        self._sem = asyncio.Semaphore(cfg.max_concurrent)
+    """Runs Overseer's own (monitoring) commands on the HPC over the shared master connection."""
 
-    def ssh_base(self) -> list[str]:
-        cp = self.control_path
-        Path(cp).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return [
-            "ssh",
-            "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={self.cfg.connect_timeout}",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ControlMaster=auto",
-            "-o", f"ControlPath={cp}",
-            "-o", f"ControlPersist={self.cfg.control_persist}",
-            *self.cfg.extra_args,
-            self.cfg.host,
-        ]
+    def __init__(self, cfg: Config):
+        self.full_cfg = cfg
+        self.cfg = cfg.ssh
+        self.audit_path = cfg.local.audit_log
+        self._sem = asyncio.Semaphore(cfg.ssh.max_concurrent)
 
     def build_command(self, argv: list[str]) -> list[str]:
-        return self.ssh_base() + ["--", self.remote_command(argv)]
+        return [*base_argv(self.full_cfg), self.cfg.host, "--", self.remote_command(argv)]
 
     @staticmethod
     def remote_command(argv: list[str]) -> str:
@@ -84,7 +64,6 @@ class SSHRunner:
         max_output: int = 2_000_000,
         check: bool = False,
     ) -> Result:
-        check_remote_argv(argv, self.write_roots())
         cmd = self.build_command(argv)
         timeout = timeout or self.cfg.command_timeout
         started = time.time()

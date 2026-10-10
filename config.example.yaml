@@ -1,97 +1,63 @@
 # Overseer configuration. Copy to config.yaml and edit.
-# Secrets are read from the environment, never from this file:
-#   TELEGRAM_BOT_TOKEN   - from @BotFather
-#   ANTHROPIC_API_KEY    - for job reports and the fixing agent
+# Secrets come from the environment, never from this file:
+#   TELEGRAM_BOT_TOKEN                       - from @BotFather
+#   ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN - only if you don't use `overseer login claude_code`
+#   OPENAI_API_KEY / CODEX_API_KEY           - only if you don't use `overseer login codex`
 
 local:
-  # On THIS machine Overseer only writes inside these folders.
+  # On THIS machine, Overseer and the agent only write inside these folders.
   # Relative paths are relative to the folder containing this config file (Overseer's folder).
   allowed_roots: [".", "/tmp"]
-  state_dir: ./state        # SQLite DB (jobs, proposals, folder grants), audit log, backups of edited HPC files
-  tmp_dir: /tmp/overseer    # SSH control socket and other scratch files
+  state_dir: ./state        # DB, audit log, SSH key/config, the CLIs' logins and sessions
+  tmp_dir: /tmp/overseer    # SSH connection socket + the agent's scratch directories (keep the path short)
 
 ssh:
-  # Host alias from ~/.ssh/config on the homelab (recommended) or user@login.cluster.edu.
-  # Must work non-interactively: `ssh <host> true` should succeed with no prompt.
-  host: hpc
-  extra_args: []            # e.g. ["-J", "gateway.cluster.edu"] if you need a jump host
-  connect_timeout: 15
-  command_timeout: 90
-  max_concurrent: 4         # parallel commands over the multiplexed connection
-
-hpc:
-  # Folders on the HPC where Overseer may create/modify/delete files and submit jobs from.
-  # Nothing else is writable. When the agent needs another folder it asks you in Telegram
-  # (Grant / Deny); you can also use /grant and /revoke.
-  write_roots:
-    - /scratch/$USER/overseer
-    # - ~/projects/my-model
-  # Folders the agent may READ (logs, code) to diagnose failures. Writable folders are readable too.
-  # Anything read may be sent to the LLM, so narrow this if that matters.
-  read_roots:
-    - "~"
-    # - /scratch/$USER
-  max_copy_mb: 200          # max size of a single copy_path (code, not data)
-  max_edit_mb: 2            # larger files can't be modified (every edited file is backed up in state_dir first)
-  # deny_read_globs: [...]  # defaults block ~/.ssh, ~/.netrc, *.pem, .env, cloud credentials, HF tokens, ...
-  # deny_write_globs: [...] # defaults additionally block ~/.bashrc & other login scripts, .git/hooks, ...
+  # Overseer uses its OWN key, ssh config and known_hosts in ./state/ssh - never ~/.ssh.
+  # Create them with:  overseer ssh setup      (or: overseer ssh setup --import ~/.ssh/id_ed25519)
+  host: hpc                 # the name the agent uses: `ssh hpc '...'`
+  hostname: login.cluster.edu
+  user: your-netid
+  port: 22
+  proxy_jump: null          # e.g. your-netid@gateway.cluster.edu (uses the same key)
+  extra_options: {}         # extra ssh_config options for the host, e.g. {Compression: "yes"}
 
 slurm:
   poll_interval: 60             # seconds
   status_interval_minutes: 60   # periodic progress message for running jobs (0 = off)
-  track: all                    # "all" of your jobs, or only jobs Overseer submitted ("overseer")
+  track: all                    # "all" of your jobs, or only the ones the agent submitted ("agent")
   notify_queued: true
   log_tail_lines: 40
   gpu_stats: false              # run `srun --overlap nvidia-smi` in running jobs for GPU utilisation
   ignore_name_globs: ["interactive", "sys/dashboard*", "ood-*"]
 
-limits:                         # applied to every job the agent proposes
-  require_approval: true        # keep this on: every sbatch/scancel needs a tap in Telegram
-  max_gpus_per_job: 4
-  max_nodes_per_job: 1
-  max_time: "2-00:00:00"
-  max_active_overseer_jobs: 4
-  allowed_partitions: []        # e.g. ["gpu", "a100_1"]; empty = any
-  max_array_tasks: 0            # 0 = no job arrays
-
 telegram:
   token_env: TELEGRAM_BOT_TOKEN
-  # Your chat id(s). Message @userinfobot (or check getUpdates) to find yours.
+  # Your chat id(s). The agent has full access to your HPC account, so only list chats you control.
   allowed_chat_ids: [123456789]
 
-llm:
+agent:
   enabled: true
-  # Who runs the agent and writes job reports:
-  #   claude   - Anthropic API directly (needs ANTHROPIC_API_KEY)
-  #   codex    - OpenAI Codex CLI   (`npm i -g @openai/codex`, then: python -m overseer login codex)
-  #   opencode - opencode CLI       (`npm i -g opencode-ai`, then: python -m overseer login opencode,
-  #                                  or just export the provider's API key)
-  # With codex/opencode their own shell/file tools are disabled; they only get Overseer's tools (via MCP).
-  backend: claude
-  cli_timeout_minutes: 30       # max length of one codex/opencode run
+  backend: claude_code          # claude_code | codex  (switch any time from Telegram: /backend codex)
+  timeout_minutes: 60           # max length of one agent run (/stop ends it earlier)
+  report_commands: summary      # summary (after each request) | live (every few seconds) | off
+  allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)
+  deny_read: []                 # extra local paths the agent may never read
+  job_reports: true             # LLM summary / root cause in job-finished reports (uses the same backend)
+  llm_status_updates: false     # one-line LLM progress summary in periodic status messages
+
+  claude_code:
+    command: claude
+    model: null                 # e.g. opus, sonnet; null = Claude Code's default
+    effort: null                # low | medium | high | xhigh | max
+    home: ./state/claude        # CLAUDE_CONFIG_DIR for Overseer's runs. Log in: overseer login claude_code
+    # pass_env: [ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, HTTPS_PROXY, ...]
+    extra_settings: {}          # merged into Claude Code settings (sandbox settings can't be loosened)
 
   codex:
     command: codex
     model: null                 # e.g. gpt-5.5-codex; null = codex default
     reasoning_effort: null      # low | medium | high | xhigh
-    home: ./state/codex         # CODEX_HOME used for Overseer's runs (login, sessions)
-    # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]   # env vars codex may see
-    extra_config: []            # extra `-c key=value` overrides, e.g. a custom model_provider
-
-  opencode:
-    command: opencode
-    model: null                 # provider/model, e.g. anthropic/claude-opus-5-5 or openai/gpt-5.5
-    variant: null               # provider-specific reasoning effort, e.g. high
-    home: ./state/opencode      # HOME + XDG dirs used for Overseer's runs (auth, sessions, caches)
-    # pass_env: [ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, ...]
-    extra_config: {}            # merged into opencode's config, e.g. {provider: {...}} for custom providers
-
-  # ---- claude backend only
-  model: claude-opus-5-5
-  report_effort: medium         # job reports / failure diagnosis
-  agent_effort: high            # the fixing agent
-  adaptive_thinking: true
-  fallbacks: true               # server-side refusal fallback (Claude API)
-  max_agent_steps: 40           # tool calls per request before the agent pauses
-
-  llm_status_updates: false     # add a one-line LLM progress summary to periodic status messages
+    home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex
+    # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
+    web_search: true            # the model's own web search (runs on OpenAI's side)
+    extra_config: []            # extra `-c key=value` overrides

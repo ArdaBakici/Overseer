@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overseer"
-version = "0.3.0"
-description = "Telegram-driven SLURM job monitor and fixer that runs on your homelab and talks to the HPC over SSH"
+version = "0.4.0"
+description = "Telegram bot that watches your SLURM jobs and lets Claude Code or Codex fix them over SSH"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=1.0",
     "python-telegram-bot>=21.0",
     "PyYAML>=6.0",
 ]

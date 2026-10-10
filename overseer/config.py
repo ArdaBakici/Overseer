@@ -1,38 +1,42 @@
 """Configuration loading.
 
-Secrets (Telegram token, Anthropic key) come from environment variables, never from
-the YAML file, so the config can be committed or shared safely.
+Secrets (Telegram token, API keys) come from environment variables, never from the YAML
+file, so the config can be committed or shared safely.
 """
 
 from __future__ import annotations
 
 import os
-import posixpath
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+UNIX_SOCKET_MAX = 107  # sun_path limit on Linux, minus the terminating NUL
+
 
 class ConfigError(ValueError):
     pass
 
 
+def _path_within(p: Path, root: Path) -> bool:
+    return p == root or root in p.parents
+
+
 @dataclass
 class LocalConfig:
-    """Where Overseer may write on the machine it runs on.
+    """Where Overseer (and the agents it runs) may write on the machine it runs on.
 
     Relative paths are resolved against the folder containing config.yaml (Overseer's own
     folder), so "." means "next to the config file".
     """
 
-    # Overseer never writes outside these folders on this machine.
+    # Nothing on this machine is written outside these folders.
     allowed_roots: list[str] = field(default_factory=lambda: [".", "/tmp"])
-    # Persistent state: SQLite DB (jobs, proposals, folder grants), audit log, backups of
-    # HPC files the agent edits. Keep it out of /tmp if grants/backups should survive reboots.
+    # Persistent state: SQLite DB, audit log, the SSH key/config, the CLIs' logins and sessions.
     state_dir: str = "./state"
-    # Scratch: SSH control socket and other throwaway files.
+    # Scratch: SSH control socket and the agents' working directories.
     tmp_dir: str = "/tmp/overseer"
     # Set by load_config to the config file's folder; relative paths resolve against it.
     base_dir: str = ""
@@ -53,6 +57,10 @@ class LocalConfig:
         if not any(_path_within(p, r) for r in self.roots):
             raise ConfigError(f"{p} is outside the allowed local folders ({', '.join(map(str, self.roots))})")
         return p
+
+    def resolve(self, p: str) -> Path:
+        """Resolve a configured local path and make sure it is inside allowed_roots."""
+        return self.check(self._resolve(p))
 
     def state(self, *parts: str) -> Path:
         base = self._resolve(self.state_dir)
@@ -76,64 +84,30 @@ class LocalConfig:
     def audit_log(self) -> Path:
         return self.state("audit.log")
 
-    @property
-    def control_path(self) -> str:
-        # Unix socket paths are limited to ~100 chars, so keep the socket in the (short) tmp dir.
-        return str(self.tmp("ssh")) + "/cm-%C"
-
-    def sessions_dir(self, sid: str) -> Path:
-        return self.state("sessions", sid)
-
-    def resolve(self, p: str) -> Path:
-        """Resolve a configured local path and make sure it is inside allowed_roots."""
-        return self.check(self._resolve(p))
-
 
 @dataclass
 class SSHConfig:
-    # Host alias from ~/.ssh/config or user@host. Pubkey auth only (BatchMode=yes).
-    host: str = ""
-    extra_args: list[str] = field(default_factory=list)  # e.g. ["-J", "jumphost"]
+    """How to reach the HPC. Overseer keeps its own key, ssh config and known_hosts in ``dir``
+    (inside the Overseer folder) and never uses ~/.ssh. Set it up with `overseer ssh setup`."""
+
+    host: str = "hpc"  # the name the agent uses: `ssh hpc '...'`
+    hostname: str = ""  # e.g. login.cluster.edu
+    user: str = ""  # your HPC username
+    port: int = 22
+    proxy_jump: str | None = None  # e.g. "netid@gateway.cluster.edu" (uses the same key)
+    dir: str = "./state/ssh"  # key, ssh config, known_hosts
+    key_name: str = "id_ed25519"
+    extra_options: dict[str, str] = field(default_factory=dict)  # extra ssh_config options for the host
     connect_timeout: int = 15
     command_timeout: int = 90
-    control_persist: int = 600
     max_concurrent: int = 4
-
-
-DEFAULT_DENY_READ = [
-    "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.netrc", "*/.git-credentials",
-    "*/.pgpass", "*/.aws", "*/.aws/*", "*/.kube", "*/.kube/*", "*/.docker/config.json",
-    "*/.config/gcloud", "*/.config/gcloud/*", "*/.cache/huggingface/token",
-    "*/.huggingface/token", "*/.env", "*.pem", "*.key", "*/id_rsa*", "*/id_ed25519*",
-    "*/id_ecdsa*", "*/.bash_history", "*/.zsh_history",
-]
-# Files that would make something *run* later (login scripts, cron...) are never writable,
-# even inside a write root.
-DEFAULT_DENY_WRITE_EXTRA = [
-    "*/.bashrc", "*/.bash_profile", "*/.bash_login", "*/.bash_logout", "*/.profile", "*/.zshrc",
-    "*/.zprofile", "*/.zshenv", "*/.zlogin", "*/.login", "*/.cshrc", "*/.tcshrc", "*/.config/autostart",
-    "*/.config/autostart/*", "*/.config/systemd", "*/.config/systemd/*", "*/.forward", "*/.git/hooks/*",
-]
-
-
-@dataclass
-class HPCAccessConfig:
-    # Directories on the HPC Overseer may create/modify/delete files in and submit jobs from.
-    # More can be granted at runtime from Telegram (the agent asks; you tap Grant).
-    write_roots: list[str] = field(default_factory=list)
-    # Directories the agent may read (to diagnose failures). Write roots are readable too.
-    read_roots: list[str] = field(default_factory=lambda: ["~"])
-    deny_read_globs: list[str] = field(default_factory=lambda: list(DEFAULT_DENY_READ))
-    deny_write_globs: list[str] = field(default_factory=lambda: list(DEFAULT_DENY_READ + DEFAULT_DENY_WRITE_EXTRA))
-    max_copy_mb: int = 200  # max size of a copy_path call
-    max_edit_mb: int = 2  # files larger than this can't be modified (they're backed up locally first)
 
 
 @dataclass
 class SlurmConfig:
     poll_interval: int = 60  # seconds between squeue/sacct polls
     status_interval_minutes: int = 60  # periodic progress update for running jobs; 0 = off
-    # "all": every job of your user. "overseer": only jobs Overseer submitted.
+    # "all": every job of your user. "agent": only jobs the agent submitted.
     track: str = "all"
     notify_queued: bool = True
     log_tail_lines: int = 40
@@ -141,17 +115,6 @@ class SlurmConfig:
     gpu_stats: bool = False
     # Jobs whose names match any of these globs are ignored (e.g. interactive sessions).
     ignore_name_globs: list[str] = field(default_factory=lambda: ["interactive", "sys/dashboard*", "ood-*"])
-
-
-@dataclass
-class LimitsConfig:
-    require_approval: bool = True  # every sbatch/scancel needs a tap on "Approve" in Telegram
-    max_gpus_per_job: int = 4
-    max_nodes_per_job: int = 1
-    max_time: str = "2-00:00:00"
-    max_active_overseer_jobs: int = 4
-    allowed_partitions: list[str] = field(default_factory=list)  # empty = any
-    max_array_tasks: int = 0  # 0 = job arrays not allowed for Overseer-submitted jobs
 
 
 @dataclass
@@ -172,71 +135,91 @@ PROXY_ENV = ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy
 
 
 @dataclass
+class ClaudeCodeConfig:
+    command: str = "claude"
+    model: str | None = None  # e.g. "opus", "sonnet", "claude-opus-5-5"; None = Claude Code's default
+    effort: str | None = None  # low | medium | high | xhigh | max
+    # CLAUDE_CONFIG_DIR (login, sessions, settings) for Overseer's runs. Log in once with:
+    #   overseer login claude_code
+    home: str = "./state/claude"
+    # Environment variables passed through (everything else, e.g. the Telegram token, is stripped).
+    pass_env: list[str] = field(default_factory=lambda: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", *PROXY_ENV])
+    # Merged into the settings Overseer passes with --settings (sandbox keys can't be loosened).
+    extra_settings: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class CodexConfig:
     command: str = "codex"
-    model: str | None = None  # e.g. "gpt-5.5-codex"; None = codex's default
-    reasoning_effort: str | None = None  # model_reasoning_effort: low | medium | high | xhigh
-    # CODEX_HOME for Overseer's runs (auth, sessions, config). Must be inside local.allowed_roots.
-    # Log in once with: python -m overseer login codex
+    model: str | None = None  # e.g. "gpt-5.5-codex"; None = codex default
+    reasoning_effort: str | None = None  # low | medium | high | xhigh
+    # CODEX_HOME for Overseer's runs. Log in once with: overseer login codex
     home: str = "./state/codex"
-    # Environment variables passed through to codex (everything else is stripped).
     pass_env: list[str] = field(default_factory=lambda: ["OPENAI_API_KEY", "CODEX_API_KEY", *PROXY_ENV])
-    # Extra `-c key=value` overrides, e.g. a custom model provider.
-    extra_config: list[str] = field(default_factory=list)
+    web_search: bool = True  # the model's own web search (runs on OpenAI's side)
+    extra_config: list[str] = field(default_factory=list)  # extra `-c key=value` overrides
 
 
 @dataclass
-class OpencodeConfig:
-    command: str = "opencode"
-    model: str | None = None  # "provider/model", e.g. "anthropic/claude-opus-5-5"; None = opencode's default
-    variant: str | None = None  # provider-specific reasoning effort (e.g. "high")
-    # HOME + XDG dirs for Overseer's runs (auth, sessions, caches). Must be inside local.allowed_roots.
-    # Log in once with: python -m overseer login opencode   (or just pass provider API keys below)
-    home: str = "./state/opencode"
-    pass_env: list[str] = field(default_factory=lambda: [
-        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
-        "GOOGLE_GENERATIVE_AI_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY", "MISTRAL_API_KEY", *PROXY_ENV])
-    # Deep-merged into the generated opencode config (e.g. {"provider": {...}} for custom providers).
-    # Can't re-enable built-in tools or change the overseer MCP server.
-    extra_config: dict = field(default_factory=dict)
-
-
-@dataclass
-class LLMConfig:
+class AgentConfig:
     enabled: bool = True
-    # Which model runner does the agent and the job reports:
-    #   claude   - Anthropic API directly (needs ANTHROPIC_API_KEY)
-    #   codex    - OpenAI Codex CLI (`codex exec`), with its own shell/file tools disabled
-    #   opencode - opencode CLI (`opencode run`), with all built-in tools disabled
-    # With codex/opencode the agent only gets Overseer's tools, via a local MCP server.
-    backend: str = "claude"
-    cli_timeout_minutes: int = 30  # max duration of one codex/opencode run
+    # claude_code or codex. Can be switched at runtime from Telegram with /backend.
+    backend: str = "claude_code"
+    timeout_minutes: int = 60  # max length of one agent run
+    # How the commands the agent runs are reported in Telegram:
+    #   summary - one message after each request; live - batched every few seconds; off
+    report_commands: str = "summary"
+    # Internet hosts the agent's local shell may reach (it reaches the HPC through Overseer's
+    # SSH connection, which needs no internet access). Empty = no internet from the shell.
+    allowed_domains: list[str] = field(default_factory=list)
+    # Extra local paths the agent's commands may never read (the SSH key folder, ~/.ssh,
+    # Overseer's state and well-known daemon sockets are always blocked).
+    deny_read: list[str] = field(default_factory=list)
+    # LLM summary of finished jobs (root cause for failures) using the same backend.
+    job_reports: bool = True
+    llm_status_updates: bool = False  # one-line LLM progress summary in periodic status messages
+    claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
-    opencode: OpencodeConfig = field(default_factory=OpencodeConfig)
-    # ---- claude backend settings
-    model: str = "claude-opus-5-5"
-    report_effort: str | None = "medium"  # effort for job reports/diagnoses
-    agent_effort: str | None = "high"  # effort for the fixing agent
-    adaptive_thinking: bool = True  # set false for models without adaptive thinking (e.g. Haiku 4.5)
-    fallbacks: bool = True  # server-side refusal fallback (Claude API only)
-    max_tokens: int = 16000
-    max_agent_steps: int = 40
-    llm_status_updates: bool = False  # one-line LLM summary in periodic status updates
+
+
+BACKENDS = ("claude_code", "codex")
 
 
 @dataclass
 class Config:
     local: LocalConfig = field(default_factory=LocalConfig)
     ssh: SSHConfig = field(default_factory=SSHConfig)
-    hpc: HPCAccessConfig = field(default_factory=HPCAccessConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
-    limits: LimitsConfig = field(default_factory=LimitsConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
-    llm: LLMConfig = field(default_factory=LLMConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
+
+    # ---- derived SSH paths (all inside the allowed local folders)
+    @property
+    def ssh_dir(self) -> Path:
+        return self.local.resolve(self.ssh.dir)
+
+    @property
+    def ssh_config_file(self) -> Path:
+        return self.ssh_dir / "config"
+
+    @property
+    def ssh_key(self) -> Path:
+        return self.ssh_dir / self.ssh.key_name
+
+    @property
+    def control_socket(self) -> Path:
+        return self.local.tmp("ssh", "master.sock")
+
+    @property
+    def agent_ssh_config(self) -> Path:
+        # Lives outside ssh_dir: the agent may read this one (it holds no secrets).
+        return self.local.tmp("agent-ssh", "config")
 
     def validate(self) -> None:
-        if not self.ssh.host:
-            raise ConfigError("ssh.host is required")
+        if not self.ssh.hostname:
+            raise ConfigError("ssh.hostname is required (the HPC login node, e.g. login.cluster.edu)")
+        if not self.ssh.host or any(c.isspace() for c in self.ssh.host) or self.ssh.host in ("*", "localhost"):
+            raise ConfigError("ssh.host must be a simple alias such as 'hpc'")
         if not self.local.allowed_roots:
             raise ConfigError("local.allowed_roots must list at least one folder")
         for r in self.local.roots:
@@ -244,33 +227,19 @@ class Config:
                 raise ConfigError(f"local.allowed_roots entry {r} is too broad; use specific folders")
         self.local.state("x")  # both dirs must sit inside an allowed root
         self.local.tmp("x")
-        for r in self.hpc.write_roots:
-            check_root_spec(r)
-        for r in self.hpc.read_roots:
-            if not (r.startswith("/") or r.startswith("~")):
-                raise ConfigError(f"read root {r!r} must be absolute or start with ~")
-        if self.llm.backend not in ("claude", "codex", "opencode"):
-            raise ConfigError("llm.backend must be 'claude', 'codex' or 'opencode'")
-        self.local.resolve(self.llm.codex.home)
-        self.local.resolve(self.llm.opencode.home)
-        if self.slurm.track not in ("all", "overseer"):
-            raise ConfigError("slurm.track must be 'all' or 'overseer'")
+        self.ssh_dir  # noqa: B018 - validates it is inside allowed roots
+        if len(str(self.control_socket)) > UNIX_SOCKET_MAX:
+            raise ConfigError(f"local.tmp_dir is too long for a unix socket path ({self.control_socket}); use e.g. /tmp/overseer")
+        if self.agent.backend not in BACKENDS:
+            raise ConfigError(f"agent.backend must be one of {', '.join(BACKENDS)}")
+        if self.agent.report_commands not in ("summary", "live", "off"):
+            raise ConfigError("agent.report_commands must be summary, live or off")
+        self.local.resolve(self.agent.claude_code.home)
+        self.local.resolve(self.agent.codex.home)
+        if self.slurm.track not in ("all", "agent"):
+            raise ConfigError("slurm.track must be 'all' or 'agent'")
         if not self.telegram.allowed_chat_ids:
             raise ConfigError("telegram.allowed_chat_ids must list at least one chat id")
-
-
-def check_root_spec(r: str) -> None:
-    """Validate a write-root as written in config or a grant request (before ~ expansion)."""
-    if not isinstance(r, str) or not (r.startswith("/") or r.startswith("~")):
-        raise ConfigError(f"write root {r!r} must be absolute or start with ~")
-    if "\n" in r or "\x00" in r:
-        raise ConfigError("write root contains control characters")
-    if posixpath.normpath(r) in ("/", "~"):
-        raise ConfigError(f"write root {r!r} is too broad")
-
-
-def _path_within(p: Path, root: Path) -> bool:
-    return p == root or root in p.parents
 
 
 def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
