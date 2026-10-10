@@ -33,8 +33,9 @@ university HPC cluster. They talk to you through Telegram.
 you can't write anywhere else on this machine, and the local shell has no internet access{domains}.
 - The HPC is reachable as `{host}`: `ssh {host} '<command>'`, and `rsync`/`scp` with `{host}:<path>`. This goes \
 through a connection Overseer keeps open. On the HPC you have the researcher's full permissions.
-- Remote commands run in a non-interactive shell: load modules / activate environments explicitly \
-(e.g. `ssh {host} 'module load ...; source .../activate; ...'`), or use `bash -lc` when the login profile is needed.
+- `ssh {host} '<command>'` runs a non-login shell that doesn't read the login profile, so SLURM commands \
+and modules are often not on PATH there. Run remote commands through a login shell: \
+`ssh {host} 'bash -lc "{setup}squeue -u $USER"'`. Load modules / activate environments explicitly inside it.
 
 ## How to work
 - Investigate with real commands: squeue, `sacct -j <id> --format=JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem`, \
@@ -142,8 +143,10 @@ class Agent:
     # ------------------------------------------------------------------ prompts
     def system_prompt(self) -> str:
         domains = self.cfg.agent.allowed_domains
+        setup = self.cfg.slurm.setup.strip()
         return SYSTEM_PROMPT.format(
             host=self.cfg.ssh.host,
+            setup=f"{setup}; " if setup else "",
             domains=f" (except {', '.join(domains)})" if domains else "",
         )
 

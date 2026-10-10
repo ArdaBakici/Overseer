@@ -164,7 +164,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name):
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg)))
+        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
         agent.set_backend(backend)
         s = agent.general_session()
         await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)

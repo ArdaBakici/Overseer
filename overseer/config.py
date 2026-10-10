@@ -126,6 +126,10 @@ class SlurmConfig:
     gpu_stats: bool = False
     # Jobs whose names match any of these globs are ignored (e.g. interactive sessions).
     ignore_name_globs: list[str] = field(default_factory=lambda: ["interactive", "sys/dashboard*", "ood-*"])
+    # SSH commands run in a non-login shell, where SLURM is often not on PATH. Overseer picks up
+    # PATH from a login shell (`bash -lc`) once per connection. If SLURM still isn't found, put
+    # what you'd type to get it here, e.g. "module load slurm" - it runs before PATH is read.
+    setup: str = ""
 
 
 @dataclass

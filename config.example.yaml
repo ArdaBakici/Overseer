@@ -30,6 +30,7 @@ slurm:
   log_tail_lines: 40
   gpu_stats: false              # run `srun --overlap nvidia-smi` in running jobs for GPU utilisation
   ignore_name_globs: ["interactive", "sys/dashboard*", "ood-*"]
+  setup: ""                     # only if SLURM isn't found: what you'd run first, e.g. "module load slurm"
 
 telegram:
   token_env: TELEGRAM_BOT_TOKEN

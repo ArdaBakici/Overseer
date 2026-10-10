@@ -46,7 +46,7 @@ def build(cfg: Config):
     prepare_local_dirs(cfg)
     write_configs(cfg)
     store = Store(cfg.local.db_path)
-    hpc = HPC(SSHRunner(cfg))
+    hpc = HPC(SSHRunner(cfg), cfg.slurm.setup)
     tasks: list[asyncio.Task] = []
 
     async def post_init(app: Application) -> None:
@@ -105,18 +105,24 @@ async def check(cfg: Config) -> int:
            else f"missing or group/world-readable: {cfg.ssh_key} (run: overseer ssh setup)")
     try:
         await ensure_master(cfg)
-        hpc = HPC(SSHRunner(cfg))
+        hpc = HPC(SSHRunner(cfg), cfg.slurm.setup)
         await hpc.connect()
         report("ssh connection", True, f"{cfg.ssh.host} -> {hpc.user}@{cfg.ssh.hostname} (home {hpc.home})")
     except Exception as e:
         report("ssh connection", False, str(e))
         return 1
+    slurm_ok = True
     for name, coro in [("squeue", hpc.squeue()), ("sacct", hpc.sacct_recent(60))]:
         try:
             jobs = await coro
             report(name, True, f"{len(jobs)} job(s)")
         except Exception as e:
+            slurm_ok = False
             report(name, False, str(e))
+    if not slurm_ok:
+        print("  SLURM isn't on PATH even in a login shell on the HPC. Log in and run `type squeue`;\n"
+              "  if you normally need e.g. `module load slurm`, put that in slurm.setup in config.yaml.\n"
+              f"  (login-shell PATH Overseer saw: {hpc.path or 'none - could not run bash -lc'})")
     try:
         cfg.telegram.token
         report("telegram token", True)

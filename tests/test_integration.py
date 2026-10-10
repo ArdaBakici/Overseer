@@ -411,6 +411,32 @@ async def test_agent_failure_is_reported(env):
 
 # ----------------------------------------------------------------------------- monitor
 
+async def test_slurm_found_via_login_shell_and_setup(env, monkeypatch):
+    """Clusters often only put SLURM on PATH in login shells (or after `module load slurm`)."""
+    plain_path = ":".join(p for p in os.environ["PATH"].split(":") if p != str(FAKE_SLURM))
+    monkeypatch.setenv("PATH", plain_path)
+    with pytest.raises(Exception, match="not found"):
+        await _squeue_without_path(env)
+
+    hpc = HPC(LocalRunner(env.cfg), setup=f"export PATH={FAKE_SLURM}:$PATH")
+    await hpc.connect()
+    assert hpc.path.startswith(str(FAKE_SLURM))
+    env.set_jobs(**{"321": {"name": "x", "state": "RUNNING"}})
+    assert [j.job_id for j in await hpc.squeue()] == ["321"]
+
+
+async def _squeue_without_path(env):
+    hpc = HPC(LocalRunner(env.cfg))
+    hpc.user = "me"  # skip discovery: plain non-login PATH
+    await hpc.squeue()
+
+
+def test_agent_prompt_mentions_login_shell(env):
+    assert "bash -lc" in env.agent.system_prompt()
+    env.cfg.slurm.setup = "module load slurm"
+    assert 'bash -lc "module load slurm; squeue' in env.agent.system_prompt()
+
+
 async def test_monitor_lifecycle(env):
     proj = str(env.home / "proj")
     log = env.home / "proj" / "slurm-77.out"
