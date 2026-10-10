@@ -6,12 +6,16 @@ file, so the config can be committed or shared safely.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+log = logging.getLogger(__name__)
 
 UNIX_SOCKET_MAX = 107  # sun_path limit on Linux, minus the terminating NUL
 
@@ -38,6 +42,9 @@ class LocalConfig:
     state_dir: str = "./state"
     # Scratch: SSH control socket and the agents' working directories.
     tmp_dir: str = "/tmp/overseer"
+    # Secrets file (TELEGRAM_BOT_TOKEN=..., API keys) loaded at startup. Variables already set in
+    # the real environment win. The agent can never read this file.
+    env_file: str = ".env"
     # Set by load_config to the config file's folder; relative paths resolve against it.
     base_dir: str = ""
 
@@ -75,6 +82,10 @@ class LocalConfig:
         if not _path_within(p, base):
             raise ConfigError(f"{p} escapes the tmp dir {base}")
         return p
+
+    @property
+    def env_path(self) -> Path:
+        return self._resolve(self.env_file)
 
     @property
     def db_path(self) -> Path:
@@ -261,10 +272,47 @@ def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
     return cls(**kwargs)
 
 
+_ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+
+
+def parse_env_file(text: str) -> dict[str, str]:
+    """Parse KEY=VALUE lines (optional `export`, quotes and # comments), like a minimal dotenv."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _ENV_LINE.match(line)
+        if not m:
+            raise ConfigError(f"bad line in env file: {line.strip()[:60]!r}")
+        key, value = m.groups()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        out[key] = value
+    return out
+
+
+def load_env_file(path: Path) -> list[str]:
+    """Load ``path`` into os.environ (without overriding variables that are already set).
+    Returns the names that were loaded."""
+    if not path.is_file():
+        return []
+    if path.stat().st_mode & 0o077:
+        log.warning("%s is readable by other users; run: chmod 600 %s", path, path)
+    loaded = []
+    for key, value in parse_env_file(path.read_text()).items():
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
 def load_config(path: str | os.PathLike) -> Config:
     with open(path) as fh:
         raw = yaml.safe_load(fh) or {}
     cfg = _build(Config, raw, "")
     cfg.local.base_dir = str(Path(path).resolve().parent)
     cfg.validate()
+    load_env_file(cfg.local.env_path)
     return cfg

@@ -147,6 +147,27 @@ def test_load_config_resolves_relative_to_config_file(tmp_path):
     assert cfg.ssh_key == (tmp_path / "state" / "ssh" / "id_ed25519").resolve()
 
 
+def test_env_file(tmp_path, monkeypatch):
+    from overseer.config import load_config, parse_env_file
+
+    assert parse_env_file('# c\nexport A=1\nB = "two words"\nC=three # note\nD=\'x#y\'\n\n') == \
+        {"A": "1", "B": "two words", "C": "three", "D": "x#y"}
+    with pytest.raises(ConfigError):
+        parse_env_file("not a valid line")
+
+    (tmp_path / "config.yaml").write_text("ssh: {hostname: h.x.edu}\ntelegram: {allowed_chat_ids: [1]}\n")
+    env_file = tmp_path / ".env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=from-dotenv\nOVERSEER_TEST_KEEP=from-dotenv\n")
+    env_file.chmod(0o600)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("OVERSEER_TEST_KEEP", "from-real-env")
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.telegram.token == "from-dotenv"
+    assert os.environ["OVERSEER_TEST_KEEP"] == "from-real-env"  # the real environment wins
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    assert cfg.local.env_path == env_file.resolve()
+
+
 def test_ssh_files(env):
     cfg = env.cfg
     own = overseer_ssh_config(cfg)
@@ -216,8 +237,10 @@ def covered(path, denied):
 def test_deny_list_covers_secrets_without_nesting(env, monkeypatch):
     from overseer.runners import Runner
 
+    env.cfg.local.env_path.write_text("TELEGRAM_BOT_TOKEN=x\n")
     denied = Runner(env.cfg).deny_read()
     assert covered(env.cfg.ssh_dir, denied) and covered(env.cfg.local.state(), denied)
+    assert str(env.cfg.local.env_path) in denied
     assert not any(Path(a) in Path(b).parents for a in denied for b in denied)  # no nested entries
     # With the key folder outside the state dir it is listed on its own.
     env.cfg.ssh.dir = str(env.tmp / "app" / "keys")

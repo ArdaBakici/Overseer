@@ -1,6 +1,6 @@
 # systemd user service. Install:
 #   mkdir -p ~/.config/systemd/user && cp deploy/overseer.service ~/.config/systemd/user/
-#   # put TELEGRAM_BOT_TOKEN=... and ANTHROPIC_API_KEY=... in ~/.config/overseer.env (chmod 600)
+#   # secrets go in ~/Overseer/.env (see .env.example, chmod 600) - Overseer loads it itself
 #   systemctl --user daemon-reload && systemctl --user enable --now overseer
 #   loginctl enable-linger $USER    # keep running when you're logged out
 [Unit]
@@ -11,7 +11,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Overseer
-EnvironmentFile=%h/.config/overseer.env
 # Overseer only writes inside local.allowed_roots (its own folder and /tmp).
 Environment=PYTHONDONTWRITEBYTECODE=1
 # `uv sync` (or pip install -e .) creates .venv; running its python directly avoids uv re-syncing on every start.

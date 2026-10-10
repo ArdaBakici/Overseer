@@ -36,7 +36,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 | write | only its own scratch dir, `/tmp/overseer/agents/<conversation>` |
 | read | the system, except Overseer's state dir (which includes the SSH key), `~/.ssh`, `~/.gnupg`, `~/.docker`, `~/.aws`, gcloud credentials, docker/podman sockets, `/run/user/<uid>` and your ssh-agent socket |
 | network | none, except `agent.allowed_domains`. The HPC is reached through the unix socket of Overseer's SSH connection |
-| environment | scrubbed. Only `PATH`, locale and the API-key variables in `pass_env` are passed; the Telegram token is never passed |
+| environment | scrubbed. Only `PATH`, locale and the API-key variables in `pass_env` are passed; the Telegram token is never passed, and the `.env` file can't be read |
 | escape hatches | Claude Code: `failIfUnavailable` and `allowUnsandboxedCommands: false`, so it never runs a command unsandboxed. Codex: a named permission profile with approvals off |
 
 **Your SSH key never leaves the Overseer folder:**
@@ -77,7 +77,7 @@ uv run overseer login claude_code       # or export ANTHROPIC_API_KEY / CLAUDE_C
 uv run overseer login codex             # device-code login: open the printed URL on your phone/laptop
 
 # 3. Telegram: create a bot with @BotFather, get your chat id (e.g. via @userinfobot)
-export TELEGRAM_BOT_TOKEN=...
+cp .env.example .env && chmod 600 .env  # put TELEGRAM_BOT_TOKEN=... in it
 uv run overseer check                   # ssh, slurm, a real test call to each installed agent
 uv run overseer run
 ```
@@ -118,6 +118,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
 - Anything the agent reads is sent to the model provider of the backend you use.
 - Overseer itself writes only to `./state` and `/tmp/overseer` (`local.allowed_roots`).
+- Secrets live in `.env` next to `config.yaml` (`local.env_file`). It is loaded at startup, and variables already set in the environment take precedence. Overseer warns if the file is readable by other users, and the agent's sandbox blocks reading it.
 
 ## Development
 
@@ -131,7 +132,7 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 
 | module | role |
 |---|---|
-| `config.py` | config schema; keeps local writes inside `local.allowed_roots` |
+| `config.py` | config schema, `.env` loading; keeps local writes inside `local.allowed_roots` |
 | `sshlink.py` | Overseer's own key/config/known_hosts, the master connection, the agent's ssh wrappers |
 | `ssh.py`, `hpc.py` | Overseer's own read-only queries (squeue/sacct/scontrol, log tails) |
 | `monitor.py`, `slurm.py`, `diagnose.py` | polling → queued/started/status/final-report messages |

@@ -5,8 +5,8 @@ connection Overseer keeps open (see sshlink.py). On this machine each CLI runs i
 own OS-level sandbox, configured by Overseer:
 
 * writes: only the session's scratch directory (inside local.tmp_dir)
-* reads: everything except Overseer's SSH key folder, ~/.ssh, Overseer's state dir and
-  well-known daemon sockets (docker, podman, the user's session bus / agents)
+* reads: everything except Overseer's SSH key folder, ~/.ssh, Overseer's state dir, its .env
+  file (Telegram token, API keys) and well-known daemon sockets (docker, podman, session bus)
 * network: none from the shell (except agent.allowed_domains); the HPC is reached through
   the unix socket of Overseer's SSH master connection
 * environment: scrubbed - only PATH/locale and the API-key variables listed in pass_env;
@@ -144,7 +144,7 @@ class Runner:
         home = Path.home()
         uid = os.getuid()
         candidates = [
-            self.cfg.ssh_dir, home / ".ssh", self.cfg.local.state(),
+            self.cfg.ssh_dir, home / ".ssh", self.cfg.local.state(), self.cfg.local.env_path,
             home / ".gnupg", home / ".docker", home / ".aws", home / ".config" / "gcloud",
             Path("/var/run/docker.sock"), Path("/run/docker.sock"), Path("/run/containerd"),
             Path("/run/podman"), Path("/var/run/podman"), Path(f"/run/user/{uid}"),

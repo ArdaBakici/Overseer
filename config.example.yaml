@@ -1,5 +1,5 @@
 # Overseer configuration. Copy to config.yaml and edit.
-# Secrets come from the environment, never from this file:
+# Secrets never go in this file. Put them in .env next to it (see .env.example; chmod 600):
 #   TELEGRAM_BOT_TOKEN                       - from @BotFather
 #   ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN - only if you don't use `overseer login claude_code`
 #   OPENAI_API_KEY / CODEX_API_KEY           - only if you don't use `overseer login codex`
@@ -10,6 +10,7 @@ local:
   allowed_roots: [".", "/tmp"]
   state_dir: ./state        # DB, audit log, SSH key/config, the CLIs' logins and sessions
   tmp_dir: /tmp/overseer    # SSH connection socket + the agent's scratch directories (keep the path short)
+  env_file: .env            # secrets (TELEGRAM_BOT_TOKEN, API keys); the agent can't read it
 
 ssh:
   # Overseer uses its OWN key, ssh config and known_hosts in ./state/ssh - never ~/.ssh.
