@@ -463,7 +463,9 @@ class CodexRunner(Runner):
         return res.text
 
     def login_command(self, extra: list[str]) -> tuple[list[str], dict[str, str]]:
-        return [self.c.command, "login", *extra], self.env(None)
+        # Overseer usually runs on a headless server, where codex's browser login can't work:
+        # default to the device-code flow (open the printed URL on any device, enter the code).
+        return [self.c.command, "login", *(extra or ["--device-auth"])], self.env(None)
 
 
 def make_runner(cfg: Config, backend: str) -> Runner:

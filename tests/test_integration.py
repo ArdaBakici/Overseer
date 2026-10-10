@@ -295,6 +295,18 @@ async def test_codex_runner_profile_and_parsing(env):
     assert '"enabled" = false' in net1 and "--ephemeral" in one
 
 
+def test_login_commands(env):
+    argv, e = CodexRunner(env.cfg).login_command([])
+    assert argv[1:] == ["login", "--device-auth"]  # headless-friendly default
+    assert e["CODEX_HOME"].endswith("state/codex") and "TELEGRAM_BOT_TOKEN" not in e
+    argv, _ = CodexRunner(env.cfg).login_command(["--with-api-key"])
+    assert argv[1:] == ["login", "--with-api-key"]
+    argv, e = ClaudeCodeRunner(env.cfg).login_command([])
+    assert argv[1:] == ["auth", "login"] and e["CLAUDE_CONFIG_DIR"].endswith("state/claude")
+    argv, _ = ClaudeCodeRunner(env.cfg).login_command(["setup-token"])
+    assert argv[1:] == ["setup-token"]
+
+
 async def test_runner_errors_are_reported(env):
     from overseer.runners import AgentRunError
 

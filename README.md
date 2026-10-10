@@ -74,7 +74,7 @@ uv run overseer ssh test
 
 # 2. Log the agents in (stored in ./state/claude and ./state/codex; your normal logins are untouched)
 uv run overseer login claude_code       # or export ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
-uv run overseer login codex             # or export OPENAI_API_KEY
+uv run overseer login codex             # device-code login: open the printed URL on your phone/laptop
 
 # 3. Telegram: create a bot with @BotFather, get your chat id (e.g. via @userinfobot)
 export TELEGRAM_BOT_TOKEN=...
@@ -82,7 +82,11 @@ uv run overseer check                   # ssh, slurm, a real test call to each i
 uv run overseer run
 ```
 
-Everything after `--` is passed to the CLI's login, e.g. `overseer login codex -- --device-auth` on a headless machine. For Claude Code on a server, `overseer login claude_code -- setup-token` prints a long-lived token, which you then export as `CLAUDE_CODE_OAUTH_TOKEN`.
+Both logins work on a headless server.
+
+- **Codex:** `overseer login codex` uses Codex's device-code flow. It prints a URL and a code; open the URL on any device and enter the code. To use an API key instead, run `printenv OPENAI_API_KEY | overseer login codex -- --with-api-key`.
+- **Claude Code:** `overseer login claude_code` prints a URL to open elsewhere and asks you to paste back the code. Alternatively, `overseer login claude_code -- setup-token` prints a long-lived token, which you then export as `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Other flags:** anything after `--` is passed to the CLI's login command in place of these defaults.
 
 **Clusters with 2FA/Duo.** Run `overseer ssh connect` once. It opens the master connection interactively so you can approve the login, and the connection then stays up (`ControlPersist`). If the network drops, run it again; the bot tells you when it can't reach the HPC.
 

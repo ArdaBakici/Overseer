@@ -57,7 +57,7 @@ agent:
     command: codex
     model: null                 # e.g. gpt-5.5-codex; null = codex default
     reasoning_effort: null      # low | medium | high | xhigh
-    home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex
+    home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex (device code)
     # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
     web_search: true            # the model's own web search (runs on OpenAI's side)
     extra_config: []            # extra `-c key=value` overrides
