@@ -144,7 +144,8 @@ class Agent:
         parts = [backend, res.model or r.model or "default model", f"effort {r.effort or 'default'}"]
         tokens = res.input_tokens + res.output_tokens
         if tokens:
-            parts.append(f"{_human(tokens)} tokens")
+            cached = f" ({_human(res.cached_tokens)} cached)" if res.cached_tokens else ""
+            parts.append(f"{_human(tokens)} tokens{cached}")
         if res.cost_usd is not None:
             parts.append(f"${res.cost_usd:.2f}")
         return " · ".join(parts)

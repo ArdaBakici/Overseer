@@ -372,7 +372,7 @@ async def test_model_effort_and_footer(env):
     s = env.agent.general_session()
     await env.agent.handle(s, "hi")
     reply = env.notifier.sent[-1].text
-    assert "<i>claude_code · claude-fake-default · effort default · 1.6k tokens · $0.03</i>" in reply
+    assert "<i>claude_code · claude-fake-default · effort default · 1.6k tokens (400 cached) · $0.03</i>" in reply
     assert "last run used claude-fake-default" in env.agent.describe("claude_code")
 
     env.agent.set_model("opus")
@@ -394,7 +394,7 @@ async def test_model_effort_and_footer(env):
     await env.agent.handle(s, "go")
     argv = env.cli_log()[-1]["argv"]
     assert argv[argv.index("-m") + 1] == "gpt-x" and 'model_reasoning_effort="minimal"' in argv
-    assert "<i>codex · gpt-x · effort minimal · 5.7k tokens</i>" in env.notifier.sent[-1].text  # no cost from codex
+    assert "<i>codex · gpt-x · effort minimal · 5.7k tokens (1.0k cached)</i>" in env.notifier.sent[-1].text  # no cost
 
     env.agent.set_model("default")
     env.agent.set_effort("default")

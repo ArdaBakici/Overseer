@@ -61,7 +61,8 @@ class RunResult:
     session_id: str | None
     is_error: bool = False
     model: str | None = None  # the model that actually ran, when the CLI reports it
-    input_tokens: int = 0
+    input_tokens: int = 0  # all input, including the cached part below
+    cached_tokens: int = 0  # input served from the provider's prompt cache (much cheaper)
     output_tokens: int = 0
     cost_usd: float | None = None  # Claude Code reports it; Codex doesn't
 
@@ -488,7 +489,8 @@ class CodexRunner(Runner):
                     messages.append(item.get("text", ""))
             elif t == "turn.completed":
                 usage = ev.get("usage") or {}
-                result.input_tokens += int(usage.get("input_tokens") or 0)
+                result.input_tokens += int(usage.get("input_tokens") or 0)  # includes the cached part
+                result.cached_tokens += int(usage.get("cached_input_tokens") or 0)
                 result.output_tokens += int(usage.get("output_tokens") or 0)
             elif t in ("turn.failed", "error"):
                 err = ev.get("error") or {}
@@ -526,6 +528,7 @@ def _claude_usage(ev: dict[str, Any], result: RunResult) -> None:
         for name, u in per_model.items():
             result.input_tokens += int(u.get("inputTokens", 0)) + int(u.get("cacheReadInputTokens", 0)) \
                 + int(u.get("cacheCreationInputTokens", 0))
+            result.cached_tokens += int(u.get("cacheReadInputTokens", 0))
             result.output_tokens += int(u.get("outputTokens", 0))
         if not result.model:
             result.model = max(per_model, key=lambda n: per_model[n].get("outputTokens", 0))
@@ -533,6 +536,7 @@ def _claude_usage(ev: dict[str, Any], result: RunResult) -> None:
         u = ev["usage"]
         result.input_tokens += int(u.get("input_tokens", 0)) + int(u.get("cache_read_input_tokens", 0)) \
             + int(u.get("cache_creation_input_tokens", 0))
+        result.cached_tokens += int(u.get("cache_read_input_tokens", 0))
         result.output_tokens += int(u.get("output_tokens", 0))
     cost = ev.get("total_cost_usd")
     if cost is None and per_model:

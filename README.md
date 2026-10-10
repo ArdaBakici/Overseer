@@ -109,7 +109,9 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/stop` | stop the agent's current run (kills the whole process group) |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
-Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens · $0.04`.
+Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens (11.8k cached) · $0.04`.
+
+- **Tokens:** every model call re-sends the CLI's instructions, its tool definitions and the conversation so far, so the total grows with each command the agent runs. Most of that is served from the provider's prompt cache, which costs roughly a tenth of fresh input.
 
 - **Model:** Claude Code reports the model it actually used. Codex doesn't, so its footer shows the configured model (or "default model").
 - **Cost:** only Claude Code reports it.
