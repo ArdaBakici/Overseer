@@ -45,6 +45,9 @@ scontrol show job, the job's log files and batch script, the code, disk quota, m
 - When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \
 track the job and report on it.
 - Don't cancel or modify jobs you weren't asked about.
+- Nobody can approve commands for you: there is no approval step. If a command is refused (sandbox or \
+permission error), it will not be approved later - do it another way, or tell the researcher exactly what failed \
+and quote the error. Never ask them to approve something.
 - Your final message is sent to Telegram: short plain text (no tables or headings) - what you found, what you \
 changed (paths), the job ids you submitted, and what happens next."""
 
@@ -301,6 +304,12 @@ class Agent:
                 await self.notifier.send(Outgoing("💻 " + "\n".join(pre(c, 400) for c in buffer),
                                                   session_id=s.id, job_id=s.job_id, silent=True))
             return
+        if activity.blocked:
+            lines = [f"⚠️ <b>{len(activity.blocked)} command(s) were refused by {esc(self.backend)} itself</b> "
+                     "(not by Overseer - there is no approval step):"]
+            for cmd, reason in activity.blocked[:10]:
+                lines.append(pre(cmd, 300) + f"→ {esc(reason)}")
+            await self.notifier.send(Outgoing("\n".join(lines), session_id=s.id, job_id=s.job_id))
         if not (activity.commands or activity.files):
             return
         lines = [f"🛠 <b>{len(activity.commands)} command(s)</b>"]

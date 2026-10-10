@@ -39,6 +39,8 @@ log = logging.getLogger(__name__)
 MAX_PROMPT = 200_000
 BASE_ENV = ["LANG", "LC_ALL", "TZ"]
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
+# Claude Code's answer when a tool call needed an interactive approval that -p mode can't give.
+PERMISSION_DENIED_RE = re.compile(r"requires approval|permission to use .* (?:was|has been) denied|haven't granted", re.I)
 PARSABLE_RE = re.compile(r"^\s*(\d+)(?:;\S+)?\s*$", re.M)
 
 # Codex features with tools that act outside the shell sandbox or aren't useful headless.
@@ -71,6 +73,7 @@ class Activity:
     commands: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
     jobs: list[tuple[str, str]] = field(default_factory=list)  # (job_id, command)
+    blocked: list[tuple[str, str]] = field(default_factory=list)  # (command, reason) refused by the CLI itself
     on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
 
@@ -93,6 +96,9 @@ class Activity:
     def file(self, path: str) -> None:
         if path and path not in self.files:
             self.files.append(path)
+
+    def block(self, cmd: str, reason: str) -> None:
+        self.blocked.append((display_command(cmd), reason.strip()[:300]))
 
 
 def display_command(cmd: str) -> str:
@@ -303,7 +309,10 @@ class ClaudeCodeRunner(Runner):
             },
             "permissions": {
                 "defaultMode": "acceptEdits",
-                "allow": ["WebSearch", "WebFetch"],
+                # Every Bash command runs inside the sandbox above (no unsandboxed escape), so allow them
+                # all. Without this, Claude Code still asks for approval on some sandboxed commands (e.g.
+                # `ssh hpc 'bash -lc "echo $HOME"'`), and in -p mode nobody can answer, so they're refused.
+                "allow": ["Bash", "WebSearch", "WebFetch"],
                 "deny": [rule for p in deny for rule in (f"Read(/{p}/**)", f"Read(/{p})", f"Edit(/{p}/**)")],
             },
         }
@@ -350,7 +359,11 @@ class ClaudeCodeRunner(Runner):
                         content = block.get("content")
                         if isinstance(content, list):
                             content = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
-                        activity.output(pending.pop(block["tool_use_id"]), str(content or ""))
+                        cmd = pending.pop(block["tool_use_id"])
+                        text = str(content or "")
+                        if block.get("is_error") and PERMISSION_DENIED_RE.search(text):
+                            activity.block(cmd, text)
+                        activity.output(cmd, text)
             elif t == "result":
                 result.is_error = bool(ev.get("is_error"))
                 if ev.get("result"):

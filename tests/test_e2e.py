@@ -157,6 +157,8 @@ async def test_agent_end_to_end(hpc, backend, cli_name):
         "curl -sS -m 5 https://example.com -o /dev/null 2>&1 && echo INTERNET-REACHABLE || echo NO-INTERNET",
         "echo hello > notes.txt && cat notes.txt",
         f"cat {app / '.env'} 2>&1; echo ENVCHECK-DONE",
+        # Variables in nested quotes + pipes: Claude Code used to refuse these as "requires approval".
+        "ssh hpc 'bash -lc \"echo HOME=$HOME; echo U=$USER | tail -1\"'",
     ]
     (app / ".env").write_text("TELEGRAM_BOT_TOKEN=999:super-secret-token\n")
     (app / ".env").chmod(0o600)
@@ -182,6 +184,8 @@ async def test_agent_end_to_end(hpc, backend, cli_name):
         assert "NO-INTERNET" in outs[5], detail
         assert "hello" in outs[6], detail                                      # scratch dir is writable
         assert "super-secret-token" not in outs[7] and "ENVCHECK-DONE" in outs[7], detail  # .env unreadable
+        assert "HOME=/" in outs[8] and "U=" in outs[8] and "requires approval" not in outs[8], detail
+        assert "refused by" not in texts, detail
         assert "Agent submitted job 5001" in texts, detail
         rec = store.get_job("5001")
         assert rec and rec.by_agent == 1 and rec.session_id == s.id

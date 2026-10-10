@@ -443,6 +443,15 @@ async def test_stop_kills_the_run(env):
     assert "Stopped" in env.notifier.sent[-1].text and not env.agent.is_running(s)
 
 
+async def test_cli_refusals_are_reported_plainly(env):
+    settings = ClaudeCodeRunner(env.cfg).settings(env.cfg.local.tmp("agents", "x"))
+    assert "Bash" in settings["permissions"]["allow"]  # sandboxed Bash never waits for an approval
+    await env.agent.handle(env.agent.general_session(), "FORCE_BLOCK please")
+    notice = next(m.text for m in env.notifier.sent if "refused by" in m.text)
+    assert "claude_code itself" in notice and "requires approval" in notice and "sbatch train.sh" in notice
+    assert "approval" in env.agent.system_prompt() and "Never ask them to approve" in env.agent.system_prompt()
+
+
 async def test_agent_failure_is_reported(env):
     await env.agent.handle(env.agent.general_session(), "FORCE_FAIL now")
     assert "boom" in env.notifier.sent[-1].text

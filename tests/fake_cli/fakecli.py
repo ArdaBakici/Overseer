@@ -42,6 +42,11 @@ if prog == "claude":
         {"type": "text", "text": "Checking the job."},
         {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ssh hpc 'cd ~/proj && sbatch train.sh'"}},
         {"type": "tool_use", "id": "t2", "name": "Write", "input": {"file_path": "/tmp/x/notes.md", "content": "x"}}]}})
+    if "FORCE_BLOCK" in stdin:
+        emit({"type": "user", "session_id": sid, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "This command requires approval"}]}})
+        emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False, "result": "Please approve it."})
+        sys.exit(0)
     emit({"type": "user", "session_id": sid, "message": {"content": [
         {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "Submitted batch job 4242\n"}]}]}})
     emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
