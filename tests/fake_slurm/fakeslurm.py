@@ -52,6 +52,9 @@ elif prog == "squeue":
             where = j.get("nodelist", "n1") if j["state"] == "RUNNING" else "(Priority)"
             print("|".join([jid, j["name"], j["state"], j.get("partition", "gpu"), j.get("elapsed", "0:10"),
                             j.get("time_limit", "1:00:00"), "1", where, "gres/gpu:1", "2026-10-07T10:00:00", "N/A"]))
+elif prog == "sacct" and "Submit" in (opt("-o") or ""):  # jobs submitted lately (who submitted what)
+    for jid, j in jobs.items():
+        print("|".join([jid, j.get("submit", "2026-01-01T00:00:00"), j["name"]]))
 elif prog == "sacct":
     sel = opt("-j")
     for jid, j in jobs.items():
@@ -90,8 +93,9 @@ elif prog == "sbatch":
     err = (opt("--error") or out).replace("%j", jid)
     name = opt("-J") or opt("--job-name") or "submitted"
     # hpc-run's worker gets a node right away here (a real queue may take a while)
+    import time
     jobs[jid] = {"name": name, "state": "RUNNING" if name == "overseer-worker" else "PENDING", "workdir": chdir,
-                 "stdout": out, "stderr": err, "script": script}
+                 "stdout": out, "stderr": err, "script": script, "submit": time.strftime("%Y-%m-%dT%H:%M:%S")}
     st.setdefault("submissions", []).append(args)
     save(st)
     print(jid if "--parsable" in args else f"Submitted batch job {jid}")

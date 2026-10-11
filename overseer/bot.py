@@ -881,10 +881,19 @@ class Bot:
             job_id, _ = self.store.message_link(update.effective_chat.id, msg.reply_to_message.message_id)
         if args and args[0].isdigit():
             job_id, args = args[0], args[1:]
+        thread = self._thread(update)
+        conv = self.agent.get(self.store.thread_session(update.effective_chat.id, thread)) if thread else None
+        if job_id and not args and conv:  # in a conversation's thread: the job becomes part of it
+            self.agent._record_job(conv, job_id)
+            auto = self.agent.autopilot and self.agent.autopilot.active(conv.id)
+            await self.reply(update, f"🔗 Job {code(job_id)} is now part of this conversation: its reports come here"
+                                     + (" and autopilot wakes the agent when it ends." if auto else "."))
+            return
         target = args[0].lower() if args else self._scope(update)
         if not job_id or not target:
             await self.reply(update, "Usage: /assign &lt;job id&gt; &lt;project|main&gt; - or reply to a job's message "
-                                     "with /assign &lt;project|main&gt;, or send /assign &lt;job id&gt; in a project's topic.")
+                                     "with /assign &lt;project|main&gt;. In a conversation's thread, /assign &lt;job id&gt; "
+                                     "makes the job part of that conversation (autopilot then waits for it).")
             return
         await self._assign(job_id, target, update)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import stat
 import time
 import uuid
@@ -20,6 +21,7 @@ from pathlib import Path
 from .config import BACKENDS, Config
 from .hpc import HPC
 from .autopilot import parse_status
+from .compute import WORKER_NAME
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
@@ -475,6 +477,8 @@ class Agent:
             progress.start()
         try:
             await ensure_master(self.cfg)
+            since = await self._cluster_clock()
+            started = time.monotonic()
             res = await runner.run(prompt, system=self.system_prompt(s.id), session_id=resume, key=s.id,
                                    activity=activity)
         except asyncio.CancelledError:
@@ -489,6 +493,7 @@ class Agent:
             if progress:
                 await progress.close()
             await self._report_activity(s, activity, buffer)
+        await self._find_submissions(activity, since, started, res.text)
         if res.session_id:
             s.rec.backend, s.rec.cli_session_id = backend, res.session_id
             self.store.upsert_session(s.rec)
@@ -575,6 +580,38 @@ class Agent:
         rich += lines[2:] if activity.commands else lines[1:]
         await self.notifier.send(Outgoing("\n".join(lines), markdown="\n\n".join(rich), session_id=s.id,
                                           job_id=s.job_id, silent=True, files=files))
+
+    async def _cluster_clock(self) -> str:
+        try:
+            await self.hpc.ensure_connected()
+            return await self.hpc.clock()
+        except Exception:
+            log.debug("could not read the cluster's clock", exc_info=True)
+            return ""
+
+    async def _find_submissions(self, activity: Activity, since: str, started: float, reply: str) -> None:
+        """Jobs the agent submitted in ways the output parsing can't see (a script or CLI that calls sbatch):
+        your jobs that SLURM says were submitted during this turn, whose id appears in the agent's command
+        output or reply. Old jobs it merely looked at weren't submitted during the turn, so they don't count."""
+        if not since or not activity.on_job:
+            return
+        try:
+            new = await self.hpc.submitted_since(since, int((time.monotonic() - started) / 60) + 3,
+                                                 skip_names=(WORKER_NAME,))  # hpc-run's worker isn't a job of yours
+        except Exception:
+            log.debug("could not ask SLURM for new jobs", exc_info=True)
+            return
+        known = {j for j, _ in activity.jobs}
+        in_reply = set(re.findall(r"(?<![\w.])\d{3,12}(?![\w.])", reply or ""))
+        for jid in new:
+            if jid in known or (jid not in activity.numbers and jid not in in_reply):
+                continue
+            rec = self.store.get_job(jid)
+            if rec and rec.by_agent:
+                continue
+            command = activity.numbers.get(jid) or "(the job id is in the agent's reply)"
+            activity.jobs.append((jid, command))
+            activity.on_job(jid, command)
 
     def _record_job(self, s: Session, job_id: str) -> None:
         rec = self.store.get_job(job_id) or JobRecord(job_id=job_id, state="PENDING", first_seen=time.time(),

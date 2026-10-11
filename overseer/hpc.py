@@ -5,6 +5,8 @@ The agent does not use this: it has its own shell and reaches the HPC with `ssh 
 
 from __future__ import annotations
 
+import re
+
 import logging
 
 from .slurm import (
@@ -95,6 +97,26 @@ class HPC:
             check=True,
         )
         return parse_sacct_list(res.stdout)
+
+    async def clock(self) -> str:
+        """The cluster's local time (to compare with SLURM's timestamps, which are in that time zone)."""
+        res = await self.run(["date", "+%Y-%m-%dT%H:%M:%S"])
+        return res.stdout.strip() if res.ok else ""
+
+    async def submitted_since(self, since: str, minutes: int, skip_names: tuple[str, ...] = ()) -> list[str]:
+        """Ids of your jobs submitted at or after `since` (cluster time), looking back `minutes`."""
+        res = await self.run(self._slurm(["sacct", "-X", "-n", "-P", "-u", self.user, "-S", f"now-{int(minutes)}minutes",
+                                          "-o", "JobID,Submit,JobName"]))
+        ids: list[str] = []
+        for line in res.stdout.splitlines():
+            parts = line.strip().split("|")
+            if len(parts) >= 3 and parts[2] in skip_names:
+                continue
+            if len(parts) >= 2 and parts[1] >= since and re.fullmatch(r"\d+(_.+)?", parts[0]):
+                jid = parts[0].split("_")[0]
+                if jid not in ids:
+                    ids.append(jid)
+        return ids
 
     async def sacct_job(self, job_id: str) -> Job | None:
         res = await self.run(self._slurm(["sacct", "-X", "-n", "-P", "-j", job_id, "-o", SACCT_LIST_FORMAT]))

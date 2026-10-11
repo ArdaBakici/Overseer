@@ -31,6 +31,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 **On the HPC: everything your account can.** That includes editing files, `sbatch`, `scancel`, `pip install` and so on. Nothing is restricted there, by design. In return you see all of it:
 - **Commands:** after each request, Telegram gets the list of commands the agent ran. Set `report_commands: live` to see them while it works.
 - **Submissions:** any job it submits is announced right away (`🚀 Agent submitted job 1234` plus the command), then tracked by the monitor.
+  - **Script submissions:** a job submitted through a script or CLI (no `sbatch` in the command itself) is found at the end of the request. Overseer asks SLURM which of your jobs were submitted during it, and links those whose id appears in the agent's output or reply.
 
 **Heavy work goes to compute nodes, not the login node.** The agent has `hpc-run`, which runs a command on a compute node and returns its output:
 ```bash
@@ -181,6 +182,7 @@ Each project gets a topic in your chat with the bot, so the main chat stays uncl
   - **Agent jobs:** jobs the agent submits in a project are reported in its topic.
   - **Your own jobs:** jobs you submit by hand go to the project whose folder contains their working directory (the deepest one if folders nest). Others stay in the main chat, with one-tap "📁 project" buttons.
   - **Moving a job:** `/assign <job> <project|main>`, or reply to a job's message with `/assign <project>`. Its later updates and its conversation follow.
+  - **Linking a job to a conversation:** `/assign <job>` with no project, sent in a conversation's thread, makes the job part of that conversation. Its reports come there, and autopilot wakes the agent when it ends.
 - **Other commands:** `/project` lists projects; `/project archive <name>` and `/project restore <name>`; `/project dir <path>`.
 
 Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.

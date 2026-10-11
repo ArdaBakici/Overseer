@@ -1703,3 +1703,53 @@ async def test_login_node_warning_in_summary(env):
     msg = env.notifier.sent[-1]
     assert "⚠️ ran 5m 12s on the login node: <code>ssh hpc 'python make_plots.py'</code>" in msg.text
     assert "⚠️ ran 5m 12s on the login node" in msg.markdown  # the rich version too
+
+
+async def test_submissions_through_scripts_are_found(env):
+    """A job submitted by a script or CLI (no "sbatch" in the agent's command) is still recognised: SLURM
+    says it was submitted during the turn and its id is in the output or reply. Old jobs mentioned aren't."""
+    import time as _time
+    ap = make_autopilot(env)
+    soon = _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime(_time.time() + 60))  # during the turn
+    env.set_jobs(**{"7777": {"name": "native7", "state": "PENDING", "submit": soon},
+                    "7778": {"name": "seed1", "state": "PENDING", "submit": soon},
+                    "1234": {"name": "old", "state": "FAILED", "submit": "2026-01-01T00:00:00"}})
+    s = env.agent.general_session()
+    await ap.start(s, 3, "rerun the benchmark FAKE_SCRIPT", None)
+    await ap.drain()
+    announced = [m.text for m in env.notifier.sent if "Agent submitted job" in m.text]
+    assert any("job 7777</b>" in t and "native7_cli.py submit" in t for t in announced), announced
+    assert any("job 7778</b>" in t and "in the agent's reply" in t for t in announced), announced
+    assert not any("job 1234" in t for t in announced)
+    assert {j.job_id for j in env.store.session_jobs(s.id)} == {"7777", "7778"}
+    reply = next(m.text for m in reversed(env.notifier.sent) if m.text.startswith("🤖"))
+    assert "waiting for job(s) 7777, 7778" in reply and "nothing will wake" not in reply
+
+
+async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
+    """A job the agent submitted unnoticed can be handed to its conversation: /assign <id> in the thread."""
+    from overseer.bot import Bot
+    ap = make_autopilot(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "reply", reply)
+    s = env.agent.new_conversation()
+    env.store.bind_thread(1, 301, s.id)
+    await ap.start(s, 3, "", None)
+    env.store.upsert_job(JobRecord(job_id="18746955", name="native7", state="RUNNING"))  # seen, but not linked
+    await bot.cmd_assign(topic_update("/assign", thread=301), NS(args=["18746955"]))
+    rec = env.store.get_job("18746955")
+    assert rec.by_agent == 1 and rec.session_id == s.id
+    assert "part of this conversation" in replies[-1] and "autopilot wakes the agent" in replies[-1]
+    # When it ends, autopilot wakes the conversation.
+    proj = env.home / "proj"
+    env.set_jobs(**{"18746955": {"name": "native7", "state": "COMPLETED", "workdir": str(proj),
+                                 "stdout": str(proj / "x.out")}})
+    (proj / "x.out").write_text("done\n")
+    await env.monitor.poll()
+    await ap.drain()
+    assert any("Autopilot round 1/3" in m.text for m in env.notifier.sent)

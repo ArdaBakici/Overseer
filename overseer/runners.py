@@ -93,6 +93,8 @@ class Activity:
     login_node: list[tuple[str, float]] = field(default_factory=list)
     login_warn_seconds: float = 0
     _started: dict[str, float] = field(default_factory=dict)
+    # Numbers seen in command output -> the command (to recognise job ids submitted by scripts)
+    numbers: dict[str, str] = field(default_factory=dict)
     on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
     on_progress: Callable[[dict[str, Any]], None] | None = None
@@ -132,6 +134,9 @@ class Activity:
 
     def output(self, cmd: str, output: str, exit_code: int | None = None) -> None:
         self._emit("output", command=display_command(cmd), output=output or "", exit_code=exit_code)
+        for n in re.findall(r"(?<![\w.])\d{3,12}(?![\w.])", (output or "")[-20_000:]):
+            if len(self.numbers) < 5000:
+                self.numbers.setdefault(n, display_command(cmd))
         started = self._started.pop(display_command(cmd), None)
         if started is not None and self.login_warn_seconds:
             took = time.monotonic() - started

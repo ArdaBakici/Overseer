@@ -56,6 +56,10 @@ def autopilot_run():
         final, status = "Reached the goal.", "DONE best lr is 3e-4"
     elif "FAKE_HELP" in stdin:
         final, status = "Not sure how to continue.", "NEED_HELP should I try a bigger model?"
+    elif "FAKE_SCRIPT" in stdin:  # submits through its own script: no "sbatch" in the command
+        steps = [("ssh hpc 'cd ~/rf && python native7_cli.py submit --gpu a100'",
+                  "native7: building manifest\nSubmitted batch job 7777\n(previous attempt was job 1234)\n")]
+        final = "Submitted 7777; also queued 7778 for the seed-1 rerun."
     elif "FAKE_NOJOB" not in stdin:
         steps = [(submit[0], submit[1](i)) for i in range(2 if "FAKE_TWO" in stdin else 1)]
     emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake-default"})
