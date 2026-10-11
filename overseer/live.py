@@ -188,7 +188,8 @@ def render_event(ev: dict[str, Any], st: Style, *, full: bool = False, output_li
     kind = ev.get("kind")
     clock = time.strftime("%H:%M:%S", time.localtime(ev.get("ts") or 0))
     if kind == "turn":
-        meta = " · ".join(x for x in [ev.get("backend"), ev.get("model"), ev.get("effort") and f"effort {ev['effort']}"] if x)
+        meta = " · ".join(x for x in [ev.get("project") and f"📁 {ev['project']}", ev.get("backend"), ev.get("model"),
+                                      ev.get("effort") and f"effort {ev['effort']}"] if x)
         return ["", st(f"── {clock} · new request · {meta} " + "─" * 20, "1;36"), st("👤 ", "1") + ev.get("text", "")]
     if kind == "thought":
         return [st("💭 " + _indent(ev.get("text", ""), 3), "2;3")]

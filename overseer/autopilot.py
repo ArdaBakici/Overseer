@@ -164,7 +164,7 @@ class Autopilot:
         if a.goal:
             lines.append(f"Goal: {esc(a.goal)}")
         if goal:
-            lines.append(f"{esc(self.agent.backend)} is planning the first experiment…")
+            lines.append(f"{esc(self.agent.backend_of(s.project))} is planning the first experiment…")
             self._spawn(self._run(s, self._kickoff_prompt(a), notice=None))
         elif pending:
             lines.append(f"Job(s) {esc(_ids(pending))} already finished: starting a round now.")
@@ -257,7 +257,7 @@ class Autopilot:
             self.store.upsert_job(j)
         states = ", ".join(f"{j.job_id} {j.state}" for j in done)
         notice = (f"🔁 <b>Autopilot round {a.rounds}/{a.max_rounds}</b>: {esc(states)}. "
-                  f"{esc(self.agent.backend)} is analysing…")
+                  f"{esc(self.agent.backend_of(s.project))} is analysing…")
         self._spawn(self._run(s, self._round_prompt(a, done, running), notice, round_jobs=[j.job_id for j in done]))
 
     def turn_ended(self, s: Session) -> None:

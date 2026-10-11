@@ -25,7 +25,8 @@ from overseer.monitor import Monitor
 from overseer.runners import Activity, ClaudeCodeRunner, CodexRunner, display_command
 from overseer.ssh import SSHRunner
 from overseer.sshlink import agent_ssh_config, overseer_ssh_config, write_configs
-from overseer.store import Store
+from overseer.notify import Outgoing
+from overseer.store import JobRecord, Store
 
 FAKE_SLURM = Path(__file__).parent / "fake_slurm"
 FAKE_CLI = Path(__file__).parent / "fake_cli"
@@ -1087,3 +1088,275 @@ async def test_status_follows_the_training_log(env):
     await env.monitor.poll()
     final = next(m for m in env.notifier.sent if "Job 18743802" in m.text and "FAILED" in m.text)
     assert "ValueError: bad replay ratio" in final.text
+
+
+# ----------------------------------------------------------------------------- projects
+
+def make_projects(env):
+    from overseer.projects import Projects
+    return Projects(env.cfg, env.store, env.agent)
+
+
+def topic_update(text, thread=None, reply_to=None):
+    msg = NS(text=text, reply_to_message=NS(message_id=reply_to) if reply_to else None,
+             message_thread_id=thread, is_topic_message=thread is not None)
+    return NS(effective_message=msg, effective_chat=NS(id=1))
+
+
+async def test_project_settings_inherit_from_main_chat(env):
+    env.agent.set_backend("codex")
+    env.agent.set_model("gpt-x")
+    env.agent.set_effort("high")
+    projects = make_projects(env)
+    projects.create("dreamer", "/scratch/me/rf-dreamer", "DreamerV3 benchmarks")
+    # A new project starts as a copy of the main chat...
+    assert env.agent.backend_of("dreamer") == "codex"
+    assert env.agent.runner("codex", "dreamer").model == "gpt-x" and env.agent.runner("codex", "dreamer").effort == "high"
+    # ...and then the two are independent.
+    env.agent.set_model("gpt-y", project="dreamer")
+    env.agent.set_model("gpt-main")
+    assert env.agent.runner("codex", "dreamer").model == "gpt-y" and env.agent.runner("codex").model == "gpt-main"
+    env.agent.set_backend("claude_code")
+    assert env.agent.backend_of("dreamer") == "codex"
+    env.agent.set_model("default", project="dreamer")  # the config / CLI default, not the main chat's
+    assert env.agent.runner("codex", "dreamer").model is None
+    # Runs in different projects never share a runner (their model/effort would leak).
+    assert env.agent.runner("codex", "dreamer") is not env.agent.runner("codex")
+
+    with pytest.raises(Exception, match="already exists"):
+        projects.create("dreamer", "/x")
+    with pytest.raises(Exception, match="can't be a project name"):
+        projects.create("Main Project", "/x")
+    with pytest.raises(Exception, match="absolute path"):
+        projects.create("chem", "scratch/chem")
+
+
+async def test_projects_from_config(env):
+    from overseer.config import ProjectConfig
+    env.agent.set_model("opus")
+    env.cfg.projects = {"chem": ProjectConfig(dir="/scratch/me/chem", context="DFT runs with ORCA", backend="codex")}
+    projects = make_projects(env)
+    assert projects.sync_config() == ["chem"]
+    p = env.store.get_project("chem")
+    assert (p.dir, p.context, p.source) == ("/scratch/me/chem", "DFT runs with ORCA", "config")
+    assert env.agent.backend_of("chem") == "codex"
+    assert env.agent.runner("claude_code", "chem").model == "opus"  # the rest is inherited
+
+    env.agent.set_backend("claude_code", "chem")  # changed from Telegram: kept across restarts...
+    assert projects.sync_config() == [] and env.agent.backend_of("chem") == "claude_code"
+    # A value that changes in the config applies (to the project's current backend) at the next start.
+    env.cfg.projects["chem"].model = "sonnet"
+    env.cfg.projects["chem"].context = "now with xtb too"
+    projects.sync_config()
+    assert env.agent.runner("claude_code", "chem").model == "sonnet"
+    assert env.agent.backend_of("chem") == "claude_code" and env.store.get_project("chem").context == "now with xtb too"
+    assert env.agent.runner("claude_code").model == "opus"  # the main chat is untouched
+
+
+async def test_jobs_are_assigned_to_projects_by_folder(env):
+    projects = make_projects(env)
+    proj = env.home / "proj"
+    projects.create("dreamer", str(proj))
+    projects.create("dreamer-a100", str(proj / "a100"))
+    (proj / "a100").mkdir()
+    env.set_jobs(**{"301": {"name": "a", "state": "RUNNING", "workdir": str(proj / "runs")},
+                    "302": {"name": "b", "state": "RUNNING", "workdir": str(proj / "a100")},
+                    "303": {"name": "c", "state": "RUNNING", "workdir": str(env.home / "elsewhere")}})
+    await env.monitor.poll()
+    assert env.store.get_job("301").project == "dreamer"
+    assert env.store.get_job("302").project == "dreamer-a100"  # the deepest folder wins
+    assert env.store.get_job("303").project is None
+    started = {m.job_id: m for m in env.notifier.sent if "started" in m.text}
+    assert ("📁 dreamer", "assign:303:dreamer") in [b for row in started["303"].buttons for b in row]
+    assert all(not d.startswith("assign:") for row in started["301"].buttons for _, d in row)
+
+
+async def test_project_conversation_context(env):
+    projects = make_projects(env)
+    proj = env.home / "proj"
+    (proj / "OVERSEER.md").write_text("Use the venv in methods/dreamerv3/venv. Crafter seed 1 had a reward bug.\n")
+    projects.create("dreamer", str(proj), "DreamerV3 benchmarks on crafter")
+    env.agent.set_model("opus", project="dreamer")
+    s = env.agent.general_session(project="dreamer")
+    assert s.id.startswith("dreamer-") and s.project == "dreamer"
+    await env.agent.handle(s, "check seed 1")
+    call = env.cli_log()[-1]
+    system = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    assert "## Project: dreamer" in system and "DreamerV3 benchmarks on crafter" in system
+    assert f"{proj}/OVERSEER.md" in system
+    assert "<project_notes" in call["stdin"] and "reward bug" in call["stdin"]  # read on a new CLI session
+    assert call["argv"][call["argv"].index("--model") + 1] == "opus"
+    assert env.store.get_job("4242").project == "dreamer"  # the job it submitted
+    await env.agent.handle(s, "and now?")
+    assert "<project_notes" not in env.cli_log()[-1]["stdin"]  # a resumed session already has them
+    # The main chat's conversation is separate and has no project section.
+    main = env.agent.general_session()
+    assert main.id != s.id and "## Project" not in env.agent.system_prompt(main.id)
+
+
+class FakeTelegram:
+    """Just enough of telegram.Bot for TelegramNotifier."""
+
+    def __init__(self, topics=True):
+        self.topics = topics
+        self.sent = []  # (chat_id, thread, text)
+        self.created = []  # (chat_id, name, thread)
+        self.dead_threads = set()
+        self.can_create = True
+        self._next = 100
+
+    async def get_me(self):
+        return NS(has_topics_enabled=self.topics)
+
+    async def create_forum_topic(self, chat_id, name):
+        from telegram.error import BadRequest
+        if not self.can_create:
+            raise BadRequest("BOT_FORUM_CREATE_FORBIDDEN")
+        self._next += 1
+        self.created.append((chat_id, name, self._next))
+        return NS(message_thread_id=self._next)
+
+    async def send_message(self, chat_id, text, message_thread_id=None, **kw):
+        from telegram.error import BadRequest
+        if message_thread_id in self.dead_threads:
+            raise BadRequest("Message thread not found")
+        self.sent.append((chat_id, message_thread_id, text))
+        return NS(message_id=len(self.sent))
+
+    async def send_document(self, chat_id, document, filename, message_thread_id=None, **kw):
+        self.sent.append((chat_id, message_thread_id, f"<file {filename}>"))
+        return NS(message_id=len(self.sent))
+
+
+async def test_topics_routing(env):
+    from overseer.bot import TelegramNotifier
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    projects = make_projects(env)
+    projects.create("dreamer", "/scratch/me/rf-dreamer")
+    assert await notifier.detect_topics()
+    await notifier.ensure_topic("dreamer")
+    thread = env.store.get_project("dreamer").thread_map["1"]
+    assert tg.created == [(1, "dreamer", thread)] and tg.sent[-1][1] == thread  # with an intro message
+    await notifier.ensure_topic("dreamer")
+    assert len(tg.created) == 1  # only once
+
+    # A job's messages go to its project's topic; others to the main chat.
+    env.store.upsert_job(JobRecord(job_id="501", project="dreamer"))
+    env.store.upsert_job(JobRecord(job_id="502"))
+    await notifier.send(Outgoing("📊 job 501", job_id="501"))
+    await notifier.send(Outgoing("📊 job 502", job_id="502"))
+    assert tg.sent[-2] == (1, thread, "📊 job 501") and tg.sent[-1] == (1, None, "📊 job 502")
+    # A conversation's messages follow the conversation's project.
+    s = env.agent.general_session(project="dreamer")
+    await notifier.send(Outgoing("🤖 hi", session_id=s.id))
+    assert tg.sent[-1][1] == thread
+    handle = await notifier.post_live(Outgoing("⏳ working", session_id=s.id))
+    assert tg.sent[-1][1] == thread and handle[0][2] == ""
+
+    # The topic was deleted: a new one is created and the message lands there.
+    tg.dead_threads.add(thread)
+    await notifier.send(Outgoing("✅ job 501 finished", job_id="501"))
+    new_thread = env.store.get_project("dreamer").thread_map["1"]
+    assert new_thread != thread and tg.sent[-1] == (1, new_thread, "✅ job 501 finished")
+    # ...but not again within the hour (a Telegram outage mustn't spawn a topic per message): the main
+    # chat gets it, labelled.
+    tg.dead_threads.add(new_thread)
+    await notifier.send(Outgoing("✅ again", job_id="501"))
+    assert tg.sent[-1] == (1, None, "📁 <b>dreamer</b> · ✅ again") and len(tg.created) == 2
+    notifier._recreated.clear()
+    tg.can_create = False  # and if no topic can be made at all, the same
+    await notifier.send(Outgoing("✅ and again", job_id="501"))
+    assert tg.sent[-1] == (1, None, "📁 <b>dreamer</b> · ✅ and again")
+
+    # Without topic mode, project messages are labelled in the main chat.
+    plain = TelegramNotifier(NS(bot=FakeTelegram(topics=False)), [1], env.store)
+    assert not await plain.detect_topics()
+    await plain.send(Outgoing("📊 job 501", job_id="501"))
+    assert plain.app.bot.sent[-1] == (1, None, "📁 <b>dreamer</b> · 📊 job 501")
+
+
+async def test_project_commands(env, monkeypatch):
+    from overseer.bot import Bot
+    projects = make_projects(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier, projects=projects)
+    replies, started = [], []
+
+    async def reply(update, text):
+        replies.append(text)
+
+    async def fake_run_agent(chat_id, session, text):
+        started.append((session.id, text))
+
+    monkeypatch.setattr(bot, "reply", reply)
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+
+    async def drain():
+        for t in list(bot._tasks):
+            await t
+
+    await bot.cmd_project(topic_update("/project"), NS(args=[]))
+    assert "No projects yet" in replies[-1]
+    env.agent.set_model("opus")
+    await bot.cmd_project(topic_update("/project new"), NS(args=["new", "dreamer", "/scratch/me/rf-dreamer", "DreamerV3",
+                                                                  "benchmarks"]))
+    assert "Project <code>dreamer</code> created" in replies[-1] and "claude_code: model opus" in replies[-1]
+    assert env.store.get_project("dreamer").context == "DreamerV3 benchmarks"
+    # Created inside an existing topic: that topic becomes the project's.
+    await bot.cmd_project(topic_update("/project new", thread=77), NS(args=["new", "chem", "/scratch/me/chem"]))
+    assert env.store.get_project("chem").thread_map == {"1": 77} and "this topic" in replies[-1]
+    await bot.cmd_project(topic_update("/project new", thread=77), NS(args=["new", "other", "/x/y"]))
+    assert "already belongs to project chem" in replies[-1]
+
+    # Messages in a project's topic go to that project's conversation; in an unknown topic, a hint.
+    await bot.on_text(topic_update("run the DFT sweep", thread=77), None)
+    await drain()
+    assert started[-1][0].startswith("chem-") and started[-1][1] == "run the DFT sweep"
+    await bot.on_text(topic_update("hello?", thread=999), None)
+    await drain()
+    assert "This topic isn't a project" in replies[-1] and len(started) == 1
+    await bot.on_text(topic_update("hi main"), None)
+    await drain()
+    assert started[-1][0].startswith("chat-")
+
+    # Settings commands act on the topic's project only.
+    await bot.cmd_model(topic_update("/model", thread=77), NS(args=["sonnet"]))
+    assert "model sonnet" in replies[-1] and "project <code>chem</code>" in replies[-1]
+    assert env.agent.runner("claude_code").model == "opus"
+    await bot.cmd_backend(topic_update("/backend", thread=77), NS(args=["codex"]))
+    assert env.agent.backend_of("chem") == "codex" and env.agent.backend == "claude_code"
+
+    # /jobs in a topic lists that project's jobs; /assign moves jobs (args, reply, in-topic, button).
+    env.store.upsert_job(JobRecord(job_id="801", name="dft", state="RUNNING", project="chem"))
+    env.store.upsert_job(JobRecord(job_id="802", name="misc", state="RUNNING"))
+    await bot.cmd_jobs(topic_update("/jobs", thread=77), NS(args=[]))
+    assert "801" in replies[-1] and "802" not in replies[-1]
+    await bot.cmd_jobs(topic_update("/jobs"), NS(args=[]))
+    assert "801" in replies[-1] and "📁chem" in replies[-1] and "802" in replies[-1]
+    await bot.cmd_assign(topic_update("/assign"), NS(args=["802", "dreamer"]))
+    assert env.store.get_job("802").project == "dreamer" and "moved to project <code>dreamer</code>" in replies[-1]
+    assert "moved here from the main chat" in env.notifier.sent[-1].text and env.notifier.sent[-1].job_id == "802"
+    env.store.link_message(1, 555, "802", None)
+    await bot.cmd_assign(topic_update("/assign", reply_to=555), NS(args=["main"]))
+    assert env.store.get_job("802").project is None
+    await bot.cmd_assign(topic_update("/assign", thread=77), NS(args=["802"]))
+    assert env.store.get_job("802").project == "chem"
+    await bot._assign("802", "nope", None)
+    assert "No active project" in replies[-1]
+    s = env.agent.session_for_job("801")
+    assert s.project == "chem"  # a job's conversation lives in the job's project
+    env.agent.move_job("801", "dreamer")
+    assert env.agent.get(s.id).project == "dreamer"
+
+    # Context, archive, restore.
+    await bot.cmd_project(topic_update("/project", thread=77), NS(args=["context", "ORCA", "6", "on", "the", "cpu", "nodes"]))
+    assert env.store.get_project("chem").context == "ORCA 6 on the cpu nodes"
+    await bot.cmd_project(topic_update("/project"), NS(args=["list"]))
+    assert "📁 <b>chem</b>" in replies[-1] and "ORCA 6" in replies[-1] and "📁 <b>dreamer</b>" in replies[-1]
+    await bot.cmd_project(topic_update("/project"), NS(args=["archive", "chem"]))
+    assert env.store.get_project("chem").archived and env.store.project_for_dir("/scratch/me/chem/x") is None
+    await bot.on_text(topic_update("still there?", thread=77), None)
+    assert "is archived" in replies[-1]
+    await bot.cmd_project(topic_update("/project"), NS(args=["restore", "chem"]))
+    assert not env.store.get_project("chem").archived and "restored" in replies[-1]

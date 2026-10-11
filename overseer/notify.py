@@ -17,6 +17,7 @@ class Outgoing:
     buttons: list[list[tuple[str, str]]] = field(default_factory=list)  # rows of (label, callback_data)
     files: list[tuple[str, bytes]] = field(default_factory=list)  # (filename, content)
     silent: bool = False
+    project: str | None = None  # the project topic to post in; by default the conversation's or job's
 
 
 class Notifier(Protocol):

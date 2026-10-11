@@ -25,6 +25,8 @@ import sys
 
 from .config import BACKENDS, Config, ConfigError, load_config
 
+log = logging.getLogger("overseer")
+
 
 def prepare_local_dirs(cfg: Config) -> None:
     """Create the local state and tmp dirs (inside local.allowed_roots), private to this user."""
@@ -44,6 +46,7 @@ def build(cfg: Config):
     from .diagnose import Reporter
     from .hpc import HPC
     from .monitor import Monitor
+    from .projects import Projects
     from .ssh import SSHRunner
     from .sshlink import write_configs
     from .store import Store
@@ -55,13 +58,20 @@ def build(cfg: Config):
     tasks: list[asyncio.Task] = []
 
     async def post_init(app: Application) -> None:
+        if await notifier.detect_topics():  # a topic per project in the chat with the bot
+            for proj in projects.active():
+                await notifier.ensure_topic(proj.name)
+        elif projects.active():
+            log.warning("projects are defined but the bot has no topics in private chats: their messages are "
+                        "labelled in the main chat (enable threaded mode for the bot in @BotFather)")
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
             ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
             ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
-            ("auto", "autopilot: keep experimenting on its own"), ("health", "connection status"), ("help", "help"),
+            ("auto", "autopilot: keep experimenting on its own"), ("project", "projects: list, new, context, notes"),
+            ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
 
     async def post_shutdown(app: Application) -> None:
@@ -86,7 +96,10 @@ def build(cfg: Config):
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     agent.monitor = monitor
     monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
-    Bot(cfg, app, store, hpc, monitor, agent, notifier).register()
+    projects = Projects(cfg, store, agent)
+    for name in projects.sync_config():
+        log.info("project %s created from config.yaml", name)
+    Bot(cfg, app, store, hpc, monitor, agent, notifier, projects).register()
     return app
 
 
@@ -222,9 +235,10 @@ def sessions_command(cfg: Config, limit: int = 20) -> int:
     if not rows:
         print("No agent conversations yet.")
         return 0
-    print(f"{'conversation':<20} {'backend':<12} {'job':<10} {'last used':<10} cli session")
+    print(f"{'conversation':<20} {'project':<12} {'backend':<12} {'job':<10} {'last used':<10} cli session")
     for r in rows:
-        print(f"{r.id:<20} {r.backend or '-':<12} {r.job_id or '-':<10} {_ago(r.updated):<10} {r.cli_session_id or '(none yet)'}")
+        print(f"{r.id:<20} {r.project or '-':<12} {r.backend or '-':<12} {r.job_id or '-':<10} {_ago(r.updated):<10} "
+              f"{r.cli_session_id or '(none yet)'}")
     print("\nOpen one with: overseer open <conversation>   (no argument = the most recent)")
     print("Follow one live: overseer watch <conversation>   (no argument = all of them)")
     return 0

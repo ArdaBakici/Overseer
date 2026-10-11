@@ -167,8 +167,19 @@ class Monitor:
     async def _register(self, job: Job) -> JobRecord:
         rec = JobRecord(job_id=job.job_id, state=job.state, first_seen=time.time(), last_status_at=time.time())
         await self._fill(rec, job)
+        # A job you submitted by hand belongs to the project whose folder it runs in (/assign moves it).
+        proj = self.store.project_for_dir(rec.workdir)
+        rec.project = proj.name if proj else None
         self.store.upsert_job(rec)
         return rec
+
+    def _assign_buttons(self, rec: JobRecord) -> list[list[tuple[str, str]]]:
+        """For a job outside every project's folder: one tap moves it to a project."""
+        if rec.project or rec.by_agent:
+            return []
+        names = [p.name for p in self.store.list_projects()][:6]
+        buttons = [(f"📁 {n}", f"assign:{rec.job_id}:{n}") for n in names]
+        return [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
 
     async def _fill(self, rec: JobRecord, job: Job) -> None:
         """Look up a job's name, paths and batch script (scontrol only knows recent jobs)."""
@@ -190,7 +201,7 @@ class Monitor:
         gres = f" · {esc(job.gres)}" if job.gres and job.gres != "N/A" else ""
         await self.notifier.send(Outgoing(
             f"{self._header(rec, '📥', 'queued')}\npartition {esc(job.partition)} · limit {esc(job.time_limit)}{gres}\nreason: {esc(job.reason)}",
-            job_id=rec.job_id, silent=True))
+            job_id=rec.job_id, silent=True, buttons=self._assign_buttons(rec)))
 
     async def _on_started(self, rec: JobRecord, job: Job) -> None:
         rec.state = "RUNNING"
@@ -200,7 +211,8 @@ class Monitor:
         text = (f"{self._header(rec, '🚀', 'started')}\nnode(s) {esc(job.reason)} · partition {esc(job.partition)} · "
                 f"limit {esc(job.time_limit)}{gres}\nlog: {code(rec.stdout)}")
         await self.notifier.send(Outgoing(text, job_id=rec.job_id,
-                                          buttons=[[("📜 Log", f"log:{rec.job_id}"), ("📊 Status", f"status:{rec.job_id}")]]))
+                                          buttons=[[("📜 Log", f"log:{rec.job_id}"), ("📊 Status", f"status:{rec.job_id}")]]
+                                          + self._assign_buttons(rec)))
 
     async def _maybe_status(self, rec: JobRecord, job: Job) -> None:
         interval = self.cfg.slurm.status_interval_minutes * 60
@@ -328,6 +340,7 @@ class Monitor:
         buttons = [[("📜 Full log", f"log:{rec.job_id}")]]
         if not success:
             buttons[0].insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
+        buttons += self._assign_buttons(rec)
         files = []
         if out_tail.strip() and not success:
             files.append((f"job-{rec.job_id}-stdout-tail.log", out_tail.encode()))

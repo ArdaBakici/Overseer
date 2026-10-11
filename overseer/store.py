@@ -39,6 +39,15 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    dir TEXT,
+    context TEXT,
+    threads TEXT DEFAULT '{}',
+    archived INTEGER DEFAULT 0,
+    source TEXT,
+    created REAL
+);
 CREATE TABLE IF NOT EXISTS autopilot (
     session_id TEXT PRIMARY KEY,
     active INTEGER DEFAULT 0,
@@ -55,6 +64,8 @@ ADDED_COLUMNS = [
     ("jobs", "agent_reported", "INTEGER DEFAULT 0"),
     ("jobs", "checkins", "INTEGER DEFAULT 0"),
     ("jobs", "last_checkin", "REAL DEFAULT 0"),
+    ("jobs", "project", "TEXT"),
+    ("sessions", "project", "TEXT"),
 ]
 
 
@@ -79,6 +90,7 @@ class JobRecord:
     agent_reported: int = 0  # autopilot: the agent has been woken with this job's final report
     checkins: int = 0  # autopilot: check-ins on this job while it ran
     last_checkin: float = 0.0
+    project: str | None = None  # None = the main chat
 
     @property
     def info_dict(self) -> dict[str, Any]:
@@ -96,6 +108,33 @@ class SessionRecord:
     cli_session_id: str | None = None  # Claude Code session id / Codex thread id
     created: float = 0.0
     updated: float = 0.0
+    project: str | None = None  # None = the main chat
+
+
+@dataclass
+class ProjectRecord:
+    name: str
+    dir: str = ""  # project root on the HPC
+    context: str = ""  # standing instructions for the agent
+    threads: str = "{}"  # {chat_id: Telegram topic (message_thread_id)}
+    archived: int = 0
+    source: str = ""  # config | telegram
+    created: float = 0.0
+
+    @property
+    def thread_map(self) -> dict[str, int]:
+        try:
+            return {str(k): int(v) for k, v in json.loads(self.threads or "{}").items()}
+        except (ValueError, TypeError):
+            return {}
+
+    def set_thread(self, chat_id: int, thread_id: int | None) -> None:
+        m = self.thread_map
+        if thread_id is None:
+            m.pop(str(chat_id), None)
+        else:
+            m[str(chat_id)] = int(thread_id)
+        self.threads = json.dumps(m)
 
 
 @dataclass
@@ -163,6 +202,43 @@ class Store:
         rows = self.db.execute("SELECT * FROM jobs WHERE session_id=? AND by_agent=1 ORDER BY first_seen",
                                (session_id,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
+
+    def project_jobs(self, project: str | None, limit: int = 15) -> list[JobRecord]:
+        q = "SELECT * FROM jobs WHERE " + ("project=?" if project else "project IS NULL") + " ORDER BY first_seen DESC LIMIT ?"
+        rows = self.db.execute(q, (project, limit) if project else (limit,)).fetchall()
+        return [_row(JobRecord, r) for r in rows]
+
+    # ---------------------------------------------------------------- projects
+    def get_project(self, name: str | None) -> ProjectRecord | None:
+        if not name:
+            return None
+        row = self.db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
+        return _row(ProjectRecord, row) if row else None
+
+    def upsert_project(self, p: ProjectRecord) -> None:
+        self._upsert("projects", "name", p)
+
+    def list_projects(self, include_archived: bool = False) -> list[ProjectRecord]:
+        q = "SELECT * FROM projects" + ("" if include_archived else " WHERE archived=0") + " ORDER BY name"
+        return [_row(ProjectRecord, r) for r in self.db.execute(q).fetchall()]
+
+    def project_for_dir(self, path: str) -> ProjectRecord | None:
+        """The (non-archived) project whose folder contains `path` - the deepest one if they nest."""
+        path = (path or "").rstrip("/")
+        best = None
+        for p in self.list_projects():
+            root = p.dir.rstrip("/")
+            if root and (path == root or path.startswith(root + "/")) and (best is None or len(root) > len(best.dir)):
+                best = p
+        return best
+
+    def project_for_thread(self, chat_id: int, thread_id: int | None) -> ProjectRecord | None:
+        if not thread_id:
+            return None
+        for p in self.list_projects(include_archived=True):
+            if p.thread_map.get(str(chat_id)) == int(thread_id):
+                return p
+        return None
 
     # ---------------------------------------------------------------- autopilot
     def get_autopilot(self, session_id: str) -> AutopilotRecord | None:

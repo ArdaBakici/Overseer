@@ -213,6 +213,21 @@ class AgentConfig:
 
 
 BACKENDS = ("claude_code", "codex")
+PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+RESERVED_PROJECT_NAMES = {"main", "all", "general", "none"}
+
+
+@dataclass
+class ProjectConfig:
+    """A project: its own Telegram topic, conversations, jobs and agent settings."""
+
+    dir: str = ""  # project root on the HPC; hand-submitted jobs running under it belong to the project
+    context: str = ""  # standing instructions for the agent in this project
+    # Unset = inherited from the main chat when the project is first created; then /backend,
+    # /model and /effort in the project's topic change them. Changing them here applies at the next start.
+    backend: str | None = None
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass
@@ -222,6 +237,7 @@ class Config:
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
     # ---- derived SSH paths (all inside the allowed local folders)
     @property
@@ -246,6 +262,13 @@ class Config:
         return self.local.tmp("agent-ssh", "config")
 
     def validate(self) -> None:
+        for name, proj in self.projects.items():
+            if not PROJECT_NAME_RE.match(name) or name in RESERVED_PROJECT_NAMES:
+                raise ConfigError(f"project name {name!r}: use lowercase letters, digits, - and _ (not main/all)")
+            if not proj.dir.startswith(("/", "~")):
+                raise ConfigError(f"projects.{name}.dir must be an absolute path on the HPC")
+            if proj.backend and proj.backend not in BACKENDS:
+                raise ConfigError(f"projects.{name}.backend must be one of {', '.join(BACKENDS)}")
         if not self.ssh.hostname:
             raise ConfigError("ssh.hostname is required (the HPC login node, e.g. login.cluster.edu)")
         if not self.ssh.host or any(c.isspace() for c in self.ssh.host) or self.ssh.host in ("*", "localhost"):
@@ -286,6 +309,10 @@ def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
         default = f.default_factory() if callable(f.default_factory) else f.default  # type: ignore[misc]
         if is_dataclass(default):
             kwargs[name] = _build(type(default), value, f"{path}.{name}".strip("."))
+        elif cls is Config and name == "projects":
+            if not isinstance(value or {}, dict):
+                raise ConfigError("projects must be a mapping of name -> {dir, context, ...}")
+            kwargs[name] = {str(k): _build(ProjectConfig, v, f"projects.{k}") for k, v in (value or {}).items()}
         else:
             kwargs[name] = value
     return cls(**kwargs)

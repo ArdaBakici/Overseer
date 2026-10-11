@@ -73,3 +73,14 @@ agent:
     checkin_minutes: 0          # default check-in interval for running jobs (0 = none; per conversation: /auto ... every 2h)
     min_checkin_minutes: 15     # shortest check-in interval allowed
     max_checkins_per_job: 12
+
+# Projects: each gets its own Telegram topic, conversations, jobs, notes (OVERSEER.md in its folder) and agent
+# settings. You can also create them from Telegram: /project new <name> <dir> [what it's about].
+# Topics in the chat with the bot need its topic mode ("threaded mode"), switched on in @BotFather.
+projects: {}
+#  dreamer:
+#    dir: /scratch/netid/rf-dreamer          # jobs running under this folder are reported in the project's topic
+#    context: "DreamerV3 benchmarks on crafter/minigrid. venv: methods/dreamerv3/venv. a100 or h100."
+#    backend: null                           # unset = copied from the main chat when the project is created
+#    model: null
+#    effort: null

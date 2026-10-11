@@ -54,6 +54,17 @@ and quote the error. Never ask them to approve something.
 changed (paths), the job ids you submitted, and what happens next."""
 
 
+PROJECT_SECTION = """
+
+## Project: {name}
+This conversation belongs to the project in `{dir}` on the HPC. Work there unless asked otherwise.{context}
+Project notes: `{notes}` holds durable notes for this project - how to run things, environments, data \
+locations, conventions, known issues. It is shown to you at the start of each conversation. When you learn \
+something future conversations here should know, add it there (keep it short and current; create it if missing)."""
+
+NOTES_FILE = "OVERSEER.md"
+
+
 def _human(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
@@ -72,6 +83,10 @@ class Session:
     def job_id(self) -> str | None:
         return self.rec.job_id
 
+    @property
+    def project(self) -> str | None:
+        return self.rec.project
+
 
 class Agent:
     def __init__(self, cfg: Config, store: Store, notifier: Notifier, hpc: HPC):
@@ -84,52 +99,83 @@ class Agent:
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
 
-    # ------------------------------------------------------------------ backend
+    # ------------------------------------------------------------------ backend, model, effort
+    # Stored per scope: the main chat ("backend", "model:<backend>", ...) and each project
+    # ("backend@dreamer", ...). A project copies the main chat's settings when it is created;
+    # an empty value there means "the config / CLI default".
+    def _setting(self, key: str, project: str | None = None) -> str | None:
+        if project:
+            v = self.store.get(f"{key}@{project}")
+            if v is not None:
+                return v or None
+        return self.store.get(key)
+
+    def _set_setting(self, key: str, value: str | None, project: str | None = None) -> None:
+        if project:
+            self.store.set(f"{key}@{project}", value or "")
+        elif value:
+            self.store.set(key, value)
+        else:
+            self.store.unset(key)
+
+    def init_project_settings(self, project: str, backend: str | None = None, model: str | None = None,
+                              effort: str | None = None) -> None:
+        """A new project starts with the main chat's backend, models and efforts, then the given ones."""
+        for key in ["backend"] + [f"{k}:{b}" for b in BACKENDS for k in ("model", "effort")]:
+            if self.store.get(f"{key}@{project}") is None:
+                self.store.set(f"{key}@{project}", self.store.get(key) or "")
+        if backend:
+            self.set_backend(backend, project)
+        if model:
+            self.set_model(model, project=project)
+        if effort:
+            self.set_effort(effort, project=project)
+
     @property
     def backend(self) -> str:
-        b = self.store.get("backend") or self.cfg.agent.backend
+        """The main chat's backend."""
+        return self.backend_of(None)
+
+    def backend_of(self, project: str | None) -> str:
+        b = self._setting("backend", project) or self.cfg.agent.backend
         return b if b in BACKENDS else self.cfg.agent.backend
 
-    def set_backend(self, name: str) -> None:
+    def set_backend(self, name: str, project: str | None = None) -> None:
         if name not in BACKENDS:
             raise ValueError(f"backend must be one of {', '.join(BACKENDS)}")
-        self.store.set("backend", name)
+        self._set_setting("backend", name, project)
 
-    def runner(self, backend: str | None = None) -> Runner:
-        b = backend or self.backend
-        if b not in self._runners:
-            self._runners[b] = make_runner(self.cfg, b)
-        r = self._runners[b]
+    def runner(self, backend: str | None = None, project: str | None = None) -> Runner:
+        b = backend or self.backend_of(project)
+        # One runner per backend and project: concurrent runs in different projects can't see
+        # each other's model / effort.
+        key = f"{b}@{project or ''}"
+        if key not in self._runners:
+            self._runners[key] = make_runner(self.cfg, b)
+        r = self._runners[key]
         # Overrides set from Telegram (/model, /effort) win over config.yaml.
-        r.model_override = self.store.get(f"model:{b}")
-        r.effort_override = self.store.get(f"effort:{b}")
+        r.model_override = self._setting(f"model:{b}", project)
+        r.effort_override = self._setting(f"effort:{b}", project)
         return r
 
-    def set_model(self, name: str, backend: str | None = None) -> None:
+    def set_model(self, name: str, backend: str | None = None, project: str | None = None) -> None:
         """Set the model for a backend; "default" goes back to config.yaml."""
-        b = backend or self.backend
+        b = backend or self.backend_of(project)
         name = name.strip()
         if not name or any(c.isspace() for c in name):
             raise ValueError("model name must be a single word, e.g. opus or gpt-5.5-codex")
-        if name == "default":
-            self.store.unset(f"model:{b}")
-        else:
-            self.store.set(f"model:{b}", name)
+        self._set_setting(f"model:{b}", None if name == "default" else name, project)
 
-    def set_effort(self, level: str, backend: str | None = None) -> None:
-        b = backend or self.backend
+    def set_effort(self, level: str, backend: str | None = None, project: str | None = None) -> None:
+        b = backend or self.backend_of(project)
         level = level.strip().lower()
-        if level == "default":
-            self.store.unset(f"effort:{b}")
-            return
-        allowed = self.runner(b).efforts
-        if level not in allowed:
-            raise ValueError(f"{b} effort must be one of: {', '.join(allowed)} (or default)")
-        self.store.set(f"effort:{b}", level)
+        if level != "default" and level not in self.runner(b, project).efforts:
+            raise ValueError(f"{b} effort must be one of: {', '.join(self.runner(b, project).efforts)} (or default)")
+        self._set_setting(f"effort:{b}", None if level == "default" else level, project)
 
-    def describe(self, backend: str) -> str:
+    def describe(self, backend: str, project: str | None = None) -> str:
         """e.g. 'codex: model default (last run: gpt-5.5) · effort default (last run: medium (model default))'."""
-        r = self.runner(backend)
+        r = self.runner(backend, project)
         last_model = self.store.get(f"last_model:{backend}")
         last_effort = self.store.get(f"last_effort:{backend}")
         model = r.model or "CLI default"
@@ -144,8 +190,8 @@ class Agent:
             effort += f" (last run: {last_effort})"
         return f"{backend}: model {model} · effort {effort}"
 
-    def footer(self, backend: str, res) -> str:
-        r = self.runner(backend)
+    def footer(self, backend: str, res, project: str | None = None) -> str:
+        r = self.runner(backend, project)
         parts = [backend, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
         tokens = res.input_tokens + res.output_tokens
         if tokens:
@@ -161,9 +207,9 @@ class Agent:
             self.sessions[rec.id] = Session(rec)
         return self.sessions[rec.id]
 
-    def _new(self, job_id: str | None) -> Session:
-        rec = SessionRecord(id=(f"j{job_id}-" if job_id else "chat-") + uuid.uuid4().hex[:6], job_id=job_id,
-                            created=time.time())
+    def _new(self, job_id: str | None, project: str | None = None) -> Session:
+        prefix = f"j{job_id}-" if job_id else f"{project}-" if project else "chat-"
+        rec = SessionRecord(id=prefix + uuid.uuid4().hex[:6], job_id=job_id, created=time.time(), project=project)
         self.store.upsert_session(rec)
         return self._load(rec)
 
@@ -181,15 +227,32 @@ class Agent:
         if job and job.session_id and (s := self.get(job.session_id)):
             return s
         rec = self.store.session_for_job(job_id)
-        return self._load(rec) if rec else self._new(job_id)
+        return self._load(rec) if rec else self._new(job_id, job.project if job else None)
 
-    def general_session(self, reset: bool = False) -> Session:
-        sid = None if reset else self.store.get("general_session")
+    def general_session(self, reset: bool = False, project: str | None = None) -> Session:
+        """The ongoing conversation of the main chat, or of a project's topic."""
+        key = f"general_session@{project}" if project else "general_session"
+        sid = None if reset else self.store.get(key)
         s = self.get(sid)
         if s is None:
-            s = self._new(None)
-            self.store.set("general_session", s.id)
+            s = self._new(None, project)
+            self.store.set(key, s.id)
         return s
+
+    def move_job(self, job_id: str, project: str | None) -> JobRecord | None:
+        """Reassign a job (and the conversation about it) to another project, or the main chat."""
+        rec = self.store.get_job(job_id)
+        if not rec:
+            return None
+        rec.project = project
+        self.store.upsert_job(rec)
+        for sess in [self.store.session_for_job(job_id)]:
+            if sess and sess.job_id == job_id:
+                sess.project = project
+                self.store.upsert_session(sess)
+                if sess.id in self.sessions:
+                    self.sessions[sess.id].rec.project = project
+        return rec
 
     def is_running(self, s: Session) -> bool:
         return s.task is not None and not s.task.done()
@@ -213,9 +276,32 @@ class Agent:
             setup=f"{setup}; " if setup else "",
             domains=f" (except {', '.join(domains)})" if domains else "",
         )
+        sess = self.get(session_id)
+        proj = self.store.get_project(sess.project) if sess else None
+        if proj:
+            context = f"\n\nAbout this project, from the researcher:\n{proj.context.strip()}" if proj.context.strip() else ""
+            prompt += PROJECT_SECTION.format(name=proj.name, dir=proj.dir, context=context,
+                                             notes=f"{proj.dir.rstrip('/')}/{NOTES_FILE}")
         if self.autopilot and session_id:
             prompt += self.autopilot.system_section(session_id)
         return prompt
+
+    def _remote_path(self, path: str) -> str:
+        """'~/x' -> '/home/me/x' (paths are passed quoted, so the remote shell won't expand ~)."""
+        if path.startswith("~/") and self.hpc.home:
+            return self.hpc.home.rstrip("/") + path[1:]
+        return path
+
+    async def _project_notes(self, project: str) -> str:
+        proj = self.store.get_project(project)
+        if not proj or not proj.dir:
+            return ""
+        path = f"{proj.dir.rstrip('/')}/{NOTES_FILE}"
+        notes = await self.hpc.try_head(self._remote_path(path), 400)
+        if not notes.strip():
+            return (f"<project_notes path='{path}'>(no notes yet - create the file when there is something "
+                    "worth keeping)</project_notes>")
+        return f"<project_notes path='{path}'>\n{notes[:12000].strip()}\n</project_notes>"
 
     async def _job_context(self, job_id: str) -> str:
         rec = self.store.get_job(job_id)
@@ -259,10 +345,12 @@ class Agent:
         return ok
 
     async def _turn(self, s: Session, user_text: str, quiet: bool = False) -> None:
-        backend = self.backend
-        runner = self.runner(backend)
+        backend = self.backend_of(s.project)
+        runner = self.runner(backend, s.project)
         resume = s.rec.cli_session_id if s.rec.backend == backend else None
         parts = []
+        if resume is None and s.project:  # a new CLI session: give it the project's notes
+            parts.append(await self._project_notes(s.project))
         if resume is None and s.job_id:
             parts.append(await self._job_context(s.job_id))
         parts.append(user_text)
@@ -270,7 +358,7 @@ class Agent:
 
         transcript = Transcript(self.cfg, s.id)
         transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
-                          "text": user_text})
+                          "text": user_text, **({"project": s.project} if s.project else {})})
         progress = Progress(self.notifier, backend, s.id, s.job_id) if self.cfg.agent.live_progress else None
         activity, live, buffer = self._activity(s)
 
@@ -309,7 +397,7 @@ class Agent:
             self.store.set(f"last_model:{backend}", res.model)
         if res.effort:
             self.store.set(f"last_effort:{backend}", res.effort)
-        footer = self.footer(backend, res)
+        footer = self.footer(backend, res, s.project)
         text, autopilot_line, status = res.text, "", None
         if self.autopilot and self.autopilot.active(s.id):
             text, status, detail = parse_status(res.text)
@@ -357,7 +445,7 @@ class Agent:
                                                   session_id=s.id, job_id=s.job_id, silent=True))
             return
         if activity.blocked:
-            lines = [f"⚠️ <b>{len(activity.blocked)} command(s) were refused by {esc(self.backend)} itself</b> "
+            lines = [f"⚠️ <b>{len(activity.blocked)} command(s) were refused by {esc(self.backend_of(s.project))} itself</b> "
                      "(not by Overseer - there is no approval step):"]
             for cmd, reason in activity.blocked[:10]:
                 lines.append(pre(cmd, 300) + f"→ {esc(reason)}")
@@ -379,6 +467,7 @@ class Agent:
                                                       last_status_at=time.time())
         rec.by_agent = 1
         rec.session_id = s.id
+        rec.project = s.project
         self.store.upsert_job(rec)
         if self.monitor:
             self.monitor.poke()

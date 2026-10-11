@@ -10,6 +10,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **Visibility:** while it works, one message updates itself with its latest reasoning and the command it is running. Afterwards you see every command it ran, and you get a message the moment it submits a job.
   - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
 - **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
+- **Projects.** Each project (e.g. dreamer, chemistry) gets its own Telegram topic, conversations, jobs, agent settings and notes.
 - **Autopilot.** `/auto 10 every 2h <goal>` lets the agent run experiments on its own. It is woken when its jobs finish, reads the results, keeps a research log and submits the next run, with optional check-ins while jobs run.
 
 ```
@@ -123,6 +124,27 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - `/backend` and `/health` show the configured values plus what the last run actually used, e.g. `model CLI default (last run: gpt-5.5)`.
 - **Cost:** only Claude Code reports it.
 
+**Projects: separate contexts, each in its own topic.**
+
+```
+/project new dreamer /scratch/ab11578/rf-dreamer DreamerV3 benchmarks on crafter and minigrid
+/project new chem /scratch/ab11578/chem DFT with ORCA 6 on the cpu partition
+```
+
+Each project gets a topic in your chat with the bot, so the main chat stays uncluttered. Projects can also be defined in `config.yaml` under `projects:`.
+- **Conversations:** a message in a project's topic goes to that project's agent conversation. `/new`, `/ask`, `/auto` and `/stop` in a topic apply to that project only.
+- **Context:**
+  - **The agent's instructions:** the project's folder and description (`/project context <text>` changes it).
+  - **Project notes:** `OVERSEER.md` in the project folder on the HPC. The agent reads it at the start of every conversation and keeps it up to date with durable facts: environments, how to run things, known issues. `/project notes` shows it.
+- **Agent settings:** a new project copies the main chat's backend, model and effort. After that, `/backend`, `/model` and `/effort` in its topic change only that project.
+- **Jobs:**
+  - **Agent jobs:** jobs the agent submits in a project are reported in its topic.
+  - **Your own jobs:** jobs you submit by hand go to the project whose folder contains their working directory (the deepest one if folders nest). Others stay in the main chat, with one-tap "📁 project" buttons.
+  - **Moving a job:** `/assign <job> <project|main>`, or reply to a job's message with `/assign <project>`. Its later updates and its conversation follow.
+- **Other commands:** `/project` lists projects; `/project archive <name>` and `/project restore <name>`; `/project dir <path>`.
+
+Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
+
 **Autopilot: letting the agent iterate on its own.**
 
 ```
@@ -203,4 +225,5 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `autopilot.py` | `/auto`: waking conversations when their jobs finish, check-ins, round limits, status lines |
+| `projects.py` | projects from config and Telegram, folder matching for jobs |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |
