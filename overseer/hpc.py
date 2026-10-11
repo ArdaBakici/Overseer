@@ -98,6 +98,14 @@ class HPC:
         )
         return parse_sacct_list(res.stdout)
 
+    async def quota(self, command: str) -> str:
+        """The output of the cluster's quota command (e.g. myquota), or "" if it fails."""
+        try:
+            res = await self.run(self._slurm(["sh", "-c", command]), timeout=60, max_output=100_000)
+        except SSHError:
+            return ""
+        return res.stdout if res.ok else ""
+
     async def clock(self) -> str:
         """The cluster's local time (to compare with SLURM's timestamps, which are in that time zone)."""
         res = await self.run(["date", "+%Y-%m-%dT%H:%M:%S"])

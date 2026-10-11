@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in for the cluster's quota command: prints the table in $FAKE_QUOTA (fails without one).
+[ -n "$FAKE_QUOTA" ] && [ -f "$FAKE_QUOTA" ] && exec cat "$FAKE_QUOTA"
+echo "myquota: not available" >&2
+exit 1

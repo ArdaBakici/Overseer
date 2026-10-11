@@ -2124,3 +2124,38 @@ async def test_hpc_run_worker_is_never_a_job(env):
     await env.monitor.poll()
     assert len(env.notifier.sent) == n, env.notifier.texts()
     assert env.store.get_job("18747467").ignored
+
+
+async def test_disk_quota(env, monkeypatch, tmp_path):
+    """The quota command's limits reach the agent; nearly full filesystems warn you once and the agent each time."""
+    from test_parsing import QUOTA
+    table = tmp_path / "quota.txt"
+    table.write_text(QUOTA.replace("301       500 ( 60%)", "425       500 ( 85%)"))
+    monkeypatch.setenv("FAKE_QUOTA", str(table))
+    await env.monitor.poll()
+    warning = next(m.text for m in env.notifier.sent if "💾" in m.text)
+    assert "<b>/scratch is at 85% of its quota</b>: 425,000 of 500,000 files (inodes)" in warning
+    system = env.agent.system_prompt()
+    assert "`/home`: 50GB and 500k files; `/scratch`: 5000GB and 500k files" in system and "(from `myquota`)" in system
+    assert "## Python on the HPC: uv" in system and "UV_CACHE_DIR" in system
+
+    await env.agent.handle(env.agent.general_session(), "train it")
+    stdin = [c for c in env.cli_log() if c["prog"] == "claude"][-1]["stdin"]
+    assert "<storage_warning>" in stdin and "/scratch: 425k of 500k files (85%)" in stdin
+
+    n = len([m for m in env.notifier.sent if "💾" in m.text])
+    await env.monitor.check_quota(force=True)
+    assert len([m for m in env.notifier.sent if "💾" in m.text]) == n  # once, not on every check
+    table.write_text(QUOTA)  # cleaned up: below the threshold again
+    await env.monitor.check_quota(force=True)
+    assert env.agent._storage_warning() == ""
+    table.write_text(QUOTA.replace("301       500 ( 60%)", "450       500 ( 90%)"))
+    await env.monitor.check_quota(force=True)
+    assert len([m for m in env.notifier.sent if "💾" in m.text]) == n + 1  # filled up again: warned again
+
+
+def test_no_quota_command_and_no_uv(env):
+    env.cfg.slurm.quota_command = ""
+    env.cfg.agent.python = ""
+    system = env.agent.system_prompt()
+    assert "not known to Overseer yet (`quota -s` may show them)" in system and "Python on the HPC" not in system

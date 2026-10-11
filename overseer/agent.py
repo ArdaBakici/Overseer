@@ -23,6 +23,7 @@ from .config import BACKENDS, Config
 from .hpc import HPC
 from .compute import WORKER_NAME
 from .ctl import TOKEN_ENV
+from .quota import Quota, limits_line, over
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
@@ -91,6 +92,36 @@ autopilot these are one-off wake-ups: use them when you told the researcher you'
 ask for autopilot: `ov auto request --goal "<goal>" [--wakeups 20] [--hours 48] [--checkins 1h]`, then end your \
 turn. The researcher approves it in Telegram (and may change the limits); you're woken to start. Don't ask for \
 a single job."""
+
+
+STORAGE_SECTION = """
+
+## Storage on the HPC: the number of files runs out first
+Quotas: {limits}. The file (inode) quota is the tight one: a few hundred thousand files fill it long before \
+the space runs out, and when it's full, jobs, installs and even logins fail. Check usage with {check} before \
+and after anything that creates many files; `du --inodes -s <dir>` counts a folder.
+- Prefer few large files over many small ones: datasets as tar/zip/HDF5/Parquet/Zarr/WebDataset shards (don't \
+unpack archives of many small files), metrics in one CSV/JSONL per run, one log file per job, a bounded number \
+of checkpoints (the last few and the best: rotate or overwrite).
+- Code you write or change and job scripts you submit must do the same: no file per step or per sample, no \
+unbounded checkpoint or sample dumps, temporary files cleaned up at the end. Point it out when the researcher's \
+code would create many files.
+- Caches are the usual hidden cause: pip/uv/conda caches, __pycache__, HuggingFace caches, wandb run folders \
+(offline runs: sync, then delete). Prune them, and delete what you created when it's no longer needed. Ask \
+before deleting the researcher's own files."""
+
+PYTHON_SECTION = """
+
+## Python on the HPC: uv
+Use uv for Python, unless the project already uses another tool (then follow it and mention it):
+- Environments: `uv venv --python 3.12` in the project folder, or a pyproject.toml with `uv add <package>` and \
+`uv sync`. Run with `uv run python train.py` (in job scripts and hpc-run too). No `pip install --user`, no \
+system Python, no new conda environments.
+- If uv is missing: `curl -LsSf https://astral.sh/uv/install.sh | sh` (installs into ~/.local/bin).
+- An ML environment is tens of thousands of files. Keep uv's cache on the same filesystem as the environments \
+(e.g. `export UV_CACHE_DIR=<that filesystem>/$USER/.cache/uv` in ~/.bashrc), so uv hard-links packages instead \
+of copying them, which would create new files. Share one environment between a project's runs instead of making \
+one per run, and `uv cache prune` now and then."""
 
 
 PROJECT_SECTION = """
@@ -475,6 +506,9 @@ class Agent:
         )
         if self.ctl:
             prompt += OV_SECTION
+        prompt += self._storage_section()
+        if self.cfg.agent.python.strip().lower() == "uv":
+            prompt += PYTHON_SECTION
         sess = self.get(session_id)
         proj = self.store.get_project(sess.project) if sess else None
         if proj:
@@ -484,6 +518,28 @@ class Agent:
         if self.autopilot and session_id:
             prompt += self.autopilot.system_section(session_id)
         return prompt
+
+    def _quota_rows(self) -> list:
+        try:
+            return [Quota(**r) for r in json.loads(self.store.get("quota") or "{}").get("rows", [])]
+        except (ValueError, TypeError):
+            return []
+
+    def _storage_section(self) -> str:
+        """The quota limits (stable: they're in the system prompt) and how to check the usage."""
+        cmd = self.cfg.slurm.quota_command.strip()
+        rows = self._quota_rows()
+        limits = (f"{limits_line(rows)} (from `{cmd}`)" if rows else
+                  "not known to Overseer yet" + (f" (`{cmd}` shows them)" if cmd else " (`quota -s` may show them)"))
+        return STORAGE_SECTION.format(limits=limits, check=f"`{cmd}`" if cmd else "the cluster's quota command")
+
+    def _storage_warning(self) -> str:
+        """For the start of a request, while a filesystem is nearly full (the usage changes, so not in the system prompt)."""
+        full = over(self._quota_rows(), self.cfg.slurm.quota_warn_percent)
+        if not full:
+            return ""
+        return ("<storage_warning>The HPC disk quota is nearly full: " + "; ".join(full) + ". Don't create more files "
+                "there than needed; clean up what you can (your own files, caches) and tell the researcher.</storage_warning>")
 
     def _remote_path(self, path: str) -> str:
         """'~/x' -> '/home/me/x' (paths are passed quoted, so the remote shell won't expand ~)."""
@@ -557,6 +613,9 @@ class Agent:
             parts.append(await self._project_notes(s.project))
         if resume is None and s.job_id:
             parts.append(await self._job_context(s.job_id))
+        warning = self._storage_warning()
+        if warning:
+            parts.append(warning)
         notes = self.take_notes(s.id)
         if notes:  # things that happened since the agent last ran (e.g. the researcher declined a request)
             parts.append("<overseer_notes>\n" + "\n".join(f"- {n}" for n in notes) + "\n</overseer_notes>")

@@ -13,6 +13,7 @@ from .config import Config
 from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, find_log_paths, tqdm_cleanup
 from .hpc import HPC
 from .notify import Notifier, Outgoing, code, esc, pre
+from .quota import parse_quota
 from .richtext import fold_text
 from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, format_gpu_stats, gpus_from_tres, human_seconds,
                     slurm_seconds, summarize_steps)
@@ -53,6 +54,7 @@ class Monitor:
         self._wake = asyncio.Event()
         self.autopilot = None  # set by Autopilot's owner: told about the agent's jobs finishing / running
         self.worker: Job | None = None  # hpc-run's compute worker, if one is queued or running
+        self._quota_checked = 0.0
 
     def poke(self) -> None:
         """Poll right away (e.g. after a submission)."""
@@ -165,6 +167,10 @@ class Monitor:
                                                     "final state for it. Check its log files.")
                 self.store.upsert_job(rec)
 
+        try:
+            await self.check_quota()
+        except Exception:
+            log.exception("quota check failed")
         if self.autopilot:  # timers, check-ins on watched jobs, autopilots running out of time
             try:
                 await self.autopilot.tick(live_by_id)
@@ -270,6 +276,38 @@ class Monitor:
             parts.append(f"📄 {label}, last lines:" + pre(shown, 1500))
         return Outgoing("\n".join(p for p in parts if p), job_id=rec.job_id, silent=True,
                         buttons=[[("📈 Plot", f"plot:{rec.job_id}"), ("📜 Log", f"log:{rec.job_id}")]])
+
+    async def check_quota(self, force: bool = False) -> None:
+        """Every quota_check_minutes: the disk quota (space and files), kept for the agent; warns you once when a
+        filesystem passes quota_warn_percent (again after it went back below)."""
+        c = self.cfg.slurm
+        if not c.quota_command.strip() or c.quota_check_minutes <= 0:
+            return
+        if not force and time.time() - self._quota_checked < c.quota_check_minutes * 60:
+            return
+        self._quota_checked = time.time()
+        rows = parse_quota(await self.hpc.quota(c.quota_command))
+        if not rows:
+            log.debug("no quota table from %r", c.quota_command)
+            return
+        self.store.set("quota", json.dumps({"checked": time.time(), "rows": [q.to_dict() for q in rows]}))
+        warn = c.quota_warn_percent
+        for q in rows:
+            for kind, pct, what in (("files", q.files_pct, f"{q.files:,} of {q.files_limit:,} files (inodes)"),
+                                    ("space", q.pct, f"{q.used} of {q.limit}")):
+                key = f"quota_warned:{q.fs}:{kind}"
+                if kind == "files" and not q.files_limit:
+                    continue
+                if pct >= warn and not self.store.get(key):
+                    self.store.set(key, "1")
+                    tip = (" Many small files are the usual cause: caches (pip, uv, conda, __pycache__), per-step outputs "
+                           "and checkpoints, wandb runs, unpacked datasets - tar them or delete them."
+                           if kind == "files" else "")
+                    await self.notifier.send(Outgoing(
+                        f"💾 <b>{esc(q.fs)} is at {pct}% of its quota</b>: {esc(what)}.{esc(tip)}\nThe agent is told "
+                        "too, at the start of its next request."))
+                elif pct < warn - 5 and self.store.get(key):
+                    self.store.set(key, "")
 
     async def _on_finished(self, rec: JobRecord, final: Job) -> None:
         rec.state = final.state

@@ -133,3 +133,29 @@ def test_fold_long_answers():
     with_code = md_to_html("\n\n".join(f"Paragraph {i}: " + "word " * 60 for i in range(10)) + "\n\n```\nx\n```")
     assert "<blockquote" not in fold_long(with_code)  # a code block can't go inside the fold
     assert fold_long("short") == "short"
+
+
+QUOTA = """
+Disk quotas for ab11578 (uid 4167280):
+                             DISK SPACE                # FILES (1000's)
+          filesystem       size      quota            number      quota
+                      --------------------------   --------------------------
+               /home       31GB       50GB ( 63%)       260       500 ( 52%)
+            /scratch      678GB     5000GB ( 14%)       301       500 ( 60%)
+            /archive        4KB     5120GB (  0%)         0       125 (  0%)
+"""
+
+
+def test_quota_table():
+    from overseer.quota import limits_line, over, parse_quota
+    rows = parse_quota(QUOTA)
+    assert [(q.fs, q.used, q.limit, q.pct, q.files, q.files_limit, q.files_pct) for q in rows] == [
+        ("/home", "31GB", "50GB", 63, 260_000, 500_000, 52),
+        ("/scratch", "678GB", "5000GB", 14, 301_000, 500_000, 60),
+        ("/archive", "4KB", "5120GB", 0, 0, 125_000, 0),
+    ]
+    assert limits_line(rows) == ("`/home`: 50GB and 500k files; `/scratch`: 5000GB and 500k files; "
+                                 "`/archive`: 5120GB and 125k files")
+    assert over(rows, 80) == []
+    assert over(rows, 60) == ["/home: 31GB of 50GB (63%)", "/scratch: 301k of 500k files (60%)"]
+    assert parse_quota("quota: command not found") == []

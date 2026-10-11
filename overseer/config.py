@@ -155,6 +155,12 @@ class SlurmConfig:
     # what you'd type to get it here, e.g. "module load slurm" - it runs before PATH is read.
     setup: str = ""
     compute: ComputeConfig = field(default_factory=ComputeConfig)
+    # Disk quota: the command that prints it ("" = don't check). Overseer reads it every quota_check_minutes,
+    # gives the agent the limits (space and number of files), and warns you and the agent when a filesystem
+    # passes quota_warn_percent. Understood: tables like `myquota`'s (size, quota (%), files, quota (%)).
+    quota_command: str = "myquota"
+    quota_check_minutes: int = 30
+    quota_warn_percent: int = 80
 
 
 @dataclass
@@ -230,6 +236,8 @@ class AgentConfig:
     # claude_code or codex. Can be switched at runtime from Telegram with /backend.
     backend: str = "claude_code"
     timeout_minutes: int = 60  # max length of one agent run
+    # How the agent runs Python on the HPC: "uv" (uv-managed environments and `uv run`), or "" (no rule).
+    python: str = "uv"
     # How the commands the agent runs are reported in Telegram:
     #   summary - one message after each request; live - batched every few seconds; off
     report_commands: str = "summary"
