@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .compute import WORKER_NAME
 from .config import Config
 from .notify import Outgoing, code, esc
 from .autopilot import WatchError, human_interval, parse_duration
@@ -251,6 +252,10 @@ class ControlServer:
             except CtlError as e:
                 out.append(f"✗ {e}")
                 continue
+            if name == WORKER_NAME:
+                out.append(f"✗ job {jid} is hpc-run's shared compute worker, not one of your jobs: don't register or "
+                           "watch it (hpc-run starts, reuses and ends it)")
+                continue
             rec = self.store.get_job(jid)
             already = bool(rec and rec.by_agent and rec.session_id == session.id and not rec.ignored)
             if rec and rec.ignored:
@@ -411,10 +416,16 @@ class ControlServer:
         ids = list(dict.fromkeys(args.ids))
         for jid in ids:
             rec = self.store.get_job(jid)
+            if rec and rec.name == WORKER_NAME:
+                raise CtlError(f"job {jid} is hpc-run's shared compute worker, not one of your jobs: there's nothing "
+                               "to watch")
             if rec and rec.ended_at:
                 raise CtlError(f"job {jid} has already ended ({rec.state}): look at it now (ov job show {jid})")
             if not rec or rec.ignored:  # not tracked yet: it's one of the agent's jobs
                 name, state, _ = await self._verify(jid)
+                if name == WORKER_NAME:
+                    raise CtlError(f"job {jid} is hpc-run's shared compute worker, not one of your jobs: there's "
+                                   "nothing to watch")
                 if state and state.split()[0] in TERMINAL_STATES:
                     raise CtlError(f"job {jid} has already ended ({state}): look at it now")
                 await self.job_add(session, argparse.Namespace(ids=[jid]))

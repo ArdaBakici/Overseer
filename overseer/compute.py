@@ -147,7 +147,7 @@ JOB=$(squeue -h -u "$USER" -n @@NAME -t RUNNING,PENDING -o %i | head -n1)
 if [ -z "$JOB" ]; then
   JOB=$(sbatch --parsable -J @@NAME -p @@PART -c @@CPUS --mem @@MEM -t @@MINUTES -o "$HOME/.overseer/worker-%j.log" @@EXTRA --wrap @@WRAP) || exit 75
   JOB=${JOB%%;*}
-  echo "[hpc-run] started a compute worker: job $JOB (it ends itself after @@IDLE_MIN min unused)" >&2
+  echo "[hpc-run] started a compute worker: job $JOB (it ends itself after @@IDLE_MIN min unused; it's Overseer's helper, not a job to register or watch)" >&2
 fi
 exec 9>&-
 end=$((SECONDS + @@WAIT))

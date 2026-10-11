@@ -143,6 +143,10 @@ class Monitor:
         for rec in self.store.active_jobs():
             if rec.job_id in live_by_id:
                 continue
+            if rec.name == WORKER_NAME:  # hpc-run's worker, registered by mistake: never reported
+                rec.ended_at, rec.ignored = time.time(), 1
+                self.store.upsert_job(rec)
+                continue
             final = recent_by_id.get(rec.job_id) or await self.hpc.sacct_job(rec.job_id)
             if final and final.is_terminal:
                 if not rec.stdout:

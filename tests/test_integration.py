@@ -2102,3 +2102,25 @@ async def test_compact_on_request(env, backend, monkeypatch):
     assert events[-1]["kind"] == "end" and any(e["kind"] == "compact" and e["trigger"] == "manual" for e in events)
     await env.agent.handle(s, "continue")  # and works afterwards
     assert env.notifier.sent[-1].text.startswith("🤖")
+
+
+async def test_hpc_run_worker_is_never_a_job(env):
+    """The agent mistook hpc-run's worker for one of its jobs: ov refuses it, and the monitor never reports it."""
+    await make_autopilot(env)
+    ctl = env.ctl
+    s = env.agent.general_session()
+    token = ctl.open(s.id)
+    env.set_jobs(**{"18747467": {"name": "overseer-worker", "state": "PENDING"}})
+    ok, text = await ctl.handle(token, ["job", "add", "18747467"])
+    assert "✗ job 18747467 is hpc-run's shared compute worker" in text and env.store.get_job("18747467") is None
+    ok, text = await ctl.handle(token, ["watch", "18747467"])
+    assert not ok and "shared compute worker" in text
+
+    # Registered anyway (an older Overseer, or by hand): when it's cancelled, nothing is reported.
+    env.store.upsert_job(JobRecord(job_id="18747467", name="overseer-worker", state="PENDING", by_agent=1,
+                                   session_id=s.id, first_seen=time.time()))
+    env.set_jobs(**{"18747467": {"name": "overseer-worker", "state": "CANCELLED", "exit": "0:0"}})
+    n = len(env.notifier.sent)
+    await env.monitor.poll()
+    assert len(env.notifier.sent) == n, env.notifier.texts()
+    assert env.store.get_job("18747467").ignored
