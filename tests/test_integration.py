@@ -1360,3 +1360,88 @@ async def test_project_commands(env, monkeypatch):
     assert "is archived" in replies[-1]
     await bot.cmd_project(topic_update("/project"), NS(args=["restore", "chem"]))
     assert not env.store.get_project("chem").archived and "restored" in replies[-1]
+
+
+# ----------------------------------------------------------------------------- rich messages
+
+async def test_rich_reply_and_outbox(env, monkeypatch):
+    secret = env.tmp / "secret.key"
+    secret.write_text("PRIVATE KEY MATERIAL")
+    monkeypatch.setenv("FAKE_SECRET", str(secret))
+    env.cfg.agent.claude_code.pass_env.append("FAKE_SECRET")
+    s = env.agent.general_session()
+    await env.agent.handle(s, "FAKE_MD FAKE_PLOT plot the reward")
+    reply = env.notifier.sent[-1]
+    # Markdown arrives formatted.
+    assert reply.text.startswith("🤖 <b>Fixed</b> the batch size in <code>train.py</code> and resubmitted:")
+    assert "• job <b>4242</b>" in reply.text
+    # The outbox: the picture and the CSV are attached; the symlink and the oversized file are not.
+    assert reply.photos == [("reward.png", b"\x89PNG\r\n\x1a\n fake image")]
+    assert reply.files == [("results.csv", b"seed,score\n0,3.1\n")]
+    assert "innocent.png: not sent (not a regular file)" in reply.text and "huge.bin: not sent (60 MB" in reply.text
+    assert all(b"PRIVATE" not in data for _, data in reply.photos + reply.files) and secret.exists()
+    assert list((env.cfg.local.tmp("agents", s.id) / "outbox").iterdir()) == []  # emptied after sending
+    # The commands come folded, and the agent knows about the outbox.
+    summary = next(m.text for m in env.notifier.sent if "command(s)" in m.text)
+    assert "<blockquote expandable>$ ssh hpc" in summary
+    assert "./outbox/" in env.agent.system_prompt(s.id) and "scp hpc:/path/plot.png ./outbox/" in env.agent.system_prompt(s.id)
+
+
+async def test_plot_button(env, monkeypatch):
+    from overseer.bot import Bot
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    started = []
+
+    async def fake_run_agent(chat_id, session, text):
+        started.append((session.id, text))
+
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+    env.store.upsert_job(JobRecord(job_id="901", name="dreamer", state="RUNNING", stdout="/s/slurm-901.out",
+                                   info=json.dumps({"progress_log": "/s/train_901.log"})))
+    await bot._start_plot(1, "901")
+    for t in list(bot._tasks):
+        await t
+    sid, text = started[-1]
+    assert sid == env.agent.session_for_job("901").id
+    assert "/s/train_901.log" in text and "./outbox/" in text and "PNG" in text
+    assert "is plotting job" in env.notifier.sent[-1].text
+
+
+async def test_telegram_pictures_and_fallbacks(env):
+    from telegram.error import BadRequest
+    from overseer.bot import TelegramNotifier
+
+    class Tg(FakeTelegram):
+        reject_photos = False
+        reject_html = False
+
+        async def send_message(self, chat_id, text, message_thread_id=None, parse_mode=None, **kw):
+            if self.reject_html and parse_mode:
+                raise BadRequest("Can't parse entities")
+            return await super().send_message(chat_id, text, message_thread_id=message_thread_id, **kw)
+
+        async def send_photo(self, chat_id, photo, filename, message_thread_id=None, **kw):
+            if self.reject_photos:
+                raise BadRequest("PHOTO_INVALID_DIMENSIONS")
+            self.sent.append((chat_id, message_thread_id, f"<photo {filename}>"))
+            return NS(message_id=len(self.sent))
+
+        async def send_media_group(self, chat_id, media, message_thread_id=None, **kw):
+            self.sent.append((chat_id, message_thread_id, f"<album {len(media)}>"))
+            return [NS(message_id=len(self.sent) * 100 + i) for i in range(len(media))]
+
+    tg = Tg()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    s = env.agent.general_session()
+    await notifier.send(Outgoing("🤖 one", session_id=s.id, photos=[("a.png", b"1")], files=[("r.csv", b"x")]))
+    assert [t for _, _, t in tg.sent[-3:]] == ["🤖 one", "<photo a.png>", "<file r.csv>"]
+    await notifier.send(Outgoing("🤖 three", session_id=s.id, photos=[(f"{i}.png", b"1") for i in range(3)]))
+    assert tg.sent[-1][2] == "<album 3>"
+    assert env.store.message_link(1, tg.sent[-1][0] and len(tg.sent) * 100)[1] == s.id  # replies to it continue
+    tg.reject_photos = True
+    await notifier.send(Outgoing("🤖 odd", photos=[("wide.png", b"1")]))
+    assert tg.sent[-1][2] == "<file wide.png>"  # sent as a file instead
+    tg.reject_html = True
+    await notifier.send(Outgoing("🤖 <b>bold</b> &amp; <code>x</code>"))
+    assert tg.sent[-1][2] == "🤖 bold & x"  # plain text, no stray tags

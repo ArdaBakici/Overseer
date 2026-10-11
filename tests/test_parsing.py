@@ -92,3 +92,44 @@ def test_split_message_keeps_pre_balanced():
     for c in chunks:
         assert len(c) <= 1000
         assert c.count("<pre>") == c.count("</pre>"), c[:80]
+
+
+def test_markdown_to_telegram_html():
+    from overseer.richtext import md_to_html
+    out = md_to_html("## Result\nSeed 1 scored **0**: the `reward` wrapper. See [log](https://x.org/a?b=1&c=2).\n\n"
+                     "1. fixed `a.py`\n2. job **42**\n   - lr `3e-4`\n\n```python\nr = 1 < 2\n```\n\n"
+                     "| seed | score |\n|---|---|\n| 0 | 3.1 |\n\n> quote with `code` and [a](https://x.org)\n\n"
+                     "Raw <b>html</b> & ~~old~~ [bad](javascript:alert(1))")
+    assert out.startswith("<b>Result</b>\n\nSeed 1 scored <b>0</b>: the <code>reward</code> wrapper.")
+    assert '<a href="https://x.org/a?b=1&amp;c=2">log</a>' in out
+    assert "1. fixed <code>a.py</code>\n2. job <b>42</b>\n   • lr <code>3e-4</code>" in out
+    assert '<pre><code class="language-python">r = 1 &lt; 2</code></pre>' in out
+    assert "<pre>seed │ score\n─────┼──────\n0    │ 3.1</pre>" in out
+    # Telegram can't nest code or links in a quote: they become plain text there.
+    assert "<blockquote>quote with code and a</blockquote>" in out
+    assert "Raw &lt;b&gt;html&lt;/b&gt; &amp; <s>old</s>" in out and '<a href="javascript' not in out
+
+
+def test_split_html_keeps_tags_balanced():
+    import re
+    from overseer.richtext import split_html, strip_html
+    text = ("<b>head</b>\n<blockquote expandable>" + "\n".join(f"$ cmd {i} &amp; more" for i in range(300))
+            + "</blockquote>\n<i>tail " + "y" * 3000 + "</i>")
+    chunks = split_html(text, 1000)
+    assert len(chunks) > 5 and all(len(c) <= 1000 for c in chunks)
+    for c in chunks:
+        opened = re.findall(r"<(b|i|blockquote)[ >]", c)
+        closed = re.findall(r"</(b|i|blockquote)>", c)
+        assert sorted(opened) == sorted(closed), c[:80]
+        assert not re.search(r"&[#\w]*$", c.split("<")[0])  # entities are never cut in half
+    assert "".join(strip_html(c) for c in chunks).replace("\n", "") == strip_html(text).replace("\n", "")
+
+
+def test_fold_long_answers():
+    from overseer.richtext import fold_long, md_to_html
+    long = md_to_html("\n\n".join(f"Paragraph {i}: " + "word " * 60 for i in range(10)))
+    folded = fold_long(long)
+    assert folded.startswith("Paragraph 0") and "<blockquote expandable>Paragraph 1" in folded
+    with_code = md_to_html("\n\n".join(f"Paragraph {i}: " + "word " * 60 for i in range(10)) + "\n\n```\nx\n```")
+    assert "<blockquote" not in fold_long(with_code)  # a code block can't go inside the fold
+    assert fold_long("short") == "short"

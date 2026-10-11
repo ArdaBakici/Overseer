@@ -72,6 +72,20 @@ def autopilot_run():
 if prog == "claude" and any("Autopilot is ON" in a for a in args):
     autopilot_run()
 
+def fake_outbox():
+    """FAKE_PLOT: leave files in the outbox like an agent would (plus things that must not be sent)."""
+    out = os.path.join(os.getcwd(), "outbox")
+    os.makedirs(out, exist_ok=True)
+    open(os.path.join(out, "reward.png"), "wb").write(b"\x89PNG\r\n\x1a\n fake image")
+    open(os.path.join(out, "results.csv"), "w").write("seed,score\n0,3.1\n")
+    os.symlink(os.environ["FAKE_SECRET"], os.path.join(out, "innocent.png"))  # must never be followed
+    with open(os.path.join(out, "huge.bin"), "wb") as fh:  # too big for Telegram (sparse, so instant)
+        fh.truncate(60 * 1024 * 1024)
+
+
+if prog == "claude" and "FAKE_PLOT" in stdin:
+    fake_outbox()
+
 if prog == "claude":
     if "--output-format" in args and args[args.index("--output-format") + 1] == "json":
         emit({"type": "result", "subtype": "success", "result": "OK report", "is_error": False})
@@ -93,7 +107,9 @@ if prog == "claude":
     emit({"type": "user", "session_id": sid, "message": {"content": [
         {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "Submitted batch job 4242\n"}]}]}})
     emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
-          "result": "Fixed the batch size and resubmitted as job 4242.", "total_cost_usd": 0.0312,
+          "result": ("**Fixed** the batch size in `train.py` and resubmitted:\n\n- job **4242**\n- lr `3e-4`"
+                     if "FAKE_MD" in stdin else "Fixed the batch size and resubmitted as job 4242."),
+          "total_cost_usd": 0.0312,
           "modelUsage": {model: {"inputTokens": 1000, "outputTokens": 200, "cacheReadInputTokens": 400,
                                  "cacheCreationInputTokens": 0, "costUSD": 0.0312}}})
     sys.exit(0)

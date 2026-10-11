@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -26,6 +26,7 @@ from telegram.ext import (
 from .agent import Agent, Session
 from .autopilot import parse_duration
 from .projects import ProjectError, Projects
+from .richtext import strip_html
 from .config import BACKENDS, Config
 from .hpc import HPC
 from .monitor import Monitor, progress_log
@@ -182,13 +183,38 @@ class TelegramNotifier:
             except BadRequest as e:
                 if thread and _thread_error(e):
                     raise
-                # Malformed HTML after splitting: fall back to plain text.
-                sent = await self.app.bot.send_message(chat_id, chunk, **kw)
+                # Telegram rejected the formatting: send the same text without it.
+                log.warning("telegram rejected the formatting (%s); sending plain text", e)
+                sent = await self.app.bot.send_message(chat_id, strip_html(chunk), **kw)
             self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+        for i in range(0, len(msg.photos), 10):  # an album holds up to 10 pictures
+            await self._send_photos(chat_id, thread, msg.photos[i:i + 10], msg)
         for name, data in msg.files:
             sent = await self.app.bot.send_document(chat_id, document=data, filename=name, disable_notification=True,
                                                     message_thread_id=thread)
             self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+
+    async def _send_photos(self, chat_id: int, thread: int | None, photos: list[tuple[str, bytes]],
+                           msg: Outgoing) -> None:
+        bot = self.app.bot
+        try:
+            if len(photos) == 1:
+                name, data = photos[0]
+                sent = [await bot.send_photo(chat_id, photo=data, filename=name, caption=name,
+                                             disable_notification=True, message_thread_id=thread)]
+            else:
+                media = [InputMediaPhoto(media=data, filename=name, caption=name) for name, data in photos]
+                sent = list(await bot.send_media_group(chat_id, media=media, disable_notification=True,
+                                                       message_thread_id=thread))
+        except BadRequest as e:
+            if thread and _thread_error(e):
+                raise
+            # Telegram refuses some images as pictures (e.g. extreme dimensions): send them as files.
+            log.warning("pictures rejected (%s); sending them as files", e)
+            sent = [await bot.send_document(chat_id, document=data, filename=name, disable_notification=True,
+                                            message_thread_id=thread) for name, data in photos]
+        for m in sent:
+            self.store.link_message(chat_id, m.message_id, msg.job_id, msg.session_id)
 
     async def post_live(self, msg: Outgoing) -> list[tuple[int, int, str]]:
         handle = []
@@ -262,7 +288,7 @@ class Bot:
             try:
                 await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
             except BadRequest:
-                await update.effective_message.reply_text(chunk)
+                await update.effective_message.reply_text(strip_html(chunk))
 
     def _thread(self, update: Update | None) -> int | None:
         msg = update.effective_message if update else None
@@ -382,6 +408,22 @@ class Bot:
                          "If it needs a decision from me, explain the options instead.")
         await self.notifier.send(Outgoing(f"🔧 {esc(self.agent.backend_of(session.project))} is working on job {code(job_id)}…",
                                           job_id=job_id, session_id=session.id, silent=True))
+        self._spawn(self._run_agent(chat_id, session, text))
+
+    async def _start_plot(self, chat_id: int, job_id: str) -> None:
+        """📈: the agent plots the job's metrics on the HPC and sends the picture."""
+        rec = self.store.get_job(job_id)
+        if not rec:
+            await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
+            return
+        log_path = (rec.info_dict.get("progress_log") or rec.stdout) if rec else ""
+        text = (f"Plot how job {job_id} ({rec.name}, {rec.state}) is doing. Find its metrics - its log {log_path}, or "
+                "metric files (metrics.jsonl, CSV, TensorBoard events) in its output folder - and make one clear PNG "
+                "on the HPC: the main metric(s) against step or time, a few panels if useful, the job id in the "
+                "title. Copy it to ./outbox/ and describe the trend in two or three sentences.")
+        session = self.agent.session_for_job(job_id)
+        await self.notifier.send(Outgoing(f"📈 {esc(self.agent.backend_of(session.project))} is plotting job "
+                                          f"{code(job_id)}…", job_id=job_id, session_id=session.id, silent=True))
         self._spawn(self._run_agent(chat_id, session, text))
 
     async def cmd_ask(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -706,6 +748,8 @@ class Bot:
                 await self._send_log(arg, 200)
             elif action == "status":
                 await self._send_status(arg)
+            elif action == "plot":
+                await self._start_plot(chat.id, arg)
             elif action == "assign":
                 job_id, _, name = arg.partition(":")
                 await self._assign(job_id, name or None, update)

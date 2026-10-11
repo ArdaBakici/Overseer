@@ -9,6 +9,7 @@ description = "Telegram bot that watches your SLURM jobs and lets Claude Code or
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "markdown-it-py>=3",
     "python-telegram-bot>=21.0",
     "PyYAML>=6.0",
 ]

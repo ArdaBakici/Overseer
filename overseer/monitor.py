@@ -12,6 +12,7 @@ from .config import Config
 from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, find_log_paths, tqdm_cleanup
 from .hpc import HPC
 from .notify import Notifier, Outgoing, code, esc, pre
+from .richtext import fold_text
 from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, format_gpu_stats, gpus_from_tres, human_seconds,
                     slurm_seconds, summarize_steps)
 from .ssh import SSHError
@@ -211,8 +212,8 @@ class Monitor:
         text = (f"{self._header(rec, '🚀', 'started')}\nnode(s) {esc(job.reason)} · partition {esc(job.partition)} · "
                 f"limit {esc(job.time_limit)}{gres}\nlog: {code(rec.stdout)}")
         await self.notifier.send(Outgoing(text, job_id=rec.job_id,
-                                          buttons=[[("📜 Log", f"log:{rec.job_id}"), ("📊 Status", f"status:{rec.job_id}")]]
-                                          + self._assign_buttons(rec)))
+                                          buttons=[[("📜 Log", f"log:{rec.job_id}"), ("📊 Status", f"status:{rec.job_id}"),
+                                                    ("📈 Plot", f"plot:{rec.job_id}")]] + self._assign_buttons(rec)))
 
     async def _maybe_status(self, rec: JobRecord, job: Job) -> None:
         interval = self.cfg.slurm.status_interval_minutes * 60
@@ -254,7 +255,8 @@ class Monitor:
         label = code(log_path.rsplit("/", 1)[-1]) if log_path else "stdout"
         if shown.strip():
             parts.append(f"📄 {label}, last lines:" + pre(shown, 1500))
-        return Outgoing("\n".join(p for p in parts if p), job_id=rec.job_id, silent=True)
+        return Outgoing("\n".join(p for p in parts if p), job_id=rec.job_id, silent=True,
+                        buttons=[[("📈 Plot", f"plot:{rec.job_id}"), ("📜 Log", f"log:{rec.job_id}")]])
 
     async def _on_finished(self, rec: JobRecord, final: Job) -> None:
         rec.state = final.state
@@ -333,11 +335,12 @@ class Monitor:
             parts.append(f"\n🧠 {esc(analysis)}")
         elif findings:
             parts.append("\n".join(f"⚠️ <b>{esc(f.category)}</b>: {esc(f.hint)}" for f in findings))
+        # Logs fold away: the first lines show, the rest on tap (the full tail is attached on failure).
         if tb:
-            parts.append(pre(tb, 1500))
-        else:
-            parts.append(pre(combined.strip(), 1200))
-        buttons = [[("📜 Full log", f"log:{rec.job_id}")]]
+            parts.append("Traceback:" + fold_text(tb, 2500))
+        elif combined.strip():
+            parts.append("End of the log:" + fold_text(combined.strip(), 2500))
+        buttons = [[("📜 Full log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]]
         if not success:
             buttons[0].insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
         buttons += self._assign_buttons(rec)

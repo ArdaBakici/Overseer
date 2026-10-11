@@ -11,6 +11,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
 - **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
 - **Projects.** Each project (e.g. dreamer, chemistry) gets its own Telegram topic, conversations, jobs, agent settings and notes.
+- **Rich messages.** Agent replies are formatted (bold, lists, code, tables), logs and command lists fold away, and the agent can send plots it makes on the HPC.
 - **Autopilot.** `/auto 10 every 2h <goal>` lets the agent run experiments on its own. It is woken when its jobs finish, reads the results, keeps a research log and submits the next run, with optional check-ins while jobs run.
 
 ```
@@ -105,6 +106,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | *reply to any job message* | talk to the agent about that job ("lower the lr to 1e-4 and resubmit", "why is it slow?") |
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
 | `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
+| **📈 Plot** button | the agent finds the job's metrics, plots them on the HPC and sends the picture with a short description of the trend |
 | **📊 Status** / **📜 Log** buttons | Status: time used and left, latest metrics, GPU use, problems on stderr and the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and autopilot check-ins too |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
@@ -123,6 +125,14 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - **Codex** doesn't report it in its output, so Overseer reads it from Codex's session log in `./state/codex/sessions`. If no effort was set, the model's default effort comes from Codex's built-in model catalog (`codex debug models`) and is shown as e.g. `effort medium (model default)`.
   - `/backend` and `/health` show the configured values plus what the last run actually used, e.g. `model CLI default (last run: gpt-5.5)`.
 - **Cost:** only Claude Code reports it.
+
+**Rich messages.**
+- **Formatted replies:** the agent writes Markdown, and Telegram shows it formatted: bold, lists, `code`, code blocks with syntax highlighting and small tables (as aligned text). Long answers keep their first paragraph visible and fold the rest.
+- **Folding:** the list of commands the agent ran, and the log tail or traceback in job reports, show their first lines and expand on tap.
+- **Files and plots:** anything the agent puts in `./outbox/` in its working folder is sent with its reply. Pictures arrive as photos (an album if several, up to 10 per reply, 10 MB each); other files as documents (up to 50 MB).
+  - **Where plots are made:** on the HPC, where the data is (e.g. "plot reward vs step for seeds 0-2"). The agent writes a small plotting script, runs it there and copies the PNG back with `scp`, so Overseer needs no plotting libraries.
+  - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
+- **Fallback:** if Telegram ever rejects the formatting, the message is resent as plain text.
 
 **Projects: separate contexts, each in its own topic.**
 
@@ -226,4 +236,5 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `autopilot.py` | `/auto`: waking conversations when their jobs finish, check-ins, round limits, status lines |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
+| `richtext.py` | Markdown → Telegram HTML, tag-safe message splitting, collapsible sections |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

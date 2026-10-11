@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import stat
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .config import BACKENDS, Config
 from .hpc import HPC
 from .autopilot import parse_status
 from .live import Progress, Transcript
+from .richtext import fold, fold_long, md_to_html
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
 from .sshlink import ensure_master
@@ -50,8 +54,17 @@ track the job and report on it.
 - Nobody can approve commands for you: there is no approval step. If a command is refused (sandbox or \
 permission error), it will not be approved later - do it another way, or tell the researcher exactly what failed \
 and quote the error. Never ask them to approve something.
-- Your final message is sent to Telegram: short plain text (no tables or headings) - what you found, what you \
-changed (paths), the job ids you submitted, and what happens next."""
+- Your final message is sent to Telegram, rendered from Markdown. Keep it short: what you found, what you changed \
+(paths), the job ids you submitted, and what happens next. **Bold**, lists, `code`, small code blocks and small \
+tables are fine; avoid headings and wide tables (it's read on a phone).
+
+## Sending plots and files
+Anything you put in `./outbox/` (in your local working directory) is sent to the researcher with your reply: \
+images (.png, .jpg) as pictures, other files as documents - up to 10 per reply, images up to 10 MB, files up to \
+50 MB. Plots are made on the HPC, where the data is: write a small plotting script there (matplotlib in the \
+project's environment; light plotting on the login node is fine, heavy processing goes in a job), save a PNG \
+(e.g. dpi=150, readable on a phone), copy it back with `scp {host}:/path/plot.png ./outbox/`, and say in your \
+reply what it shows."""
 
 
 PROJECT_SECTION = """
@@ -63,6 +76,57 @@ locations, conventions, known issues. It is shown to you at the start of each co
 something future conversations here should know, add it there (keep it short and current; create it if missing)."""
 
 NOTES_FILE = "OVERSEER.md"
+
+
+IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MAX_PHOTO = 10 * 1024 * 1024  # Telegram's limits for pictures and documents sent by bots
+MAX_FILE = 50 * 1024 * 1024
+MAX_ATTACHMENTS = 10
+
+
+def collect_outbox(folder: Path) -> tuple[list[tuple[str, bytes]], list[tuple[str, bytes]], list[str]]:
+    """Take the files the agent left in its outbox: (pictures, documents, notes about skipped files).
+    Overseer isn't sandboxed, so only regular files are read - never symlinks or hard links, which
+    could point at something the agent itself can't read."""
+    photos: list[tuple[str, bytes]] = []
+    docs: list[tuple[str, bytes]] = []
+    notes: list[str] = []
+    try:
+        entries = sorted((e for e in os.scandir(folder) if not e.name.startswith(".")),
+                         key=lambda e: e.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return photos, docs, notes
+    for e in entries:
+        if len(photos) + len(docs) >= MAX_ATTACHMENTS:
+            notes.append(f"more than {MAX_ATTACHMENTS} files: the rest are sent with the next reply")
+            break
+        path = Path(e.path)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            notes.append(f"{e.name}: not sent (not a regular file)")
+            path.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                notes.append(f"{e.name}: not sent (not a regular file)")
+            elif st.st_size > MAX_FILE:
+                notes.append(f"{e.name}: not sent ({st.st_size / 2**20:.0f} MB, the limit is 50 MB)")
+            elif path.suffix.lower() in IMAGE_TYPES and st.st_size <= MAX_PHOTO:
+                photos.append((e.name, fh.read()))
+            else:
+                docs.append((e.name, fh.read()))
+        path.unlink(missing_ok=True)
+    return photos, docs, notes
+
+
+def _command_fold(commands: list[str]) -> str:
+    """Commands in a collapsible section: the first few lines show, the rest on tap."""
+    def clip(c: str) -> str:
+        c = c.strip()
+        return c if len(c) <= 300 else c[:299] + "…"
+    return fold(esc("\n".join(f"$ {clip(c)}" for c in commands)))
 
 
 def _human(n: int) -> str:
@@ -356,6 +420,8 @@ class Agent:
         parts.append(user_text)
         prompt = "\n\n".join(parts)
 
+        outbox = runner.workdir(s.id) / "outbox"  # files the agent leaves here are sent with its reply
+        outbox.mkdir(exist_ok=True)
         transcript = Transcript(self.cfg, s.id)
         transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
                           "text": user_text, **({"project": s.project} if s.project else {})})
@@ -402,12 +468,17 @@ class Agent:
         if self.autopilot and self.autopilot.active(s.id):
             text, status, detail = parse_status(res.text)
             autopilot_line = self.autopilot.after_turn(s, status, detail, activity.cancelled)
+        photos, docs, notes = collect_outbox(outbox)
+        if photos or docs:
+            transcript.write({"kind": "tool", "name": "attachments", "detail": ", ".join(n for n, _ in photos + docs)})
         transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer,
                           **({"autopilot": status} if status else {})})
+        skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
         await self.notifier.send(Outgoing(
-            f"🤖 {esc(text or '(no answer)')}" + (f"\n\n{autopilot_line}" if autopilot_line else "")
-            + f"\n\n<i>{esc(footer)}</i>",
-            session_id=s.id, job_id=s.job_id, silent=quiet and status not in ("DONE", "NEED_HELP")))
+            f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + (f"\n\n{autopilot_line}" if autopilot_line else "")
+            + (f"\n\n{skipped}" if skipped else "") + f"\n\n<i>{esc(footer)}</i>",
+            session_id=s.id, job_id=s.job_id, silent=quiet and status not in ("DONE", "NEED_HELP"),
+            photos=photos, files=docs))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
         activity = Activity()
@@ -430,7 +501,7 @@ class Agent:
                         batch = buffer[:]
                         buffer.clear()
                         await self.notifier.send(Outgoing(
-                            "💻 " + "\n".join(pre(c, 400) for c in batch), session_id=s.id, job_id=s.job_id, silent=True))
+                            "💻 " + _command_fold(batch), session_id=s.id, job_id=s.job_id, silent=True))
 
             live = asyncio.get_running_loop().create_task(flush_loop())
         return activity, live, buffer
@@ -441,7 +512,7 @@ class Agent:
             return
         if mode == "live":
             if buffer:
-                await self.notifier.send(Outgoing("💻 " + "\n".join(pre(c, 400) for c in buffer),
+                await self.notifier.send(Outgoing("💻 " + _command_fold(buffer),
                                                   session_id=s.id, job_id=s.job_id, silent=True))
             return
         if activity.blocked:
@@ -452,11 +523,10 @@ class Agent:
             await self.notifier.send(Outgoing("\n".join(lines), session_id=s.id, job_id=s.job_id))
         if not (activity.commands or activity.files):
             return
-        lines = [f"🛠 <b>{len(activity.commands)} command(s)</b>"]
-        for c in activity.commands[-40:]:
-            lines.append(pre(c, 300))
-        if len(activity.commands) > 40:
-            lines.insert(1, f"(showing the last 40 of {len(activity.commands)})")
+        n = len(activity.commands)
+        lines = [f"🛠 <b>{n} command(s)</b>" + (" (the last 40 here, all in commands.txt)" if n > 40 else "")]
+        if activity.commands:
+            lines.append(_command_fold(activity.commands[-40:]))
         if activity.files:
             lines.append("✏️ local files: " + ", ".join(code(f) for f in activity.files[:20]))
         files = [("commands.txt", "\n\n".join(activity.commands).encode())] if len(activity.commands) > 15 else []

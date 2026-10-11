@@ -16,6 +16,7 @@ class Outgoing:
     session_id: str | None = None
     buttons: list[list[tuple[str, str]]] = field(default_factory=list)  # rows of (label, callback_data)
     files: list[tuple[str, bytes]] = field(default_factory=list)  # (filename, content)
+    photos: list[tuple[str, bytes]] = field(default_factory=list)  # images, sent as pictures (an album if several)
     silent: bool = False
     project: str | None = None  # the project topic to post in; by default the conversation's or job's
 
@@ -47,20 +48,6 @@ def code(text: object) -> str:
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
-    """Split on line boundaries without breaking <pre> blocks (re-opened in each chunk)."""
-    if len(text) <= limit:
-        return [text]
-    chunks, cur, in_pre = [], "", False
-    for line in text.split("\n"):
-        while len(line) > limit - 20:
-            head, line = line[: limit - 40], line[limit - 40:]
-            chunks.append(cur + head + ("</pre>" if in_pre else ""))
-            cur = "<pre>" if in_pre else ""
-        if len(cur) + len(line) + 1 > limit - 10:
-            chunks.append(cur + ("</pre>" if in_pre else ""))
-            cur = "<pre>" if in_pre else ""
-        cur += line + "\n"
-        in_pre = (in_pre or "<pre>" in line) and "</pre>" not in line.split("<pre>")[-1]
-    if cur.strip():
-        chunks.append(cur)
-    return [c for c in chunks if c.strip() and c.strip() not in ("<pre>", "<pre></pre>")]
+    """Split Telegram HTML into messages, keeping every tag balanced in each one."""
+    from .richtext import split_html
+    return split_html(text, limit)
