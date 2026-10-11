@@ -278,12 +278,12 @@ class Monitor:
                         buttons=[[("📈 Plot", f"plot:{rec.job_id}"), ("📜 Log", f"log:{rec.job_id}")]])
 
     async def check_quota(self, force: bool = False) -> None:
-        """Every quota_check_minutes: the disk quota (space and files), kept for the agent; warns you once when a
+        """At startup and every quota_check_hours: the disk quota (space and files), kept for the agent; warns you once when a
         filesystem passes quota_warn_percent (again after it went back below)."""
         c = self.cfg.slurm
-        if not c.quota_command.strip() or c.quota_check_minutes <= 0:
+        if not c.quota_command.strip() or c.quota_check_hours <= 0:
             return
-        if not force and time.time() - self._quota_checked < c.quota_check_minutes * 60:
+        if not force and time.time() - self._quota_checked < c.quota_check_hours * 3600:
             return
         self._quota_checked = time.time()
         rows = parse_quota(await self.hpc.quota(c.quota_command))

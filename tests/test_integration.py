@@ -2154,8 +2154,7 @@ async def test_disk_quota(env, monkeypatch, tmp_path):
     assert len([m for m in env.notifier.sent if "💾" in m.text]) == n + 1  # filled up again: warned again
 
 
-def test_no_quota_command_and_no_uv(env):
+def test_no_quota_command(env):
     env.cfg.slurm.quota_command = ""
-    env.cfg.agent.python = ""
     system = env.agent.system_prompt()
-    assert "not known to Overseer yet (`quota -s` may show them)" in system and "Python on the HPC" not in system
+    assert "not known to Overseer yet (`quota -s` may show them)" in system and "Python on the HPC: uv" in system

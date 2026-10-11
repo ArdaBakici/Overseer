@@ -49,7 +49,7 @@ slurm:
   # Disk quota (space and number of files): its limits go into the agent's instructions, and past the
   # threshold you and the agent are warned. "" = don't check.
   quota_command: myquota
-  quota_check_minutes: 30
+  quota_check_hours: 24          # and once at startup
   quota_warn_percent: 80
 
 telegram:
@@ -63,7 +63,6 @@ agent:
   enabled: true
   backend: claude_code          # claude_code | codex  (switch any time from Telegram: /backend codex)
   timeout_minutes: 60           # max length of one agent run (/stop ends it earlier)
-  python: uv                    # the agent uses uv for Python on the HPC ("" = no rule)
   report_commands: summary      # summary (after each request) | live (every few seconds) | off
   live_progress: true           # a self-updating "⏳ working" message: latest reasoning, running command
   allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)

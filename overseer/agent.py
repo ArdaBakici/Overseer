@@ -113,7 +113,7 @@ before deleting the researcher's own files."""
 PYTHON_SECTION = """
 
 ## Python on the HPC: uv
-Use uv for Python, unless the project already uses another tool (then follow it and mention it):
+Use uv for Python:
 - Environments: `uv venv --python 3.12` in the project folder, or a pyproject.toml with `uv add <package>` and \
 `uv sync`. Run with `uv run python train.py` (in job scripts and hpc-run too). No `pip install --user`, no \
 system Python, no new conda environments.
@@ -506,9 +506,7 @@ class Agent:
         )
         if self.ctl:
             prompt += OV_SECTION
-        prompt += self._storage_section()
-        if self.cfg.agent.python.strip().lower() == "uv":
-            prompt += PYTHON_SECTION
+        prompt += self._storage_section() + PYTHON_SECTION
         sess = self.get(session_id)
         proj = self.store.get_project(sess.project) if sess else None
         if proj:

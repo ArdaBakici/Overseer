@@ -85,10 +85,10 @@ hpc-run --status | --stop                                          # the shared 
 - **Files (inodes):** on clusters the file-count quota usually runs out long before space does. When it's full, jobs, installs and even logins fail.
   - **The agent's instructions** include your quotas, read with `slurm.quota_command` (e.g. `myquota`). For example: `/home` 50GB and 500k files, `/scratch` 5000GB and 500k files.
   - **Rules for the agent:** few large files instead of many small ones (sharded datasets, one metrics file per run, rotating checkpoints). The code it writes and the job scripts it submits must do the same. Clean up caches and temporary files, and ask before deleting your files.
-- **Warnings:** Overseer reads the quota every 30 minutes.
+- **Warnings:** Overseer reads the quota at startup and once a day.
   - When a filesystem's space or files pass 80%, you get one Telegram message ("💾 /scratch is at 85% of its quota: 425,000 of 500,000 files"). It warns again only after usage has dropped back below and risen again.
   - The agent is told at the start of every request while it stays above 80%.
-- **Python:** the agent uses uv (`uv venv`, `uv add`, `uv run`, in job scripts too), unless a project already uses something else. It keeps uv's cache on the same filesystem as the environments, so packages are hard-linked rather than copied into new files. Set `agent.python: ""` to drop this rule.
+- **Python:** the agent's instructions say to use uv (`uv venv`, `uv add`, `uv run`, in job scripts too). They also say to keep uv's cache on the same filesystem as the environments, so packages are hard-linked rather than copied into new files.
 
 **On your homelab: confined.** Claude Code and Codex each run their shell inside their own OS sandbox (bubblewrap on Linux), configured by Overseer:
 
@@ -317,8 +317,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).
-- `slurm.quota_command`, `quota_check_minutes`, `quota_warn_percent`: the disk quota check (above). The command's output must be a table like `myquota`'s: size, quota (%), files, quota (%). Set it to `""` to turn the check off.
-- `agent.python`: `uv` (default) or `""`.
+- `slurm.quota_command`, `quota_check_hours`, `quota_warn_percent`: the disk quota check (above). The command's output must be a table like `myquota`'s: size, quota (%), files, quota (%). Set it to `""` to turn the check off.
 - `slurm.compute`: the partition, cores, memory and hours of the shared worker, how long it may stay idle, how long `hpc-run` waits for a node, the GPU partition and gres for `--gpu`, extra `sbatch` flags (e.g. an account), the login-node CPU limit (`login_cpu_seconds`, 0 = off) and the warning threshold.
 - `agent.autopilot`: the default and maximum wake-ups and hours per approval, the check-in interval the card offers, the shortest check-in interval allowed (15 minutes), the check-in cap per job (30), and the one-off limits (pending per conversation, how far ahead, how many in a row). The old `default_rounds`/`max_rounds` names still work.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.

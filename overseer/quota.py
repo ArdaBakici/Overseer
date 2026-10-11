@@ -1,6 +1,6 @@
 """Disk quotas on the HPC: space, and the number of files (inodes), which is the one that runs out.
 
-Overseer runs slurm.quota_command (e.g. `myquota`) every slurm.quota_check_minutes. The limits go
+Overseer runs slurm.quota_command (e.g. `myquota`) at startup and every slurm.quota_check_hours. The limits go
 into the agent's instructions; when a filesystem's space or file count passes quota_warn_percent,
 you get a Telegram warning and the agent is told at the start of its next request.
 """
