@@ -165,10 +165,40 @@ class TelegramNotifier:
                 log.exception("telegram send failed (attempt %d)", attempt + 1)
                 await asyncio.sleep(2 * (attempt + 1))
 
+    def general_thread(self, chat_id: int) -> int | None:
+        """The "general" topic: everything that belongs to no project."""
+        v = self.store.get(f"general_topic:{chat_id}")
+        return int(v) if v else None
+
+    async def ensure_general_topic(self) -> None:
+        if not self.topics:
+            return
+        for chat_id in self.chat_ids:
+            if not self.general_thread(chat_id):
+                await self._create_general(chat_id)
+
+    async def _create_general(self, chat_id: int) -> int | None:
+        try:
+            topic = await self.app.bot.create_forum_topic(chat_id, name="general")
+        except Exception:
+            log.warning("could not create the general topic", exc_info=True)
+            return None
+        self.store.set(f"general_topic:{chat_id}", str(topic.message_thread_id))
+        try:
+            await self.app.bot.send_message(
+                chat_id, "💬 <b>general</b> - for anything that isn't about a project: questions, quick runs, your "
+                "jobs outside every project's folder. Projects have their own topics; a new thread is a new "
+                "conversation.", parse_mode=ParseMode.HTML, message_thread_id=topic.message_thread_id,
+                disable_notification=True)
+        except Exception:
+            log.debug("general topic intro failed", exc_info=True)
+        return topic.message_thread_id
+
     def _route(self, proj: ProjectRecord | None, chat_id: int) -> tuple[int | None, str]:
-        """(topic to post in, label to prefix): a project without a topic gets labelled."""
+        """(topic to post in, label to prefix): a project without a topic gets labelled; no project means
+        the general topic (or the main chat without topics)."""
         if not proj:
-            return None, ""
+            return (self.general_thread(chat_id) if self.topics else None), ""
         thread = proj.thread_map.get(str(chat_id)) if self.topics else None
         return thread, "" if thread else f"📁 <b>{esc(proj.name)}</b> · "
 
@@ -193,18 +223,19 @@ class TelegramNotifier:
                             raise
                 # The topic was deleted (or Telegram lost it): make a new one - at most once an hour, so an
                 # outage on Telegram's side can't spawn a topic per message - else use the main chat.
-                log.warning("topic of project %s unavailable (%s)", proj.name, e)
-                if time.time() - self._recreated.get(proj.name, 0) > 3600:
-                    self._recreated[proj.name] = time.time()
-                    new = await self._create_topic(proj, chat_id)
-                    proj = self.store.get_project(proj.name) or proj
+                key = proj.name if proj else "\0general"
+                log.warning("topic %s unavailable (%s)", proj.name if proj else "general", e)
+                if time.time() - self._recreated.get(key, 0) > 3600:
+                    self._recreated[key] = time.time()
+                    new = await (self._create_topic(proj, chat_id) if proj else self._create_general(chat_id))
+                    proj = (self.store.get_project(proj.name) or proj) if proj else None
                     if new:
                         try:
                             await self._deliver_any(chat_id, new, "", msg)
                             continue
                         except BadRequest:
                             pass
-                await self._deliver_any(chat_id, None, f"📁 <b>{esc(proj.name)}</b> · ", msg)
+                await self._deliver_any(chat_id, None, f"📁 <b>{esc(proj.name)}</b> · " if proj else "", msg)
 
     async def _deliver_any(self, chat_id: int, thread: int | None, label: str, msg: Outgoing) -> None:
         """A rich message when there is one and Telegram takes it, else the regular formatted message."""
@@ -424,11 +455,16 @@ class Bot:
         sess = self.agent.get(self.store.thread_session(update.effective_chat.id, thread))
         return sess.project if sess else None
 
-    def _here(self, update: Update | None) -> Session | None:
-        """The conversation of the place a message was sent: its thread's, a project topic's, or the main chat's.
-        None for a new thread nobody has assigned yet."""
+    def _is_general(self, update: Update | None) -> bool:
         thread = self._thread(update)
-        if not thread:
+        gen = self.notifier.general_thread(update.effective_chat.id) if hasattr(self.notifier, "general_thread") else None
+        return bool(thread) and thread == gen
+
+    def _here(self, update: Update | None) -> Session | None:
+        """The conversation of the place a message was sent: its thread's, a project topic's, or the main
+        chat's (= the general topic's). None for a new thread nobody has assigned yet."""
+        thread = self._thread(update)
+        if not thread or self._is_general(update):
             return self.agent.general_session()
         chat_id = update.effective_chat.id
         p = self.store.project_for_thread(chat_id, thread)
@@ -574,7 +610,7 @@ class Bot:
 
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         scope, thread = self._scope(update), self._thread(update)
-        if thread and not self.store.project_for_thread(update.effective_chat.id, thread):
+        if thread and not self._is_general(update) and not self.store.project_for_thread(update.effective_chat.id, thread):
             s = self.agent.new_conversation(scope)  # a thread of its own: it gets a fresh conversation
             self.store.bind_thread(update.effective_chat.id, thread, s.id)
         else:

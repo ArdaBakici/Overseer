@@ -116,9 +116,11 @@ def write_configs(cfg: Config) -> None:
     bin_dir = cfg.local.tmp("agent-bin")
     for name in WRAPPED:
         _write(bin_dir / name, f'#!/bin/sh\nexec {_q(real_binary(name, cfg))} -F {_q(cfg.agent_ssh_config)} "$@"\n', 0o700)
-    # ssh again, with the login-node CPU limit, and hpc-run (see compute.py)
+    # ssh again, with the login-node CPU limit, and hpc-run (see compute.py); ov talks to Overseer (ctl.py)
     from .compute import write_agent_tools
+    from .ctl import write_ov_tool
     write_agent_tools(cfg, bin_dir, real_binary("ssh", cfg), _write)
+    write_ov_tool(cfg, bin_dir, _write)
 
 
 def agent_bin_dir(cfg: Config) -> Path:

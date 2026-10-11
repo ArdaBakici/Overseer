@@ -95,6 +95,7 @@ class Activity:
     _started: dict[str, float] = field(default_factory=dict)
     # Numbers seen in command output -> the command (to recognise job ids submitted by scripts)
     numbers: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)  # extra environment for this run (e.g. the ov token)
     on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
     on_progress: Callable[[dict[str, Any]], None] | None = None
@@ -456,7 +457,7 @@ class ClaudeCodeRunner(Runner):
                     result.text = str(ev["result"])
                 _claude_usage(ev, result)
 
-        stderr = await self._exec(argv, self.env(workdir), workdir, prompt[:MAX_PROMPT], on_event)
+        stderr = await self._exec(argv, {**self.env(workdir), **activity.env}, workdir, prompt[:MAX_PROMPT], on_event)
         if not result.text:
             result.text = texts[-1] if texts else ""
         if stderr and not result.text:
@@ -545,7 +546,7 @@ class CodexRunner(Runner):
             net.update({
                 "mode": "limited",
                 "domains": {d: "allow" for d in self.cfg.agent.allowed_domains},
-                "unix_sockets": {str(self.cfg.control_socket): "allow"},
+                "unix_sockets": {str(self.cfg.control_socket): "allow", str(self.cfg.ctl_socket): "allow"},
             })
         out = [
             'default_permissions="overseer"',
@@ -628,7 +629,7 @@ class CodexRunner(Runner):
                 err = ev.get("error") or {}
                 errors.append(err.get("message") if isinstance(err, dict) else str(ev.get("message", err)))
 
-        stderr = await self._exec(argv, self.env(workdir), workdir, prompt[:MAX_PROMPT], on_event)
+        stderr = await self._exec(argv, {**self.env(workdir), **activity.env}, workdir, prompt[:MAX_PROMPT], on_event)
         text = out_file.read_text().strip() if out_file.exists() else ""
         out_file.unlink(missing_ok=True)
         result.text = text or (messages[-1] if messages else "")

@@ -43,6 +43,7 @@ def build(cfg: Config):
     from .agent import Agent
     from .autopilot import Autopilot
     from .bot import Bot, TelegramNotifier
+    from .ctl import ControlServer
     from .diagnose import Reporter
     from .hpc import HPC
     from .monitor import Monitor
@@ -58,12 +59,14 @@ def build(cfg: Config):
     tasks: list[asyncio.Task] = []
 
     async def post_init(app: Application) -> None:
-        if await notifier.detect_topics():  # a topic per project in the chat with the bot
+        if await notifier.detect_topics():  # a topic per project, and "general", in the chat with the bot
+            await notifier.ensure_general_topic()
             for proj in projects.active():
                 await notifier.ensure_topic(proj.name)
         elif projects.active():
             log.warning("projects are defined but the bot has no topics in private chats: their messages are "
                         "labelled in the main chat (enable threaded mode for the bot in @BotFather)")
+        await ctl.start()  # the agent's `ov` command
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
@@ -77,6 +80,7 @@ def build(cfg: Config):
     async def post_shutdown(app: Application) -> None:
         for t in tasks:
             t.cancel()
+        await ctl.stop()
 
     app = (
         Application.builder()
@@ -100,6 +104,7 @@ def build(cfg: Config):
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)
+    ctl = ControlServer(cfg, agent, projects, notifier, hpc)
     Bot(cfg, app, store, hpc, monitor, agent, notifier, projects).register()
     return app
 

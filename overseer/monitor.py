@@ -90,6 +90,8 @@ class Monitor:
             if job.state == "RUNNING" or self.worker is None:
                 self.worker = job
             return True
+        if rec and rec.ignored:  # deleted from Overseer (ov job delete)
+            return True
         if rec and rec.by_agent:
             return False
         if self.cfg.slurm.track == "agent":

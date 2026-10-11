@@ -1753,3 +1753,123 @@ async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
     await env.monitor.poll()
     await ap.drain()
     assert any("Autopilot round 1/3" in m.text for m in env.notifier.sent)
+
+
+async def test_general_topic(env, monkeypatch):
+    """With topics, anything outside every project lives in a "general" topic."""
+    from overseer.bot import Bot, TelegramNotifier
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    await notifier.ensure_general_topic()
+    gen = notifier.general_thread(1)
+    assert tg.created == [(1, "general", gen)] and "general" in tg.sent[-1][2]
+    await notifier.ensure_general_topic()
+    assert len(tg.created) == 1  # once
+
+    # A job of yours outside every project reports there; a conversation of the main chat answers there.
+    env.store.upsert_job(JobRecord(job_id="610"))
+    await notifier.send(Outgoing("📥 Job 610 queued", job_id="610"))
+    assert tg.sent[-1] == (1, gen, "📥 Job 610 queued")
+    main = env.agent.general_session()
+    await notifier.send(Outgoing("🤖 hi", session_id=main.id))
+    assert tg.sent[-1][1] == gen
+
+    # Messages in the general topic go to the main conversation; /new there starts a fresh one.
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=notifier)
+    started, replies = [], []
+
+    async def fake_run_agent(chat_id, session, text):
+        started.append((session.id, text))
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(bot, "reply", reply)
+    await bot.on_text(topic_update("how much quota do I have?", thread=gen), None)
+    for t in list(bot._tasks):
+        await t
+    assert started[-1] == (main.id, "how much quota do I have?")
+    await bot.cmd_new(topic_update("/new", thread=gen), NS(args=[]))
+    assert env.agent.general_session().id != main.id and env.store.thread_session(1, gen) is None
+
+    # The general topic was deleted: a new one is made.
+    tg.dead_threads.add(gen)
+    await notifier.send(Outgoing("✅ Job 610 finished", job_id="610"))
+    assert notifier.general_thread(1) != gen and tg.sent[-1] == (1, notifier.general_thread(1), "✅ Job 610 finished")
+
+
+# ----------------------------------------------------------------------------- ov: the agent talks to Overseer
+
+async def test_ov_interface(env):
+    """The agent's `ov` command, run by the (fake) agent CLI through the generated client and the socket."""
+    from overseer.ctl import ControlServer
+    projects = make_projects(env)
+    ctl = ControlServer(env.cfg, env.agent, projects, env.notifier, env.hpc)
+    await ctl.start()
+    try:
+        assert "## Talking to Overseer: `ov`" in env.agent.system_prompt()
+        env.set_jobs(**{
+            "5001": {"name": "native7", "state": "RUNNING", "workdir": str(env.home / "proj")},
+            "5002": {"name": "theirs", "state": "RUNNING", "user": "someone-else"},
+        })
+        s = env.agent.general_session()
+        await env.agent.handle(s, "\n".join([
+            "FAKE_OV ov job add 5001",
+            "FAKE_OV ov job add 5001 999999 5002",
+            "FAKE_OV ov project new dreamer --dir ~/dreamer --about 'world models' --move-here",
+            "FAKE_OV ov job move 5001 dreamer",
+            "FAKE_OV ov status",
+            "FAKE_OV ov job delete 5001",
+            "FAKE_OV ov job list",
+            "FAKE_OV ov project nonsense",
+            "FAKE_OV echo token=$OVERSEER_CTL > token.txt",
+        ]))
+        answer = env.notifier.sent[-1].text
+        outs = answer.split("@@@")
+        assert "✓ job 5001 (native7, RUNNING) is tracked in this conversation" in outs[0] and "[exit 0]" in outs[0]
+        assert "(already was)" in outs[1] and "doesn't know a job 999999" in outs[1]
+        assert "belongs to someone-else" in outs[1]
+        assert "✓ project dreamer created" in outs[2] and "now in dreamer" in outs[2]
+        assert "✓ job 5001 moved to dreamer" in outs[3]
+        assert "project: dreamer" in outs[4] and "5001 (RUNNING)" in outs[4]
+        assert "no longer tracked" in outs[5]
+        assert "No jobs in this conversation" in outs[6]
+        assert "[exit 1]" in outs[7]
+
+        rec = env.store.get_job("5001")
+        assert rec.by_agent and rec.session_id == s.id and rec.project == "dreamer" and rec.ignored
+        assert env.store.get_job("999999") is None and env.store.get_job("5002") is None
+        assert 5001 not in [int(j.job_id) for j in env.store.active_jobs()]
+        assert env.store.get_session(s.id).project == "dreamer"
+        assert projects.get("dreamer").dir == "~/dreamer" and projects.get("dreamer").context == "world models"
+        texts = env.notifier.texts()
+        assert texts.count("Agent submitted job 5001") == 1  # announced once
+        assert "created project <code>dreamer</code>" in texts and "no longer tracks job <code>5001</code>" in texts
+
+        # The run's token stops working when the run ends.
+        token = (env.agent.runner().workdir(s.id) / "token.txt").read_text().split("=", 1)[1].strip()
+        assert token and not ctl.tokens
+        ok, text = await ctl.handle(token, ["status"])
+        assert not ok and "Not connected" in text
+    finally:
+        await ctl.stop()
+    assert not env.cfg.ctl_socket.exists()
+
+
+async def test_ov_job_add_needs_slurm(env):
+    """Jobs that finished long ago are still found in accounting; ids that aren't numbers are refused."""
+    from overseer.ctl import ControlServer
+    ctl = ControlServer(env.cfg, env.agent, make_projects(env), env.notifier, env.hpc)
+    s = env.agent.general_session()
+    token = ctl.open(s.id)
+    ok, text = await ctl.handle(token, ["job", "add", "12;rm"])
+    assert ok and "isn't a job id" in text
+    env.set_jobs(**{"5003": {"name": "old", "state": "COMPLETED"}})
+    ok, text = await ctl.handle(token, ["job", "add", "5003"])
+    assert ok and "✓ job 5003" in text
+    ok, text = await ctl.handle(token, ["job", "move", "5003", "nope"])
+    assert not ok and "no project 'nope'" in text
+    ok, text = await ctl.handle(token, [])
+    assert ok and "ov job add" in text

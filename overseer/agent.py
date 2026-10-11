@@ -22,6 +22,7 @@ from .config import BACKENDS, Config
 from .hpc import HPC
 from .autopilot import parse_status
 from .compute import WORKER_NAME
+from .ctl import TOKEN_ENV
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
@@ -56,7 +57,7 @@ starts at once; `hpc-run --cpus N --mem 64G --time 120 -- ...` or `--gpu` gets a
 `hpc-run --help` for more). Long runs and experiments are sbatch jobs as usual.{login_limit}
 - For non-trivial changes to the researcher's code, prefer a copy or a git branch, and say where it is.
 - When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \
-track the job and report on it.
+track the job and report on it.{ov_rule}
 - Don't cancel or modify jobs you weren't asked about.
 - Nobody can approve commands for you: there is no approval step. If a command is refused (sandbox or \
 permission error), it will not be approved later - do it another way, or tell the researcher exactly what failed \
@@ -72,6 +73,27 @@ images (.png, .jpg) as pictures, other files as documents - up to 10 per reply, 
 project's environment), run it with `hpc-run --dir <dir> -- python plot.py` (not on the login node), save a PNG \
 (e.g. dpi=150, readable on a phone), copy it back with `scp {host}:/path/plot.png ./outbox/`, and say in your \
 reply what it shows."""
+
+
+OV_SECTION = """
+
+## Talking to Overseer: `ov`
+Overseer tracks jobs, reports on them to the researcher, and wakes you when they finish (autopilot). The local \
+`ov` command talks to it directly (it answers at once; `ov help` for everything):
+- `ov job add <id> [<id>...]`: register jobs you submitted. Do this right after every submission, whichever \
+way it was made (sbatch, a script, a CLI, a job array): Overseer checks the id with SLURM and tracks it in this \
+conversation. A job that isn't registered may go unnoticed.
+- `ov job list [--all]`, `ov job show <id>`
+- `ov job move <id> <project|main>`: reassign a job to a project.
+- `ov job delete <id>`: Overseer stops tracking it; the job itself keeps running (`scancel` cancels it - do \
+both if the researcher wants a job gone).
+- `ov project list`, `ov project new <name> --dir <folder on the HPC> --about "<what it is>" [--move-here]`, \
+`ov project set <name> [--dir ...] [--about ...]`, `ov project archive <name>`: each project gets its own \
+Telegram topic. `--move-here` also moves this conversation into the new project.
+- `ov conversation move <project|main>`, `ov status`, `ov notify <text>` (a message to the researcher right \
+away, for long runs).
+When the researcher asks you to create a project, reassign a job or stop tracking one, use these commands. \
+Every change is announced to the researcher, so you don't need to ask first."""
 
 
 PROJECT_SECTION = """
@@ -172,6 +194,7 @@ class Agent:
         self.hpc = hpc
         self.monitor = None  # set by the app; poked when the agent submits a job
         self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
+        self.ctl = None  # set by ControlServer(...): the agent's `ov` command
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
 
@@ -374,7 +397,10 @@ class Agent:
             host=self.cfg.ssh.host,
             setup=f"{setup}; " if setup else "",
             domains=f" (except {', '.join(domains)})" if domains else "",
+            ov_rule=" Then register it: `ov job add <id>`." if self.ctl else "",
         )
+        if self.ctl:
+            prompt += OV_SECTION
         sess = self.get(session_id)
         proj = self.store.get_project(sess.project) if sess else None
         if proj:
@@ -473,6 +499,9 @@ class Agent:
                 self.store.upsert_session(s.rec)
 
         activity.on_progress = on_progress
+        token = self.ctl.open(s.id) if self.ctl else None
+        if token:
+            activity.env = {TOKEN_ENV: token}
         if progress:
             progress.start()
         try:
@@ -488,6 +517,8 @@ class Agent:
             transcript.write({"kind": "end", "status": "error", "text": str(e)[:2000]})
             raise
         finally:
+            if token:
+                self.ctl.close(token)
             if live:
                 live.cancel()
             if progress:

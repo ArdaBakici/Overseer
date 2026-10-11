@@ -186,6 +186,9 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         "hpc-run --status",
         # ...and directly on the login node it hits the CPU limit (2 s in this test).
         "ssh hpc 'python3 -c \"while True: pass\"'; echo EXIT=$?",
+        # Talking to Overseer from inside the sandbox: register the job, create a project.
+        "ov job add 5001",
+        "ov project new e2eproj --dir ~/e2eproj --about 'made by the agent'",
     ]
     (remote / "proj" / "reward.png").write_bytes(b"\x89PNG\r\n\x1a\n made on the HPC")
     # A login shell may reset PATH; on a real cluster this is where "module load slurm" goes.
@@ -203,6 +206,10 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         notes = Notes()
         agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
         agent.set_backend(backend)
+        from overseer.ctl import ControlServer
+        from overseer.projects import Projects
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
+        await ctl.start()
         s = agent.general_session()
         # With autopilot on, its instructions must reach the model through each CLI's own mechanism.
         from overseer.autopilot import Autopilot
@@ -210,7 +217,10 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         autopilot = Autopilot(cfg, store, agent, notes, agent.hpc)
         store.upsert_autopilot(AutopilotRecord(session_id=s.id, active=1, goal="beat 'baseline' \"score\" 9.0",
                                                max_rounds=3, status="waiting"))
-        await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+        try:
+            await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+        finally:
+            await ctl.stop()
         await autopilot.drain()
         texts = notes.texts()
         outs = fm.outputs
@@ -239,6 +249,10 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         assert [a for a in st["steps"] if f"--jobid={workers[0]}" in a and "--overlap" in a], st["steps"]
         assert f"worker: {workers[0]} RUNNING" in outs[13], detail
         assert "EXIT=152" in outs[14] and "login node's CPU limit" in outs[14], detail
+        assert "✓ job 5001 (" in outs[15] and "tracked in this conversation (already was)" in outs[15], detail
+        assert "✓ project e2eproj created (~/e2eproj)" in outs[16], detail
+        assert store.get_project("e2eproj").context == "made by the agent"
+        assert texts.count("Agent submitted job 5001") == 1, detail
         assert f"Agent submitted job {workers[0]}" not in texts, detail  # the worker isn't reported as a job
         assert "on the login node: <code>ssh hpc 'python3 -c" in texts, detail
         assert notes.sent[-1].photos == [("reward.png", b"\x89PNG\r\n\x1a\n made on the HPC")], detail

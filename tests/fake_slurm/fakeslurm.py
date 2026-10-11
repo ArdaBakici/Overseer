@@ -73,7 +73,9 @@ elif prog == "scontrol":
         j = jobs.get(jid)
         if not j:
             sys.exit(1)
-        print(f"JobId={jid} JobName={j['name']} JobState={j['state']} WorkDir={j.get('workdir', '')} "
+        import getpass
+        print(f"JobId={jid} JobName={j['name']} UserId={j.get('user') or getpass.getuser()}(1000) "
+              f"JobState={j['state']} WorkDir={j.get('workdir', '')} "
               f"StdErr={j.get('stderr', '')} StdOut={j.get('stdout', '')} TimeLimit=01:00:00")
     elif args[:2] == ["write", "batch_script"]:
         j = jobs.get(args[2])

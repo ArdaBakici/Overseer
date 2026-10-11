@@ -10,6 +10,7 @@ Autopilot (fake claude, when the system prompt says autopilot is on): every run 
 id and ends with a status line. Markers in the prompt (the goal, or job logs quoted in a round's
 report) steer it: FAKE_DONE, FAKE_HELP, FAKE_NOJOB (submit nothing), FAKE_TWO (submit two jobs);
 in a check-in, FAKE_DIVERGE makes it scancel the job and resubmit.
+Lines "FAKE_OV <command>" make it run those commands (the `ov` tool) and answer with their output.
 """
 import re
 import json
@@ -89,6 +90,29 @@ def fake_outbox():
 
 if prog == "claude" and "FAKE_PLOT" in stdin:
     fake_outbox()
+
+
+def ov_run():
+    """Lines "FAKE_OV <command>" in the prompt: run them (they use the generated `ov`) like an agent would."""
+    import subprocess
+    sid = str(uuid.uuid4())
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake-default"})
+    outputs = []
+    for i, cmd in enumerate(re.findall(r"^FAKE_OV (.+)$", stdin, re.M)):
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        out = res.stdout + res.stderr + f"[exit {res.returncode}]"
+        outputs.append(out)
+        emit({"type": "assistant", "session_id": sid, "message": {"content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": cmd}}]}})
+        emit({"type": "user", "session_id": sid, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "content": out}]}})
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
+          "result": "\n\n@@@\n\n".join(outputs)})
+    sys.exit(0)
+
+
+if prog == "claude" and "FAKE_OV" in stdin:
+    ov_run()
 
 if prog == "claude":
     if "--output-format" in args and args[args.index("--output-format") + 1] == "json":

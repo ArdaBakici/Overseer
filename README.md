@@ -10,7 +10,8 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **Visibility:** while it works, one message updates itself with its latest reasoning and the command it is running. Afterwards you see every command it ran, and you get a message the moment it submits a job.
   - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
 - **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
-- **Projects.** Each project (e.g. dreamer, chemistry) gets its own Telegram topic, conversations, jobs, agent settings and notes.
+- **Projects.** Each project (e.g. dreamer, chemistry) gets its own Telegram topic, conversations, jobs, agent settings and notes. A "general" topic holds everything that isn't about a project.
+- **The agent talks to Overseer.** With its `ov` command it registers the jobs it submits, creates projects and moves or stops tracking jobs when you ask it to.
 - **Rich messages.** Agent replies are formatted (bold, lists, code, tables), logs and command lists fold away, and the agent can send plots it makes on the HPC.
 - **Autopilot.** `/auto 10 every 2h <goal>` lets the agent run experiments on its own. It is woken when its jobs finish, reads the results, keeps a research log and submits the next run, with optional check-ins while jobs run.
 
@@ -31,7 +32,27 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 **On the HPC: everything your account can.** That includes editing files, `sbatch`, `scancel`, `pip install` and so on. Nothing is restricted there, by design. In return you see all of it:
 - **Commands:** after each request, Telegram gets the list of commands the agent ran. Set `report_commands: live` to see them while it works.
 - **Submissions:** any job it submits is announced right away (`🚀 Agent submitted job 1234` plus the command), then tracked by the monitor.
-  - **Script submissions:** a job submitted through a script or CLI (no `sbatch` in the command itself) is found at the end of the request. Overseer asks SLURM which of your jobs were submitted during it, and links those whose id appears in the agent's output or reply.
+  - **Registration:** the agent registers every job it submits with `ov job add <id>` (below), whichever way it submitted it. Overseer checks the id with SLURM first.
+  - **Fallback detection:** Overseer also spots submissions itself, in case the agent forgets to register one. It reads `sbatch` output as the agent works. At the end of each request it asks SLURM which of your jobs were submitted during it, and links those whose id appears in the agent's output or reply. This catches jobs submitted through a script or CLI.
+
+**The agent talks to Overseer: `ov`.** The agent's shell has an `ov` command that sends requests to the running Overseer over a local unix socket and gets an answer at once:
+```bash
+ov job add 18746955 18746956          # "I submitted these": checked with SLURM, then tracked in this conversation
+ov job list [--all] | show <id>
+ov job move 18746955 dreamer          # reassign to a project (or "main")
+ov job delete 18746955                # stop tracking it - the job keeps running (scancel cancels it)
+ov project new chem --dir /scratch/me/chem --about "DFT with ORCA" [--move-here]
+ov project set <name> --dir … --about … | archive <name> | list
+ov conversation move <project|main>   # this conversation belongs to a project
+ov notify "epoch 3 done, loss 0.41"   # a message to you right away
+ov status                             # project, autopilot, the jobs Overseer waits for
+```
+So you can just tell the agent "make a project for my chemistry runs in /scratch/me/chem", "this job belongs to dreamer" or "stop tracking 18746955".
+- **No confirmations:** every change is announced in Telegram (`📁 The agent created project chem`, `🗑 Overseer no longer tracks job …`), and all of them are easy to undo with `/project restore` or `/assign`.
+- **Verified:** `ov job add` only accepts jobs that SLURM knows as yours: from `scontrol`, or from `sacct` for jobs that finished a while ago. Ids that don't exist, or that belong to another user, are refused.
+- **Stop tracking:** `ov job delete` only stops Overseer from tracking a job: no more reports, and autopilot doesn't wait for it. The agent can cancel a job with `scancel`.
+- **Scoped to the run:** each run of the agent gets a one-time token (`$OVERSEER_CTL`) that tells Overseer which conversation is asking. The token stops working when the run ends.
+- **Sandbox:** the socket sits in Overseer's tmp dir, and both sandboxes allow connecting to it (as with the SSH socket).
 
 **Heavy work goes to compute nodes, not the login node.** The agent has `hpc-run`, which runs a command on a compute node and returns its output:
 ```bash
@@ -56,7 +77,7 @@ hpc-run --status | --stop                                          # the shared 
 |---|---|
 | write | only its own scratch dir, `/tmp/overseer/agents/<conversation>` |
 | read | the system, except Overseer's state dir (which includes the SSH key), `~/.ssh`, `~/.gnupg`, `~/.docker`, `~/.aws`, gcloud credentials, docker/podman sockets, `/run/user/<uid>` and your ssh-agent socket |
-| network | none, except `agent.allowed_domains`. The HPC is reached through the unix socket of Overseer's SSH connection. **With Codex**, commands can still connect to services listening on this machine's localhost (127.0.0.1), because Codex's sandbox doesn't give them a network of their own; Claude Code's does. If your homelab runs services on localhost that the agent mustn't reach, use Claude Code. Proxy settings passed to Codex for its own API traffic aren't handed to the agent's commands |
+| network | none, except `agent.allowed_domains`. The HPC is reached through the unix socket of Overseer's SSH connection, and Overseer itself through the `ov` socket. **With Codex**, commands can still connect to services listening on this machine's localhost (127.0.0.1), because Codex's sandbox doesn't give them a network of their own; Claude Code's does. If your homelab runs services on localhost that the agent mustn't reach, use Claude Code. Proxy settings passed to Codex for its own API traffic aren't handed to the agent's commands |
 | environment | scrubbed. Only `PATH`, locale and the API-key variables in `pass_env` are passed; the Telegram token is never passed, and the `.env` file can't be read |
 | escape hatches | Claude Code: `failIfUnavailable` and `allowUnsandboxedCommands: false`, so it never runs a command unsandboxed. Codex: a named permission profile with approvals off |
 
@@ -73,6 +94,7 @@ All of this was tested end to end, using the real Claude Code (2.1) and Codex (0
 - Reading the key and `~/.ssh` fails.
 - Writing outside the scratch dir fails.
 - `curl` to the internet fails.
+- `hpc-run`, `scp` into the outbox and `ov` work from inside both sandboxes.
 
 ## Setup
 
@@ -185,6 +207,8 @@ Each project gets a topic in your chat with the bot, so the main chat stays uncl
   - **Linking a job to a conversation:** `/assign <job>` with no project, sent in a conversation's thread, makes the job part of that conversation. Its reports come there, and autopilot wakes the agent when it ends.
 - **Other commands:** `/project` lists projects; `/project archive <name>` and `/project restore <name>`; `/project dir <path>`.
 
+**The "general" topic: anything that isn't about a project.** With topics on, Overseer also creates a 💬 general topic. Use it for questions like "how much quota do I have left?" or "which partitions have free GPUs?". It is the main chat's conversation, so `/new`, `/ask`, `/auto` and `/stop` there act on the main conversation. Jobs that belong to no project are reported there too, and if the topic is deleted, Overseer makes a new one.
+
 Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
 
 **Autopilot: letting the agent iterate on its own.**
@@ -269,6 +293,7 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `autopilot.py` | `/auto`: waking conversations when their jobs finish, check-ins, round limits, status lines |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
+| `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, notifications) |
 | `compute.py` | `hpc-run` and the shared compute worker, the agent's ssh wrapper with the login-node CPU limit |
 | `richtext.py` | Markdown → Telegram HTML (fallback) and Rich Markdown, tag-safe message splitting, collapsible sections |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

@@ -72,6 +72,7 @@ ADDED_COLUMNS = [
     ("jobs", "last_checkin", "REAL DEFAULT 0"),
     ("jobs", "project", "TEXT"),
     ("sessions", "project", "TEXT"),
+    ("jobs", "ignored", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -97,6 +98,7 @@ class JobRecord:
     checkins: int = 0  # autopilot: check-ins on this job while it ran
     last_checkin: float = 0.0
     project: str | None = None  # None = the main chat
+    ignored: int = 0  # "deleted": Overseer stops tracking and reporting it (the job itself isn't touched)
 
     @property
     def info_dict(self) -> dict[str, Any]:
@@ -196,21 +198,22 @@ class Store:
         self._upsert("jobs", "job_id", rec)
 
     def active_jobs(self) -> list[JobRecord]:
-        rows = self.db.execute("SELECT * FROM jobs WHERE ended_at IS NULL ORDER BY first_seen").fetchall()
+        rows = self.db.execute("SELECT * FROM jobs WHERE ended_at IS NULL AND NOT ignored ORDER BY first_seen").fetchall()
         return [_row(JobRecord, r) for r in rows]
 
     def recent_jobs(self, limit: int = 15) -> list[JobRecord]:
-        rows = self.db.execute("SELECT * FROM jobs ORDER BY first_seen DESC LIMIT ?", (limit,)).fetchall()
+        rows = self.db.execute("SELECT * FROM jobs WHERE NOT ignored ORDER BY first_seen DESC LIMIT ?", (limit,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
 
     def session_jobs(self, session_id: str) -> list[JobRecord]:
         """Jobs the agent submitted in a conversation."""
-        rows = self.db.execute("SELECT * FROM jobs WHERE session_id=? AND by_agent=1 ORDER BY first_seen",
+        rows = self.db.execute("SELECT * FROM jobs WHERE session_id=? AND by_agent=1 AND NOT ignored ORDER BY first_seen",
                                (session_id,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
 
     def project_jobs(self, project: str | None, limit: int = 15) -> list[JobRecord]:
-        q = "SELECT * FROM jobs WHERE " + ("project=?" if project else "project IS NULL") + " ORDER BY first_seen DESC LIMIT ?"
+        q = ("SELECT * FROM jobs WHERE NOT ignored AND " + ("project=?" if project else "project IS NULL")
+             + " ORDER BY first_seen DESC LIMIT ?")
         rows = self.db.execute(q, (project, limit) if project else (limit,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
 

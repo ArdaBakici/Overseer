@@ -272,6 +272,11 @@ class Config:
 
     # ---- derived SSH paths (all inside the allowed local folders)
     @property
+    def ctl_socket(self) -> Path:
+        """Overseer's control socket for the agent's `ov` command."""
+        return self.local.tmp("ctl.sock")
+
+    @property
     def ssh_dir(self) -> Path:
         return self.local.resolve(self.ssh.dir)
 
