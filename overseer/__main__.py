@@ -86,7 +86,8 @@ def build(cfg: Config):
         .post_shutdown(post_shutdown)
         .build()
     )
-    notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store)
+    notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store, rich=cfg.telegram.rich_messages,
+                                streaming=cfg.telegram.streaming)
     agent = Agent(cfg, store, notifier, hpc)
 
     async def report_text(system: str, prompt: str) -> str:
@@ -326,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         return 2
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    app.run_polling(allowed_updates=["message", "callback_query", "stopped_message_generation"])
     return 0
 
 

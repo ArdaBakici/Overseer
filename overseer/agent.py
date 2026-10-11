@@ -21,7 +21,7 @@ from .config import BACKENDS, Config
 from .hpc import HPC
 from .autopilot import parse_status
 from .live import Progress, Transcript
-from .richtext import fold, fold_long, md_to_html
+from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
 from .sshlink import ensure_master
@@ -254,13 +254,30 @@ class Agent:
             effort += f" (last run: {last_effort})"
         return f"{backend}: model {model} · effort {effort}"
 
+    def _usage_delta(self, backend: str, res, resumed: bool) -> None:
+        """Turn a running total (codex) into this request's usage, remembering the total."""
+        if not res.usage_is_total or not res.session_id:
+            return
+        key = f"usage:{backend}:{res.session_id}"
+        total = (res.input_tokens, res.cached_tokens, res.output_tokens)
+        prev = self.store.get(key)
+        self.store.set(key, ",".join(map(str, total)))
+        if prev:
+            p = [int(x) for x in prev.split(",")]
+            if all(t >= q for t, q in zip(total, p)):
+                res.input_tokens, res.cached_tokens, res.output_tokens = (t - q for t, q in zip(total, p))
+                res.usage_is_total = False
+        elif not resumed:
+            res.usage_is_total = False  # a new conversation: its total is this request's usage
+        # else: resumed from before Overseer kept totals - the footer says it's the conversation's total
+
     def footer(self, backend: str, res, project: str | None = None) -> str:
         r = self.runner(backend, project)
         parts = [backend, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
         tokens = res.input_tokens + res.output_tokens
         if tokens:
             cached = f" ({_human(res.cached_tokens)} cached)" if res.cached_tokens else ""
-            parts.append(f"{_human(tokens)} tokens{cached}")
+            parts.append(f"{_human(tokens)} tokens{cached}" + (" in this conversation so far" if res.usage_is_total else ""))
         if res.cost_usd is not None:
             parts.append(f"${res.cost_usd:.2f}")
         return " · ".join(parts)
@@ -292,6 +309,10 @@ class Agent:
             return s
         rec = self.store.session_for_job(job_id)
         return self._load(rec) if rec else self._new(job_id, job.project if job else None)
+
+    def new_conversation(self, project: str | None = None) -> Session:
+        """A fresh conversation (e.g. for a new Telegram thread)."""
+        return self._new(None, project)
 
     def general_session(self, reset: bool = False, project: str | None = None) -> Session:
         """The ongoing conversation of the main chat, or of a project's topic."""
@@ -463,6 +484,7 @@ class Agent:
             self.store.set(f"last_model:{backend}", res.model)
         if res.effort:
             self.store.set(f"last_effort:{backend}", res.effort)
+        self._usage_delta(backend, res, resumed=resume is not None)
         footer = self.footer(backend, res, s.project)
         text, autopilot_line, status = res.text, "", None
         if self.autopilot and self.autopilot.active(s.id):
@@ -474,9 +496,11 @@ class Agent:
         transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer,
                           **({"autopilot": status} if status else {})})
         skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
+        extra = [x for x in (autopilot_line, skipped) if x]  # HTML, which Rich Markdown accepts as well
         await self.notifier.send(Outgoing(
-            f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + (f"\n\n{autopilot_line}" if autopilot_line else "")
-            + (f"\n\n{skipped}" if skipped else "") + f"\n\n<i>{esc(footer)}</i>",
+            f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + "".join(f"\n\n{x}" for x in extra)
+            + f"\n\n<i>{esc(footer)}</i>",
+            markdown="\n\n".join([rich_markdown(text) or "(no answer)", *extra, f"<i>{esc(footer)}</i>"]),
             session_id=s.id, job_id=s.job_id, silent=quiet and status not in ("DONE", "NEED_HELP"),
             photos=photos, files=docs))
 
@@ -530,7 +554,13 @@ class Agent:
         if activity.files:
             lines.append("✏️ local files: " + ", ".join(code(f) for f in activity.files[:20]))
         files = [("commands.txt", "\n\n".join(activity.commands).encode())] if len(activity.commands) > 15 else []
-        await self.notifier.send(Outgoing("\n".join(lines), session_id=s.id, job_id=s.job_id, silent=True, files=files))
+        # As a rich message: the commands in a collapsible block, as a real code block.
+        rich = [lines[0]]
+        if activity.commands:
+            rich.append(rich_details("Show", rich_code("\n".join(f"$ {c.strip()}" for c in activity.commands[-40:]), "bash")))
+        rich += lines[2:] if activity.commands else lines[1:]
+        await self.notifier.send(Outgoing("\n".join(lines), markdown="\n\n".join(rich), session_id=s.id,
+                                          job_id=s.job_id, silent=True, files=files))
 
     def _record_job(self, s: Session, job_id: str) -> None:
         rec = self.store.get_job(job_id) or JobRecord(job_id=job_id, state="PENDING", first_seen=time.time(),

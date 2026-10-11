@@ -136,6 +136,12 @@ class SlurmConfig:
 class TelegramConfig:
     token_env: str = "TELEGRAM_BOT_TOKEN"
     allowed_chat_ids: list[int] = field(default_factory=list)
+    # Telegram's native rich messages (Bot API 10.1+) for agent replies: real tables, collapsible
+    # sections, formulas, pictures inside the reply. Falls back to regular formatted messages.
+    rich_messages: bool = True
+    # Stream the agent's progress as a live draft with a Stop button (private chats), instead of
+    # a message that is edited every few seconds.
+    streaming: bool = True
 
     @property
     def token(self) -> str:

@@ -38,7 +38,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 |---|---|
 | write | only its own scratch dir, `/tmp/overseer/agents/<conversation>` |
 | read | the system, except Overseer's state dir (which includes the SSH key), `~/.ssh`, `~/.gnupg`, `~/.docker`, `~/.aws`, gcloud credentials, docker/podman sockets, `/run/user/<uid>` and your ssh-agent socket |
-| network | none, except `agent.allowed_domains`. The HPC is reached through the unix socket of Overseer's SSH connection |
+| network | none, except `agent.allowed_domains`. The HPC is reached through the unix socket of Overseer's SSH connection. **With Codex**, commands can still connect to services listening on this machine's localhost (127.0.0.1), because Codex's sandbox doesn't give them a network of their own; Claude Code's does. If your homelab runs services on localhost that the agent mustn't reach, use Claude Code. Proxy settings passed to Codex for its own API traffic aren't handed to the agent's commands |
 | environment | scrubbed. Only `PATH`, locale and the API-key variables in `pass_env` are passed; the Telegram token is never passed, and the `.env` file can't be read |
 | escape hatches | Claude Code: `failIfUnavailable` and `allowUnsandboxedCommands: false`, so it never runs a command unsandboxed. Codex: a named permission profile with approvals off |
 
@@ -111,7 +111,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
-| *(while the agent works)* | a ⏳ message that updates itself every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. It is removed when the answer arrives |
+| *(while the agent works)* | a live ⏳ preview that updates every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. Its **Stop** button stops the run. It's a Telegram streaming draft, which vanishes when the answer arrives; where drafts aren't available (`telegram.streaming: false`, group chats) it's a message that is edited in place and then removed |
 | `/stop` | stop the agent's current run (kills the whole process group) |
 | `/auto [rounds] [every 2h] <goal>` | autopilot (below). As a reply to a message, it applies to that conversation. `/auto` shows progress, `/auto off` stops it |
 | `/health` | SSH connection, last poll, agents with their model and effort |
@@ -119,6 +119,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens (11.8k cached) · $0.04`.
 
 - **Tokens:** every model call re-sends the CLI's instructions, its tool definitions and the conversation so far, so the total grows with each command the agent runs. Most of that is served from the provider's prompt cache, which costs roughly a tenth of fresh input.
+  - **Codex counts:** Codex reports a running total for the whole conversation, so Overseer subtracts the previous total and shows this request's share. A conversation started with an older Overseer shows its total once, labelled "in this conversation so far".
 
 - **Model and effort:** the footer shows what actually ran, even when nothing is configured.
   - **Claude Code** reports the model it used.
@@ -127,12 +128,24 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
 - **Cost:** only Claude Code reports it.
 
 **Rich messages.**
-- **Formatted replies:** the agent writes Markdown, and Telegram shows it formatted: bold, lists, `code`, code blocks with syntax highlighting and small tables (as aligned text). Long answers keep their first paragraph visible and fold the rest.
+- **Formatted replies:** the agent writes Markdown, and the reply is sent as one of Telegram's native rich messages (Bot API 10.1). That gives real tables, task lists, code blocks with syntax highlighting, formulas, collapsible sections, and pictures and files inside the reply itself, up to 32,768 characters per message.
+  - **Escaping:** outside code, `$`, `||`, `==` and `<` are escaped, so `$HOME` or `a == b` doesn't turn into a formula, highlight or tag.
+  - **Fallback:** if rich messages aren't available or Telegram rejects one, the regular formatted message goes out instead. Bold, lists, code and tables become aligned text, long answers keep their first paragraph and fold the rest, and pictures and files follow as separate messages. `telegram.rich_messages: false` always uses that path.
+  - **No library change:** python-telegram-bot doesn't wrap the new methods yet, so Overseer calls them directly through its generic API call.
 - **Folding:** the list of commands the agent ran, and the log tail or traceback in job reports, show their first lines and expand on tap.
 - **Files and plots:** anything the agent puts in `./outbox/` in its working folder is sent with its reply. Pictures arrive as photos (an album if several, up to 10 per reply, 10 MB each); other files as documents (up to 50 MB).
   - **Where plots are made:** on the HPC, where the data is (e.g. "plot reward vs step for seeds 0-2"). The agent writes a small plotting script, runs it there and copies the PNG back with `scp`, so Overseer needs no plotting libraries.
   - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
 - **Fallback:** if Telegram ever rejects the formatting, the message is resent as plain text.
+
+**Threads: each one is a conversation.** With topics enabled, the chat with the bot works like an AI chat app:
+- **New thread:** a message from the ✏️ composer starts a new thread, which is its own conversation. If you have projects, Overseer asks which one it's about (📁 dreamer / 📁 chem / 💬 no project) and renames the thread, e.g. "dreamer · plot the reward curves". Starting the message with `dreamer: …` skips the question.
+- **Continuing:** write in an existing thread to continue that conversation.
+- **Commands:** `/new` gives the thread a fresh conversation, and `/ask`, `/auto` and `/stop` act on the thread they're sent in.
+- **Job reports:** reports on jobs the agent submitted come back to the thread that submitted them.
+- **What a thread inherits:** everything in a project shares its notes (`OVERSEER.md`), research log, agent settings and jobs. The project's own topic stays its home for jobs you submit by hand.
+- **Deleted threads:** if you delete a thread, its messages continue in the project's topic.
+- **Turning it off:** to stop users creating threads, use the setting in the @BotFather Mini App; then only Overseer's project topics exist.
 
 **Projects: separate contexts, each in its own topic.**
 
@@ -236,5 +249,5 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `autopilot.py` | `/auto`: waking conversations when their jobs finish, check-ins, round limits, status lines |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
-| `richtext.py` | Markdown → Telegram HTML, tag-safe message splitting, collapsible sections |
+| `richtext.py` | Markdown → Telegram HTML (fallback) and Rich Markdown, tag-safe message splitting, collapsible sections |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

@@ -72,6 +72,7 @@ class RunResult:
     cached_tokens: int = 0  # input served from the provider's prompt cache (much cheaper)
     output_tokens: int = 0
     cost_usd: float | None = None  # Claude Code reports it; Codex doesn't
+    usage_is_total: bool = False  # Codex: the token counts are the whole conversation's running total
 
 
 @dataclass
@@ -534,6 +535,8 @@ class CodexRunner(Runner):
             f"permissions.overseer.network={_toml(net)}",
             'approval_policy="never"',
             "project_doc_max_bytes=0",  # ignore AGENTS.md files in the scratch dir
+            # The proxy settings passed for codex's own API traffic are not handed to the agent's commands.
+            'shell_environment_policy.exclude=["*PROXY*", "*proxy*", "ALL_PROXY", "all_proxy"]',
             *[f"features.{f}=false" for f in CODEX_DISABLED_FEATURES],
         ]
         if not self.c.web_search:
@@ -565,7 +568,8 @@ class CodexRunner(Runner):
         out_file = workdir / f".last-{uuid.uuid4().hex[:8]}.txt"
         argv = self._argv(session_id=session_id, out_file=out_file, ephemeral=ephemeral,
                           overrides=self.overrides(workdir, system=system, writable=writable, network=network))
-        result = RunResult(text="", session_id=session_id, model=self.model, effort=self.effort)
+        # codex reports the thread's running token total, not this run's; the caller subtracts the last one
+        result = RunResult(text="", session_id=session_id, model=self.model, effort=self.effort, usage_is_total=True)
         messages: list[str] = []
         errors: list[str] = []
 

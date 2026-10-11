@@ -246,3 +246,31 @@ def split_html(text: str, limit: int = TG_LIMIT) -> list[str]:
     if strip_html(cur).strip():
         chunks.append(cur)
     return [c for c in chunks if strip_html(c).strip()]
+
+
+# ============================================================================ native rich messages
+
+RICH_LIMIT = 32_000  # Telegram: 32768 characters per rich message
+_CODE_SPANS = re.compile(r"(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]+`)")
+
+
+def rich_markdown(text: str) -> str:
+    """The agent's Markdown, made safe for Telegram's Rich Markdown: outside code, `$` would start a
+    formula, `||` a spoiler, `==` highlighting and `<` an HTML tag - so they are escaped there."""
+    parts = _CODE_SPANS.split(text or "")
+    for i in range(0, len(parts), 2):  # the even parts are outside code
+        t = parts[i].replace("\\$", "$").replace("$", "\\$")
+        parts[i] = t.replace("||", "\\|\\|").replace("==", "\\=\\=").replace("<", "&lt;")
+    return "".join(parts).strip()
+
+
+def rich_code(text: str, lang: str = "") -> str:
+    """A fenced code block that can't be closed early by backticks in the content."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}{lang}\n{text.rstrip()}\n{fence}"
+
+
+def rich_details(summary_html: str, body_markdown: str) -> str:
+    """A collapsible section (closed until tapped); its body may contain Markdown, code blocks included."""
+    return f"<details><summary>{summary_html}</summary>\n\n{body_markdown}\n\n</details>"

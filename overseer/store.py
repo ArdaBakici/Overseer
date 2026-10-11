@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS threads (
+    chat_id INTEGER, thread_id INTEGER,
+    session_id TEXT,
+    created REAL,
+    PRIMARY KEY (chat_id, thread_id)
+);
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
     dir TEXT,
@@ -207,6 +213,28 @@ class Store:
         q = "SELECT * FROM jobs WHERE " + ("project=?" if project else "project IS NULL") + " ORDER BY first_seen DESC LIMIT ?"
         rows = self.db.execute(q, (project, limit) if project else (limit,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
+
+    # ---------------------------------------------------------------- Telegram threads <-> conversations
+    def thread_session(self, chat_id: int, thread_id: int | None) -> str | None:
+        if not thread_id:
+            return None
+        row = self.db.execute("SELECT session_id FROM threads WHERE chat_id=? AND thread_id=?",
+                              (chat_id, thread_id)).fetchone()
+        return row["session_id"] if row else None
+
+    def bind_thread(self, chat_id: int, thread_id: int, session_id: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO threads VALUES (?,?,?,?)", (chat_id, thread_id, session_id, time.time()))
+        self.db.commit()
+
+    def unbind_thread(self, chat_id: int, thread_id: int) -> None:
+        self.db.execute("DELETE FROM threads WHERE chat_id=? AND thread_id=?", (chat_id, thread_id))
+        self.db.commit()
+
+    def session_thread(self, session_id: str, chat_id: int) -> int | None:
+        """The Telegram thread a conversation lives in (the latest one, if it moved)."""
+        row = self.db.execute("SELECT thread_id FROM threads WHERE session_id=? AND chat_id=? ORDER BY created DESC "
+                              "LIMIT 1", (session_id, chat_id)).fetchone()
+        return row["thread_id"] if row else None
 
     # ---------------------------------------------------------------- projects
     def get_project(self, name: str | None) -> ProjectRecord | None:

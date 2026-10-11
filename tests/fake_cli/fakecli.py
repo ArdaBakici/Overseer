@@ -149,5 +149,10 @@ if prog == "codex":
     emit({"type": "item.completed", "item": {"id": "i2", "type": "file_change", "changes": [{"path": "/tmp/x/a.py", "kind": "update"}]}})
     emit({"type": "item.completed", "item": {"id": "i3", "type": "agent_message", "text": "Resubmitted as job 4343."}})
     open(out_file, "w").write("Resubmitted as job 4343.")
-    emit({"type": "turn.completed", "usage": {"input_tokens": 5000, "cached_input_tokens": 1000, "output_tokens": 700}})
+    # Like the real codex: usage is the thread's running total (5000/1000/700 more per run).
+    counter = os.environ["FAKE_CLI_LOG"] + f".{tid}.runs"
+    runs = (int(open(counter).read()) if os.path.exists(counter) else 0) + 1
+    open(counter, "w").write(str(runs))
+    emit({"type": "turn.completed", "usage": {"input_tokens": 5000 * runs, "cached_input_tokens": 1000 * runs,
+                                              "output_tokens": 700 * runs}})
     sys.exit(0)

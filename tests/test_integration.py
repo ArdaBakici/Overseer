@@ -467,6 +467,13 @@ async def test_model_effort_and_footer(env):
     assert argv[argv.index("-m") + 1] == "gpt-x" and 'model_reasoning_effort="minimal"' in argv
     assert "<i>codex · gpt-x · effort minimal · 5.7k tokens (1.0k cached)</i>" in env.notifier.sent[-1].text  # no cost
 
+    # codex reports the conversation's running total; the footer shows this request's share.
+    await env.agent.handle(s, "go on")
+    assert "5.7k tokens (1.0k cached)</i>" in env.notifier.sent[-1].text
+    env.store.unset(f"usage:codex:{env.store.get_session(s.id).cli_session_id}")  # total from an older version
+    await env.agent.handle(s, "and on")
+    assert "17.1k tokens (3.0k cached) in this conversation so far" in env.notifier.sent[-1].text
+
     env.agent.set_model("default")
     env.agent.set_effort("default")
     await env.agent.handle(s, "go")
@@ -1097,9 +1104,15 @@ def make_projects(env):
     return Projects(env.cfg, env.store, env.agent)
 
 
+PICKERS = []  # (text, buttons) the bot replied with directly
+
+
 def topic_update(text, thread=None, reply_to=None):
+    async def reply_text(text, reply_markup=None, **kw):
+        rows = reply_markup.inline_keyboard if reply_markup else []
+        PICKERS.append((text, [(b.text, b.callback_data) for row in rows for b in row]))
     msg = NS(text=text, reply_to_message=NS(message_id=reply_to) if reply_to else None,
-             message_thread_id=thread, is_topic_message=thread is not None)
+             message_thread_id=thread, is_topic_message=thread is not None, reply_text=reply_text)
     return NS(effective_message=msg, effective_chat=NS(id=1))
 
 
@@ -1227,6 +1240,24 @@ class FakeTelegram:
         self.sent.append((chat_id, message_thread_id, f"<file {filename}>"))
         return NS(message_id=len(self.sent))
 
+    async def send_photo(self, chat_id, photo, filename, message_thread_id=None, **kw):
+        self.sent.append((chat_id, message_thread_id, f"<photo {filename}>"))
+        return NS(message_id=len(self.sent))
+
+    api_calls: list = None  # (endpoint, kwargs) of do_api_request
+    api_errors: dict = None  # endpoint -> exception to raise
+
+    async def do_api_request(self, endpoint, api_kwargs=None, return_type=None):
+        self.api_calls = (self.api_calls or []) + [(endpoint, api_kwargs)]
+        err = (self.api_errors or {}).get(endpoint)
+        if err:
+            raise err
+        if endpoint == "sendRichMessage":
+            self.sent.append((api_kwargs["chat_id"], api_kwargs.get("message_thread_id"),
+                              "<rich>" + api_kwargs["rich_message"]["markdown"]))
+            return NS(message_id=len(self.sent))
+        return True
+
 
 async def test_topics_routing(env):
     from overseer.bot import TelegramNotifier
@@ -1251,8 +1282,9 @@ async def test_topics_routing(env):
     s = env.agent.general_session(project="dreamer")
     await notifier.send(Outgoing("🤖 hi", session_id=s.id))
     assert tg.sent[-1][1] == thread
+    notifier.streaming = False  # (drafts are tested in test_streaming_drafts)
     handle = await notifier.post_live(Outgoing("⏳ working", session_id=s.id))
-    assert tg.sent[-1][1] == thread and handle[0][2] == ""
+    assert tg.sent[-1][1] == thread and handle["messages"][0][2] == ""
 
     # The topic was deleted: a new one is created and the message lands there.
     tg.dead_threads.add(thread)
@@ -1313,9 +1345,9 @@ async def test_project_commands(env, monkeypatch):
     await bot.on_text(topic_update("run the DFT sweep", thread=77), None)
     await drain()
     assert started[-1][0].startswith("chem-") and started[-1][1] == "run the DFT sweep"
-    await bot.on_text(topic_update("hello?", thread=999), None)
+    await bot.on_text(topic_update("hello?", thread=999), None)  # a thread of its own: which project?
     await drain()
-    assert "This topic isn't a project" in replies[-1] and len(started) == 1
+    assert PICKERS[-1][0] == "New conversation. Which project is it about?" and len(started) == 1
     await bot.on_text(topic_update("hi main"), None)
     await drain()
     assert started[-1][0].startswith("chat-")
@@ -1445,3 +1477,158 @@ async def test_telegram_pictures_and_fallbacks(env):
     tg.reject_html = True
     await notifier.send(Outgoing("🤖 <b>bold</b> &amp; <code>x</code>"))
     assert tg.sent[-1][2] == "🤖 bold & x"  # plain text, no stray tags
+
+
+async def test_threads_are_conversations(env, monkeypatch):
+    from overseer.bot import Bot, TelegramNotifier
+    tg = FakeTelegram()
+    renamed = []
+
+    async def edit_forum_topic(chat_id, message_thread_id, name):
+        renamed.append((message_thread_id, name))
+    tg.edit_forum_topic = edit_forum_topic
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    projects = make_projects(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=notifier, projects=projects)
+    started = []
+
+    async def fake_run_agent(chat_id, session, text):
+        started.append((session.id, text))
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+
+    async def drain():
+        for t in list(bot._tasks):
+            await t
+
+    async def press(data, thread):
+        q = NS(data=data, message=NS(message_thread_id=thread), answer=_noop,
+               edit_message_text=lambda text: _noop())
+        await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
+        await drain()
+
+    # Without projects, a new thread simply becomes a new conversation.
+    await bot.on_text(topic_update("why is seed 1 at zero?", thread=201), None)
+    await drain()
+    first = started[-1][0]
+    assert env.store.thread_session(1, 201) == first and env.agent.get(first).project is None
+    await bot.on_text(topic_update("and seed 2?", thread=201), None)  # same thread, same conversation
+    await drain()
+    assert started[-1][0] == first
+    await bot.on_text(topic_update("unrelated", thread=202), None)  # another thread, another conversation
+    await drain()
+    assert started[-1][0] not in (first,)
+
+    # With projects: a picker; the choice binds the thread to that project and renames it.
+    projects.create("dreamer", "/scratch/me/rf-dreamer")
+    projects.create("chem", "/scratch/me/chem")
+    n = len(started)
+    await bot.on_text(topic_update("plot the reward curves", thread=203), None)
+    await drain()
+    assert len(started) == n and ("📁 dreamer", "thread:dreamer") in PICKERS[-1][1]
+    assert ("💬 No project", "thread:") in PICKERS[-1][1]
+    await press("thread:dreamer", 203)
+    sid, text = started[-1]
+    assert text == "plot the reward curves" and env.agent.get(sid).project == "dreamer"
+    assert env.store.thread_session(1, 203) == sid and renamed[-1] == (203, "dreamer · plot the reward curves")
+    # "<project>: ..." skips the picker.
+    await bot.on_text(topic_update("chem: is the DFT run done?", thread=204), None)
+    await drain()
+    assert env.agent.get(started[-1][0]).project == "chem" and started[-1][1] == "is the DFT run done?"
+    # Commands act on the thread's conversation: /new gives the thread a fresh one, in the same project.
+    await bot.cmd_new(topic_update("/new", thread=203), NS(args=[]))
+    fresh = env.store.thread_session(1, 203)
+    assert fresh != sid and env.agent.get(fresh).project == "dreamer"
+
+    # Replies of a conversation, and reports on the jobs it submitted, go to its thread.
+    await notifier.send(Outgoing("🤖 done", session_id=fresh))
+    assert tg.sent[-1] == (1, 203, "🤖 done")
+    env.store.upsert_job(JobRecord(job_id="777", by_agent=1, session_id=fresh, project="dreamer"))
+    await notifier.send(Outgoing("✅ Job 777 finished", job_id="777"))
+    assert tg.sent[-1] == (1, 203, "✅ Job 777 finished")
+    # The thread was deleted: messages continue in the project's topic (here: labelled main chat).
+    tg.dead_threads.add(203)
+    await notifier.send(Outgoing("🤖 still there?", session_id=fresh))
+    assert tg.sent[-1] == (1, None, "📁 <b>dreamer</b> · 🤖 still there?") and env.store.thread_session(1, 203) is None
+
+
+async def _noop(*a, **k):
+    return None
+
+
+async def test_native_rich_messages(env):
+    from telegram import InputFile
+    from telegram.error import BadRequest, EndPointNotFound
+    from overseer.bot import TelegramNotifier
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    s = env.agent.general_session()
+    msg = Outgoing("🤖 <b>html</b> fallback", markdown="**Done** - a table:\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+                   session_id=s.id, photos=[("reward.png", b"PNG")], files=[('res"ults.csv', b"x,y")],
+                   buttons=[[("📜 Log", "log:1")]])
+    await notifier.send(msg)
+    endpoint, kw = tg.api_calls[-1]
+    assert endpoint == "sendRichMessage" and kw["chat_id"] == 1
+    md = kw["rich_message"]["markdown"]
+    assert md.startswith("**Done** - a table:") and '![](tg://photo?id=p0 "reward.png")' in md
+    assert '![](tg://document?id=d0 "results.csv")' in md  # quotes can't break the caption
+    assert kw["rich_message"]["media"] == [{"id": "p0", "media": {"type": "photo", "media": "attach://file_p0"}},
+                                           {"id": "d0", "media": {"type": "document", "media": "attach://file_d0"}}]
+    assert isinstance(kw["file_p0"], InputFile) and isinstance(kw["file_d0"], InputFile)
+    assert kw["reply_markup"].inline_keyboard[0][0].callback_data == "log:1"
+    assert env.store.message_link(1, len(tg.sent))[1] == s.id  # replies to it continue the conversation
+
+    # Telegram rejects it: the regular message goes out instead (with its pictures and files).
+    tg.api_errors = {"sendRichMessage": BadRequest("Can't parse rich message")}
+    await notifier.send(msg)
+    assert [t for _, _, t in tg.sent[-3:]] == ["🤖 <b>html</b> fallback", "<photo reward.png>", '<file res"ults.csv>']
+    # A server without rich messages: switched off for good.
+    tg.api_errors = {"sendRichMessage": EndPointNotFound("Not Found")}
+    await notifier.send(Outgoing("plain", markdown="**rich**"))
+    assert not notifier.rich and tg.sent[-1][2] == "plain"
+    n = len(tg.api_calls)
+    await notifier.send(Outgoing("plain again", markdown="**rich**"))
+    assert len(tg.api_calls) == n
+
+    # The agent's replies and command summaries come with a rich version.
+    await env.agent.handle(s, "FAKE_MD go")
+    reply = env.notifier.sent[-1]
+    assert reply.markdown.startswith("**Fixed** the batch size in `train.py`") and "<i>claude_code ·" in reply.markdown
+    summary = next(m for m in env.notifier.sent if "command(s)" in m.text)
+    assert "<details><summary>Show</summary>" in summary.markdown and "```bash\n$ ssh hpc" in summary.markdown
+
+
+async def test_streaming_drafts(env, monkeypatch):
+    from overseer.bot import Bot, TelegramNotifier
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    s = env.agent.general_session()
+    handle = await notifier.post_live(Outgoing("⏳ codex is working", session_id=s.id))
+    endpoint, kw = tg.api_calls[-1]
+    assert endpoint == "sendMessageDraft" and kw["can_stop"] and kw["parse_mode"] == "HTML"
+    assert kw["draft_id"] == handle["draft"] and notifier.draft_session(handle["draft"]) == s.id
+    await notifier.edit_live(handle, "⏳ still working")
+    assert tg.api_calls[-1][1]["draft_id"] == handle["draft"] and tg.api_calls[-1][1]["text"] == "⏳ still working"
+
+    # The draft's Stop button stops the agent's run.
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    stopped = []
+
+    async def stop(sid):
+        stopped.append(sid)
+        return True
+    monkeypatch.setattr(env.agent, "stop", stop)
+    update = NS(api_kwargs={"stopped_message_generation": {"chat": {"id": 1, "type": "private"}, "draft_id": handle["draft"]}})
+    await bot.on_raw_update(update, None)
+    assert stopped == [s.id]
+    await bot.on_raw_update(NS(api_kwargs={"stopped_message_generation": {"chat": {"id": 666}, "draft_id": handle["draft"]}}), None)
+    assert stopped == [s.id]  # not from a stranger
+    await notifier.delete_live(handle)
+    assert notifier.draft_session(handle["draft"]) is None
+
+    # Drafts unavailable: back to a message edited in place.
+    from telegram.error import EndPointNotFound
+    tg.api_errors = {"sendMessageDraft": EndPointNotFound("Not Found")}
+    handle = await notifier.post_live(Outgoing("⏳ working", session_id=s.id))
+    assert "messages" in handle and not notifier.streaming and tg.sent[-1][2] == "⏳ working"

@@ -19,6 +19,9 @@ class Outgoing:
     photos: list[tuple[str, bytes]] = field(default_factory=list)  # images, sent as pictures (an album if several)
     silent: bool = False
     project: str | None = None  # the project topic to post in; by default the conversation's or job's
+    # Telegram Rich Markdown version of the message, used when rich messages are available
+    # (`text` is the fallback). Pictures and files are embedded in it.
+    markdown: str | None = None
 
 
 class Notifier(Protocol):

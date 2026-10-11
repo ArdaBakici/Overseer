@@ -36,6 +36,8 @@ telegram:
   token_env: TELEGRAM_BOT_TOKEN
   # Your chat id(s). The agent has full access to your HPC account, so only list chats you control.
   allowed_chat_ids: [123456789]
+  rich_messages: true           # Telegram's native rich messages for agent replies (tables, formulas, plots inline)
+  streaming: true               # live progress as a streaming draft with a Stop button
 
 agent:
   enabled: true

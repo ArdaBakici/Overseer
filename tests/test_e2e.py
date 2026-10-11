@@ -175,6 +175,8 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         "ssh hpc 'bash -lc \"echo HOME=$HOME; echo U=$USER | tail -1\"'",
         # A plot made on the HPC, copied into the outbox: it's sent with the reply.
         f"scp hpc:{remote / 'proj' / 'reward.png'} ./outbox/ && echo SCP-DONE",
+        # A service listening on this machine's localhost (here: the test sshd).
+        f"(exec 3<>/dev/tcp/127.0.0.1/{cfg.ssh.port}) 2>/dev/null && echo LOOPBACK-OPEN || echo LOOPBACK-CLOSED",
     ]
     (remote / "proj" / "reward.png").write_bytes(b"\x89PNG\r\n\x1a\n made on the HPC")
     (app / ".env").write_text("TELEGRAM_BOT_TOKEN=999:super-secret-token\n")
@@ -212,6 +214,9 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         assert "super-secret-token" not in outs[7] and "ENVCHECK-DONE" in outs[7], detail  # .env unreadable
         assert "HOME=/" in outs[8] and "U=" in outs[8] and "requires approval" not in outs[8], detail
         assert "SCP-DONE" in outs[9], detail
+        # Known gap: Codex's sandbox doesn't isolate the machine's localhost (Claude Code's does). If this
+        # starts failing for codex, Codex closed it: update the README's sandbox table.
+        assert ("LOOPBACK-OPEN" if backend == "codex" else "LOOPBACK-CLOSED") in outs[10], detail
         assert notes.sent[-1].photos == [("reward.png", b"\x89PNG\r\n\x1a\n made on the HPC")], detail
         assert "refused by" not in texts, detail
         assert "Agent submitted job 5001" in texts, detail
