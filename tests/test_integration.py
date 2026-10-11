@@ -1247,6 +1247,12 @@ class FakeTelegram:
     api_calls: list = None  # (endpoint, kwargs) of do_api_request
     api_errors: dict = None  # endpoint -> exception to raise
 
+    async def send_message_draft(self, chat_id, draft_id, text=None, message_thread_id=None, parse_mode=None,
+                                 api_kwargs=None):
+        return await self.do_api_request("sendMessageDraft", {
+            "chat_id": chat_id, "draft_id": draft_id, "text": text, "message_thread_id": message_thread_id,
+            "parse_mode": parse_mode, **(api_kwargs or {})})
+
     async def do_api_request(self, endpoint, api_kwargs=None, return_type=None):
         self.api_calls = (self.api_calls or []) + [(endpoint, api_kwargs)]
         err = (self.api_errors or {}).get(endpoint)

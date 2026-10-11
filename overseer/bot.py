@@ -329,11 +329,9 @@ class TelegramNotifier:
         return {"messages": handle}
 
     async def _draft(self, chat_id: int, thread: int | None, draft_id: int, text: str) -> None:
-        kwargs = {"chat_id": chat_id, "draft_id": draft_id, "text": text[:TG_LIMIT], "parse_mode": "HTML",
-                  "can_stop": True}
-        if thread:
-            kwargs["message_thread_id"] = thread
-        await self.app.bot.do_api_request("sendMessageDraft", api_kwargs=kwargs)
+        # can_stop (the Stop button, Bot API 10.3) is newer than python-telegram-bot: passed as an extra field.
+        await self.app.bot.send_message_draft(chat_id, draft_id, text=text[:TG_LIMIT], message_thread_id=thread,
+                                              parse_mode=ParseMode.HTML, api_kwargs={"can_stop": True})
 
     async def edit_live(self, handle: dict, text: str) -> None:
         if "draft" in handle:  # same draft id: Telegram animates the change; refreshing also keeps it alive
