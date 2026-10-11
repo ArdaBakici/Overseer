@@ -27,8 +27,8 @@ slurm:
   status_interval_minutes: 60   # periodic progress message for running jobs (0 = off)
   track: all                    # "all" of your jobs, or only the ones the agent submitted ("agent")
   notify_queued: true
-  log_tail_lines: 40
-  gpu_stats: false              # run `srun --overlap nvidia-smi` in running jobs for GPU utilisation
+  log_tail_lines: 12            # lines of the (training) log shown in status messages
+  gpu_stats: false              # GPU use in the hourly status (srun --overlap nvidia-smi); the 📊 Status button always shows it
   ignore_name_globs: ["interactive", "sys/dashboard*", "ood-*"]
   setup: ""                     # only if SLURM isn't found: what you'd run first, e.g. "module load slurm"
 

@@ -9,16 +9,33 @@ import logging
 import time
 
 from .config import Config
-from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, tqdm_cleanup
+from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, find_log_paths, tqdm_cleanup
 from .hpc import HPC
 from .notify import Notifier, Outgoing, code, esc, pre
-from .slurm import STATE_EMOJI, SUCCESS_STATES, Job, gpus_from_tres, summarize_steps
+from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, format_gpu_stats, gpus_from_tres, human_seconds,
+                    slurm_seconds, summarize_steps)
 from .ssh import SSHError
 from .store import JobRecord, Store
 
 log = logging.getLogger(__name__)
 
 MISSING_POLLS_BEFORE_GIVING_UP = 10
+
+
+async def progress_log(hpc: HPC, rec: JobRecord) -> str:
+    """The log file the job's program actually writes to, when its SLURM stdout names one
+    (e.g. "output: .../train_<jobid>.log"). Remembered in rec.info; the caller saves rec."""
+    info = rec.info_dict
+    if info.get("progress_log"):
+        return info["progress_log"]
+    if not rec.stdout:
+        return ""
+    paths = find_log_paths(await hpc.try_head(rec.stdout, 80), rec.job_id, exclude=(rec.stdout, rec.stderr))
+    if not paths:
+        return ""
+    info["progress_log"] = paths[0]
+    rec.info = json.dumps(info)
+    return paths[0]
 
 
 class Monitor:
@@ -192,27 +209,39 @@ class Monitor:
         rec.last_status_at = time.time()
         await self.notifier.send(await self.status_message(rec, job))
 
-    async def status_message(self, rec: JobRecord, job: Job | None = None) -> Outgoing:
-        tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, self.cfg.slurm.log_tail_lines))
-        err_tail = ""
-        if rec.stderr and rec.stderr != rec.stdout:
-            err_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 15))
-        parts = [f"📊 <b>Job {esc(rec.job_id)}</b> {esc(rec.name)} — {esc(job.state if job else rec.state)}"]
+    async def status_message(self, rec: JobRecord, job: Job | None = None, gpu: bool | None = None) -> Outgoing:
+        """Where the job stands: time used/left, metrics, GPU use, and the last few lines of its
+        (training) log. `gpu`: query nvidia-smi on the node (default: slurm.gpu_stats)."""
+        log_path = await progress_log(self.hpc, rec)
+        self.store.upsert_job(rec)
+        source = log_path or rec.stdout
+        text = tqdm_cleanup(await self.hpc.try_tail(source, max(200, self.cfg.slurm.log_tail_lines)))
+        shown = "\n".join(text.rstrip("\n").split("\n")[-self.cfg.slurm.log_tail_lines:])
+        state = job.state if job else rec.state
+        parts = [f"📊 <b>Job {esc(rec.job_id)}</b> {esc(rec.name)} — {esc(state)}"]
         if job:
-            parts.append(f"elapsed {esc(job.elapsed)} / {esc(job.time_limit)} · {esc(job.reason)}")
-        metrics = extract_metrics(tail)
+            elapsed, limit = slurm_seconds(job.elapsed), slurm_seconds(job.time_limit)
+            timing = f"⏱ {esc(job.elapsed)} of {esc(job.time_limit)}"
+            if elapsed is not None and limit:
+                timing += f" ({100 * elapsed // limit}%, {human_seconds(max(0, limit - elapsed))} left)"
+            where = f"node {esc(job.reason)}" if state == "RUNNING" else f"waiting: {esc(job.reason)}"
+            parts.append(f"{timing} · {where}")
+        metrics = extract_metrics(text)
         if metrics:
-            parts.append("metrics: " + ", ".join(f"{esc(k)}={esc(v)}" for k, v in metrics.items()))
-        line = await self.reporter.status_line(tail)
+            parts.append("📈 " + " · ".join(f"{esc(k)} {esc(v)}" for k, v in metrics.items()))
+        line = await self.reporter.status_line(text)
         if line:
             parts.append(f"🧠 {esc(line)}")
-        if self.cfg.slurm.gpu_stats and job and job.state == "RUNNING":
-            gpu = await self.hpc.gpu_stats(rec.job_id)
-            if gpu:
-                parts.append("GPU:" + pre(gpu, 800))
-        parts.append(pre(tail, 1800))
-        if err_tail.strip():
-            parts.append("stderr:" + pre(err_tail, 800))
+        if (self.cfg.slurm.gpu_stats if gpu is None else gpu) and state == "RUNNING":
+            stats = await self.hpc.gpu_stats(rec.job_id)
+            parts += [f"🎮 {esc(g)}" for g in format_gpu_stats(stats)] if stats else ["🎮 (GPU usage unavailable)"]
+        if rec.stderr and rec.stderr != rec.stdout and state == "RUNNING":
+            err = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 60))
+            for f in find_issues(err)[:3]:  # only real problems; warnings are noise here
+                parts.append(f"⚠️ stderr: <b>{esc(f.category)}</b> {code(f.evidence[:200])}")
+        label = code(log_path.rsplit("/", 1)[-1]) if log_path else "stdout"
+        if shown.strip():
+            parts.append(f"📄 {label}, last lines:" + pre(shown, 1500))
         return Outgoing("\n".join(p for p in parts if p), job_id=rec.job_id, silent=True)
 
     async def _on_finished(self, rec: JobRecord, final: Job) -> None:
@@ -244,6 +273,10 @@ class Monitor:
         seff = await self.hpc.seff(rec.job_id)
         out_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 200))
         err_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 120)) if rec.stderr and rec.stderr != rec.stdout else ""
+        log_path = await progress_log(self.hpc, rec)
+        if log_path:  # the program's own log: its metrics and its traceback, if it crashed
+            out_tail = (f"{out_tail}\n--- {log_path} ---\n"
+                        + tqdm_cleanup(await self.hpc.try_tail(log_path, 200)))
         combined = out_tail + "\n" + err_tail
         success = final.state in SUCCESS_STATES and final.exit_code.startswith("0")
         findings = [] if success else find_issues(combined, final.state)

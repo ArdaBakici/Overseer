@@ -121,7 +121,7 @@ class SlurmConfig:
     # "all": every job of your user. "agent": only jobs the agent submitted.
     track: str = "all"
     notify_queued: bool = True
-    log_tail_lines: int = 40
+    log_tail_lines: int = 12  # lines of the (training) log shown in status messages
     # Run `srun --overlap nvidia-smi` inside running jobs for GPU utilisation in status updates.
     gpu_stats: bool = False
     # Jobs whose names match any of these globs are ignored (e.g. interactive sessions).

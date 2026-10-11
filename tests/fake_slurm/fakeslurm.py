@@ -79,6 +79,11 @@ elif prog == "sbatch":
     st.setdefault("submissions", []).append(args)
     save(st)
     print(jid if "--parsable" in args else f"Submitted batch job {jid}")
+elif prog == "srun":  # only used for `srun --jobid=N --overlap ... nvidia-smi --query-gpu=...`
+    if "nvidia-smi" in args:
+        print("0, NVIDIA A100-SXM4-80GB, 87 %, 31234 MiB, 81920 MiB")
+    else:
+        sys.exit(1)
 elif prog == "scancel":
     jobs[args[0]]["state"] = "CANCELLED"
     save(st)

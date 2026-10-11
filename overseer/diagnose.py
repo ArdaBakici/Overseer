@@ -92,20 +92,45 @@ def extract_traceback(log_text: str, max_lines: int = 40) -> str:
     return "\n".join(out)
 
 
+_METRIC_WORDS = (r"epoch|step|iter(?:ation)?|loss|acc(?:uracy)?|lr|ppl|perplexity|f1|bleu|reward|return|score"
+                 r"|success(?:_rate)?|mse|mae|auc|map|fps")
+# A metric name, optionally namespaced like episode/score, train/loss/dyn, val_loss or eval.acc.
 METRIC_RE = re.compile(
-    r"\b(epoch|step|iter(?:ation)?|loss|train_loss|val_loss|eval_loss|acc(?:uracy)?|val_acc|lr|ppl|perplexity|f1|bleu|reward)\b"
-    r"\s*[:=]?\s*\[?\s*(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?:\s*/\s*(\d+))?",
+    r"(?<![\w/.-])((?:[a-z][\w.-]*[/.])*(?:[a-z]+_)?(?:" + _METRIC_WORDS + r")(?:[/.][\w.-]+)*)\b"
+    r"\s*[:=]?\s*\[?\s*(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?![\w.])(?:\s*/\s*(\d+)(?![\w.]))?",
     re.I,
 )
+# Shown first: progress, then results, then losses.
+_METRIC_RANK = [r"^(epoch|step|iter)", r"score|return|reward|success", r"(^|[/._])(eval|val|test)", r"acc|f1|bleu|auc",
+                r"loss|ppl|perplexity|mse|mae"]
 
 
-def extract_metrics(log_text: str) -> dict[str, str]:
-    """Last seen value of common training metrics, e.g. {'epoch': '3/10', 'loss': '0.412'}."""
+def extract_metrics(log_text: str, limit: int = 10) -> dict[str, str]:
+    """Last seen value of common training metrics, e.g. {'epoch': '3/10', 'loss': '0.412',
+    'episode/score': '3.1'}, at most `limit` of them, most informative first."""
     metrics: dict[str, str] = {}
     for m in METRIC_RE.finditer(log_text[-50_000:]):
         key = m.group(1).lower()
         metrics[key] = m.group(2) + (f"/{m.group(3)}" if m.group(3) else "")
-    return metrics
+
+    def rank(key: str) -> int:
+        return next((i for i, rx in enumerate(_METRIC_RANK) if re.search(rx, key)), len(_METRIC_RANK))
+
+    return dict(sorted(metrics.items(), key=lambda kv: rank(kv[0]))[:limit])
+
+
+_PATH_RE = re.compile(r"(?<![\w.-])(/[\w./%+=@-]+\.(?:log|out|txt|err|jsonl|csv))\b")
+
+
+def find_log_paths(text: str, job_id: str, exclude: tuple[str, ...] = ()) -> list[str]:
+    """Log files a job's output points to: absolute paths that contain the job id
+    (e.g. "output: /scratch/me/runs/x/train_18743802.log"). Training scripts often
+    redirect their real output there, leaving only a preamble in SLURM's stdout file."""
+    out = []
+    for path in _PATH_RE.findall(text):
+        if job_id in path and path not in exclude and path not in out:
+            out.append(path)
+    return out
 
 
 def tqdm_cleanup(text: str) -> str:

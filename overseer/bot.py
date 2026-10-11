@@ -27,7 +27,7 @@ from .agent import Agent, Session
 from .autopilot import parse_duration
 from .config import BACKENDS, Config
 from .hpc import HPC
-from .monitor import Monitor
+from .monitor import Monitor, progress_log
 from .notify import TG_LIMIT, Outgoing, code, esc, pre, split_message
 from .slurm import STATE_EMOJI
 from .ssh import SSHError
@@ -219,7 +219,7 @@ class Bot:
             await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
             return
         live = {j.job_id: j for j in await self.hpc.squeue()}
-        msg = await self.monitor.status_message(rec, live.get(job_id))
+        msg = await self.monitor.status_message(rec, live.get(job_id), gpu=True)
         msg.silent = False
         if rec.report:
             msg.text += f"\n\n🧠 {esc(rec.report[:1500])}"
@@ -238,10 +238,19 @@ class Bot:
             await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
             return
         lines = max(1, min(lines, 5000))
+        log_path = await progress_log(self.hpc, rec)
+        self.store.upsert_job(rec)
         out = await self.hpc.try_tail(rec.stdout, lines)
         files = [(f"job-{job_id}-stdout.log", out.encode())]
         if rec.stderr and rec.stderr != rec.stdout:
             files.append((f"job-{job_id}-stderr.log", (await self.hpc.try_tail(rec.stderr, lines)).encode()))
+        if log_path:  # the program writes its real output here; SLURM's stdout only has the preamble
+            main = await self.hpc.try_tail(log_path, lines)
+            files.insert(0, (log_path.rsplit("/", 1)[-1], main.encode()))
+            text = f"📜 Job {code(job_id)} {code(log_path)}" + pre(main, 3000) + f"\nSLURM stdout: {code(rec.stdout)}"
+            files = files if lines > 60 else []
+            await self.notifier.send(Outgoing(text, job_id=job_id, files=files))
+            return
         await self.notifier.send(Outgoing(f"📜 Job {code(job_id)} {code(rec.stdout)}" + pre(out, 3000),
                                           job_id=job_id, files=files if lines > 60 else []))
 

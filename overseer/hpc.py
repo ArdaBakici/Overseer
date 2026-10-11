@@ -61,6 +61,16 @@ class HPC:
         if not self.user:
             await self.connect()
 
+    async def try_head(self, path: str, lines: int) -> str:
+        """First lines of a file, or "" if it can't be read."""
+        if not path:
+            return ""
+        try:
+            res = await self.run(["head", "-n", str(int(lines)), "--", path], max_output=100_000)
+        except SSHError:
+            return ""
+        return res.stdout if res.ok else ""
+
     async def try_tail(self, path: str, lines: int) -> str:
         """Last lines of a (log) file, or a short explanation if it can't be read."""
         if not path:

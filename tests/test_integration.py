@@ -1036,3 +1036,54 @@ def test_status_line_and_durations():
     assert parse_status("no status here") == ("no status here", None, "")
     assert parse_duration("2h") == 7200 and parse_duration("90m") == 5400 and parse_duration("1d") == 86400
     assert parse_duration("1.5") == 5400 and parse_duration("off") == 0 and parse_duration("soon") is None
+
+
+async def test_status_follows_the_training_log(env):
+    """SLURM's stdout often only has a launcher preamble; the training output goes to a file it names."""
+    from overseer.bot import Bot
+    proj = env.home / "proj"
+    run = proj / "runs" / "seed0"
+    run.mkdir(parents=True)
+    train_log = run / "train_18743802.log"
+    train_log.write_text("──── Step 11000 ────\nepisode/score 2.4 / episode/length 230\n"
+                         "──── Step 12000 ────\nepisode/score 3.1 / episode/length 245 / train/loss/dyn 0.42\n")
+    stdout = proj / "slurm-18743802.out"
+    stdout.write_text(f"node: cn257 MUJOCO_GL: egl\npygame 2.6.1\ntraining: /venv/bin/python train.py --logdir {run}\n"
+                      f"output: {train_log}\n")
+    stderr = proj / "slurm-18743802.err"
+    stderr.write_text("gymnasium/core.py:311: UserWarning: env.get_frame to get variables is deprecated\n")
+    job = {"name": "bench-dreamerv3-mixed-s0", "state": "RUNNING", "workdir": str(proj), "stdout": str(stdout),
+           "stderr": str(stderr), "elapsed": "1:00:00", "time_limit": "4:00:00", "nodelist": "cn257"}
+    env.set_jobs(**{"18743802": job})
+    await env.monitor.poll()
+
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    await bot._send_status("18743802")
+    text = env.notifier.sent[-1].text
+    assert "⏱ 1:00:00 of 4:00:00 (25%, 3h00m left) · node cn257" in text
+    assert "📈 step 12000 · episode/score 3.1 · train/loss/dyn 0.42" in text
+    assert "🎮 GPU 0 A100-SXM4-80GB: 87% busy · 30.5/80 GB" in text
+    assert "<code>train_18743802.log</code>, last lines:" in text and "Step 12000" in text
+    assert "pygame" not in text and "UserWarning" not in text  # the preamble and harmless warnings stay out
+    assert json.loads(env.store.get_job("18743802").info)["progress_log"] == str(train_log)
+
+    # A real problem on stderr is flagged.
+    stderr.write_text("Traceback (most recent call last):\n  File \"train.py\"\ntorch.OutOfMemoryError: CUDA out of memory.\n")
+    await bot._send_status("18743802")
+    assert "⚠️ stderr: <b>" in env.notifier.sent[-1].text
+
+    # 📜 Log shows the training log; SLURM's own files come along as attachments.
+    await bot._send_log("18743802", 200)
+    msg = env.notifier.sent[-1]
+    assert "train_18743802.log" in msg.text and "episode/score 3.1" in msg.text
+    assert [name for name, _ in msg.files] == ["train_18743802.log", "job-18743802-stdout.log", "job-18743802-stderr.log"]
+
+    # The final report reads the training log too (that's where a crash's traceback is).
+    stderr.write_text("gymnasium/core.py:311: UserWarning: env.get_frame is deprecated\n")
+    with train_log.open("a") as fh:
+        fh.write("Traceback (most recent call last):\n  File \"dreamer.py\", line 9\nValueError: bad replay ratio\n")
+    env.set_jobs(**{"18743802": {**job, "state": "FAILED", "exit": "1:0"}})
+    await env.monitor.poll()
+    final = next(m for m in env.notifier.sent if "Job 18743802" in m.text and "FAILED" in m.text)
+    assert "ValueError: bad replay ratio" in final.text

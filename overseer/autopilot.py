@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from .config import Config
 from .diagnose import extract_metrics, tqdm_cleanup
 from .hpc import HPC
+from .monitor import progress_log
 from .notify import Notifier, Outgoing, code, esc
 from .slurm import SUCCESS_STATES, Job
 from .store import AutopilotRecord, JobRecord, Store
@@ -328,7 +329,11 @@ class Autopilot:
     async def _checkin(self, s: Session, a: AutopilotRecord, due: list[tuple[JobRecord, Job]]) -> None:
         parts = []
         for rec, job in due:
-            tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 80)) if rec.stdout else ""
+            tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 40)) if rec.stdout else ""
+            log_path = await progress_log(self.hpc, rec)
+            if log_path:  # the program's own log, where the training progress is
+                self.store.upsert_job(rec)
+                tail += f"\n--- {log_path} ---\n" + tqdm_cleanup(await self.hpc.try_tail(log_path, 80))
             err = ""
             if rec.stderr and rec.stderr != rec.stdout:
                 err = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 30))

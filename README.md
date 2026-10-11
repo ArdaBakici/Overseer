@@ -104,6 +104,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | *reply to any job message* | talk to the agent about that job ("lower the lr to 1e-4 and resubmit", "why is it slow?") |
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
 | `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
+| **📊 Status** / **📜 Log** buttons | Status: time used and left, latest metrics, GPU use, problems on stderr and the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and autopilot check-ins too |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |

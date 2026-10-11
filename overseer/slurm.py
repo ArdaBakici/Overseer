@@ -174,3 +174,47 @@ def summarize_steps(rows: list[dict[str, str]]) -> dict[str, str]:
 def gpus_from_tres(tres: str) -> str:
     m = re.search(r"gres/gpu(?::[^=,]+)?=(\d+)", tres or "")
     return m.group(1) if m else ""
+
+
+def slurm_seconds(t: str) -> int | None:
+    """SLURM durations ('1:58', '4:00:00', '1-02:00:00') in seconds; None for UNLIMITED etc."""
+    t = (t or "").strip()
+    if not t or not t[0].isdigit():
+        return None
+    days = 0
+    if "-" in t:
+        d, t = t.split("-", 1)
+        days = int(d)
+    try:
+        parts = [int(float(x)) for x in t.split(":")]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts[-3:]
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def human_seconds(sec: int) -> str:
+    if sec < 3600:
+        return f"{sec // 60}m"
+    if sec < 86400:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{sec // 86400}d{sec % 86400 // 3600}h"
+
+
+def format_gpu_stats(csv: str) -> list[str]:
+    """nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total CSV -> readable lines."""
+    out = []
+    for line in csv.strip().splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) != 5:
+            out.append(line.strip())
+            continue
+        idx, name, util, used, total = cols
+        try:
+            mem = f"{float(used.split()[0]) / 1024:.1f}/{float(total.split()[0]) / 1024:.0f} GB"
+        except (ValueError, IndexError):
+            mem = f"{used}/{total}"
+        out.append(f"GPU {idx} {name.replace('NVIDIA ', '')}: {util.replace(' ', '')} busy · {mem}")
+    return out
