@@ -103,6 +103,10 @@ class Progress:
             self.steps.append(("🔧", f"{ev.get('name')} {ev.get('detail') or ''}".strip()))
         elif kind == "file":
             self.steps.append(("✏️", ev.get("path", "")))
+        elif kind == "compacting":
+            self.steps.append(("🗜", "compacting the conversation (the context is full)…"))
+        elif kind == "compact":
+            self.steps.append(("🗜", "conversation compacted: older turns are now a summary"))
         elif kind == "command":
             self.commands += 1
             self.running = (ev["command"], time.monotonic())
@@ -213,6 +217,13 @@ def render_event(ev: dict[str, Any], st: Style, *, full: bool = False, output_li
         return [st(f"🔧 {ev.get('name')} {ev.get('detail') or ''}".rstrip(), "35")]
     if kind == "file":
         return [st(f"✏️  {ev.get('path')}", "35")]
+    if kind == "compacting":
+        return [st("🗜 compacting the conversation…", "1;34")]
+    if kind == "compact":
+        tokens = (f" ({ev['pre_tokens']} → {ev['post_tokens']} tokens)" if ev.get("pre_tokens") and ev.get("post_tokens")
+                  else "")
+        how = "on request" if ev.get("trigger") == "manual" else "automatically"
+        return [st(f"🗜 conversation compacted {how}{tokens}: older turns are now a summary", "1;34")]
     if kind == "end":
         status = ev.get("status")
         out = []

@@ -160,8 +160,26 @@ def _duration(seconds: float) -> str:
     return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
 
 
+def strip_tags(html_text: str) -> str:
+    return re.sub(r"<[^>]+>", "", html_text)
+
+
 def _human(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def compaction_line(compactions: list[dict]) -> str:
+    """🗜 The conversation was compacted during the run (HTML), or "" if it wasn't."""
+    if not compactions:
+        return ""
+    if len(compactions) > 1:
+        return f"🗜 <i>The conversation was compacted {len(compactions)} times during this run: older turns are now a summary.</i>"
+    c = compactions[0]
+    how = "on request" if c.get("trigger") == "manual" else "automatically, as the context was full"
+    tokens = f" ({_human(c['pre_tokens'])} → {_human(c['post_tokens'])} tokens)" if c.get("pre_tokens") and c.get("post_tokens") else ""
+    return f"🗜 <i>The conversation was compacted {how}{tokens}: older turns are now a summary.</i>"
 
 
 @dataclass
@@ -384,6 +402,52 @@ class Agent:
                     self.sessions[sess.id].rec.project = project
         return rec
 
+    async def compact(self, s: Session, focus: str = "") -> bool:
+        """Compact the conversation now (the researcher's /compact): the CLI summarises its older turns."""
+        backend = self.backend_of(s.project)
+        if not s.rec.cli_session_id or s.rec.backend != backend:
+            await self.notifier.send(Outgoing(f"🗜 Nothing to compact: this conversation has no history with "
+                                              f"{esc(backend)} yet.", session_id=s.id, job_id=s.job_id))
+            return False
+        if self.is_running(s):
+            await self.notifier.send(Outgoing("The agent is working in this conversation: send /compact when it's "
+                                              "done (or /stop it first).", session_id=s.id, job_id=s.job_id))
+            return False
+        runner = self.runner(backend, s.project)
+        async with s.lock:
+            s.task = asyncio.current_task()
+            transcript = Transcript(self.cfg, s.id)
+            transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
+                              "text": ("/compact " + focus).strip()})
+            activity = Activity()
+            activity.on_progress = transcript.write
+            await self.notifier.send(Outgoing(f"🗜 Compacting the conversation ({esc(backend)})…", session_id=s.id,
+                                              job_id=s.job_id, silent=True))
+            try:
+                res = await runner.compact(session_id=s.rec.cli_session_id, key=s.id, system=self.system_prompt(s.id),
+                                           activity=activity, focus=focus)
+            except asyncio.CancelledError:
+                transcript.write({"kind": "end", "status": "stopped"})
+                await self.notifier.send(Outgoing("⏹ Stopped.", session_id=s.id, job_id=s.job_id))
+                return False
+            except AgentRunError as e:
+                transcript.write({"kind": "end", "status": "error", "text": str(e)[:2000]})
+                await self.notifier.send(Outgoing(f"⚠️ Couldn't compact: {esc(e)}", session_id=s.id, job_id=s.job_id))
+                return False
+            finally:
+                s.task = None
+            if res.session_id and res.session_id != s.rec.cli_session_id:
+                s.rec.cli_session_id = res.session_id
+                self.store.upsert_session(s.rec)
+            c = res.compactions[-1]
+            tokens = (f": {_human(c['pre_tokens'])} → {_human(c['post_tokens'])} tokens"
+                      if c.get("pre_tokens") and c.get("post_tokens") else "")
+            note = " (Codex doesn't take a focus: it summarised everything)" if focus and backend == "codex" else ""
+            text = f"🗜 <b>Compacted the conversation</b>{tokens}. Older turns are now a summary{note}."
+            transcript.write({"kind": "end", "status": "done", "text": strip_tags(text)})
+            await self.notifier.send(Outgoing(text, session_id=s.id, job_id=s.job_id))
+            return True
+
     def is_running(self, s: Session) -> bool:
         return s.task is not None and not s.task.done()
 
@@ -562,7 +626,8 @@ class Agent:
         transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer,
                           **({"autopilot": status} if status else {})})
         skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
-        extra = [x for x in (autopilot_line, skipped) if x]  # HTML, which Rich Markdown accepts as well
+        compacted = compaction_line(res.compactions)
+        extra = [x for x in (compacted, autopilot_line, skipped) if x]  # HTML, which Rich Markdown accepts as well
         await self.notifier.send(Outgoing(
             f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + "".join(f"\n\n{x}" for x in extra)
             + f"\n\n<i>{esc(footer)}</i>",

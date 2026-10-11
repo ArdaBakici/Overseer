@@ -75,6 +75,9 @@ class RunResult:
     output_tokens: int = 0
     cost_usd: float | None = None  # Claude Code reports it; Codex doesn't
     usage_is_total: bool = False  # Codex: the token counts are the whole conversation's running total
+    # The CLI compacted the conversation (summarised older turns to free context): one dict each,
+    # {"trigger": "auto" | "manual", "pre_tokens": int | None, "post_tokens": int | None}
+    compactions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -82,7 +85,8 @@ class Activity:
     """What the agent did during one request (for Telegram reports, job tracking and the live view).
 
     Every step is also passed to `on_progress` as a dict with a "kind": thought (reasoning summary),
-    message (text the agent wrote between steps), command, output, tool, file or session."""
+    message (text the agent wrote between steps), command, output, tool, file, session, compacting or
+    compact (the conversation was compacted)."""
 
     commands: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
@@ -120,6 +124,13 @@ class Activity:
 
     def session(self, session_id: str) -> None:
         self._emit("session", id=session_id)
+
+    def compacting(self) -> None:
+        self._emit("compacting")
+
+    def compacted(self, info: dict[str, Any]) -> None:
+        """The CLI summarised the conversation's older turns to free context."""
+        self._emit("compact", **info)
 
     def command(self, cmd: str) -> None:
         cmd = display_command(cmd)
@@ -340,6 +351,10 @@ class Runner:
         """One-shot answer without tools (job reports)."""
         raise NotImplementedError
 
+    async def compact(self, *, session_id: str, key: str, system: str, activity: Activity, focus: str = "") -> RunResult:
+        """Compact the conversation now (summarise its older turns to free context)."""
+        raise NotImplementedError
+
     def login_command(self, extra: list[str]) -> tuple[list[str], dict[str, str]]:
         raise NotImplementedError
 
@@ -423,6 +438,14 @@ class ClaudeCodeRunner(Runner):
                 activity.session(result.session_id)
             if t == "system" and ev.get("subtype") == "init" and ev.get("model"):
                 result.model = ev["model"]
+            if t == "system" and ev.get("subtype") == "status" and ev.get("status") == "compacting":
+                activity.compacting()
+            if t == "system" and ev.get("subtype") == "compact_boundary":
+                meta = ev.get("compact_metadata") or {}
+                info = {"trigger": meta.get("trigger") or "auto", "pre_tokens": meta.get("pre_tokens"),
+                        "post_tokens": meta.get("post_tokens")}
+                result.compactions.append(info)
+                activity.compacted(info)
             if t == "assistant":
                 for block in (ev.get("message") or {}).get("content") or []:
                     kind = block.get("type")
@@ -463,6 +486,14 @@ class ClaudeCodeRunner(Runner):
         if stderr and not result.text:
             raise AgentRunError("claude: " + "\n".join(stderr.strip().splitlines()[-15:])[-1500:])
         return result
+
+    async def compact(self, *, session_id: str, key: str, system: str, activity: Activity, focus: str = "") -> RunResult:
+        """Compact the conversation now: Claude Code's own /compact, in the same session."""
+        res = await self.run(("/compact " + focus).strip(), system=system, session_id=session_id, key=key,
+                             activity=activity)
+        if not res.compactions:
+            raise AgentRunError("claude: the conversation wasn't compacted" + (f" ({res.text[:300]})" if res.text else ""))
+        return res
 
     async def text(self, *, system: str, prompt: str) -> str:
         workdir = self.workdir("oneshot")
@@ -592,6 +623,7 @@ class CodexRunner(Runner):
                           overrides=self.overrides(workdir, system=system, writable=writable, network=network))
         # codex reports the thread's running token total, not this run's; the caller subtracts the last one
         result = RunResult(text="", session_id=session_id, model=self.model, effort=self.effort, usage_is_total=True)
+        compacted_before = self.compaction_count(session_id) if session_id else 0
         messages: list[str] = []
         errors: list[str] = []
 
@@ -641,6 +673,100 @@ class CodexRunner(Runner):
             raise AgentRunError("codex: " + detail[-1500:])
         if not ephemeral and result.session_id:
             await self._fill_actual_settings(result)
+            # codex's --json events don't report compactions either; its session log does
+            for _ in range(self.compaction_count(result.session_id) - compacted_before):
+                info = {"trigger": "auto", "pre_tokens": None, "post_tokens": None}
+                result.compactions.append(info)
+                activity.compacted(info)
+        return result
+
+    def _rollout(self, thread_id: str) -> Path | None:
+        logs = sorted(self.home().glob(f"sessions/*/*/*/rollout-*{thread_id}.jsonl"), key=lambda f: f.stat().st_mtime)
+        return logs[-1] if logs else None
+
+    def compaction_count(self, thread_id: str) -> int:
+        """How often the thread was compacted so far (its session log has a "compacted" entry for each)."""
+        path = self._rollout(thread_id)
+        if not path:
+            return 0
+        n = 0
+        try:
+            with path.open(errors="replace") as fh:
+                for line in fh:
+                    if '"compacted"' in line:
+                        try:
+                            n += json.loads(line).get("type") == "compacted"
+                        except json.JSONDecodeError:
+                            pass
+        except OSError:
+            pass
+        return n
+
+    async def compact(self, *, session_id: str, key: str, system: str, activity: Activity, focus: str = "") -> RunResult:
+        """Compact the conversation now. `codex exec` has no way to, so this asks codex's app server
+        (JSON-RPC over stdio): resume the thread, then thread/compact/start. `focus` isn't supported."""
+        workdir = self.workdir(key)
+        argv = [self.c.command, "app-server"]
+        if self.model:
+            argv += ["-c", f"model={_toml(self.model)}"]
+        for o in self.overrides(workdir, system=system, writable=True, network=True):
+            argv += ["-c", o]
+        before = self.compaction_count(session_id)
+        activity.compacting()
+        proc = await asyncio.create_subprocess_exec(
+            *argv, env=self.env(workdir), cwd=str(workdir), stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, limit=32 * 1024 * 1024)
+
+        async def send(msg: dict[str, Any]) -> None:
+            proc.stdin.write((json.dumps(msg) + "\n").encode())
+            await proc.stdin.drain()
+
+        async def converse() -> None:
+            await send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "overseer", "version": "1"}}})
+            await send({"method": "initialized"})
+            await send({"id": 2, "method": "thread/resume", "params": {"threadId": session_id}})
+            await send({"id": 3, "method": "thread/compact/start", "params": {"threadId": session_id}})
+            compacted = False
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    raise AgentRunError("codex app-server stopped before the compaction finished")
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("error"):
+                    err = msg["error"]
+                    raise AgentRunError("codex: " + str(err.get("message") if isinstance(err, dict) else err)[:800])
+                method = msg.get("method")
+                item = (msg.get("params") or {}).get("item") or {}
+                if method == "item/completed" and item.get("type") == "contextCompaction":
+                    compacted = True
+                elif method == "turn/completed":
+                    turn = (msg.get("params") or {}).get("turn") or {}
+                    if turn.get("status") not in (None, "completed"):
+                        raise AgentRunError(f"codex: the compaction {turn.get('status')}: {turn.get('error')}"[:800])
+                    if compacted:
+                        return
+
+        try:
+            await asyncio.wait_for(converse(), timeout=self.cfg.agent.timeout_minutes * 60)
+        except asyncio.TimeoutError:
+            raise AgentRunError("codex: the compaction timed out")
+        finally:
+            if proc.returncode is None:
+                proc.stdin.close()
+                try:
+                    await asyncio.wait_for(proc.wait(), 10)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+        result = RunResult(text="", session_id=session_id, model=self.model, effort=self.effort)
+        if self.compaction_count(session_id) <= before:
+            raise AgentRunError("codex: the conversation wasn't compacted")
+        info = {"trigger": "manual", "pre_tokens": None, "post_tokens": None}
+        result.compactions.append(info)
+        activity.compacted(info)
         return result
 
     # codex's --json events don't say which model ran, but its session log does.

@@ -163,6 +163,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
 | *(while the agent works)* | a live ⏳ preview that updates every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. Its **Stop** button stops the run. It's a Telegram streaming draft, which vanishes when the answer arrives; where drafts aren't available (`telegram.streaming: false`, group chats) it's a message that is edited in place and then removed |
 | `/stop` | stop the agent's current run (kills the whole process group) |
+| `/compact [focus]` | compact the conversation now (below). As a reply to a message, it applies to that conversation |
 | `/auto [wake-ups] [every 2h] [for 48h] <goal>` | autopilot (below). As a reply to a message, it applies to that conversation. `/auto` shows progress and pending wake-ups, `/auto off` stops it |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
@@ -262,6 +263,19 @@ Guardrails:
 - **Jobs it cancels:** they leave its watches, so their end doesn't wake it.
 - **Visible at every step:** every wake-up, command and submitted job shows up in Telegram as usual. `/auto` lists what each conversation is waiting for, and `overseer watch` shows the reasoning live.
 - **Cost:** each wake-up re-sends the conversation so far. Wake-ups are usually hours apart, so the provider's prompt cache has expired and long autopilot runs get pricier per wake-up. The research log keeps the important history in a file you can read any time.
+
+**Long conversations: context compaction.** When a conversation's context fills up, the CLIs compact it on their own: older turns are replaced by a summary, and the work goes on. Overseer leaves this on and shows it:
+- **When it happens:**
+  - **Claude Code:** when the context is almost full (about 97% of the model's window in tests).
+  - **Codex:** at the model's auto-compact limit. To compact earlier, set it with `agent.codex.extra_config: ["model_auto_compact_token_limit=200000"]`.
+- **Where you see it:**
+  - **In the reply:** `🗜 The conversation was compacted automatically, as the context was full (970.2k → 12.4k tokens): older turns are now a summary.` Codex doesn't report token counts.
+  - **While it works:** the live progress message says "🗜 compacting the conversation…".
+  - **Afterwards:** the transcript and `overseer watch` record it too.
+- **Doing it yourself:** `/compact`, in the conversation's thread or topic, or as a reply to one of its messages, compacts it now. Use it before a long autopilot run, or when old details keep confusing the agent.
+  - **Claude Code** runs its own `/compact` in the same session and takes a focus: `/compact keep the lr sweep results and the baseline numbers`.
+  - **Codex** compacts through its app server (`thread/compact/start` on the same thread). It doesn't take a focus.
+- **What survives:** the summary is lossy, so the important facts are kept in files the agent re-reads: `OVERSEER.md` for project notes and `RESEARCH_LOG.md` for autopilot. `/new` starts a clean conversation instead.
 
 **Watching the agent live from the homelab.** `overseer watch` follows what the agent is doing in the terminal: its reasoning summaries, what it writes between steps, every command with its output, and the final answer.
 

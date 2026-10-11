@@ -2046,3 +2046,59 @@ async def test_ov_job_add_needs_slurm(env):
     assert not ok and "no project 'nope'" in text
     ok, text = await ctl.handle(token, [])
     assert ok and "ov job add" in text
+
+
+# ----------------------------------------------------------------------------- context compaction
+
+@pytest.mark.parametrize("backend", ["claude_code", "codex"])
+async def test_automatic_compaction_is_reported(env, backend):
+    """The CLI compacts the conversation on its own when the context fills up: the reply says so."""
+    env.agent.set_backend(backend)
+    s = env.agent.general_session()
+    await env.agent.handle(s, "go on FAKE_COMPACT")
+    reply = next(m.text for m in reversed(env.notifier.sent) if m.text.startswith("🤖"))
+    assert "🗜 <i>The conversation was compacted automatically, as the context was full" in reply
+    if backend == "claude_code":  # Claude Code says how much it freed
+        assert "(190.0k → 4.0k tokens)" in reply
+    events = [json.loads(line) for line in (env.cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()]
+    assert any(e["kind"] == "compact" and e["trigger"] == "auto" for e in events)
+
+    await env.agent.handle(s, "and again, without compacting")  # only compactions of this run count
+    reply = next(m.text for m in reversed(env.notifier.sent) if m.text.startswith("🤖"))
+    assert "🗜" not in reply
+
+
+@pytest.mark.parametrize("backend", ["claude_code", "codex"])
+async def test_compact_on_request(env, backend, monkeypatch):
+    from overseer.bot import Bot
+    env.agent.set_backend(backend)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "reply", reply)
+
+    s = env.agent.general_session()
+    await env.agent.compact(s)
+    assert "Nothing to compact" in env.notifier.sent[-1].text  # no history yet
+
+    await env.agent.handle(s, "hi")
+    cli_session = env.store.get_session(s.id).cli_session_id
+    await bot.cmd_compact(None, NS(args=["keep", "the", "lr", "results"]))  # in the main chat: its conversation
+    for t in list(bot._tasks):
+        await t
+    done = env.notifier.sent[-1].text
+    assert "🗜 <b>Compacted the conversation</b>" in done
+    call = env.cli_log()[-1]
+    if backend == "claude_code":  # Claude Code's own /compact, in the same session
+        assert call["stdin"] == "/compact keep the lr results" and call["argv"][call["argv"].index("--resume") + 1] == cli_session
+        assert ": 150.0k → 3.0k tokens" in done
+    else:  # codex's app server, on the same thread
+        assert call["argv"][0] == "app-server" and "doesn't take a focus" in done
+    assert env.store.get_session(s.id).cli_session_id == cli_session  # the conversation continues
+    events = [json.loads(line) for line in (env.cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()]
+    assert events[-1]["kind"] == "end" and any(e["kind"] == "compact" and e["trigger"] == "manual" for e in events)
+    await env.agent.handle(s, "continue")  # and works afterwards
+    assert env.notifier.sent[-1].text.startswith("🤖")

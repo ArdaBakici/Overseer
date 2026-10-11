@@ -295,3 +295,37 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         if backend == "codex":
             assert "name: overseer" in outs[19], detail
             assert re.search(r"r\d+` = `[^`]*/agents/" + re.escape(s.id) + r"/\.agents/skills`", body), body[:3000]
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_compaction_end_to_end(hpc, backend, cli_name):
+    """The real CLIs compact on their own when the model reports a full context (Overseer reports it), and
+    on request (/compact: Claude Code's own command, codex's app server)."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    # One response reports a context far beyond the limit; the CLI compacts before its next request.
+    big, at = (5_000_000, 1) if backend == "claude_code" else (50_000, 2)
+    with FakeModel(["echo one", "echo two"], input_tokens=lambda n: big if n == at else 1) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        if backend == "codex":  # compact above 20k tokens
+            cfg.agent.codex.extra_config.append("model_auto_compact_token_limit=20000")
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        await asyncio.wait_for(agent.handle(s, "Run the checks."), 180)
+        reply = notes.sent[-1].text
+        assert "🗜 <i>The conversation was compacted automatically" in reply, notes.texts()
+
+        n = len(fm.requests)
+        assert await asyncio.wait_for(agent.compact(s), 180), notes.texts()
+        assert "🗜 <b>Compacted the conversation</b>" in notes.sent[-1].text, notes.texts()
+        assert len(fm.requests) > n  # the CLI asked the model for the summary
+        await asyncio.wait_for(agent.handle(s, "Anything else?"), 180)  # the conversation goes on
+        assert notes.sent[-1].text.startswith("🤖"), notes.texts()
+        events = [json.loads(line) for line in
+                  (cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()]
+        assert [e["trigger"] for e in events if e["kind"] == "compact"] == ["auto", "manual"], events

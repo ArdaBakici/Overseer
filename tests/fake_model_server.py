@@ -16,10 +16,16 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+# The CLIs' requests for a summary of the conversation when they compact it: answered with a summary.
+COMPACTION_PROMPTS = ("create a detailed summary of the conversation", "CONTEXT CHECKPOINT COMPACTION")
+
+
 class FakeModel:
-    def __init__(self, script, think: bool = False):
+    def __init__(self, script, think: bool = False, input_tokens: int = 1):
         self.script = list(script)
         self.think = think
+        # reported per request (an int, or a function of the request number): a big number makes the CLIs compact
+        self.input_tokens = input_tokens
         self.requests = []
         self.outputs: list[str] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -89,7 +95,14 @@ class FakeModel:
 
         return H
 
-    def _next(self, n_outputs: int, has_tools: bool):
+    def _tokens(self) -> int:
+        t = self.input_tokens
+        return int(t(len(self.requests)) if callable(t) else t)
+
+    def _next(self, n_outputs: int, has_tools: bool, body=None):
+        if body is not None and any(marker in json.dumps(body) for marker in COMPACTION_PROMPTS):
+            return ("text", "<analysis>Ran the scripted commands.</analysis>\n<summary>The agent ran the scripted "
+                            "commands; nothing else is pending.</summary>")
         if not has_tools:
             return ("text", "OK")
         if n_outputs < len(self.script):
@@ -111,9 +124,9 @@ class FakeModel:
         tools = [t.get("name") for t in body.get("tools") or []]
         if outputs and len(outputs) > len(self.outputs):
             self.outputs = outputs
-        decision = self._next(len(outputs), "Bash" in tools)
+        decision = self._next(len(outputs), "Bash" in tools, body)
         n = len(self.requests)
-        usage = {"input_tokens": 1, "output_tokens": 1}
+        usage = {"input_tokens": self._tokens(), "output_tokens": 1}
         msg = {"id": f"msg_{n}", "type": "message", "role": "assistant", "model": body.get("model", "fake"),
                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}
         if decision[0] == "call":
@@ -175,7 +188,7 @@ class FakeModel:
             if t.get("name"):
                 tools[t["name"]] = t
         shell = next((n for n in ("exec_command", "shell_command", "shell") if n in tools), None)
-        decision = self._next(len(outputs), shell is not None)
+        decision = self._next(len(outputs), shell is not None, body)
         n = len(self.requests)
         if decision[0] == "call":
             if shell == "exec_command":
@@ -196,8 +209,9 @@ class FakeModel:
                       "summary": [{"type": "summary_text", "text": f"THOUGHT {k}: checking step {k}"}]},
                      {"type": "message", "role": "assistant", "id": f"msg_{n}_note", "status": "completed",
                       "content": [{"type": "output_text", "text": f"NOTE {k}", "annotations": []}]}] + items
-        usage = {"input_tokens": 1, "input_tokens_details": None, "output_tokens": 1,
-                 "output_tokens_details": None, "total_tokens": 2}
+        tokens = self._tokens()
+        usage = {"input_tokens": tokens, "input_tokens_details": None, "output_tokens": 1,
+                 "output_tokens_details": None, "total_tokens": tokens + 1}
         events = [("response.created", {"type": "response.created", "response": {"id": f"resp_{n}"}})]
         for i, it in enumerate(items):
             events.append(("response.output_item.added", {"type": "response.output_item.added", "output_index": i, "item": it}))

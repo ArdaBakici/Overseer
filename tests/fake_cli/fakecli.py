@@ -12,6 +12,8 @@ quoted in a wake-up's report) steer it: FAKE_DONE (`ov auto done`), FAKE_HELP (`
 FAKE_NOJOB (submit nothing), FAKE_TWO (submit two jobs), FAKE_NOWATCH (submit without watching);
 FAKE_EVERY in the goal adds check-ins; in a check-in, FAKE_DIVERGE makes it scancel and resubmit.
 Lines "FAKE_OV <command>" make it run those commands (the `ov` tool) and answer with their output.
+FAKE_COMPACT: the CLI compacts the conversation on its own during the run; a prompt starting with
+/compact (claude) or `codex app-server` + thread/compact/start compacts it on request.
 """
 import re
 import json
@@ -22,7 +24,7 @@ import uuid
 
 prog = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
-stdin = "" if sys.stdin.isatty() else sys.stdin.read()
+stdin = "" if sys.stdin.isatty() or args[:1] == ["app-server"] else sys.stdin.read()  # (app-server: a conversation)
 with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
     fh.write(json.dumps({"prog": prog, "argv": args, "env": dict(os.environ), "stdin": stdin, "cwd": os.getcwd()}) + "\n")
 
@@ -153,7 +155,18 @@ if prog == "claude":
         sys.exit(0)
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
     model = args[args.index("--model") + 1] if "--model" in args else "claude-fake-default"
+    if stdin.startswith("/compact"):  # Claude Code's own /compact, like in `claude -p`
+        emit({"type": "system", "subtype": "status", "status": "compacting", "session_id": sid})
+        emit({"type": "system", "subtype": "init", "session_id": sid, "model": model})
+        emit({"type": "system", "subtype": "compact_boundary", "session_id": sid,
+              "compact_metadata": {"trigger": "manual", "pre_tokens": 150000, "post_tokens": 3000}})
+        emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False, "result": ""})
+        sys.exit(0)
     emit({"type": "system", "subtype": "init", "session_id": sid, "model": model})
+    if "FAKE_COMPACT" in stdin:  # the context filled up: Claude Code compacted it on its own
+        emit({"type": "system", "subtype": "status", "status": "compacting", "session_id": sid})
+        emit({"type": "system", "subtype": "compact_boundary", "session_id": sid,
+              "compact_metadata": {"trigger": "auto", "pre_tokens": 190000, "post_tokens": 4000}})
     emit({"type": "assistant", "session_id": sid, "message": {"content": [
         {"type": "thinking", "thinking": "The batch size is probably too big for the GPU.", "signature": "x"}]}})
     emit({"type": "assistant", "session_id": sid, "message": {"content": [
@@ -179,6 +192,39 @@ if prog == "codex" and args[:1] == ["resume"]:  # interactive `overseer open`
     print("codex TUI would open here")
     sys.exit(0)
 
+
+def codex_rollout(tid):
+    log_dir = os.path.join(os.environ["CODEX_HOME"], "sessions", "2026", "10", "10")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"rollout-2026-10-10T00-00-00-{tid}.jsonl")
+
+
+def codex_compacted(tid):
+    with open(codex_rollout(tid), "a") as fh:  # what codex's session log records for a compaction
+        fh.write(json.dumps({"type": "compacted", "payload": {"message": "summary of the earlier turns"}}) + "\n")
+
+
+if prog == "codex" and args[:1] == ["app-server"]:  # JSON-RPC over stdio: only what /compact uses
+    for line in sys.stdin:
+        msg = json.loads(line)
+        if msg.get("method") != "thread/compact/start":
+            if "id" in msg:
+                print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+            continue
+        tid = msg["params"]["threadId"]
+        if not os.path.exists(codex_rollout(tid)):
+            print(json.dumps({"id": msg["id"], "error": {"message": f"no rollout found for thread id {tid}"}}), flush=True)
+            continue
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        codex_compacted(tid)
+        item = {"type": "contextCompaction", "id": "c1"}
+        print(json.dumps({"method": "item/completed", "params": {"threadId": tid, "turnId": "t1", "item": item}}),
+              flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": "t1",
+                                                                                           "status": "completed"}}}),
+              flush=True)
+    sys.exit(0)
+
 if prog == "codex" and args[:2] == ["debug", "models"]:
     emit({"models": [{"slug": "gpt-fake-default", "default_reasoning_level": "medium"},
                      {"slug": "gpt-x", "default_reasoning_level": "low"}]})
@@ -196,11 +242,11 @@ if prog == "codex":
     # Session log, like codex's own: the model and effort are only recorded here.
     model = args[args.index("-m") + 1] if "-m" in args else "gpt-fake-default"
     effort = next((a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort=")), None)
-    log_dir = os.path.join(os.environ["CODEX_HOME"], "sessions", "2026", "10", "10")
-    os.makedirs(log_dir, exist_ok=True)
-    with open(os.path.join(log_dir, f"rollout-2026-10-10T00-00-00-{tid}.jsonl"), "a") as fh:
+    with open(codex_rollout(tid), "a") as fh:
         fh.write(json.dumps({"type": "turn_context", "payload": {"model": model, "collaboration_mode": {
             "mode": "default", "settings": {"model": model, "reasoning_effort": effort}}}}) + "\n")
+    if "FAKE_COMPACT" in stdin:  # the context filled up: codex compacted it (only its session log says so)
+        codex_compacted(tid)
     cmd = "/bin/bash -lc 'ssh hpc sbatch --parsable ~/proj/train.sh'"
     emit({"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "The batch size is probably too big for the GPU."}})
     emit({"type": "item.completed", "item": {"id": "i0b", "type": "agent_message", "text": "Checking the job."}})

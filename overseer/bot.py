@@ -53,6 +53,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /model [name|default] — show or set the active agent's model
 /effort [level|default] — show or set the active agent's effort
 /stop — stop the agent's current run
+/compact [focus] — compact the conversation now: older turns become a summary, which frees context (as a reply: that conversation). Claude Code takes a focus, e.g. /compact keep the lr sweep results
 /auto [wake-ups] [every 2h] [for 48h] &lt;goal&gt; — autopilot: the agent keeps experimenting on its own, woken by the jobs it watches (as a reply: in that conversation). The agent can also ask for it: you get a card to approve
 /auto — autopilot progress and pending wake-ups · /auto off — stop it
 /health — connection status
@@ -421,6 +422,7 @@ class Bot:
         add(CommandHandler("backend", self.cmd_backend, filters=allowed))
         add(CommandHandler("model", self.cmd_model, filters=allowed))
         add(CommandHandler("effort", self.cmd_effort, filters=allowed))
+        add(CommandHandler("compact", self.cmd_compact, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
@@ -680,6 +682,14 @@ class Bot:
             return
         for s in running:
             await self.agent.stop(s.id)
+
+    async def cmd_compact(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        session = self._replied_session(update) or self._here(update)
+        if session is None:
+            await self.reply(update, "No conversation here to compact (reply to one of its messages, or use it in its "
+                                     "thread).")
+            return
+        self._spawn(self.agent.compact(session, " ".join(ctx.args or []).strip()))
 
     async def cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         last = f"{int(time.time() - self.monitor.last_ok)}s ago" if self.monitor.last_ok else "never"
