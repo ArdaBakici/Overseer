@@ -208,13 +208,20 @@ class CodexConfig:
 
 @dataclass
 class AutopilotConfig:
-    """`/auto` in Telegram: the agent continues on its own when the jobs it submitted finish."""
+    """Autopilot: the agent works on its own, woken by the jobs it watches and the timers it sets.
+    It asks first (an approval card in Telegram), or you start it with /auto."""
 
-    default_rounds: int = 10  # /auto without a number
-    max_rounds: int = 50  # upper bound for /auto <rounds>
-    checkin_minutes: int = 0  # default check-in interval on running jobs (0 = none; /auto ... every 2h)
-    min_checkin_minutes: int = 15  # shortest interval /auto accepts
-    max_checkins_per_job: int = 12
+    default_wakeups: int = 20  # wake-ups (a watched job ending, or a timer) per approval, unless changed
+    max_wakeups: int = 100  # upper bound, also for the approval card's +/- buttons
+    default_hours: float = 48  # how long an approval lasts
+    max_hours: float = 336
+    checkin_minutes: int = 60  # check-in interval the card offers when the agent doesn't ask for one
+    min_checkin_minutes: int = 15  # check-ins on running jobs: never more often than this
+    max_checkins_per_job: int = 30
+    # One-off self-wakes, without autopilot: "wake me when job X ends" / "in 2h".
+    oneoff_max_pending: int = 3  # per conversation
+    oneoff_max_hours: float = 168  # how far ahead a one-off timer may be
+    oneoff_chain: int = 3  # one-off wake-ups in a row without a message from you; then it must ask for autopilot
 
 
 @dataclass
@@ -331,11 +338,17 @@ class Config:
             raise ConfigError("telegram.allowed_chat_ids must list at least one chat id")
 
 
+RENAMED = {"AutopilotConfig": {"default_rounds": "default_wakeups", "max_rounds": "max_wakeups"}}
+
+
 def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
     data = data or {}
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must be a mapping")
     known = {f.name: f for f in fields(cls)}
+    for old_name, new_name in RENAMED.get(cls.__name__, {}).items():  # settings renamed since: still accepted
+        if old_name in data and new_name not in data:
+            data = {**{k: v for k, v in data.items() if k != old_name}, new_name: data[old_name]}
     unknown = set(data) - set(known)
     if unknown:
         raise ConfigError(f"unknown keys in {path or 'config'}: {', '.join(sorted(unknown))}")

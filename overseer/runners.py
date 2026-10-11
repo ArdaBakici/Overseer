@@ -584,6 +584,9 @@ class CodexRunner(Runner):
     async def _run(self, prompt: str, *, system: str | None, session_id: str | None, key: str,
                    activity: Activity, writable: bool, network: bool, ephemeral: bool) -> RunResult:
         workdir = self.workdir(key)
+        if writable:  # the `overseer` skill, where codex finds it and its sandbox can read it
+            from .ctl import install_skill
+            install_skill(workdir / ".agents" / "skills")
         out_file = workdir / f".last-{uuid.uuid4().hex[:8]}.txt"
         argv = self._argv(session_id=session_id, out_file=out_file, ephemeral=ephemeral,
                           overrides=self.overrides(workdir, system=system, writable=writable, network=network))

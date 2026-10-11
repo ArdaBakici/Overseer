@@ -11,6 +11,8 @@ socket (local.tmp_dir/ctl.sock) to the running Overseer, which answers right awa
   ov conversation move <project>   this conversation belongs to a project (or "main")
   ov notify <text>             a message to the researcher right now
   ov status                    this conversation: project, autopilot, jobs
+  ov watch <ids> | wake in 2h  what wakes the agent (autopilot.py)
+  ov auto request|done|help    ask for autopilot (an approval card in Telegram), finish it, ask for help
 
 Each agent run gets a one-time token (OVERSEER_CTL in its environment) that tells Overseer which
 conversation is asking; it stops working when the run ends. Every change is announced in Telegram.
@@ -31,7 +33,9 @@ from typing import TYPE_CHECKING
 
 from .config import Config
 from .notify import Outgoing, code, esc
+from .autopilot import WatchError, human_interval, parse_duration
 from .projects import ProjectError, Projects
+from .slurm import TERMINAL_STATES
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -77,6 +81,25 @@ def _parser() -> _Parser:
     proj.add_parser("archive", add_help=False).add_argument("name")
     conv = sub.add_parser("conversation", add_help=False).add_subparsers(dest="action")
     conv.add_parser("move", add_help=False).add_argument("project")
+    a = sub.add_parser("watch", add_help=False)
+    a.add_argument("ids", nargs="+")
+    a.add_argument("--every")
+    a.add_argument("--note", default="")
+    sub.add_parser("unwatch", add_help=False).add_argument("ref")
+    sub.add_parser("watches", add_help=False)
+    a = sub.add_parser("wake", add_help=False)
+    a.add_argument("mode", choices=["in", "every"])
+    a.add_argument("duration")
+    a.add_argument("note", nargs="*")
+    auto = sub.add_parser("auto", add_help=False).add_subparsers(dest="action")
+    a = auto.add_parser("request", add_help=False)
+    a.add_argument("--goal", required=True)
+    a.add_argument("--wakeups", type=int)
+    a.add_argument("--hours", type=float)
+    a.add_argument("--checkins")
+    auto.add_parser("status", add_help=False)
+    auto.add_parser("done", add_help=False).add_argument("text", nargs="*")
+    auto.add_parser("help", add_help=False).add_argument("text", nargs="+")
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
     sub.add_parser("status", add_help=False)
     sub.add_parser("help", add_help=False)
@@ -86,7 +109,7 @@ def _parser() -> _Parser:
 HELP = """ov - talk to Overseer (the system that runs you and reports to the researcher on Telegram)
 
   ov job add <id> [<id>...]        register jobs you submitted (any way: sbatch, a script, a CLI). Overseer
-                                   checks them with SLURM, reports on them, and autopilot waits for them.
+                                   checks them with SLURM and reports on them to the researcher.
   ov job list [--all]              jobs of this conversation (--all: every job Overseer tracks)
   ov job show <id>
   ov job move <id> <project|main>  reassign a job to a project
@@ -97,7 +120,26 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
-  ov status                        this conversation: project, autopilot, its jobs
+  ov status                        this conversation: project, autopilot, its jobs, what will wake you
+
+Being woken (you only run when someone writes to you - or when something you set up wakes you):
+  ov watch <id> [<id>...] [--every 2h] [--note "what to do then"]
+                                   wake me when these jobs have ended (all of them, or as soon as one fails);
+                                   --every: check-ins while they run (autopilot only)
+  ov wake in 90m ["what to do then"]      wake me once, later
+  ov wake every 2h ["..."]         wake me repeatedly (autopilot only)
+  ov watches                       what will wake me (ids like w12)
+  ov unwatch <w12 | job id | all>
+  Without autopilot each of these wakes you once ("one-off"); a few can be pending, and after a few
+  one-off wake-ups in a row without the researcher writing, ask for autopilot instead.
+
+Autopilot (working on your own over many runs; the researcher approves it in Telegram):
+  ov auto request --goal "..." [--wakeups 20] [--hours 48] [--checkins 1h|off]
+                                   ask; then end your turn. If they approve (they may change the limits),
+                                   you're woken to start.
+  ov auto status
+  ov auto done ["conclusion"]      the goal is reached / nothing sensible left: ends autopilot
+  ov auto help "question"          you need the researcher's decision (they get a notification)
 """
 
 
@@ -169,12 +211,16 @@ class ControlServer:
                 return True, await getattr(self, f"project_{args.action}")(session, args)
             if area == "conversation" and args.action == "move":
                 return True, await self.conversation_move(session, args)
+            if area in ("watch", "unwatch", "watches", "wake"):
+                return True, await getattr(self, area)(session, args)
+            if area == "auto" and args.action:
+                return True, await getattr(self, f"auto_{args.action}")(session, args)
             if area == "notify":
                 return True, await self.notify(session, " ".join(args.text))
             if area == "status":
                 return True, self.status(session)
             return False, HELP
-        except (CtlError, ProjectError, ValueError) as e:
+        except (CtlError, ProjectError, WatchError, ValueError) as e:
             return False, str(e)
 
     async def _announce(self, session, text: str, **kw) -> None:
@@ -220,8 +266,7 @@ class ControlServer:
                                      job_id=jid)
             out.append(f"✓ job {jid} ({name or '?'}, {state or '?'}) is tracked in this conversation"
                        + (" (already was)" if already else "") + ": Overseer reports on it"
-                       + (", and autopilot waits for it" if self.agent.autopilot and self.agent.autopilot.active(session.id)
-                          else ""))
+                       + (f" (ov watch {jid} to be woken when it ends)" if not self._watched(session, jid) else ""))
         return "\n".join(out)
 
     async def job_list(self, session, args) -> str:
@@ -267,6 +312,8 @@ class ControlServer:
                 continue
             rec.ignored = 1
             self.store.upsert_job(rec)
+            if self.agent.autopilot:
+                self.agent.autopilot.forget_job(jid)
             await self._announce(session, f"🗑 Overseer no longer tracks job {code(jid)} {esc(rec.name)} "
                                           "(the job itself wasn't touched).")
             out.append(f"✓ job {jid} is no longer tracked (it keeps running; scancel {jid} would cancel it)")
@@ -324,12 +371,116 @@ class ControlServer:
         return "✓ sent"
 
     def status(self, session) -> str:
-        ap = self.agent.autopilot.active(session.id) if self.agent.autopilot else None
         jobs = [j for j in self.store.session_jobs(session.id) if not j.ended_at]
-        lines = [f"conversation {session.id}, project: {session.project or 'none'}",
-                 (f"autopilot: on, round {ap.rounds}/{ap.max_rounds}, {ap.status}" if ap else "autopilot: off"),
-                 "jobs Overseer waits for: " + (", ".join(f"{j.job_id} ({j.state})" for j in jobs) or "none")]
+        lines = [f"conversation {session.id}, project: {session.project or 'none'}", self._auto_line(session),
+                 "running jobs of this conversation: " + (", ".join(f"{j.job_id} ({j.state})" for j in jobs) or "none")]
+        if self.agent.autopilot:
+            lines.append("what will wake you:\n" + self.agent.autopilot.watch_lines(session.id))
         return "\n".join(lines)
+
+    # ---- being woken
+    def _ap(self):
+        if not self.agent.autopilot:
+            raise CtlError("wake-ups aren't available in this Overseer")
+        return self.agent.autopilot
+
+    def _watched(self, session, job_id: str) -> bool:
+        return bool(self.agent.autopilot) and any(
+            w.session_id == session.id for w in self.store.job_watches(job_id))
+
+    def _auto_line(self, session) -> str:
+        ap = self.agent.autopilot
+        a = ap.active(session.id) if ap else None
+        if a:
+            return (f"autopilot: ON - wake-up {a.rounds} of {a.max_rounds} used, {ap._left(a)} left, check-ins "
+                    f"{ap._checkin_text(a)}; goal: {a.goal}")
+        rec = self.store.get_autopilot(session.id) if ap else None
+        if rec and rec.status == "requested":
+            return "autopilot: requested - waiting for the researcher's answer"
+        return "autopilot: off" + (f" (last: {rec.status})" if rec and rec.status else "")
+
+    def _duration(self, text: str, what: str) -> float:
+        d = parse_duration(text)
+        if d is None or d <= 0:
+            raise CtlError(f"{what}: {text!r} isn't a duration (e.g. 30m, 2h, 1d)")
+        return d
+
+    async def watch(self, session, args) -> str:
+        ap = self._ap()
+        every = self._duration(args.every, "--every") if args.every else 0.0
+        ids = list(dict.fromkeys(args.ids))
+        for jid in ids:
+            rec = self.store.get_job(jid)
+            if rec and rec.ended_at:
+                raise CtlError(f"job {jid} has already ended ({rec.state}): look at it now (ov job show {jid})")
+            if not rec or rec.ignored:  # not tracked yet: it's one of the agent's jobs
+                name, state, _ = await self._verify(jid)
+                if state and state.split()[0] in TERMINAL_STATES:
+                    raise CtlError(f"job {jid} has already ended ({state}): look at it now")
+                await self.job_add(session, argparse.Namespace(ids=[jid]))
+        w, remark = ap.add_watch(session, ids, every, args.note)
+        what = f"job{'s' if len(ids) > 1 else ''} {', '.join(ids)}"
+        if w.oneoff:
+            await self._oneoff_announce(session, w, f"look at {what} when {'they end' if len(ids) > 1 else 'it ends'}")
+            return (f"✓ w{w.id}: you'll be woken once, when {what} {'have' if len(ids) > 1 else 'has'} ended "
+                    "(a one-off: autopilot isn't on). The researcher was told and can cancel it.")
+        return (f"✓ w{w.id}: you'll be woken when {what} {'have' if len(ids) > 1 else 'has'} ended"
+                + (" (or as soon as one fails)" if len(ids) > 1 else "")
+                + (f", with check-ins every {human_interval(w.every)} while running" if w.every else "") + remark)
+
+    async def _oneoff_announce(self, session, w, what: str) -> None:
+        note = f"\n{esc(w.note)}" if w.note else ""
+        await self.notifier.send(Outgoing(f"⏰ The agent will {esc(what)} (a one-off wake-up).{note}",
+                                          session_id=session.id, silent=True,
+                                          buttons=[[("✖ Cancel", f"uw:{w.id}")]]))
+
+    async def wake(self, session, args) -> str:
+        ap = self._ap()
+        d = self._duration(args.duration, "wake")
+        note = " ".join(args.note)
+        w = ap.add_timer(session, d, d if args.mode == "every" else 0.0, note)
+        if w.oneoff:
+            await self._oneoff_announce(session, w, f"look again in {human_interval(d)}")
+            return (f"✓ w{w.id}: you'll be woken once, in {human_interval(d)} (a one-off: autopilot isn't on). The "
+                    "researcher was told and can cancel it.")
+        return f"✓ w{w.id}: you'll be woken in {human_interval(d)}" + (
+            f", then every {human_interval(d)} (each one is a wake-up)" if w.every else " (one wake-up)")
+
+    async def watches(self, session, args) -> str:
+        return self._ap().watch_lines(session.id)
+
+    async def unwatch(self, session, args) -> str:
+        changed = self._ap().unwatch(session.id, args.ref.strip())
+        if not changed:
+            raise CtlError(f"nothing matches {args.ref!r} (ov watches lists them)")
+        return "✓ updated: " + ", ".join(f"w{w.id} ({'removed' if w.state == 'cancelled' else 'now ' + w.jobs})"
+                                          for w in changed)
+
+    # ---- autopilot
+    async def auto_request(self, session, args) -> str:
+        ap = self._ap()
+        checkin = None
+        if args.checkins is not None:
+            checkin = parse_duration(args.checkins)
+            if checkin is None:
+                raise CtlError(f"--checkins: {args.checkins!r} isn't a duration (e.g. 1h, or off)")
+        a = ap.request(session, args.goal, args.wakeups, args.hours, checkin)
+        text, buttons = ap.card(a)
+        await self.notifier.send(Outgoing(text, session_id=session.id, buttons=buttons))
+        return ("✓ asked: the researcher sees an approval card in Telegram (they may change the limits). End your "
+                "turn now. If they approve, you're woken to start; if not, you'll hear it next time they write.")
+
+    async def auto_status(self, session, args) -> str:
+        return self._auto_line(session) + "\nwhat will wake you:\n" + self._ap().watch_lines(session.id)
+
+    async def auto_done(self, session, args) -> str:
+        self._ap().finish(session.id, " ".join(args.text))
+        return "✓ autopilot finished (announced with your reply); your autopilot watches and timers are removed"
+
+    async def auto_help(self, session, args) -> str:
+        self._ap().need_help(session.id, " ".join(args.text))
+        return ("✓ the researcher will be asked (with a notification) when your reply is sent. End your reply now; "
+                "your watches stay, and their answer comes as a message.")
 
 
 # ============================================================================ the agent's `ov` command
@@ -367,3 +518,21 @@ def write_ov_tool(cfg: Config, bin_dir: Path, write) -> None:
     write(bin_dir / "ov", OV_CLIENT.replace("@PYTHON@", sys.executable).replace("@SOCK@", repr(str(cfg.ctl_socket))),
           0o700)
 
+
+SKILL = Path(__file__).parent / "skills" / "overseer" / "SKILL.md"
+
+
+def install_skill(skills_dir: Path) -> None:
+    """Put the `overseer` skill (how to use ov) into an agent CLI's skills folder."""
+    text = SKILL.read_text()
+    d = skills_dir / "overseer"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not (d / "SKILL.md").exists() or (d / "SKILL.md").read_text() != text:
+        (d / "SKILL.md").write_text(text)
+
+
+def write_skills(cfg: Config) -> None:
+    """Claude Code's copy of the skill, in CLAUDE_CONFIG_DIR/skills (Claude Code reads skills itself).
+    Codex has the model read a skill's file with a command, and its sandbox can't read Overseer's state
+    dir: its copy goes into each scratch dir, as .agents/skills (CodexRunner)."""
+    install_skill(cfg.local.resolve(cfg.agent.claude_code.home) / "skills")

@@ -7,9 +7,10 @@ A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL (or 
 FORCE_SLOW pauses between events (to watch the live progress).
 
 Autopilot (fake claude, when the system prompt says autopilot is on): every run submits a new job
-id and ends with a status line. Markers in the prompt (the goal, or job logs quoted in a round's
-report) steer it: FAKE_DONE, FAKE_HELP, FAKE_NOJOB (submit nothing), FAKE_TWO (submit two jobs);
-in a check-in, FAKE_DIVERGE makes it scancel the job and resubmit.
+id and watches it with `ov watch`, like a real agent. Markers in the prompt (the goal, or job logs
+quoted in a wake-up's report) steer it: FAKE_DONE (`ov auto done`), FAKE_HELP (`ov auto help`),
+FAKE_NOJOB (submit nothing), FAKE_TWO (submit two jobs), FAKE_NOWATCH (submit without watching);
+FAKE_EVERY in the goal adds check-ins; in a check-in, FAKE_DIVERGE makes it scancel and resubmit.
 Lines "FAKE_OV <command>" make it run those commands (the `ov` tool) and answer with their output.
 """
 import re
@@ -41,36 +42,68 @@ if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail")
     print("boom: model unavailable", file=sys.stderr)
     sys.exit(3)
 
+def ov(cmd):
+    """Run an `ov` command like an agent would (Overseer's generated client, on PATH)."""
+    import subprocess
+    res = subprocess.run("ov " + cmd, shell=True, capture_output=True, text=True)
+    return res.stdout + res.stderr
+
+
+def fake_submit(jid):
+    """sbatch, as far as Overseer can tell: the job exists in (fake) SLURM, and the output says so."""
+    state_file = os.environ.get("FAKE_SLURM_STATE")
+    if state_file:
+        with open(state_file) as fh:
+            st = json.load(fh)
+        st["jobs"].setdefault(str(jid), {"name": f"run{jid}", "state": "PENDING"})
+        with open(state_file, "w") as fh:
+            json.dump(st, fh)
+    return f"Submitted batch job {jid}\n"
+
+
 def autopilot_run():
     with open(os.environ["FAKE_CLI_LOG"]) as fh:
         n = sum(1 for _ in fh)  # runs so far: makes job ids unique
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
-    submit = ("ssh hpc 'cd ~/proj && sbatch train.sh'", lambda i: f"Submitted batch job {6000 + n * 10 + i}\n")
-    steps, final, status = [], "Submitted the next experiment.", "CONTINUE"
+    system = " ".join(args)
+    every = " --every 1h" if "FAKE_EVERY" in system else ""
+    steps, final = [], "Submitted the next experiment."
+
+    def submit_and_watch(count):
+        ids = [6000 + n * 10 + i for i in range(count)]
+        for jid in ids:
+            steps.append(("ssh hpc 'cd ~/proj && sbatch train.sh'", lambda jid=jid: fake_submit(jid)))
+        if "FAKE_NOWATCH" not in stdin:
+            cmd = "watch " + " ".join(map(str, ids)) + every
+            steps.append(("ov " + cmd, lambda: ov(cmd)))
+
     if "Autopilot check-in" in stdin:
         final = "Looks healthy."
         if "FAKE_DIVERGE" in stdin:
             jid = re.search(r"<job id='(\d+)'", stdin).group(1)
-            steps = [(f"ssh hpc scancel {jid}", ""), (submit[0], submit[1](0))]
+            steps.append((f"ssh hpc scancel {jid}", lambda: ""))
+            submit_and_watch(1)
             final = f"Job {jid} diverged: cancelled it and resubmitted with a lower lr."
     elif "FAKE_DONE" in stdin:
-        final, status = "Reached the goal.", "DONE best lr is 3e-4"
+        steps.append(("ov auto done best lr is 3e-4", lambda: ov("auto done best lr is 3e-4")))
+        final = "Reached the goal."
     elif "FAKE_HELP" in stdin:
-        final, status = "Not sure how to continue.", "NEED_HELP should I try a bigger model?"
+        steps.append(("ov auto help should I try a bigger model?", lambda: ov("auto help should I try a bigger model?")))
+        final = "Not sure how to continue."
     elif "FAKE_SCRIPT" in stdin:  # submits through its own script: no "sbatch" in the command
         steps = [("ssh hpc 'cd ~/rf && python native7_cli.py submit --gpu a100'",
-                  "native7: building manifest\nSubmitted batch job 7777\n(previous attempt was job 1234)\n")]
+                  lambda: "native7: building manifest\nSubmitted batch job 7777\n(previous attempt was job 1234)\n")]
         final = "Submitted 7777; also queued 7778 for the seed-1 rerun."
     elif "FAKE_NOJOB" not in stdin:
-        steps = [(submit[0], submit[1](i)) for i in range(2 if "FAKE_TWO" in stdin else 1)]
+        submit_and_watch(2 if "FAKE_TWO" in stdin else 1)
     emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake-default"})
-    for i, (cmd, out) in enumerate(steps):
+    for i, (cmd, run) in enumerate(steps):
         emit({"type": "assistant", "session_id": sid, "message": {"content": [
             {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": cmd}}]}})
         emit({"type": "user", "session_id": sid, "message": {"content": [
-            {"type": "tool_result", "tool_use_id": f"t{i}", "content": out}]}})
-    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
-          "result": f"{final}\n\n**AUTOPILOT: {status}**"})
+            {"type": "tool_result", "tool_use_id": f"t{i}", "content": run()}]}})
+        time.sleep(0.2)  # a real agent thinks between commands: Overseer has seen the output by then
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False, "result": final})
     sys.exit(0)
 
 

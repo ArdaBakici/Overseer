@@ -161,11 +161,11 @@ class Monitor:
                                                     "final state for it. Check its log files.")
                 self.store.upsert_job(rec)
 
-        if self.autopilot:  # mid-job check-ins on the agent's running jobs
+        if self.autopilot:  # timers, check-ins on watched jobs, autopilots running out of time
             try:
-                await self.autopilot.poll_running(live_by_id)
+                await self.autopilot.tick(live_by_id)
             except Exception:
-                log.exception("autopilot check-ins failed")
+                log.exception("autopilot tick failed")
 
         # Finished jobs we never saw in the queue (short jobs between polls).
         if not first:
@@ -271,7 +271,7 @@ class Monitor:
         rec.state = final.state
         rec.ended_at = time.time()
         self.store.upsert_job(rec)  # mark ended first so a crash below can't cause duplicate reports
-        # An autopilot job is analysed by the agent itself right after: skip the one-shot LLM summary.
+        # A watched job is analysed by the agent itself right after: skip the one-shot LLM summary.
         analyze = not (self.autopilot and self.autopilot.handles(rec))
         try:
             msg, context = await self.final_report(rec, final, analyze=analyze)
@@ -284,7 +284,7 @@ class Monitor:
         await self._tell_autopilot(rec, context)
 
     async def _tell_autopilot(self, rec: JobRecord, report: str) -> None:
-        if self.autopilot and rec.by_agent:
+        if self.autopilot:
             try:
                 await self.autopilot.job_finished(rec, report)
             except Exception:

@@ -53,8 +53,8 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /model [name|default] — show or set the active agent's model
 /effort [level|default] — show or set the active agent's effort
 /stop — stop the agent's current run
-/auto [rounds] [every 2h] &lt;goal&gt; — autopilot: the agent keeps experimenting on its own, woken when its jobs finish (as a reply: in that conversation)
-/auto — autopilot progress · /auto off — stop it
+/auto [wake-ups] [every 2h] [for 48h] &lt;goal&gt; — autopilot: the agent keeps experimenting on its own, woken by the jobs it watches (as a reply: in that conversation). The agent can also ask for it: you get a card to approve
+/auto — autopilot progress and pending wake-ups · /auto off — stop it
 /health — connection status
 
 <b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
@@ -776,35 +776,41 @@ class Bot:
             await self.reply(update, f"⏹ Autopilot off for {', '.join(code(x) for x in stopped)}. Jobs keep running "
                                      "and are still reported." if stopped else "Autopilot wasn't on.")
             return
-        rounds, every, i = None, None, 0
+        wakeups, every, hours, i = None, None, None, 0
         if args[0].isdigit():
-            rounds, i = int(args[0]), 1
+            wakeups, i = int(args[0]), 1
         while i < len(args):
             word = args[i].lower()
-            if word.startswith(("every=", "checkin=")):
-                value, step = word.split("=", 1)[1], 1
-            elif word in ("every", "checkin") and i + 1 < len(args):
-                value, step = args[i + 1], 2
+            if "=" in word and word.split("=", 1)[0] in ("every", "checkin", "for"):
+                key, value, step = *word.split("=", 1), 1
+            elif word in ("every", "checkin", "for") and i + 1 < len(args):
+                key, value, step = word, args[i + 1], 2
             else:
                 break
-            every = parse_duration(value)
-            if every is None:
-                await self.reply(update, f"⛔ {code(value)} isn't a duration: use e.g. 30m, 2h, 1d or off.")
+            d = parse_duration(value)
+            if d is None or (key == "for" and d <= 0):
+                await self.reply(update, f"⛔ {code(value)} isn't a duration: use e.g. 30m, 2h, 1d"
+                                         + (" or off." if key != "for" else "."))
                 return
+            if key == "for":
+                hours = d / 3600
+            else:
+                every = d
             i += step
         goal = " ".join(args[i:]).strip()
-        if rounds is None and every is None and not goal:
-            await self.reply(update, "Usage: /auto [rounds] [every 2h] &lt;goal&gt;, /auto off, or /auto for progress.")
+        if wakeups is None and every is None and hours is None and not goal:
+            await self.reply(update, "Usage: /auto [wake-ups] [every 2h] [for 48h] &lt;goal&gt;, /auto off, or /auto for "
+                                     "progress.")
             return
         session = target or self._here(update)
         if session is None:
             session = self.agent.new_conversation(scope)
             if self._thread(update):
                 self.store.bind_thread(update.effective_chat.id, self._thread(update), session.id)
-        if rounds is None and not goal and ap.active(session.id):  # only the check-in interval changes
+        if wakeups is None and hours is None and not goal and ap.active(session.id):  # only the check-ins change
             await self.reply(update, ap.set_checkins(session.id, every))
             return
-        text = await ap.start(session, rounds or self.cfg.agent.autopilot.default_rounds, goal, every)
+        text = await ap.start(session, wakeups or self.cfg.agent.autopilot.default_wakeups, goal, every, hours)
         await self.notifier.send(Outgoing(text, session_id=session.id, job_id=session.job_id))
 
     # ------------------------------------------------------------------ projects
@@ -921,7 +927,11 @@ class Bot:
         conv = self.agent.get(self.store.thread_session(update.effective_chat.id, thread)) if thread else None
         if job_id and not args and conv:  # in a conversation's thread: the job becomes part of it
             self.agent._record_job(conv, job_id)
-            auto = self.agent.autopilot and self.agent.autopilot.active(conv.id)
+            ap = self.agent.autopilot
+            auto = ap and ap.active(conv.id)
+            rec = self.store.get_job(job_id)
+            if auto and rec and not rec.ended_at:  # part of the loop: its end wakes the agent
+                ap.add_watch(conv, [job_id])
             await self.reply(update, f"🔗 Job {code(job_id)} is now part of this conversation: its reports come here"
                                      + (" and autopilot wakes the agent when it ends." if auto else "."))
             return
@@ -929,7 +939,7 @@ class Bot:
         if not job_id or not target:
             await self.reply(update, "Usage: /assign &lt;job id&gt; &lt;project|main&gt; - or reply to a job's message "
                                      "with /assign &lt;project|main&gt;. In a conversation's thread, /assign &lt;job id&gt; "
-                                     "makes the job part of that conversation (autopilot then waits for it).")
+                                     "makes the job part of that conversation (with autopilot on, its end wakes the agent).")
             return
         await self._assign(job_id, target, update)
 
@@ -964,6 +974,32 @@ class Bot:
         sid = self.notifier.draft_session(stopped.get("draft_id")) if hasattr(self.notifier, "draft_session") else None
         if sid and await self.agent.stop(sid):
             log.info("stopped %s from the draft's Stop button", sid)
+
+    async def _edit(self, q, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                       for row in buttons]) if buttons else None
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                log.warning("could not edit the message (%s)", e)
+
+    async def _approval(self, q, what: str, sid: str) -> None:
+        ap = self.agent.autopilot
+        a = self.store.get_autopilot(sid) if ap else None
+        if not a or a.status != "requested":
+            await self._edit(q, "This request is no longer open." + (f" (autopilot: {esc(a.status)})" if a else ""))
+            return
+        if what == "ok":
+            text = await ap.approve(sid)
+            await self._edit(q, "✅ <b>Approved.</b>\n" + (text or ""))
+        elif what == "no":
+            ap.decline(sid)
+            await self._edit(q, f"❌ <b>Declined</b>: {esc(a.goal)}\nThe agent is told the next time you write to it.")
+        else:
+            a = ap.adjust(sid, what)
+            if a:
+                await self._edit(q, *ap.card(a))
 
     async def on_stranger(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat:
@@ -1000,5 +1036,11 @@ class Bot:
             elif action == "assign":
                 job_id, _, name = arg.partition(":")
                 await self._assign(job_id, name or None, update)
+            elif action == "ap":  # the autopilot approval card
+                await self._approval(q, *arg.partition(":")[::2])
+            elif action == "uw":  # ✖ on a one-off wake-up
+                w = self.agent.autopilot.cancel_watch(int(arg)) if self.agent.autopilot and arg.isdigit() else None
+                await self._edit(q, "✖ Cancelled: the agent won't be woken for this." if w else
+                                 "This wake-up has already happened or was cancelled.")
         except SSHError as e:
             await self.notifier.send(Outgoing(f"⚠️ {esc(e)}"))

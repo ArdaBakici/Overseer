@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS autopilot (
     status TEXT,
     created REAL, updated REAL
 );
+CREATE TABLE IF NOT EXISTS watches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    kind TEXT,
+    jobs TEXT DEFAULT '',
+    every REAL DEFAULT 0,
+    due REAL DEFAULT 0,
+    note TEXT DEFAULT '',
+    oneoff INTEGER DEFAULT 0,
+    state TEXT DEFAULT 'active',
+    created REAL, fired REAL DEFAULT 0
+);
 """
 # Columns added after the first release: (table, column, definition).
 ADDED_COLUMNS = [
@@ -73,6 +85,8 @@ ADDED_COLUMNS = [
     ("jobs", "project", "TEXT"),
     ("sessions", "project", "TEXT"),
     ("jobs", "ignored", "INTEGER DEFAULT 0"),
+    ("autopilot", "hours", "REAL DEFAULT 0"),
+    ("autopilot", "expires", "REAL DEFAULT 0"),
 ]
 
 
@@ -153,9 +167,31 @@ class AutopilotRecord:
     max_rounds: int = 0
     rounds: int = 0  # wake-ups after jobs finished (check-ins don't count)
     checkin_every: float = 0.0  # seconds between check-ins on running jobs; 0 = none
-    status: str = ""  # waiting | working | idle | need_help | done | limit | stopped | error | off
+    status: str = ""  # requested | declined | waiting | working | idle | need_help | done | limit | expired | paused | off
     created: float = 0.0
     updated: float = 0.0
+    hours: float = 0.0  # how long the approval lasts
+    expires: float = 0.0  # when it ends (set when it starts)
+
+
+@dataclass
+class WatchRecord:
+    """Something that wakes the agent: jobs ending (kind "jobs") or a timer (kind "timer")."""
+    session_id: str
+    kind: str  # jobs | timer
+    jobs: str = ""  # job ids, space-separated: the agent is woken when all have ended, or one failed
+    every: float = 0.0  # jobs: seconds between check-ins while they run; timer: repeat interval (0 = once)
+    due: float = 0.0  # timer: when it fires next
+    note: str = ""  # what the agent wanted to do when woken
+    oneoff: int = 0  # set without autopilot: wakes the agent once
+    state: str = "active"  # active | fired | cancelled
+    created: float = 0.0
+    fired: float = 0.0
+    id: int | None = None
+
+    @property
+    def job_ids(self) -> list[str]:
+        return self.jobs.split()
 
 
 def _row(cls, row):
@@ -283,6 +319,34 @@ class Store:
     def list_autopilots(self, active_only: bool = False) -> list[AutopilotRecord]:
         q = "SELECT * FROM autopilot" + (" WHERE active=1" if active_only else "") + " ORDER BY updated DESC"
         return [_row(AutopilotRecord, r) for r in self.db.execute(q).fetchall()]
+
+    # ---------------------------------------------------------------- watches
+    def add_watch(self, w: WatchRecord) -> WatchRecord:
+        w.created = w.created or time.time()
+        d = {k: v for k, v in w.__dict__.items() if k != "id"}
+        cur = self.db.execute(f"INSERT INTO watches ({','.join(d)}) VALUES ({','.join('?' * len(d))})",
+                              tuple(d.values()))
+        self.db.commit()
+        w.id = cur.lastrowid
+        return w
+
+    def update_watch(self, w: WatchRecord) -> None:
+        self._upsert("watches", "id", w)
+
+    def get_watch(self, wid: int) -> WatchRecord | None:
+        row = self.db.execute("SELECT * FROM watches WHERE id=?", (wid,)).fetchone()
+        return _row(WatchRecord, row) if row else None
+
+    def watches(self, session_id: str | None = None, state: str | None = "active") -> list[WatchRecord]:
+        q, args = "SELECT * FROM watches WHERE 1=1", []
+        if session_id:
+            q, args = q + " AND session_id=?", args + [session_id]
+        if state:
+            q, args = q + " AND state=?", args + [state]
+        return [_row(WatchRecord, r) for r in self.db.execute(q + " ORDER BY id", args).fetchall()]
+
+    def job_watches(self, job_id: str) -> list[WatchRecord]:
+        return [w for w in self.watches() if w.kind == "jobs" and job_id in w.job_ids]
 
     # ---------------------------------------------------------------- agent sessions
     def get_session(self, sid: str) -> SessionRecord | None:

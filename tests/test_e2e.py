@@ -16,6 +16,7 @@ import asyncio
 import getpass
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -189,6 +190,11 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         # Talking to Overseer from inside the sandbox: register the job, create a project.
         "ov job add 5001",
         "ov project new e2eproj --dir ~/e2eproj --about 'made by the agent'",
+        # Being woken: autopilot is on (below), so check-ins and timers are allowed.
+        "ov watch 5001 --every 1h --note 'compare with the baseline'",
+        "ov wake in 1h check the curves",
+        # The overseer skill: Codex has the model read it with a command, so its sandbox must allow that.
+        "cat .agents/skills/overseer/SKILL.md 2>&1 | head -2; echo SKILL-DONE",
     ]
     (remote / "proj" / "reward.png").write_bytes(b"\x89PNG\r\n\x1a\n made on the HPC")
     # A login shell may reset PATH; on a real cluster this is where "module load slurm" goes.
@@ -216,7 +222,8 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         from overseer.store import AutopilotRecord
         autopilot = Autopilot(cfg, store, agent, notes, agent.hpc)
         store.upsert_autopilot(AutopilotRecord(session_id=s.id, active=1, goal="beat 'baseline' \"score\" 9.0",
-                                               max_rounds=3, status="waiting"))
+                                               max_rounds=3, status="waiting", checkin_every=900, hours=2,
+                                               expires=time.time() + 7200))
         try:
             await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
         finally:
@@ -279,5 +286,12 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         tool_requests = [r for r in fm.requests if r["body"].get("tools")]
         assert "You are Overseer's agent" in json.dumps(tool_requests[0]["body"]), "system prompt missing"
         body = json.dumps(tool_requests[0]["body"])
-        assert "Autopilot is ON" in body and "beat 'baseline'" in body and "AUTOPILOT: NEED_HELP" in body
-        assert "waiting for job(s) 5001" in notes.sent[-1].text, notes.sent[-1].text
+        assert "Autopilot is ON" in body and "beat 'baseline'" in body and "ov auto done" in body
+        assert "Autopilot: waiting for job 5001 (check-ins every 1h); ⏰ in 1h" in notes.sent[-1].text, detail
+        assert "✓ w1: you'll be woken when job 5001 has ended, with check-ins every 1h" in outs[17], detail
+        assert "✓ w2: you'll be woken in 1h" in outs[18], detail
+        # Each CLI offers the overseer skill to the model; Codex's copy is where its sandbox can read it.
+        assert "overseer: How to talk to Overseer with the `ov` command" in body
+        if backend == "codex":
+            assert "name: overseer" in outs[19], detail
+            assert re.search(r"r\d+` = `[^`]*/agents/" + re.escape(s.id) + r"/\.agents/skills`", body), body[:3000]

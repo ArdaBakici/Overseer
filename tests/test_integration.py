@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -72,8 +73,8 @@ def make_cfg(tmp_path, short_tmp):
     cfg.local.tmp_dir = short_tmp  # unix socket paths must stay short
     cfg.agent.claude_code.command = str(FAKE_CLI / "claude")
     cfg.agent.codex.command = str(FAKE_CLI / "codex")
-    cfg.agent.claude_code.pass_env.append("FAKE_CLI_LOG")
-    cfg.agent.codex.pass_env.append("FAKE_CLI_LOG")
+    cfg.agent.claude_code.pass_env += ["FAKE_CLI_LOG", "FAKE_SLURM_STATE"]
+    cfg.agent.codex.pass_env += ["FAKE_CLI_LOG", "FAKE_SLURM_STATE"]
     cfg.validate()
     return cfg
 
@@ -848,15 +849,24 @@ def test_build_app(env):
 
 # ----------------------------------------------------------------------------- autopilot
 
-def make_autopilot(env):
+async def make_autopilot(env):
+    """The autopilot, and the ov socket the (fake) agent uses to watch its jobs."""
     from overseer.autopilot import Autopilot
+    from overseer.ctl import ControlServer
+    from overseer.projects import Projects
     ap = Autopilot(env.cfg, env.store, env.agent, env.notifier, env.hpc)
     env.monitor.autopilot = ap
+    env.ctl = ControlServer(env.cfg, env.agent, Projects(env.cfg, env.store, env.agent), env.notifier, env.hpc)
+    await env.ctl.start()
     return ap
 
 
 def agent_jobs(env, s):
     return [j.job_id for j in env.store.session_jobs(s.id)]
+
+
+def watched(env, s):
+    return [(w.kind, w.jobs, w.oneoff) for w in env.store.watches(s.id)]
 
 
 async def run_job(env, jid, state="COMPLETED", log_text="step 100 loss=0.50\n", finish=True):
@@ -876,74 +886,82 @@ def claude_calls(env):
     return [c for c in env.cli_log() if c["prog"] == "claude"]
 
 
+def system_of(call):
+    return call["argv"][call["argv"].index("--append-system-prompt") + 1]
+
+
 async def test_autopilot_loop(env):
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     s = env.agent.general_session()
     text = await ap.start(s, 3, "find the best lr", None)
-    assert "Autopilot on" in text and "up to 3 rounds" in text and "planning the first experiment" in text
+    assert "Autopilot on" in text and "up to 3 wake-ups for 2d" in text and "planning the first experiment" in text
     await ap.drain()
 
-    # Kickoff: the agent got the goal and the autopilot rules, and submitted a job.
+    # Kickoff: the agent got the goal and the autopilot rules, submitted a job and watched it.
     call = claude_calls(env)[-1]
-    system = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    system = system_of(call)
     assert "Autopilot is ON" in system and "find the best lr" in system and "RESEARCH_LOG.md" in system
+    assert "ov auto done" in system and "AUTOPILOT:" not in system
     assert "Goal: find the best lr" in call["stdin"]
     (j1,) = agent_jobs(env, s)
+    assert watched(env, s) == [("jobs", j1, 0)]
     reply = env.notifier.sent[-1].text
-    assert "AUTOPILOT" not in reply and f"waiting for job(s) {j1}" in reply and "round 0/3" in reply
+    assert f"Autopilot: waiting for job {j1} · wake-up 0/3 used" in reply and "auto-watched" not in reply
 
-    # Job 1 finishes: round 1 wakes the conversation with its report; no one-shot LLM summary.
+    # Job 1 finishes: wake-up 1 resumes the conversation with its report; no one-shot LLM summary.
     await run_job(env, j1)
     final = next(m.text for m in env.notifier.sent if f"Job {j1}" in m.text and "finished" in m.text)
     assert "OK report" not in final
-    assert any("Autopilot round 1/3" in m.text for m in env.notifier.sent)
+    assert any("Autopilot wake-up 1/3" in m.text for m in env.notifier.sent)
     call = claude_calls(env)[-1]
-    assert "[Autopilot round 1 of 3]" in call["stdin"] and f"<job id='{j1}'" in call["stdin"]
+    assert "[Autopilot wake-up 1 of 3" in call["stdin"] and f"<job id='{j1}'" in call["stdin"]
     assert "loss=0.50" in call["stdin"] and "final state COMPLETED" in call["stdin"]
     assert call["argv"][call["argv"].index("--resume") + 1] == env.store.get_session(s.id).cli_session_id
     j2 = agent_jobs(env, s)[-1]
-    assert j2 != j1 and env.store.get_autopilot(s.id).rounds == 1
-    assert call["argv"][call["argv"].index("--append-system-prompt") + 1] == system  # stays cacheable
+    assert j2 != j1 and env.store.get_autopilot(s.id).rounds == 1 and watched(env, s) == [("jobs", j2, 0)]
+    assert system_of(call) == system  # stays cacheable
 
-    # Job 2's results reach the goal: the agent says DONE and autopilot turns itself off.
+    # Job 2's results reach the goal: the agent runs `ov auto done` and autopilot turns itself off.
     n = len(claude_calls(env))
     await run_job(env, j2, log_text="score 9.1 FAKE_DONE\n")
     assert len(claude_calls(env)) == n + 1
     reply = env.notifier.sent[-1].text
-    assert "Autopilot finished</b> after 2 round(s): best lr is 3e-4" in reply and "AUTOPILOT" not in reply
+    assert "Autopilot finished</b> after 2 wake-up(s): best lr is 3e-4" in reply
     a = env.store.get_autopilot(s.id)
-    assert not a.active and a.status == "done"
+    assert not a.active and a.status == "done" and not watched(env, s)
     last = (env.cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()[-1]
     assert json.loads(last)["autopilot"] == "DONE"
+    assert "Autopilot is ON" not in env.agent.system_prompt(s.id)
 
 
-async def test_autopilot_batches_and_round_limit(env):
-    ap = make_autopilot(env)
+async def test_autopilot_batches_and_wakeup_limit(env):
+    ap = await make_autopilot(env)
     s = env.agent.general_session()
     await ap.start(s, 1, "sweep FAKE_TWO", None)
     await ap.drain()
     j1, j2 = agent_jobs(env, s)
+    assert watched(env, s) == [("jobs", f"{j1} {j2}", 0)]  # one batch
     n = len(claude_calls(env))
 
     # The first of the two finishes: wait for the other one.
     await run_job(env, j1)
-    assert len(claude_calls(env)) == n and f"waiting for {j2}" in env.notifier.sent[-1].text
-    # Both done: one round with both reports. It's the last round.
+    assert len(claude_calls(env)) == n and f"waking the agent when {j2} has finished too" in env.notifier.sent[-1].text
+    # Both done: one wake-up with both reports. It's the last one.
     await run_job(env, j2)
     stdin = claude_calls(env)[-1]["stdin"]
-    assert f"<job id='{j1}'" in stdin and f"<job id='{j2}'" in stdin and "LAST round" in stdin
+    assert f"<job id='{j1}'" in stdin and f"<job id='{j2}'" in stdin and "LAST wake-up" in stdin
 
-    # The agent submitted again anyway; when that finishes the round limit stops the loop.
+    # The agent submitted again anyway; when that finishes the limit stops the loop.
     j3 = agent_jobs(env, s)[-1]
     n = len(claude_calls(env))
     await run_job(env, j3)
     assert len(claude_calls(env)) == n
-    assert "Autopilot stopped</b>: it used all 1 rounds" in env.notifier.sent[-1].text
-    assert env.store.get_autopilot(s.id).status == "limit"
+    assert "Autopilot stopped</b>: it used all 1 wake-ups" in env.notifier.sent[-1].text
+    assert env.store.get_autopilot(s.id).status == "limit" and not watched(env, s)
 
 
 async def test_autopilot_wakes_early_on_failure(env):
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     s = env.agent.general_session()
     await ap.start(s, 5, "sweep FAKE_TWO", None)
     await ap.drain()
@@ -952,19 +970,21 @@ async def test_autopilot_wakes_early_on_failure(env):
     await run_job(env, j1, state="FAILED", log_text="CUDA out of memory\n")
     stdin = claude_calls(env)[-1]["stdin"]
     assert f"<job id='{j1}' name='run{j1}' state='FAILED'" in stdin and f"Still running: {j2}" in stdin
+    assert ("jobs", j2, 0) in watched(env, s)  # still watched
 
 
-async def test_autopilot_needs_help_and_idle(env):
-    ap = make_autopilot(env)
+async def test_autopilot_needs_help_idle_and_safety_net(env):
+    ap = await make_autopilot(env)
     s = env.agent.general_session()
     await ap.start(s, 5, "try things FAKE_NOJOB", None)
     await ap.drain()
-    assert "no job is running, so nothing will wake the agent" in env.notifier.sent[-1].text
+    assert "nothing is watched, so nothing will wake the agent" in env.notifier.sent[-1].text
     assert env.store.get_autopilot(s.id).status == "idle"
 
-    # The researcher replies; the agent submits; the loop continues on its own.
-    await env.agent.handle(s, "ok, start a baseline run")
+    # The researcher replies; the agent submits but forgets to watch: Overseer watches it anyway.
+    await env.agent.handle(s, "ok, start a baseline run FAKE_NOWATCH")
     (j1,) = agent_jobs(env, s)
+    assert f"auto-watched {j1}" in env.notifier.sent[-1].text and watched(env, s) == [("jobs", j1, 0)]
     await run_job(env, j1, log_text="FAKE_HELP\n")
     reply = env.notifier.sent[-1]
     assert "Autopilot needs you</b>: should I try a bigger model?" in reply.text and not reply.silent
@@ -973,12 +993,13 @@ async def test_autopilot_needs_help_and_idle(env):
 
 
 async def test_autopilot_checkins(env, monkeypatch):
-    env.cfg.agent.autopilot.min_checkin_minutes = 0
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     s = env.agent.general_session()
-    await ap.start(s, 5, "train", 3600)
+    await ap.start(s, 5, "train FAKE_EVERY", 3600)
     await ap.drain()
     (j1,) = agent_jobs(env, s)
+    (w,) = env.store.watches(s.id)
+    assert w.every == 3600
     await run_job(env, j1, finish=False)
     assert env.store.get_job(j1).last_checkin  # the clock starts when the job runs
     n = len(claude_calls(env))
@@ -996,20 +1017,20 @@ async def test_autopilot_checkins(env, monkeypatch):
     await ap.drain()
     stdin = claude_calls(env)[-1]["stdin"]
     assert "[Autopilot check-in" in stdin and f"<job id='{j1}'" in stdin and "loss=0.50" in stdin
-    assert env.store.get_autopilot(s.id).rounds == 0  # check-ins aren't rounds
+    assert "of at most 30 for this job" in stdin
+    assert env.store.get_autopilot(s.id).rounds == 0  # check-ins aren't wake-ups
     reply = env.notifier.sent[-1]
     assert "Looks healthy." in reply.text and reply.silent  # a routine check-in doesn't buzz
     assert env.store.get_job(j1).checkins == 1
 
-    # The run diverges: the agent cancels it and resubmits; the cancelled job's end is not a new round.
+    # The run diverges: the agent cancels it and resubmits; the cancelled job's end wakes nobody.
     (env.home / "proj" / f"slurm-{j1}.out").write_text("loss=nan FAKE_DIVERGE\n")
     make_due()
     await env.monitor.poll()
     await ap.drain()
     assert f"Job {j1} diverged: cancelled it and resubmitted" in env.notifier.sent[-1].text
-    assert any(f"scancel {j1}" in m.text for m in env.notifier.sent[-3:])  # in the command summary
     j2 = agent_jobs(env, s)[-1]
-    assert j2 != j1 and env.store.get_job(j1).agent_reported
+    assert j2 != j1 and [x[1] for x in watched(env, s)] == [j2]
     n = len(claude_calls(env))
     env.set_jobs(**{j1: {"name": f"run{j1}", "state": "CANCELLED", "exit": "0:15", "workdir": str(env.home / "proj"),
                          "stdout": str(env.home / "proj" / f"slurm-{j1}.out")}})
@@ -1021,29 +1042,42 @@ async def test_autopilot_checkins(env, monkeypatch):
 
 
 async def test_autopilot_pauses_on_failure_and_retries(env):
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     s = env.agent.general_session()
     await ap.start(s, 5, "train", None)
     await ap.drain()
     (j1,) = agent_jobs(env, s)
     fail = Path(os.environ["FAKE_CLI_LOG"] + ".fail")
-    fail.touch()  # the CLI crashes during the round
+    fail.touch()  # the CLI crashes during the wake-up
     await run_job(env, j1)
     assert "Autopilot paused" in env.notifier.sent[-1].text
     a = env.store.get_autopilot(s.id)
-    assert not a.active and a.rounds == 0 and not env.store.get_job(j1).agent_reported
+    assert not a.active and a.rounds == 0 and watched(env, s) == [("jobs", j1, 0)]  # the watch is back
 
     fail.unlink()
-    text = await ap.start(s, 5)  # /auto 5 as a reply: retries the round
-    assert "already finished: starting a round now" in text
+    text = await ap.start(s, 5)  # /auto 5 as a reply: retries the wake-up
+    assert "resumed" in text
     await ap.drain()
-    assert "[Autopilot round 1 of 5]" in claude_calls(env)[-1]["stdin"]
+    assert "[Autopilot wake-up 1 of 5" in claude_calls(env)[-1]["stdin"]
     assert env.store.get_autopilot(s.id).rounds == 1
+
+
+async def test_autopilot_runs_out_of_time(env):
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    await ap.start(s, 5, "train", None)
+    await ap.drain()
+    a = env.store.get_autopilot(s.id)
+    a.expires = 1.0
+    env.store.upsert_autopilot(a)
+    await env.monitor.poll()
+    assert "Autopilot ended</b>: its 2d are up" in env.notifier.sent[-1].text
+    assert env.store.get_autopilot(s.id).status == "expired" and not watched(env, s)
 
 
 async def test_auto_command(env, monkeypatch):
     from overseer.bot import Bot
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
               notifier=env.notifier)
     replies = []
@@ -1057,32 +1091,171 @@ async def test_auto_command(env, monkeypatch):
     await bot.cmd_auto(None, NS(args=["every", "soon"]))
     assert "isn't a duration" in replies[-1]
 
-    env.cfg.agent.autopilot.min_checkin_minutes = 15
-    await bot.cmd_auto(None, NS(args=["4", "every", "5m", "tune", "the", "lr"]))
+    await bot.cmd_auto(None, NS(args=["4", "every", "5m", "for", "12h", "tune", "the", "lr"]))
     await ap.drain()
     s = env.agent.general_session()
     a = env.store.get_autopilot(s.id)
-    assert (a.active, a.max_rounds, a.goal, a.checkin_every) == (1, 4, "tune the lr", 15 * 60)  # raised to the minimum
+    assert (a.active, a.max_rounds, a.goal, a.checkin_every, a.hours) == (1, 4, "tune the lr", 15 * 60, 12)
     assert any("Autopilot on" in m.text and m.session_id == s.id for m in env.notifier.sent)
 
-    await bot.cmd_auto(None, NS(args=["every", "2h"]))  # only changes the interval
+    await bot.cmd_auto(None, NS(args=["every", "2h"]))  # only changes the check-ins
     a = env.store.get_autopilot(s.id)
     assert a.checkin_every == 7200 and a.max_rounds == 4 and "every 2h" in replies[-1]
     await bot.cmd_auto(None, NS(args=["status"]))
-    assert s.id in replies[-1] and "round 0/4" in replies[-1] and "tune the lr" in replies[-1]
+    assert s.id in replies[-1] and "wake-up 0/4" in replies[-1] and "tune the lr" in replies[-1]
     await bot.cmd_auto(None, NS(args=["off"]))
     assert "Autopilot off" in replies[-1] and not env.store.get_autopilot(s.id).active
     assert "Autopilot is ON" not in env.agent.system_prompt(s.id)
 
 
-def test_status_line_and_durations():
-    from overseer.autopilot import parse_duration, parse_status
-    assert parse_status("Done.\n\nAUTOPILOT: CONTINUE") == ("Done.", "CONTINUE", "")
-    assert parse_status("x\n**AUTOPILOT: DONE — lr 3e-4 wins**") == ("x", "DONE", "lr 3e-4 wins")
-    assert parse_status("x\nautopilot: need help: which model?")[1:] == ("NEED_HELP", "which model?")
-    assert parse_status("no status here") == ("no status here", None, "")
+class FakeQuery:
+    """A pressed inline button: records how the message was edited."""
+    def __init__(self, data=""):
+        self.edits = []
+        self.data = data
+        self.message = None
+
+    async def answer(self, *a, **kw):
+        pass
+
+    async def edit_message_text(self, text, parse_mode=None, reply_markup=None):
+        rows = [[(b.text, b.callback_data) for b in row] for row in reply_markup.inline_keyboard] if reply_markup else []
+        self.edits.append((text, rows))
+
+
+async def test_agent_asks_for_autopilot(env, monkeypatch):
+    """The agent asks (ov auto request); the researcher changes the limits on the card and approves."""
+    from overseer.bot import Bot
+    ap = await make_autopilot(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    s = env.agent.general_session()
+    await env.agent.handle(s, "FAKE_OV ov auto request --goal 'tune the lr FAKE_EVERY' --wakeups 5 --hours 24 "
+                              "--checkins 30m")
+    assert "✓ asked" in env.notifier.sent[-1].text
+    card = next(m for m in env.notifier.sent if "asks to work on its own" in m.text)
+    assert "up to <b>5</b> wake-ups" in card.text and "for <b>1d</b>" in card.text and "at most every 30m</b>" in card.text
+    assert card.session_id == s.id and ("✅ Start", f"ap:ok:{s.id}") in card.buttons[0]
+    a = env.store.get_autopilot(s.id)
+    assert (a.status, a.active, a.max_rounds, a.hours, a.checkin_every) == ("requested", 0, 5, 24, 1800)
+    n = len(claude_calls(env))
+
+    q = FakeQuery()
+    for what in ("w+", "w+", "h-", "c-", "c+", "c+", "c+"):
+        await bot._approval(q, what, s.id)
+    a = env.store.get_autopilot(s.id)
+    # wake-ups 5 -> 10 -> 15; time 24h -> 12h; check-ins 30m -> 1h (fewer), then 30m, 15m, and 15m is the floor
+    assert (a.max_rounds, a.hours, a.checkin_every) == (15, 12, 900)
+    assert "up to <b>15</b> wake-ups" in q.edits[-1][0] and q.edits[-1][1][0][0][0] == "✅ Start"
+    assert len(claude_calls(env)) == n  # nothing runs before the approval
+
+    await bot._approval(q, "ok", s.id)
+    await ap.drain()
+    assert "✅ <b>Approved.</b>" in q.edits[-1][0] and not q.edits[-1][1]
+    a = env.store.get_autopilot(s.id)
+    assert a.active and a.status == "waiting" and abs(a.expires - time.time() - 12 * 3600) < 60
+    call = claude_calls(env)[-1]
+    assert "[Autopilot started: up to 15 wake-ups for 12h]" in call["stdin"] and "Autopilot is ON" in system_of(call)
+    (j1,) = agent_jobs(env, s)
+    (w,) = env.store.watches(s.id)
+    assert w.jobs == j1 and w.every == 3600 and not w.oneoff  # --every 1h, allowed (the floor is 15m)
+
+    await bot._approval(q, "ok", s.id)  # the card is used up
+    assert "no longer open" in q.edits[-1][0]
+
+
+async def test_declined_autopilot_request(env):
+    from overseer.bot import Bot
+    await make_autopilot(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    s = env.agent.general_session()
+    await env.agent.handle(s, "FAKE_OV ov auto request --goal 'sweep everything'")
+    a = env.store.get_autopilot(s.id)
+    assert (a.max_rounds, a.hours, a.checkin_every) == (20, 48, 3600)  # the defaults
+    q = FakeQuery()
+    await bot._approval(q, "no", s.id)
+    assert "Declined" in q.edits[-1][0] and env.store.get_autopilot(s.id).status == "declined"
+    await env.agent.handle(s, "what now?")
+    stdin = claude_calls(env)[-1]["stdin"]
+    assert "<overseer_notes>" in stdin and "declined your autopilot request" in stdin
+    await env.agent.handle(s, "and now?")
+    assert "<overseer_notes>" not in claude_calls(env)[-1]["stdin"]  # told once
+
+
+async def test_oneoff_wakeups(env):
+    """Without autopilot the agent can wake itself once - a few times, then it has to ask."""
+    from overseer.bot import Bot
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    env.set_jobs(**{"5001": {"name": "train", "state": "RUNNING", "workdir": str(env.home / "proj")}})
+    await env.agent.handle(s, "\n".join([
+        "FAKE_OV ov watch 5001 --note 'compare the loss with the baseline'",
+        "FAKE_OV ov watch 5001 --every 1h",
+        "FAKE_OV ov wake every 2h summarise",
+        "FAKE_OV ov wake in 30m look at the eval",
+        "FAKE_OV ov watches",
+    ]))
+    outs = env.notifier.sent[-1].text.split("@@@")
+    assert "you'll be woken once, when job 5001 has ended" in outs[0] and "[exit 0]" in outs[0]
+    assert "check-ins need autopilot" in outs[1] and "[exit 1]" in outs[1]
+    assert "repeating wake-ups need autopilot" in outs[2]
+    assert "you'll be woken once, in 30m" in outs[3]
+    assert "job 5001" in outs[4] and "[one-off]" in outs[4] and "⏰ in 30m" in outs[4]
+    note = next(m for m in env.notifier.sent if "will look at job 5001 when it ends" in m.text)
+    assert note.buttons[0][0][0] == "✖ Cancel" and "compare the loss" in note.text
+    assert env.store.get_job("5001").by_agent  # watching registered the job
+    (w_job, w_timer) = env.store.watches(s.id)
+
+    # The job ends: the agent is woken once, with its report and its note.
+    n = len(claude_calls(env))
+    env.set_jobs(**{"5001": {"name": "train", "state": "COMPLETED", "exit": "0:0", "workdir": str(env.home / "proj")}})
+    await env.monitor.poll()
+    await ap.drain()
+    assert len(claude_calls(env)) == n + 1
+    stdin = claude_calls(env)[-1]["stdin"]
+    assert "[The wake-up you asked for (one-off)]" in stdin and "<job id='5001'" in stdin
+    assert "compare the loss with the baseline" in stdin
+    assert any("Waking the agent</b> as it asked: 5001 COMPLETED" in m.text for m in env.notifier.sent)
+    assert env.store.get_watch(w_job.id).state == "fired"
+
+    # The timer comes due: woken again.
+    w_timer.due = time.time() - 1
+    env.store.update_watch(w_timer)
+    await env.monitor.poll()
+    await ap.drain()
+    assert "look at the eval" in claude_calls(env)[-1]["stdin"] and len(claude_calls(env)) == n + 2
+
+    # A third one in a row is fine; then the agent has to ask for autopilot.
+    env.store.set(f"oneoff_chain:{s.id}", "3")
+    await env.agent.handle(s, "FAKE_OV ov wake in 1h again", origin="oneoff")
+    assert "woken yourself 3 times in a row" in env.notifier.sent[-1].text
+    # Until the researcher writes.
+    await env.agent.handle(s, "FAKE_OV ov wake in 1h again")
+    assert "you'll be woken once, in 1h" in env.notifier.sent[-1].text
+    for _ in range(3):  # 2 more are allowed, the 4th pending one isn't
+        await env.agent.handle(s, "FAKE_OV ov wake in 2h more")
+    assert "already have 3 one-off wake-ups pending" in env.notifier.sent[-1].text
+
+    # The researcher cancels one with its ✖ button; the agent hears about it next time.
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    w = env.store.watches(s.id)[0]
+    q = FakeQuery(f"uw:{w.id}")
+    await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
+    assert "Cancelled" in q.edits[-1][0] and env.store.get_watch(w.id).state == "cancelled"
+    await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
+    assert "already happened or was cancelled" in q.edits[-1][0]
+    await env.agent.handle(s, "hi")
+    assert f"cancelled your wake-up w{w.id}" in claude_calls(env)[-1]["stdin"]
+
+
+def test_durations():
+    from overseer.autopilot import human_interval, parse_duration
     assert parse_duration("2h") == 7200 and parse_duration("90m") == 5400 and parse_duration("1d") == 86400
     assert parse_duration("1.5") == 5400 and parse_duration("off") == 0 and parse_duration("soon") is None
+    assert parse_duration("30 minutes") == 1800
+    assert human_interval(5400) == "1h30" and human_interval(172800) == "2d" and human_interval(900) == "15m"
 
 
 async def test_status_follows_the_training_log(env):
@@ -1709,7 +1882,7 @@ async def test_submissions_through_scripts_are_found(env):
     """A job submitted by a script or CLI (no "sbatch" in the agent's command) is still recognised: SLURM
     says it was submitted during the turn and its id is in the output or reply. Old jobs mentioned aren't."""
     import time as _time
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     soon = _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime(_time.time() + 60))  # during the turn
     env.set_jobs(**{"7777": {"name": "native7", "state": "PENDING", "submit": soon},
                     "7778": {"name": "seed1", "state": "PENDING", "submit": soon},
@@ -1723,13 +1896,13 @@ async def test_submissions_through_scripts_are_found(env):
     assert not any("job 1234" in t for t in announced)
     assert {j.job_id for j in env.store.session_jobs(s.id)} == {"7777", "7778"}
     reply = next(m.text for m in reversed(env.notifier.sent) if m.text.startswith("🤖"))
-    assert "waiting for job(s) 7777, 7778" in reply and "nothing will wake" not in reply
+    assert "waiting for jobs 7777, 7778 (auto-watched 7777, 7778" in reply and "nothing will wake" not in reply
 
 
 async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
     """A job the agent submitted unnoticed can be handed to its conversation: /assign <id> in the thread."""
     from overseer.bot import Bot
-    ap = make_autopilot(env)
+    ap = await make_autopilot(env)
     bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
               notifier=env.notifier)
     replies = []
@@ -1752,7 +1925,7 @@ async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
     (proj / "x.out").write_text("done\n")
     await env.monitor.poll()
     await ap.drain()
-    assert any("Autopilot round 1/3" in m.text for m in env.notifier.sent)
+    assert any("Autopilot wake-up 1/3" in m.text for m in env.notifier.sent)
 
 
 async def test_general_topic(env, monkeypatch):

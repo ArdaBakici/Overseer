@@ -9,6 +9,7 @@ submits so the monitor reports on them and replies continue the same conversatio
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -20,7 +21,6 @@ from pathlib import Path
 
 from .config import BACKENDS, Config
 from .hpc import HPC
-from .autopilot import parse_status
 from .compute import WORKER_NAME
 from .ctl import TOKEN_ENV
 from .live import Progress, Transcript
@@ -78,22 +78,19 @@ reply what it shows."""
 OV_SECTION = """
 
 ## Talking to Overseer: `ov`
-Overseer tracks jobs, reports on them to the researcher, and wakes you when they finish (autopilot). The local \
-`ov` command talks to it directly (it answers at once; `ov help` for everything):
-- `ov job add <id> [<id>...]`: register jobs you submitted. Do this right after every submission, whichever \
-way it was made (sbatch, a script, a CLI, a job array): Overseer checks the id with SLURM and tracks it in this \
-conversation. A job that isn't registered may go unnoticed.
-- `ov job list [--all]`, `ov job show <id>`
-- `ov job move <id> <project|main>`: reassign a job to a project.
-- `ov job delete <id>`: Overseer stops tracking it; the job itself keeps running (`scancel` cancels it - do \
-both if the researcher wants a job gone).
-- `ov project list`, `ov project new <name> --dir <folder on the HPC> --about "<what it is>" [--move-here]`, \
-`ov project set <name> [--dir ...] [--about ...]`, `ov project archive <name>`: each project gets its own \
-Telegram topic. `--move-here` also moves this conversation into the new project.
-- `ov conversation move <project|main>`, `ov status`, `ov notify <text>` (a message to the researcher right \
-away, for long runs).
-When the researcher asks you to create a project, reassign a job or stop tracking one, use these commands. \
-Every change is announced to the researcher, so you don't need to ask first."""
+Overseer tracks jobs, reports on them to the researcher, and wakes you up. The local `ov` command talks to it \
+directly and answers at once. The `overseer` skill has the full reference (or run `ov help`). The essentials:
+- After every job you submit, whichever way (sbatch, a script, a CLI, an array): `ov job add <id>`. Overseer \
+checks the id with SLURM and reports on the job to the researcher.
+- When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
+(`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
+- You only run when someone writes to you. To look at something later, have Overseer wake you: \
+`ov watch <job id> --note "<what to check>"` (when the job ends) or `ov wake in 2h "<what to check>"`. Without \
+autopilot these are one-off wake-ups: use them when you told the researcher you'd follow up.
+- For work that needs several runs, with waiting for results in between (tuning, sweeps, "keep going until X"), \
+ask for autopilot: `ov auto request --goal "<goal>" [--wakeups 20] [--hours 48] [--checkins 1h]`, then end your \
+turn. The researcher approves it in Telegram (and may change the limits); you're woken to start. Don't ask for \
+a single job."""
 
 
 PROJECT_SECTION = """
@@ -172,6 +169,7 @@ class Session:
     rec: SessionRecord
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     task: asyncio.Task | None = None
+    origin: str = "user"  # what started the current turn: user | autopilot | checkin | oneoff
 
     @property
     def id(self) -> str:
@@ -359,6 +357,18 @@ class Agent:
             self.store.set(key, s.id)
         return s
 
+    # Notes for the agent's next turn in a conversation, about things that happened while it wasn't running.
+    def add_note(self, sid: str, text: str) -> None:
+        notes = json.loads(self.store.get(f"notes:{sid}") or "[]")
+        self.store.set(f"notes:{sid}", json.dumps((notes + [text])[-10:]))
+
+    def take_notes(self, sid: str) -> list[str]:
+        raw = self.store.get(f"notes:{sid}")
+        if not raw or raw == "[]":
+            return []
+        self.store.set(f"notes:{sid}", "[]")
+        return json.loads(raw)
+
     def move_job(self, job_id: str, project: str | None) -> JobRecord | None:
         """Reassign a job (and the conversation about it) to another project, or the main chat."""
         rec = self.store.get_job(job_id)
@@ -443,15 +453,19 @@ class Agent:
         ] if x)
 
     # ------------------------------------------------------------------ running a request
-    async def handle(self, s: Session, user_text: str, quiet: bool = False) -> bool:
+    async def handle(self, s: Session, user_text: str, quiet: bool = False, origin: str = "user") -> bool:
         """Run one request in a conversation. True if the agent answered. `quiet`: send the answer
-        without a notification sound (autopilot check-ins) unless the autopilot needs attention."""
+        without a notification sound (autopilot check-ins) unless the autopilot needs attention.
+        `origin`: who asked - the researcher, or a wake-up (autopilot, checkin, oneoff)."""
         if not self.cfg.agent.enabled:
             await self.notifier.send(Outgoing("The agent is disabled in the config."))
             return False
         ok = False
         async with s.lock:
             s.task = asyncio.current_task()
+            s.origin = origin
+            if origin == "user" and self.autopilot:
+                self.autopilot.user_turn(s)
             try:
                 await self._turn(s, user_text, quiet)
                 ok = True
@@ -465,6 +479,7 @@ class Agent:
                                                   session_id=s.id, job_id=s.job_id))
             finally:
                 s.task = None
+                s.origin = "user"
         if self.autopilot:
             self.autopilot.turn_ended(s)
         return ok
@@ -478,8 +493,12 @@ class Agent:
             parts.append(await self._project_notes(s.project))
         if resume is None and s.job_id:
             parts.append(await self._job_context(s.job_id))
+        notes = self.take_notes(s.id)
+        if notes:  # things that happened since the agent last ran (e.g. the researcher declined a request)
+            parts.append("<overseer_notes>\n" + "\n".join(f"- {n}" for n in notes) + "\n</overseer_notes>")
         parts.append(user_text)
         prompt = "\n\n".join(parts)
+        turn_started = time.time()
 
         outbox = runner.workdir(s.id) / "outbox"  # files the agent leaves here are sent with its reply
         outbox.mkdir(exist_ok=True)
@@ -535,9 +554,8 @@ class Agent:
         self._usage_delta(backend, res, resumed=resume is not None)
         footer = self.footer(backend, res, s.project)
         text, autopilot_line, status = res.text, "", None
-        if self.autopilot and self.autopilot.active(s.id):
-            text, status, detail = parse_status(res.text)
-            autopilot_line = self.autopilot.after_turn(s, status, detail, activity.cancelled)
+        if self.autopilot:
+            autopilot_line, status = self.autopilot.after_turn(s, activity.cancelled, turn_started)
         photos, docs, notes = collect_outbox(outbox)
         if photos or docs:
             transcript.write({"kind": "tool", "name": "attachments", "detail": ", ".join(n for n, _ in photos + docs)})
@@ -557,6 +575,9 @@ class Agent:
         buffer: list[str] = []  # live mode: commands not yet sent
 
         def on_job(job_id: str, command: str) -> None:
+            known = self.store.get_job(job_id)
+            if known and known.by_agent and known.session_id == s.id and not known.ignored:
+                return  # already registered (ov job add) and announced
             self._record_job(s, job_id)
             asyncio.get_running_loop().create_task(self.notifier.send(Outgoing(
                 f"🚀 <b>Agent submitted job {esc(job_id)}</b>\n{pre(command, 600)}", job_id=job_id, session_id=s.id)))
