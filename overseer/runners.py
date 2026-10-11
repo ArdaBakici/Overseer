@@ -26,11 +26,13 @@ import re
 import shlex
 import shutil
 import signal
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .compute import DISPATCHED, LOGIN_NODE_CMD
 from .config import Config
 from .sshlink import agent_bin_dir
 
@@ -87,6 +89,10 @@ class Activity:
     jobs: list[tuple[str, str]] = field(default_factory=list)  # (job_id, command)
     blocked: list[tuple[str, str]] = field(default_factory=list)  # (command, reason) refused by the CLI itself
     cancelled: list[str] = field(default_factory=list)  # job ids the agent ran scancel on
+    # (command, seconds) that ran on the login node for at least login_warn_seconds (0 = don't check)
+    login_node: list[tuple[str, float]] = field(default_factory=list)
+    login_warn_seconds: float = 0
+    _started: dict[str, float] = field(default_factory=dict)
     on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
     on_progress: Callable[[dict[str, Any]], None] | None = None
@@ -115,6 +121,7 @@ class Activity:
     def command(self, cmd: str) -> None:
         cmd = display_command(cmd)
         self.commands.append(cmd)
+        self._started[cmd] = time.monotonic()
         for args in SCANCEL_RE.findall(cmd):
             for jid in re.findall(r"(?<![\w-])(\d+)(?:_\d+)?(?![\w.])", args):
                 if jid not in self.cancelled:
@@ -125,6 +132,12 @@ class Activity:
 
     def output(self, cmd: str, output: str, exit_code: int | None = None) -> None:
         self._emit("output", command=display_command(cmd), output=output or "", exit_code=exit_code)
+        started = self._started.pop(display_command(cmd), None)
+        if started is not None and self.login_warn_seconds:
+            took = time.monotonic() - started
+            shown = display_command(cmd)
+            if took >= self.login_warn_seconds and LOGIN_NODE_CMD.search(shown) and not DISPATCHED.search(shown):
+                self.login_node.append((shown, took))
         for jid in submitted_jobs(cmd, output or ""):
             if all(jid != j for j, _ in self.jobs):
                 self.jobs.append((jid, display_command(cmd)))

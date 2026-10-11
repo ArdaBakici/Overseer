@@ -193,11 +193,50 @@ def test_ssh_files(env):
     agent_cfg = agent_ssh_config(cfg)
     assert "IdentityFile none" in agent_cfg and "ControlMaster no" in agent_cfg
     assert str(cfg.ssh_dir) not in agent_cfg  # the agent's config doesn't even mention the key folder
-    for name in ("ssh", "scp", "sftp"):
+    for name in ("scp", "sftp"):
         w = cfg.local.tmp("agent-bin", name)
         assert os.access(w, os.X_OK) and f"-F {cfg.agent_ssh_config}" in w.read_text()
+    w = cfg.local.tmp("agent-bin", "ssh")  # see test_login_node_cpu_limit
+    assert os.access(w, os.X_OK) and repr(str(cfg.agent_ssh_config)) in w.read_text()
+    assert os.access(cfg.local.tmp("agent-bin", "hpc-run"), os.X_OK)
     assert (cfg.ssh_dir.stat().st_mode & 0o777) == 0o700
     assert (cfg.ssh_config_file.stat().st_mode & 0o777) == 0o600
+
+
+def test_login_node_cpu_limit(env, tmp_path):
+    """The agent's ssh caps the CPU time of commands run directly on the login node; commands that
+    hand work to SLURM are left alone (SLURM would pass the limit on to the job)."""
+    import subprocess
+    from overseer.compute import write_agent_tools
+    from overseer.sshlink import _write
+    fake = tmp_path / "real-ssh"
+    fake.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_SSH_ARGS\"\nexit ${FAKE_SSH_RC:-0}\n")
+    fake.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    write_agent_tools(env.cfg, bin_dir, str(fake), _write)
+
+    def ssh(*args, rc=0):
+        out = tmp_path / "args"
+        p = subprocess.run([str(bin_dir / "ssh"), *args], capture_output=True, text=True,
+                           env={**os.environ, "FAKE_SSH_ARGS": str(out), "FAKE_SSH_RC": str(rc)})
+        return p, out.read_text().splitlines()
+
+    _, argv = ssh("hpc", "python train.py --lr 3e-4")
+    assert argv[:2] == ["-F", str(env.cfg.agent_ssh_config)]
+    assert argv[2:] == ["hpc", "ulimit -H -t 130 2>/dev/null; ulimit -S -t 120 2>/dev/null; python train.py --lr 3e-4",
+                        "exit $?"]
+    _, argv = ssh("-o", "ConnectTimeout=5", "-p22", "-t", "hpc", "bash", "-lc", "'make all'")
+    assert argv[-2] == "ulimit -H -t 130 2>/dev/null; ulimit -S -t 120 2>/dev/null; bash -lc 'make all'"
+    assert argv[-3] == "hpc"  # options and their values skipped correctly
+    for dispatching in ["cd ~/proj && sbatch train.sh", "bash -lc 'srun --jobid=5 --overlap nvidia-smi'",
+                        "salloc -N1", "rsync --server -vlogDtpre.iLsfxC . ~/x"]:
+        assert ssh("hpc", dispatching)[1][-1] == dispatching, dispatching
+    assert ssh("hpc")[1] == ["-F", str(env.cfg.agent_ssh_config), "hpc"]  # no command: untouched
+    p, _ = ssh("hpc", "python heavy.py", rc=152)  # killed by SIGXCPU: says what to do instead
+    assert p.returncode == 152 and "login node's CPU limit (120 CPU seconds)" in p.stderr and "hpc-run" in p.stderr
+    env.cfg.slurm.compute.login_cpu_seconds = 0  # switched off
+    write_agent_tools(env.cfg, bin_dir, str(fake), _write)
+    assert ssh("hpc", "python heavy.py")[1][-1] == "python heavy.py"
 
 
 def test_ssh_setup_generates_and_imports_key(env, tmp_path):
@@ -1638,3 +1677,29 @@ async def test_streaming_drafts(env, monkeypatch):
     tg.api_errors = {"sendMessageDraft": EndPointNotFound("Not Found")}
     handle = await notifier.post_live(Outgoing("⏳ working", session_id=s.id))
     assert "messages" in handle and not notifier.streaming and tg.sent[-1][2] == "⏳ working"
+
+
+def test_login_node_warnings(monkeypatch):
+    """Commands that ran a while directly on the login node are flagged; work handed to SLURM isn't."""
+    import overseer.runners as runners
+    clock = [1000.0]
+    monkeypatch.setattr(runners.time, "monotonic", lambda: clock[0])
+    a = Activity(login_warn_seconds=120)
+    for cmd, took in [("ssh hpc 'python make_plots.py'", 200), ("ssh hpc 'ls -la'", 2),
+                      ("hpc-run --dir ~/proj -- python make_plots.py", 900), ("ssh hpc 'cd x && sbatch run.sh'", 300),
+                      ("python local_thing.py", 500), ("/bin/bash -lc \"ssh hpc 'srun -p compute python x.py'\"", 400)]:
+        a.command(cmd)
+        clock[0] += took
+        a.output(cmd, "")
+    assert a.login_node == [("ssh hpc 'python make_plots.py'", 200)]
+
+
+async def test_login_node_warning_in_summary(env):
+    s = env.agent.general_session()
+    a = Activity(login_warn_seconds=120)
+    a.commands = ["ssh hpc 'python make_plots.py'"]
+    a.login_node = [("ssh hpc 'python make_plots.py'", 312)]
+    await env.agent._report_activity(s, a, [])
+    msg = env.notifier.sent[-1]
+    assert "⚠️ ran 5m 12s on the login node: <code>ssh hpc 'python make_plots.py'</code>" in msg.text
+    assert "⚠️ ran 5m 12s on the login node" in msg.markdown  # the rich version too

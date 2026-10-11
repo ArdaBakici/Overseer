@@ -32,6 +32,23 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 - **Commands:** after each request, Telegram gets the list of commands the agent ran. Set `report_commands: live` to see them while it works.
 - **Submissions:** any job it submits is announced right away (`🚀 Agent submitted job 1234` plus the command), then tracked by the monitor.
 
+**Heavy work goes to compute nodes, not the login node.** The agent has `hpc-run`, which runs a command on a compute node and returns its output:
+```bash
+hpc-run --dir /scratch/me/rf-dreamer -- python plot_rewards.py      # on the shared worker node
+hpc-run --cpus 32 --mem 128G --time 120 -- python preprocess.py    # on a node of its own
+hpc-run --gpu -- python eval.py                                    # on a GPU node of its own
+hpc-run --status | --stop                                          # the shared worker
+```
+- **Shared worker:** the first `hpc-run` submits a small job (`overseer-worker`) on the compute partition that just holds a node (8 cores, 32 GB, 8 h by default). Later commands run inside it as job steps (`srun --jobid … --overlap`), so they start at once instead of queueing.
+  - **Ending:** it ends itself after 45 minutes unused, before clusters cancel idle jobs.
+  - **Not reported:** it isn't announced as a job; `/health` shows it.
+- **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display.
+- **Instructions:** the agent is told to use `hpc-run` for anything that computes (scripts, plots, data processing, tests) and `sbatch` for real runs. The 📈 Plot button asks for plots made this way.
+- **Guardrail:** commands the agent runs directly on the login node get 120 CPU seconds (`ulimit -t`, set by its `ssh` wrapper). A heavy script there is stopped with a message pointing to `hpc-run`.
+  - **Exemptions:** commands that hand work to SLURM (`sbatch`, `srun`, `salloc`) aren't limited, because SLURM would pass the limit on to the job.
+  - **Not a security boundary:** it guards against mistakes only.
+- **Visibility:** a command that ran on the login node for 2 minutes or more is flagged in the command summary (`⚠️ ran 3m 10s on the login node: …`).
+
 **On your homelab: confined.** Claude Code and Codex each run their shell inside their own OS sandbox (bubblewrap on Linux), configured by Overseer:
 
 | | agent's shell |
@@ -221,6 +238,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).
+- `slurm.compute`: the partition, cores, memory and hours of the shared worker, how long it may stay idle, how long `hpc-run` waits for a node, the GPU partition and gres for `--gpu`, extra `sbatch` flags (e.g. an account), the login-node CPU limit (`login_cpu_seconds`, 0 = off) and the warning threshold.
 - `agent.autopilot`: default and maximum rounds, a default check-in interval (`checkin_minutes`, 0 = off), the shortest interval allowed, and the check-in cap per job.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
 - `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
@@ -249,5 +267,6 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `autopilot.py` | `/auto`: waking conversations when their jobs finish, check-ins, round limits, status lines |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
+| `compute.py` | `hpc-run` and the shared compute worker, the agent's ssh wrapper with the login-node CPU limit |
 | `richtext.py` | Markdown → Telegram HTML (fallback) and Rich Markdown, tag-safe message splitting, collapsible sections |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

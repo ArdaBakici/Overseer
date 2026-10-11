@@ -115,6 +115,30 @@ class SSHConfig:
 
 
 @dataclass
+class ComputeConfig:
+    """Where the agent runs anything heavier than a quick command (`hpc-run` on the HPC side).
+
+    A shared "worker" job holds a compute node so commands start without queueing; it ends
+    itself after `idle_minutes` unused. Commands asking for other resources (or a GPU) get an
+    allocation of their own."""
+
+    partition: str = "compute"
+    cpus: int = 8
+    mem: str = "32G"
+    worker_hours: float = 8  # time limit of the worker job
+    idle_minutes: int = 45  # the worker ends itself after this long unused (clusters cancel idle jobs too)
+    wait_minutes: int = 15  # how long hpc-run waits for a node before giving up
+    gpu_partition: str = "nvidia"  # for `hpc-run --gpu`
+    gpu_gres: str = "gpu:1"
+    sbatch_args: list[str] = field(default_factory=list)  # extra flags for every allocation, e.g. ["--account=x"]
+    # Guardrail against mistakes (not a security boundary): commands the agent runs directly on
+    # the login node get this many CPU seconds (ulimit -t); 0 = no limit. Commands that hand work
+    # to SLURM (sbatch, srun, salloc, hpc-run) aren't limited - SLURM would pass the limit on to the job.
+    login_cpu_seconds: int = 120
+    login_warn_seconds: int = 120  # flag commands that ran this long on the login node
+
+
+@dataclass
 class SlurmConfig:
     poll_interval: int = 60  # seconds between squeue/sacct polls
     status_interval_minutes: int = 60  # periodic progress update for running jobs; 0 = off
@@ -130,6 +154,7 @@ class SlurmConfig:
     # PATH from a login shell (`bash -lc`) once per connection. If SLURM still isn't found, put
     # what you'd type to get it here, e.g. "module load slurm" - it runs before PATH is read.
     setup: str = ""
+    compute: ComputeConfig = field(default_factory=ComputeConfig)
 
 
 @dataclass

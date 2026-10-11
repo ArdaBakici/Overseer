@@ -46,7 +46,12 @@ and modules are often not on PATH there. Run remote commands through a login she
 ## How to work
 - Investigate with real commands: squeue, `sacct -j <id> --format=JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem`, \
 scontrol show job, the job's log files and batch script, the code, disk quota, module/env availability.
-- Never run heavy computation on the login node; use sbatch (or srun inside an allocation).
+- The login node is only for quick commands: looking at files and logs, git, editing, squeue/sacct, submitting \
+jobs, installing packages. Anything that computes - running Python scripts, plotting, processing data, \
+compiling, tests, evaluation - runs on a compute node: `hpc-run --dir <project dir> -- <command>` runs it in a \
+compute node's login shell and returns its output (it reuses a node Overseer keeps for a while, so it usually \
+starts at once; `hpc-run --cpus N --mem 64G --time 120 -- ...` or `--gpu` gets a node of its own; \
+`hpc-run --help` for more). Long runs and experiments are sbatch jobs as usual.{login_limit}
 - For non-trivial changes to the researcher's code, prefer a copy or a git branch, and say where it is.
 - When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \
 track the job and report on it.
@@ -62,7 +67,7 @@ tables are fine; avoid headings and wide tables (it's read on a phone).
 Anything you put in `./outbox/` (in your local working directory) is sent to the researcher with your reply: \
 images (.png, .jpg) as pictures, other files as documents - up to 10 per reply, images up to 10 MB, files up to \
 50 MB. Plots are made on the HPC, where the data is: write a small plotting script there (matplotlib in the \
-project's environment; light plotting on the login node is fine, heavy processing goes in a job), save a PNG \
+project's environment), run it with `hpc-run --dir <dir> -- python plot.py` (not on the login node), save a PNG \
 (e.g. dpi=150, readable on a phone), copy it back with `scp {host}:/path/plot.png ./outbox/`, and say in your \
 reply what it shows."""
 
@@ -127,6 +132,11 @@ def _command_fold(commands: list[str]) -> str:
         c = c.strip()
         return c if len(c) <= 300 else c[:299] + "…"
     return fold(esc("\n".join(f"$ {clip(c)}" for c in commands)))
+
+
+def _duration(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
 
 
 def _human(n: int) -> str:
@@ -356,7 +366,9 @@ class Agent:
     def system_prompt(self, session_id: str | None = None) -> str:
         domains = self.cfg.agent.allowed_domains
         setup = self.cfg.slurm.setup.strip()
+        cpu = self.cfg.slurm.compute.login_cpu_seconds
         prompt = SYSTEM_PROMPT.format(
+            login_limit=(f" Commands run directly on the login node are stopped after {cpu} CPU seconds." if cpu else ""),
             host=self.cfg.ssh.host,
             setup=f"{setup}; " if setup else "",
             domains=f" (except {', '.join(domains)})" if domains else "",
@@ -505,7 +517,7 @@ class Agent:
             photos=photos, files=docs))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
-        activity = Activity()
+        activity = Activity(login_warn_seconds=self.cfg.slurm.compute.login_warn_seconds)
         buffer: list[str] = []  # live mode: commands not yet sent
 
         def on_job(job_id: str, command: str) -> None:
@@ -551,6 +563,8 @@ class Agent:
         lines = [f"🛠 <b>{n} command(s)</b>" + (" (the last 40 here, all in commands.txt)" if n > 40 else "")]
         if activity.commands:
             lines.append(_command_fold(activity.commands[-40:]))
+        for cmd, took in activity.login_node[:5]:  # heavy work that should have gone to a compute node
+            lines.append(f"⚠️ ran {_duration(took)} on the login node: {code(cmd[:200])}")
         if activity.files:
             lines.append("✏️ local files: " + ", ".join(code(f) for f in activity.files[:20]))
         files = [("commands.txt", "\n\n".join(activity.commands).encode())] if len(activity.commands) > 15 else []

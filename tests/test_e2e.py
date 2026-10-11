@@ -128,9 +128,12 @@ SetEnv PATH={FAKE_SLURM}:/usr/local/bin:/usr/bin:/bin FAKE_SLURM_STATE={state}
         except OSError:
             time.sleep(0.1)
     write_configs(cfg)
+    had_overseer_dir = (Path.home() / ".overseer").exists()  # hpc-run's worker files go to the "HPC" home
     try:
         yield cfg, remote, state, app
     finally:
+        if not had_overseer_dir:
+            shutil.rmtree(Path.home() / ".overseer", ignore_errors=True)
         subprocess.run(["ssh", "-F", str(cfg.ssh_config_file), "-O", "exit", cfg.ssh.host], capture_output=True)
         proc.terminate()
         proc.wait(5)
@@ -177,8 +180,19 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         f"scp hpc:{remote / 'proj' / 'reward.png'} ./outbox/ && echo SCP-DONE",
         # A service listening on this machine's localhost (here: the test sshd).
         f"(exec 3<>/dev/tcp/127.0.0.1/{cfg.ssh.port}) 2>/dev/null && echo LOOPBACK-OPEN || echo LOOPBACK-CLOSED",
+        # Heavy work on a compute node: the first hpc-run starts the shared worker, the second reuses it.
+        f"hpc-run --dir {remote / 'proj'} -- python3 -c \"import os; print('ON-COMPUTE', os.getcwd(), os.environ['MPLBACKEND'])\"",
+        "hpc-run -- sh -c 'echo AGAIN'",
+        "hpc-run --status",
+        # ...and directly on the login node it hits the CPU limit (2 s in this test).
+        "ssh hpc 'python3 -c \"while True: pass\"'; echo EXIT=$?",
     ]
     (remote / "proj" / "reward.png").write_bytes(b"\x89PNG\r\n\x1a\n made on the HPC")
+    # A login shell may reset PATH; on a real cluster this is where "module load slurm" goes.
+    cfg.slurm.setup = f"export PATH={FAKE_SLURM}:$PATH"
+    cfg.slurm.compute.login_cpu_seconds = 2
+    cfg.slurm.compute.login_warn_seconds = 1
+    write_configs(cfg)
     (app / ".env").write_text("TELEGRAM_BOT_TOKEN=999:super-secret-token\n")
     (app / ".env").chmod(0o600)
     from overseer import live
@@ -217,6 +231,16 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         # Known gap: Codex's sandbox doesn't isolate the machine's localhost (Claude Code's does). If this
         # starts failing for codex, Codex closed it: update the README's sandbox table.
         assert ("LOOPBACK-OPEN" if backend == "codex" else "LOOPBACK-CLOSED") in outs[10], detail
+        st = json.loads(state.read_text())
+        workers = [j for j, v in st["jobs"].items() if v["name"] == "overseer-worker"]
+        assert len(workers) == 1, st  # started once, reused by the second hpc-run
+        assert f"ON-COMPUTE {remote / 'proj'} Agg" in outs[11] and "started a compute worker" in outs[11], detail
+        assert "AGAIN" in outs[12] and "started a compute worker" not in outs[12], detail
+        assert [a for a in st["steps"] if f"--jobid={workers[0]}" in a and "--overlap" in a], st["steps"]
+        assert f"worker: {workers[0]} RUNNING" in outs[13], detail
+        assert "EXIT=152" in outs[14] and "login node's CPU limit" in outs[14], detail
+        assert f"Agent submitted job {workers[0]}" not in texts, detail  # the worker isn't reported as a job
+        assert "on the login node: <code>ssh hpc 'python3 -c" in texts, detail
         assert notes.sent[-1].photos == [("reward.png", b"\x89PNG\r\n\x1a\n made on the HPC")], detail
         assert "refused by" not in texts, detail
         assert "Agent submitted job 5001" in texts, detail

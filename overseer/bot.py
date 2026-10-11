@@ -553,8 +553,9 @@ class Bot:
         log_path = (rec.info_dict.get("progress_log") or rec.stdout) if rec else ""
         text = (f"Plot how job {job_id} ({rec.name}, {rec.state}) is doing. Find its metrics - its log {log_path}, or "
                 "metric files (metrics.jsonl, CSV, TensorBoard events) in its output folder - and make one clear PNG "
-                "on the HPC: the main metric(s) against step or time, a few panels if useful, the job id in the "
-                "title. Copy it to ./outbox/ and describe the trend in two or three sentences.")
+                "with a plotting script run on a compute node (hpc-run): the main metric(s) against step or time, a "
+                "few panels if useful, the job id in the title. Copy it to ./outbox/ and describe the trend in two "
+                "or three sentences.")
         session = self.agent.session_for_job(job_id)
         await self.notifier.send(Outgoing(f"📈 {esc(self.agent.backend_of(session.project))} is plotting job "
                                           f"{code(job_id)}…", job_id=job_id, session_id=session.id, silent=True))
@@ -653,9 +654,17 @@ class Bot:
         await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · SSH connection {conn}\n"
                                  f"last successful poll: {last}{err}\n"
                                  f"agent runs in progress: {running} · autopilots on: {len(auto)}\n"
+                                 f"{self._worker_line()}\n"
                                  f"projects: {len(self.store.list_projects())} · topics "
                                  f"{'on' if getattr(self.notifier, 'topics', False) else 'off (enable threaded mode in BotFather)'}"
                                  f"\n\n{self._agents_summary(self._scope(update))}")
+
+    def _worker_line(self) -> str:
+        w = getattr(self.monitor, "worker", None)
+        if not w:
+            return "compute worker: none (hpc-run starts one when needed)"
+        where = f"on {esc(w.reason)}" if w.state == "RUNNING" else f"{esc(w.state)} ({esc(w.reason)})"
+        return f"compute worker: job {code(w.job_id)} {where} · {esc(w.elapsed)} of {esc(w.time_limit)}"
 
     # ------------------------------------------------------------------ free text & buttons
     def _replied_session(self, update: Update | None) -> Session | None:

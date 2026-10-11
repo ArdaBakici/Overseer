@@ -34,7 +34,19 @@ def opt(name):
 st = load()
 jobs = st["jobs"]
 
-if prog == "squeue":
+FIELDS = {"%i": lambda jid, j: jid, "%T": lambda jid, j: j["state"], "%j": lambda jid, j: j["name"],
+          "%r": lambda jid, j: j.get("reason", "None"), "%M": lambda jid, j: j.get("elapsed", "0:10"),
+          "%l": lambda jid, j: j.get("time_limit", "1:00:00"), "%N": lambda jid, j: j.get("nodelist", "n1")}
+
+if prog == "squeue" and "|" not in (opt("-o") or "|"):  # filtered queries with a simple format (hpc-run)
+    name, states, sel = opt("-n"), (opt("-t") or "PENDING,RUNNING").split(","), opt("-j")
+    for jid, j in jobs.items():
+        if j["state"] in states and (not name or j["name"] == name) and (not sel or jid == sel):
+            line = opt("-o")
+            for k, f in FIELDS.items():
+                line = line.replace(k, str(f(jid, j)))
+            print(line)
+elif prog == "squeue":
     for jid, j in jobs.items():
         if j["state"] in ("PENDING", "RUNNING"):
             where = j.get("nodelist", "n1") if j["state"] == "RUNNING" else "(Priority)"
@@ -68,24 +80,35 @@ elif prog == "scontrol":
 elif prog == "sbatch":
     st["next_id"] += 1
     jid = str(st["next_id"])
-    script_path = args[-1]
-    with open(os.path.join(os.getcwd(), script_path)) as fh:
-        script = fh.read()
+    if opt("--wrap"):
+        script = "#!/bin/sh\n" + opt("--wrap")
+    else:
+        with open(os.path.join(os.getcwd(), args[-1])) as fh:
+            script = fh.read()
     chdir = opt("--chdir") or os.getcwd()
-    out = (opt("--output") or f"{chdir}/slurm-%j.out").replace("%j", jid)
+    out = (opt("--output") or opt("-o") or f"{chdir}/slurm-%j.out").replace("%j", jid)
     err = (opt("--error") or out).replace("%j", jid)
-    jobs[jid] = {"name": "submitted", "state": "PENDING", "workdir": chdir,
+    name = opt("-J") or opt("--job-name") or "submitted"
+    # hpc-run's worker gets a node right away here (a real queue may take a while)
+    jobs[jid] = {"name": name, "state": "RUNNING" if name == "overseer-worker" else "PENDING", "workdir": chdir,
                  "stdout": out, "stderr": err, "script": script}
     st.setdefault("submissions", []).append(args)
     save(st)
     print(jid if "--parsable" in args else f"Submitted batch job {jid}")
-elif prog == "srun":  # only used for `srun --jobid=N --overlap ... nvidia-smi --query-gpu=...`
-    if "nvidia-smi" in args:
+elif prog == "srun":
+    if "nvidia-smi" in args:  # srun --jobid=N --overlap ... nvidia-smi --query-gpu=...
         print("0, NVIDIA A100-SXM4-80GB, 87 %, 31234 MiB, 81920 MiB")
-    else:
+        sys.exit(0)
+    if "bash" not in args:
         sys.exit(1)
+    st.setdefault("steps", []).append(args)  # hpc-run: run the command here, as if on the node
+    save(st)
+    import subprocess
+    sys.exit(subprocess.call(args[args.index("bash"):]))
 elif prog == "scancel":
-    jobs[args[0]]["state"] = "CANCELLED"
+    name = opt("-n")
+    for jid in ([j for j, v in jobs.items() if v["name"] == name] if name else [args[0]]):
+        jobs[jid]["state"] = "CANCELLED"
     save(st)
 elif prog == "seff":
     sys.exit(1)

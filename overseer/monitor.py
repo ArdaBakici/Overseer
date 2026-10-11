@@ -8,6 +8,7 @@ import json
 import logging
 import time
 
+from .compute import WORKER_NAME
 from .config import Config
 from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, find_log_paths, tqdm_cleanup
 from .hpc import HPC
@@ -51,6 +52,7 @@ class Monitor:
         self._error_notified = False
         self._wake = asyncio.Event()
         self.autopilot = None  # set by Autopilot's owner: told about the agent's jobs finishing / running
+        self.worker: Job | None = None  # hpc-run's compute worker, if one is queued or running
 
     def poke(self) -> None:
         """Poll right away (e.g. after a submission)."""
@@ -84,6 +86,10 @@ class Monitor:
 
     # ------------------------------------------------------------------ polling
     def _ignored(self, job: Job, rec: JobRecord | None) -> bool:
+        if job.name == WORKER_NAME:  # hpc-run's compute worker: shown in /health, not reported as a job
+            if job.state == "RUNNING" or self.worker is None:
+                self.worker = job
+            return True
         if rec and rec.by_agent:
             return False
         if self.cfg.slurm.track == "agent":
@@ -94,6 +100,7 @@ class Monitor:
         await self.hpc.ensure_connected()
         live = await self.hpc.squeue()
         live_by_id = {j.job_id: j for j in live}
+        self.worker = None
         # Jobs that started and finished between polls never show up in squeue; sacct catches them.
         window = max(10, int(self.cfg.slurm.poll_interval * 3 / 60) + 10)
         recent = await self.hpc.sacct_recent(window if not first else 60)

@@ -30,6 +30,21 @@ slurm:
   log_tail_lines: 12            # lines of the (training) log shown in status messages
   gpu_stats: false              # GPU use in the hourly status (srun --overlap nvidia-smi); the 📊 Status button always shows it
   ignore_name_globs: ["interactive", "sys/dashboard*", "ood-*"]
+  # Where the agent runs anything heavier than a quick command (scripts, plots, data processing):
+  # `hpc-run -- <command>` runs it on a compute node. A shared worker job keeps a node for a while
+  # so commands start right away; it ends itself after idle_minutes unused.
+  compute:
+    partition: compute
+    cpus: 8
+    mem: 32G
+    worker_hours: 8
+    idle_minutes: 45
+    wait_minutes: 15            # give up if no node is free after this long
+    gpu_partition: nvidia       # for hpc-run --gpu
+    gpu_gres: "gpu:1"
+    sbatch_args: []             # e.g. ["--account=myproject"]
+    login_cpu_seconds: 120      # guardrail: CPU seconds for commands run directly on the login node (0 = off)
+    login_warn_seconds: 120     # flag commands that ran this long on the login node
   setup: ""                     # only if SLURM isn't found: what you'd run first, e.g. "module load slurm"
 
 telegram:
