@@ -210,7 +210,8 @@ class CodexConfig:
     # CODEX_HOME for Overseer's runs. Log in once with: overseer login codex
     home: str = "./state/codex"
     pass_env: list[str] = field(default_factory=lambda: ["OPENAI_API_KEY", "CODEX_API_KEY", *PROXY_ENV])
-    web_search: bool = True  # the model's own web search (runs on OpenAI's side)
+    # The model's own web search (runs on OpenAI's side): live, cached (OpenAI's index only) or disabled.
+    web_search: str = "live"
     extra_config: list[str] = field(default_factory=list)  # extra `-c key=value` overrides
 
 
@@ -333,6 +334,10 @@ class Config:
             raise ConfigError("agent.report_commands must be summary, live or off")
         self.local.resolve(self.agent.claude_code.home)
         self.local.resolve(self.agent.codex.home)
+        ws = self.agent.codex.web_search  # true/false in older config files
+        self.agent.codex.web_search = {True: "live", False: "disabled"}.get(ws, ws) if isinstance(ws, bool) else ws
+        if self.agent.codex.web_search not in ("live", "cached", "disabled"):
+            raise ConfigError("agent.codex.web_search must be live, cached or disabled")
         if self.slurm.track not in ("all", "agent"):
             raise ConfigError("slurm.track must be 'all' or 'agent'")
         if not self.telegram.allowed_chat_ids:

@@ -230,6 +230,14 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         detail = f"\n\nTELEGRAM:\n{texts}\n\nTOOL OUTPUTS:\n" + "\n====\n".join(outs)
         if os.environ.get("OVERSEER_E2E_VERBOSE"):
             print(detail)
+        # Web search: Claude's WebSearch/WebFetch tools, Codex's live web_search.
+        main = next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"]))
+        tools = main.get("tools") or []
+        if backend == "codex":
+            assert {"type": "web_search", "external_web_access": True} in tools, tools
+        else:
+            assert {"WebSearch", "WebFetch"} <= {t.get("name") for t in tools}, tools
+        assert "search the web" in json.dumps(main), detail
         assert len(outs) >= len(script), detail
         assert f"remote-user:{getpass.getuser()}" in outs[0], detail          # HPC reachable via the master socket
         assert "Submitted batch job 5001" in outs[1], detail

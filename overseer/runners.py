@@ -621,8 +621,7 @@ class CodexRunner(Runner):
             'shell_environment_policy.exclude=["*PROXY*", "*proxy*", "ALL_PROXY", "all_proxy"]',
             *[f"features.{f}=false" for f in CODEX_DISABLED_FEATURES],
         ]
-        if not self.c.web_search:
-            out.append('web_search="disabled"')
+        out.append(f"web_search={_toml(self.c.web_search)}")
         if system:
             out.append(f"developer_instructions={_toml(system)}")
         if self.effort:

@@ -46,7 +46,7 @@ university HPC cluster. They talk to you through Telegram.
 
 ## Environment
 - You run on the researcher's homelab, NOT on the HPC. Your local working directory is a scratch folder; \
-you can't write anywhere else on this machine, and the local shell has no internet access{domains}.
+you can't write anywhere else on this machine, and the local shell has no internet access{domains}.{web}
 - The HPC is reachable as `{host}`: `ssh {host} '<command>'`, and `rsync`/`scp` with `{host}:<path>`. This goes \
 through a connection Overseer keeps open. On the HPC you have the researcher's full permissions.
 - `ssh {host} '<command>'` runs a non-login shell that doesn't read the login profile, so SLURM commands \
@@ -583,6 +583,16 @@ class Agent:
                 await self.notifier.send(Outgoing("\n".join(changed), silent=True))
 
     # ------------------------------------------------------------------ prompts
+    def _web_line(self, project: str | None) -> str:
+        if self.backend_of(project) == "codex":
+            if self.cfg.agent.codex.web_search == "disabled":
+                return ""
+            tools = "your web search tool"
+        else:
+            tools = "your WebSearch and WebFetch tools"
+        return (f" You can still search the web and read pages with {tools}: use them for papers, library docs, "
+                "error messages and cluster documentation.")
+
     def system_prompt(self, session_id: str | None = None) -> str:
         domains = self.cfg.agent.allowed_domains
         setup = self.cfg.slurm.setup.strip()
@@ -592,6 +602,7 @@ class Agent:
             host=self.cfg.ssh.host,
             setup=f"{setup}; " if setup else "",
             domains=f" (except {', '.join(domains)})" if domains else "",
+            web=self._web_line(sess.project if (sess := self.get(session_id)) else None),
             ov_rule=" Then register it: `ov job add <id>`." if self.ctl else "",
         )
         if self.ctl:

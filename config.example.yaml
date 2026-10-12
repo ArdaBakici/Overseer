@@ -85,7 +85,7 @@ agent:
     reasoning_effort: null      # minimal | low | medium | high | xhigh (also: /effort in Telegram)
     home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex (device code)
     # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
-    web_search: true            # the model's own web search (runs on OpenAI's side)
+    web_search: live            # the model's own web search (OpenAI's side): live | cached | disabled
     extra_config: []            # extra `-c key=value` overrides
 
   # Wake-ups: the agent watches jobs (ov watch) and sets timers (ov wake) on its own, no approval needed.

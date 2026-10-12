@@ -111,7 +111,7 @@ All of this was tested end to end, using the real Claude Code (2.1) and Codex (0
 - `ssh hpc` and `sbatch` work.
 - Reading the key and `~/.ssh` fails.
 - Writing outside the scratch dir fails.
-- `curl` to the internet fails.
+- `curl` to the internet fails, while the models' own web search works: Claude Code's WebSearch and WebFetch, and Codex's live `web_search` (`agent.codex.web_search: live | cached | disabled`).
 - `hpc-run`, `scp` into the outbox and `ov` work from inside both sandboxes.
 
 ## Setup
