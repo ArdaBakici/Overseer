@@ -76,7 +76,7 @@ def build(cfg: Config):
             ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
-            ("auto", "autopilot: keep experimenting on its own"), ("project", "projects: list, new, context, notes"),
+            ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"), ("project", "projects: list, new, context, notes"),
             ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
 

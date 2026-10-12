@@ -214,20 +214,10 @@ class CodexConfig:
 
 @dataclass
 class AutopilotConfig:
-    """Autopilot: the agent works on its own, woken by the jobs it watches and the timers it sets.
-    It asks first (an approval card in Telegram), or you start it with /auto."""
+    """Wake-ups: the agent watches jobs (`ov watch`) and sets timers (`ov wake`) on its own; no approval."""
 
-    default_wakeups: int = 20  # wake-ups (a watched job ending, or a timer) per approval, unless changed
-    max_wakeups: int = 100  # upper bound, also for the approval card's +/- buttons
-    default_hours: float = 48  # how long an approval lasts
-    max_hours: float = 336
-    checkin_minutes: int = 60  # check-in interval the card offers when the agent doesn't ask for one
-    min_checkin_minutes: int = 15  # check-ins on running jobs: never more often than this
-    max_checkins_per_job: int = 30
-    # One-off self-wakes, without autopilot: "wake me when job X ends" / "in 2h".
-    oneoff_max_pending: int = 3  # per conversation
-    oneoff_max_hours: float = 168  # how far ahead a one-off timer may be
-    oneoff_chain: int = 3  # one-off wake-ups in a row without a message from you; then it must ask for autopilot
+    min_checkin_minutes: int = 15  # check-ins on running jobs and repeating timers: at least this far apart
+    repeat_hours: float = 24  # a repeating timer stops after this, unless the agent gives `--for`
 
 
 @dataclass
@@ -347,7 +337,11 @@ class Config:
             raise ConfigError("telegram.allowed_chat_ids must list at least one chat id")
 
 
-RENAMED = {"AutopilotConfig": {"default_rounds": "default_wakeups", "max_rounds": "max_wakeups"}}
+RENAMED: dict[str, dict[str, str]] = {}
+# Settings that no longer exist: ignored (with a warning) rather than refused, so old config files keep working.
+DROPPED = {"AutopilotConfig": {"default_rounds", "max_rounds", "default_wakeups", "max_wakeups", "default_hours",
+                               "max_hours", "checkin_minutes", "max_checkins_per_job", "oneoff_max_pending",
+                               "oneoff_max_hours", "oneoff_chain"}}
 
 
 def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
@@ -358,6 +352,10 @@ def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
     for old_name, new_name in RENAMED.get(cls.__name__, {}).items():  # settings renamed since: still accepted
         if old_name in data and new_name not in data:
             data = {**{k: v for k, v in data.items() if k != old_name}, new_name: data[old_name]}
+    old = set(data) & DROPPED.get(cls.__name__, set())
+    if old:
+        logging.getLogger(__name__).warning("%s: no longer used, ignored: %s", path or "config", ", ".join(sorted(old)))
+        data = {k: v for k, v in data.items() if k not in old}
     unknown = set(data) - set(known)
     if unknown:
         raise ConfigError(f"unknown keys in {path or 'config'}: {', '.join(sorted(unknown))}")

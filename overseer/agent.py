@@ -22,12 +22,14 @@ from pathlib import Path
 from .config import BACKENDS, Config
 from .hpc import HPC
 from .compute import WORKER_NAME
+from .autopilot import human_interval
 from .ctl import TOKEN_ENV
 from .quota import Quota, limits_line, over
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
+from .ssh import SSHError
 from .sshlink import ensure_master
 from .store import JobRecord, SessionRecord, Store
 
@@ -88,13 +90,23 @@ directly and answers at once. The `overseer` skill has the full reference (or ru
 checks the id with SLURM and reports on the job to the researcher.
 - When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
 (`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
-- You only run when someone writes to you. To look at something later, have Overseer wake you: \
-`ov watch <job id> --note "<what to check>"` (when the job ends) or `ov wake in 2h "<what to check>"`. Without \
-autopilot these are one-off wake-ups: use them when you told the researcher you'd follow up.
-- For work that needs several runs, with waiting for results in between (tuning, sweeps, "keep going until X"), \
-ask for autopilot: `ov auto request --goal "<goal>" [--wakeups 20] [--hours 48] [--checkins 1h]`, then end your \
-turn. The researcher approves it in Telegram (and may change the limits); you're woken to start. Don't ask for \
-a single job."""
+
+
+## Working over time: watches and wake-ups
+You only run when the researcher writes to you or when a wake-up you set up fires. You don't need permission \
+to set them up:
+- `ov watch <job ids> [--note "<what to do then>"]`: woken when the jobs have ended (all of them, or as soon as \
+one fails), with their final reports. `--every 30m` adds check-ins while they run (at least {min_gap} apart).
+- `ov wake in 90m "<what to look at>"`: woken once, later. `ov wake every 2h [--for 12h] "<...>"`: woken \
+repeatedly (at least {min_gap} apart), for {repeat} unless you give `--for`.
+- `ov watches` lists them, `ov unwatch <w12|job id|all>` removes them. Each one is announced to the researcher, \
+who can cancel it.
+For work that takes several runs (tuning, sweeps, ablations, "keep going until X"), carry on by yourself: \
+submit, `ov watch`, end your reply; when woken, read the results, decide, submit the next run and watch it. \
+Don't wait, poll or sleep: Overseer wakes you. Stop when the goal is reached or nothing sensible is left to \
+try: say so and set no more wake-ups. When you need the researcher's decision, ask in your reply (`ov notify` \
+for something urgent mid-run) instead of spending more runs. Every wake-up re-reads the whole conversation and \
+costs real money: wake yourself when there is something to look at, and prefer job ends over frequent check-ins."""
 
 
 STORAGE_SECTION = """
@@ -133,9 +145,17 @@ PROJECT_SECTION = """
 This conversation belongs to the project in `{dir}` on the HPC. Work there unless asked otherwise.{context}
 Project notes: `{notes}` holds durable notes for this project - how to run things, environments, data \
 locations, conventions, known issues. It is shown to you at the start of each conversation. When you learn \
-something future conversations here should know, add it there (keep it short and current; create it if missing)."""
+something future conversations here should know, add it there (keep it short and current; create it if missing).
+Research log: `{log}` is this project's experiment history. Whenever you run experiments here, keep it up to \
+date: at the top the current goal (rewrite it when the goal changes, with a one-line note of the old one), then \
+one entry per experiment or wake-up - what you changed and why, the job ids, the key results, the next idea. \
+Overseer shows you its beginning and latest entries when a conversation starts and when you are woken. Keep it \
+compact, well under 200k tokens (~800 KB): when it grows long, condense the old entries into a short summary \
+section at the top."""
 
 NOTES_FILE = "OVERSEER.md"
+LOG_FILE = "RESEARCH_LOG.md"
+LOG_CONDENSE_BYTES = 600_000  # ~150k tokens: past this the agent is asked to condense the research log
 
 
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -221,7 +241,7 @@ class Session:
     rec: SessionRecord
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     task: asyncio.Task | None = None
-    origin: str = "user"  # what started the current turn: user | autopilot | checkin | oneoff
+    origin: str = "user"  # what started the current turn: user | wakeup | checkin
 
     @property
     def id(self) -> str:
@@ -357,6 +377,14 @@ class Agent:
             res.usage_is_total = False  # a new conversation: its total is this request's usage
         # else: resumed from before Overseer kept totals - the footer says it's the conversation's total
 
+    def _record_usage(self, s: Session, backend: str, res) -> None:
+        """Tokens and cost of this run, for /usage (a codex total Overseer can't split yet isn't counted)."""
+        if res.usage_is_total:
+            return
+        self.store.add_usage(session_id=s.id, project=s.project, backend=backend, model=res.model, origin=s.origin,
+                             input=res.input_tokens, cached=res.cached_tokens, output=res.output_tokens,
+                             cost=res.cost_usd)
+
     def footer(self, backend: str, res, project: str | None = None) -> str:
         r = self.runner(backend, project)
         parts = [backend, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
@@ -474,6 +502,9 @@ class Agent:
             if res.session_id and res.session_id != s.rec.cli_session_id:
                 s.rec.cli_session_id = res.session_id
                 self.store.upsert_session(s.rec)
+            s.origin = "compact"
+            self._record_usage(s, backend, res)
+            s.origin = "user"
             c = res.compactions[-1]
             tokens = (f": {_human(c['pre_tokens'])} → {_human(c['post_tokens'])} tokens"
                       if c.get("pre_tokens") and c.get("post_tokens") else "")
@@ -556,16 +587,16 @@ class Agent:
             ov_rule=" Then register it: `ov job add <id>`." if self.ctl else "",
         )
         if self.ctl:
-            prompt += OV_SECTION
+            prompt += OV_SECTION.format(min_gap=human_interval(self.cfg.agent.autopilot.min_checkin_minutes * 60),
+                                        repeat=human_interval(self.cfg.agent.autopilot.repeat_hours * 3600))
         prompt += self._storage_section() + PYTHON_SECTION
         sess = self.get(session_id)
         proj = self.store.get_project(sess.project) if sess else None
         if proj:
             context = f"\n\nAbout this project, from the researcher:\n{proj.context.strip()}" if proj.context.strip() else ""
             prompt += PROJECT_SECTION.format(name=proj.name, dir=proj.dir, context=context,
-                                             notes=f"{proj.dir.rstrip('/')}/{NOTES_FILE}")
-        if self.autopilot and session_id:
-            prompt += self.autopilot.system_section(session_id)
+                                             notes=f"{proj.dir.rstrip('/')}/{NOTES_FILE}",
+                                             log=f"{proj.dir.rstrip('/')}/{LOG_FILE}")
         return prompt
 
     def _quota_rows(self) -> list:
@@ -603,9 +634,43 @@ class Agent:
         path = f"{proj.dir.rstrip('/')}/{NOTES_FILE}"
         notes = await self.hpc.try_head(self._remote_path(path), 400)
         if not notes.strip():
-            return (f"<project_notes path='{path}'>(no notes yet - create the file when there is something "
-                    "worth keeping)</project_notes>")
-        return f"<project_notes path='{path}'>\n{notes[:12000].strip()}\n</project_notes>"
+            notes = (f"<project_notes path='{path}'>(no notes yet - create the file when there is something "
+                     "worth keeping)</project_notes>")
+        else:
+            notes = f"<project_notes path='{path}'>\n{notes[:12000].strip()}\n</project_notes>"
+        return notes + "\n\n" + await self.research_log(project)
+
+    async def research_log(self, project: str) -> str:
+        """The project's research log for the agent: its beginning (the goal) and its latest entries."""
+        proj = self.store.get_project(project)
+        if not proj or not proj.dir:
+            return ""
+        path = f"{proj.dir.rstrip('/')}/{LOG_FILE}"
+        remote = self._remote_path(path)
+        try:
+            res = await self.hpc.run(["stat", "-c", "%s", remote])
+            size = int(res.stdout.strip()) if res.ok and res.stdout.strip().isdigit() else -1
+        except SSHError:
+            size = -1
+        if size <= 0:
+            return (f"<research_log path='{path}'>(none yet - start it when you run experiments in this "
+                    "project)</research_log>")
+        async def part(argv: list[str]) -> str:  # bytes, not lines: a line can be huge
+            try:
+                res = await self.hpc.run(argv, max_output=20_000)
+            except SSHError:
+                return ""
+            return res.stdout if res.ok else ""
+
+        if size <= 12_000:
+            body = await part(["head", "-c", "12000", "--", remote])
+        else:
+            head = await part(["head", "-c", "4000", "--", remote])
+            tail = await part(["tail", "-c", "8000", "--", remote])
+            body = f"{head.rstrip()}\n[... {size // 1000} KB in all; the latest entries: ...]\n{tail}"
+        note = (f"\n(The log is {size // 1000} KB - too long: condense the older entries into a short summary.)"
+                if size > LOG_CONDENSE_BYTES else "")
+        return f"<research_log path='{path}'>\n{body.strip()}\n</research_log>{note}"
 
     async def _job_context(self, job_id: str) -> str:
         rec = self.store.get_job(job_id)
@@ -624,8 +689,8 @@ class Agent:
     # ------------------------------------------------------------------ running a request
     async def handle(self, s: Session, user_text: str, quiet: bool = False, origin: str = "user") -> bool:
         """Run one request in a conversation. True if the agent answered. `quiet`: send the answer
-        without a notification sound (autopilot check-ins) unless the autopilot needs attention.
-        `origin`: who asked - the researcher, or a wake-up (autopilot, checkin, oneoff)."""
+        without a notification sound (check-ins). `origin`: who asked - the researcher (user), or a
+        wake-up the agent set up (wakeup, checkin)."""
         if not self.cfg.agent.enabled:
             await self.notifier.send(Outgoing("The agent is disabled in the config."))
             return False
@@ -674,7 +739,6 @@ class Agent:
             parts.append("<overseer_notes>\n" + "\n".join(f"- {n}" for n in notes) + "\n</overseer_notes>")
         parts.append(user_text)
         prompt = "\n\n".join(parts)
-        turn_started = time.time()
 
         outbox = runner.workdir(s.id) / "outbox"  # files the agent leaves here are sent with its reply
         outbox.mkdir(exist_ok=True)
@@ -729,14 +793,14 @@ class Agent:
             self.store.set(f"last_effort:{backend}", res.effort)
         self._usage_delta(backend, res, resumed=resume is not None)
         footer = self.footer(backend, res, s.project)
-        text, autopilot_line, status = res.text, "", None
+        self._record_usage(s, backend, res)
+        text, autopilot_line = res.text, ""
         if self.autopilot:
-            autopilot_line, status = self.autopilot.after_turn(s, activity.cancelled, turn_started)
+            autopilot_line = self.autopilot.after_turn(s, activity.cancelled)
         photos, docs, notes = collect_outbox(outbox)
         if photos or docs:
             transcript.write({"kind": "tool", "name": "attachments", "detail": ", ".join(n for n, _ in photos + docs)})
-        transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer,
-                          **({"autopilot": status} if status else {})})
+        transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer})
         skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
         compacted = compaction_line(res.compactions)
         extra = [x for x in (compacted, autopilot_line, skipped) if x]  # HTML, which Rich Markdown accepts as well
@@ -744,7 +808,7 @@ class Agent:
             f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + "".join(f"\n\n{x}" for x in extra)
             + f"\n\n<i>{esc(footer)}</i>",
             markdown="\n\n".join([rich_markdown(text) or "(no answer)", *extra, f"<i>{esc(footer)}</i>"]),
-            session_id=s.id, job_id=s.job_id, silent=quiet and status not in ("DONE", "NEED_HELP"),
+            session_id=s.id, job_id=s.job_id, silent=quiet,
             photos=photos, files=docs))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:

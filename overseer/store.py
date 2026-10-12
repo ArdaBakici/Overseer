@@ -76,6 +76,14 @@ CREATE TABLE IF NOT EXISTS watches (
     state TEXT DEFAULT 'active',
     created REAL, fired REAL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS usage (
+    ts REAL, day TEXT,
+    session_id TEXT, project TEXT,
+    backend TEXT, model TEXT,
+    origin TEXT,
+    input INTEGER DEFAULT 0, cached INTEGER DEFAULT 0, output INTEGER DEFAULT 0,
+    cost REAL
+);
 """
 # Columns added after the first release: (table, column, definition).
 ADDED_COLUMNS = [
@@ -87,6 +95,7 @@ ADDED_COLUMNS = [
     ("jobs", "ignored", "INTEGER DEFAULT 0"),
     ("autopilot", "hours", "REAL DEFAULT 0"),
     ("autopilot", "expires", "REAL DEFAULT 0"),
+    ("watches", "until", "REAL DEFAULT 0"),
 ]
 
 
@@ -183,10 +192,11 @@ class WatchRecord:
     every: float = 0.0  # jobs: seconds between check-ins while they run; timer: repeat interval (0 = once)
     due: float = 0.0  # timer: when it fires next
     note: str = ""  # what the agent wanted to do when woken
-    oneoff: int = 0  # set without autopilot: wakes the agent once
+    oneoff: int = 0  # (no longer used: from when wake-ups needed approval)
     state: str = "active"  # active | fired | cancelled
     created: float = 0.0
     fired: float = 0.0
+    until: float = 0.0  # repeating timer: no more wake-ups after this
     id: int | None = None
 
     @property
@@ -347,6 +357,21 @@ class Store:
 
     def job_watches(self, job_id: str) -> list[WatchRecord]:
         return [w for w in self.watches() if w.kind == "jobs" and job_id in w.job_ids]
+
+    # ---------------------------------------------------------------- token usage
+    def add_usage(self, *, session_id: str, project: str | None, backend: str, model: str | None, origin: str,
+                  input: int, cached: int, output: int, cost: float | None) -> None:
+        now = time.time()
+        self.db.execute("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (now, time.strftime("%Y-%m-%d", time.localtime(now)), session_id, project, backend, model or "",
+                         origin, input, cached, output, cost))
+        self.db.commit()
+
+    def usage_rows(self, since: float, until: float | None = None) -> list[sqlite3.Row]:
+        q, args = "SELECT * FROM usage WHERE ts >= ?", [since]
+        if until is not None:
+            q, args = q + " AND ts < ?", args + [until]
+        return self.db.execute(q, args).fetchall()
 
     # ---------------------------------------------------------------- agent sessions
     def get_session(self, sid: str) -> SessionRecord | None:

@@ -14,7 +14,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 - **Projects.** Each project (e.g. dreamer, chemistry) gets its own Telegram topic, conversations, jobs, agent settings and notes. A "general" topic holds everything that isn't about a project.
 - **The agent talks to Overseer.** With its `ov` command it registers the jobs it submits, creates projects and moves or stops tracking jobs when you ask it to.
 - **Rich messages.** Agent replies are formatted (bold, lists, code, tables), logs and command lists fold away, and the agent can send plots it makes on the HPC.
-- **Autopilot.** For multi-run work the agent asks you (an approval card whose limits you can change), or you start it with `/auto <goal>`. Then it runs experiments on its own: it watches the jobs it submits and is woken when they end (or by timers it sets), reads the results, keeps a research log and submits the next run, with optional check-ins while jobs run.
+- **Working on its own.** The agent watches the jobs it submits and is woken when they end, or by timers it sets. It then reads the results, updates the project's research log and submits the next run. It needs no approval, and every wake-up is announced with a Cancel button. `/auto <goal>` hands it a goal, and `/usage` shows the tokens and cost of the day.
 
 ```
  homelab (your machine)                                                    HPC login node
@@ -46,11 +46,9 @@ ov project new chem --dir /scratch/me/chem --about "DFT with ORCA" [--move-here]
 ov project set <name> --dir … --about … | archive <name> | list
 ov conversation move <project|main>   # this conversation belongs to a project
 ov notify "epoch 3 done, loss 0.41"   # a message to you right away
-ov status                             # project, autopilot, its jobs, what will wake it
+ov status                             # project, its jobs, what will wake it
 ov watch 18746955 [--every 2h] [--note "…"]   # wake me when this job ends (below)
-ov wake in 90m "…"  |  ov watches  |  ov unwatch w3
-ov auto request --goal "…" [--wakeups 20] [--hours 48] [--checkins 1h]   # ask for autopilot
-ov auto done "…"  |  ov auto help "…"
+ov wake in 90m "…"  |  ov wake every 2h [--for 12h] "…"  |  ov watches  |  ov unwatch w3
 ```
 So you can just tell the agent "make a project for my chemistry runs in /scratch/me/chem", "this job belongs to dreamer" or "stop tracking 18746955".
 - **No confirmations:** every change is announced in Telegram (`📁 The agent created project chem`, `🗑 Overseer no longer tracks job …`), and all of them are easy to undo with `/project restore` or `/assign`.
@@ -59,7 +57,7 @@ So you can just tell the agent "make a project for my chemistry runs in /scratch
 - **Scoped to the run:** each run of the agent gets a one-time token (`$OVERSEER_CTL`) that tells Overseer which conversation is asking. The token stops working when the run ends.
 - **Sandbox:** the socket sits in Overseer's tmp dir, and both sandboxes allow connecting to it (as with the SSH socket).
 - **The agents know how to use it:**
-  - **System prompt:** it has the essential rules (register every job, use `ov` for project and job requests, how to be woken, when to ask for autopilot).
+  - **System prompt:** it has the essential rules (register every job, use `ov` for project and job requests, how to be woken and work on its own over many runs).
   - **`overseer` skill:** a full reference with workflows (`overseer/skills/overseer/SKILL.md`). Overseer installs it for both CLIs:
     - Claude Code: in its config dir.
     - Codex: in each conversation's scratch dir as `.agents/skills`, because Codex has the model read the file with a command, and the sandbox can't read Overseer's state dir.
@@ -167,7 +165,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
 | `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
 | **📈 Plot** button | the agent finds the job's metrics, plots them on the HPC and sends the picture with a short description of the trend |
-| **📊 Status** / **📜 Log** buttons | Status: time used and left, latest metrics, GPU use, problems on stderr and the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and autopilot check-ins too |
+| **📊 Status** / **📜 Log** buttons | Status: time used and left, latest metrics, GPU use, problems on stderr and the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and check-ins too |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
@@ -175,7 +173,8 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/stop` | stop the agent's current run (kills the whole process group) |
 | `/update` | update Claude Code and Codex now, with their own updaters; `/health` shows their versions. Overseer also does it once a day while no agent run is in progress (`agent.auto_update`), and tells you when a version changed. On the homelab: `uv run overseer update` |
 | `/compact [focus]` | compact the conversation now (below). As a reply to a message, it applies to that conversation |
-| `/auto [wake-ups] [every 2h] [for 48h] <goal>` | autopilot (below). As a reply to a message, it applies to that conversation. `/auto` shows progress and pending wake-ups, `/auto off` stops it |
+| `/auto <goal>` | ask the agent to work on a goal on its own (below). As a reply to a message, it applies to that conversation. `/auto` lists pending wake-ups, `/auto off` cancels them (in this thread, topic, or replied-to conversation) |
+| `/usage [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
 Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens (11.8k cached) · $0.04`.
@@ -226,54 +225,30 @@ Each project gets a topic in your chat with the bot, so the main chat stays uncl
   - **Agent jobs:** jobs the agent submits in a project are reported in its topic.
   - **Your own jobs:** jobs you submit by hand go to the project whose folder contains their working directory (the deepest one if folders nest). Others stay in the main chat, with one-tap "📁 project" buttons.
   - **Moving a job:** `/assign <job> <project|main>`, or reply to a job's message with `/assign <project>`. Its later updates and its conversation follow.
-  - **Linking a job to a conversation:** `/assign <job>` with no project, sent in a conversation's thread, makes the job part of that conversation. Its reports come there, and with autopilot on, its end wakes the agent.
+  - **Linking a job to a conversation:** `/assign <job>` with no project, sent in a conversation's thread, makes the job part of that conversation. Its reports come there, and its end wakes the agent.
 - **Other commands:** `/project` lists projects; `/project archive <name>` and `/project restore <name>`; `/project dir <path>`.
 
 **The "general" topic: anything that isn't about a project.** With topics on, Overseer also creates a 💬 general topic. Use it for questions like "how much quota do I have left?" or "which partitions have free GPUs?". It is the main chat's conversation, so `/new`, `/ask`, `/auto` and `/stop` there act on the main conversation. Jobs that belong to no project are reported there too, and if the topic is deleted, Overseer makes a new one.
 
 Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
 
-**Being woken: watches, timers and autopilot.** The agent only runs when you write to it, unless it set something up to wake it:
-- `ov watch <jobs>`: woken when those jobs have ended (all of them, or as soon as one fails), with their final reports: state, exit code, runtime, peak memory, findings and the end of the log.
-- `ov wake in 90m`: woken by a timer.
+**Working on its own: watches and wake-ups.** The agent only runs when you write to it, or when something it set up wakes it. It needs no approval:
+- `ov watch <jobs>`: woken when those jobs have ended (all of them, or as soon as one fails), with their final reports: state, exit code, runtime, peak memory, findings and the end of the log. `--every 30m` adds check-ins while they run.
+- `ov wake in 90m` / `ov wake every 2h [--for 12h]`: woken by a timer, once or repeatedly.
 
-**Without autopilot: one-off wake-ups.** When the agent says "I'll look at the results when it finishes", it can set a watch or timer that wakes it once.
-- **You see each one:** "⏰ The agent will look at job 18746955 when it ends", with a ✖ Cancel button.
-- **Limits:**
-  - at most 3 pending per conversation, and timers at most 7 days ahead;
-  - after 3 one-off wake-ups in a row without a message from you, it has to ask for autopilot. Writing to it resets the count.
-- **Not allowed:** check-ins while jobs run, and repeating timers. Both need autopilot.
-
-**Autopilot: letting the agent iterate on its own.** For work that needs several runs (tuning, sweeps, "keep going until X"), the agent asks with `ov auto request`, and you get a card:
-
-> 🤖 **The agent asks to work on its own**
-> Goal: crafter seed 1 above score 5, one change per run
-> • up to **20** wake-ups (a watched job ending, or a timer) • for **2d** • check-ins on running jobs: **at most every 1h**
-> [✅ Start] [❌ No] · [➖/➕ wake-ups] · [➖/➕ time] · [➖/➕ check-ins]
-
-- **Changing the limits:** the buttons change them before you start.
-- **❌ No:** nothing runs, and the agent is told the next time you write.
-- **Starting it yourself:** `/auto [wake-ups] [every 2h] [for 48h] <goal>`, e.g.
-  ```
-  /auto 20 every 2h Get crafter seed 1 above score 5 in /scratch/me/rf-dreamer. One change per run, a100 or h100, whichever starts first.
-  ```
-
-1. **Kickoff:** the agent looks at the project, creates `RESEARCH_LOG.md` in the project folder on the HPC, submits the first experiment, `ov watch`es it and stops. Nothing runs while the job waits in the queue.
-2. **Wake-ups:** when the watched jobs end (or a timer fires), Overseer resumes the same conversation with their reports. The agent reads the results, updates the log, submits the next run and watches it. That is one wake-up.
-   - **Batches:** jobs watched together (`ov watch 1 2 3`) wake it once, when all have ended, or as soon as one fails. The others stay watched.
-   - **Safety net:** a job it submitted during autopilot but forgot to watch is watched for it (`auto-watched …` in the reply).
-3. **Check-ins** (`ov watch <id> --every 2h`, never more often than the card's limit): while a job runs, the agent sees its progress (metrics and the end of the log). If a run is clearly broken or diverging, it cancels it, notes why in the log and resubmits. Healthy check-ins come silently and don't count as wake-ups. There are at most 30 per job.
-4. **Ending:**
-   - **`ov auto done "…"`:** 🏁 the goal is reached or nothing sensible is left. Autopilot turns off and its watches go.
-   - **`ov auto help "…"`:** 🙋 you get pinged with the agent's question. Reply to answer; its watches stay.
-
-Guardrails:
-- **Wake-up budget and time limit:** 20 wake-ups and 48 hours by default; the maximums are set in the config. The agent is told when it's on its last wake-up and should wrap up. When the time is up, autopilot ends and you're told.
-- **Nothing pending:** if a reply leaves nothing watched, you get "⚠️ nothing will wake the agent".
-- **Pauses on any problem:** a wake-up that fails or is `/stop`ped pauses the loop. Send `/auto` as a reply to retry it.
-- **Jobs it cancels:** they leave its watches, so their end doesn't wake it.
-- **Visible at every step:** every wake-up, command and submitted job shows up in Telegram as usual. `/auto` lists what each conversation is waiting for, and `overseer watch` shows the reasoning live.
-- **Cost:** each wake-up re-sends the conversation so far. Wake-ups are usually hours apart, so the provider's prompt cache has expired and long autopilot runs get pricier per wake-up. The research log keeps the important history in a file you can read any time.
+This is how it runs experiments over many hours: submit, watch, end its reply. When woken it reads the results, updates the research log, submits the next run and watches it. It stops when the goal is reached or nothing sensible is left, and says so; when it needs your decision, it asks. `/auto <goal>` hands it a goal to work on this way, e.g.
+```
+/auto Get crafter seed 1 above score 5 in /scratch/me/rf-dreamer. One change per run, a100 or h100, whichever starts first.
+```
+- **You see every one:** each new watch or timer is announced quietly in the conversation's topic ("⏰ The agent will look at job 18746955 when it ends"), with a ✖ Cancel button. Replies end with what the agent is waiting for, and `/auto` lists everything pending.
+- **Turning it off:** `/auto off` cancels the pending wake-ups (in that thread or topic, or as a reply: that conversation), and the agent is told. `/stop` stops a run.
+- **Limits:** check-ins and repeating timers are at least 15 minutes apart, and a repeating timer ends (after 24 hours unless the agent sets `--for`). There is no limit on the number of wake-ups. `/usage` shows what they cost.
+- **Pauses on problems:** a wake-up that fails or is `/stop`ped pauses that conversation's wake-ups until you write to it there.
+- **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder.
+  - **Contents:** the current goal at the top (rewritten when the goal changes), then an entry per experiment: what changed and why, the job ids, the results, the next idea.
+  - **What the agent sees:** Overseer shows it the log's beginning and latest entries when a conversation starts and at every wake-up, so it keeps the thread across long gaps and compaction.
+  - **Size:** the agent keeps it well under 200k tokens; past about 600 KB, Overseer asks it to condense the older entries.
+- **Cost:** each wake-up re-sends the conversation so far, and wake-ups are often hours apart, after the provider's prompt cache has expired. The agent is told to wake itself only when there is something to look at.
 
 **Long conversations: context compaction.** When a conversation's context fills up, the CLIs compact it on their own: older turns are replaced by a summary, and the work goes on. Overseer leaves this on and shows it:
 - **When it happens:**
@@ -283,10 +258,10 @@ Guardrails:
   - **In the reply:** `🗜 The conversation was compacted automatically, as the context was full (970.2k → 12.4k tokens): older turns are now a summary.` Codex doesn't report token counts.
   - **While it works:** the live progress message says "🗜 compacting the conversation…".
   - **Afterwards:** the transcript and `overseer watch` record it too.
-- **Doing it yourself:** `/compact`, in the conversation's thread or topic, or as a reply to one of its messages, compacts it now. Use it before a long autopilot run, or when old details keep confusing the agent.
+- **Doing it yourself:** `/compact`, in the conversation's thread or topic, or as a reply to one of its messages, compacts it now. Use it before a long run of experiments, or when old details keep confusing the agent.
   - **Claude Code** runs its own `/compact` in the same session and takes a focus: `/compact keep the lr sweep results and the baseline numbers`.
   - **Codex** compacts through its app server (`thread/compact/start` on the same thread). It doesn't take a focus.
-- **What survives:** the summary is lossy, so the important facts are kept in files the agent re-reads: `OVERSEER.md` for project notes and `RESEARCH_LOG.md` for autopilot. `/new` starts a clean conversation instead.
+- **What survives:** the summary is lossy, so the important facts are kept in files the agent re-reads: `OVERSEER.md` for project notes and `RESEARCH_LOG.md` for the experiments. `/new` starts a clean conversation instead.
 
 **Watching the agent live from the homelab.** `overseer watch` follows what the agent is doing in the terminal: its reasoning summaries, what it writes between steps, every command with its output, and the final answer.
 
@@ -321,7 +296,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).
 - `slurm.quota_command`, `quota_check_hours`, `quota_warn_percent`: the disk quota check (above). The command's output must be a table like `myquota`'s: size, quota (%), files, quota (%). Set it to `""` to turn the check off.
 - `slurm.compute`: the partition, cores, memory and hours of the shared worker, how long it may stay idle, how long `hpc-run` waits for a node, the GPU partition and gres for `--gpu`, extra `sbatch` flags (e.g. an account), the login-node CPU limit (`login_cpu_seconds`, 0 = off) and the warning threshold.
-- `agent.autopilot`: the default and maximum wake-ups and hours per approval, the check-in interval the card offers, the shortest check-in interval allowed (15 minutes), the check-in cap per job (30), and the one-off limits (pending per conversation, how far ahead, how many in a row). The old `default_rounds`/`max_rounds` names still work.
+- `agent.autopilot`: the shortest interval for check-ins and repeating timers (`min_checkin_minutes`, 15), and how long a repeating timer lasts when the agent doesn't say (`repeat_hours`, 24). Settings from the old approval-based autopilot are ignored.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
 - `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
 - Anything the agent reads is sent to the model provider of the backend you use.
@@ -347,9 +322,10 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `runners.py` | Claude Code / Codex: sandbox settings, scrubbed env, event parsing, job detection |
 | `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
-| `autopilot.py` | watches and timers that wake conversations, one-off wake-ups, autopilot approvals and limits, check-ins |
+| `autopilot.py` | watches and timers that wake conversations, check-ins, pausing after a failed wake-up |
+| `usage.py` | `/usage`: tokens and cost per day, by origin, backend and conversation |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
-| `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches, autopilot, notifications); installs the `overseer` skill |
+| `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches and timers, notifications); installs the `overseer` skill |
 | `compute.py` | `hpc-run` and the shared compute worker, the agent's ssh wrapper with the login-node CPU limit |
 | `richtext.py` | Markdown → Telegram HTML (fallback) and Rich Markdown, tag-safe message splitting, collapsible sections |
 | `bot.py` | Telegram commands, buttons, message → conversation routing |

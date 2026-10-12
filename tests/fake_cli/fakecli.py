@@ -6,14 +6,11 @@ the agent runs `ssh hpc ...sbatch...`, sbatch answers with a job id, then a fina
 A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL (or a file $FAKE_CLI_LOG.fail) makes it exit with an error;
 FORCE_SLOW pauses between events (to watch the live progress).
 
-Autopilot (fake claude, when the system prompt says autopilot is on): every run submits a new job
-id and watches it with `ov watch`, like a real agent. Markers in the prompt (the goal, or job logs
-quoted in a wake-up's report) steer it: FAKE_DONE (`ov auto done`), FAKE_HELP (`ov auto help`),
-FAKE_NOJOB (submit nothing), FAKE_TWO (submit two jobs), FAKE_NOWATCH (submit without watching);
-FAKE_EVERY in the goal adds check-ins; in a check-in, FAKE_DIVERGE makes it scancel and resubmit.
-Lines "FAKE_OV <command>" make it run those commands (the `ov` tool) and answer with their output.
-FAKE_COMPACT: the CLI compacts the conversation on its own during the run; a prompt starting with
-/compact (claude) or `codex app-server` + thread/compact/start compacts it on request.
+Working alone over many runs (fake claude, for prompts with FAKE_LOOP, and wake-ups and check-ins):
+every run submits a new job id and watches it with `ov watch`, like a real agent. Markers in the
+prompt (the first message, or job logs quoted in a wake-up's report) steer it: FAKE_DONE (stop),
+FAKE_HELP (ask), FAKE_NOJOB (submit nothing), FAKE_TWO (two jobs), FAKE_NOWATCH (submit without
+watching), FAKE_EVERY (watch with check-ins); in a check-in, FAKE_DIVERGE makes it scancel and resubmit.
 """
 import re
 import json
@@ -93,8 +90,7 @@ def autopilot_run():
     with open(os.environ["FAKE_CLI_LOG"]) as fh:
         n = sum(1 for _ in fh)  # runs so far: makes job ids unique
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
-    system = " ".join(args)
-    every = " --every 1h" if "FAKE_EVERY" in system else ""
+    every = " --every 1h" if "FAKE_EVERY" in stdin else ""
     steps, final = [], "Submitted the next experiment."
 
     def submit_and_watch(count):
@@ -105,19 +101,17 @@ def autopilot_run():
             cmd = "watch " + " ".join(map(str, ids)) + every
             steps.append(("ov " + cmd, lambda: ov(cmd)))
 
-    if "Autopilot check-in" in stdin:
+    if "[Check-in you asked for" in stdin:
         final = "Looks healthy."
         if "FAKE_DIVERGE" in stdin:
             jid = re.search(r"<job id='(\d+)'", stdin).group(1)
             steps.append((f"ssh hpc scancel {jid}", lambda: ""))
             submit_and_watch(1)
             final = f"Job {jid} diverged: cancelled it and resubmitted with a lower lr."
-    elif "FAKE_DONE" in stdin:
-        steps.append(("ov auto done best lr is 3e-4", lambda: ov("auto done best lr is 3e-4")))
-        final = "Reached the goal."
-    elif "FAKE_HELP" in stdin:
-        steps.append(("ov auto help should I try a bigger model?", lambda: ov("auto help should I try a bigger model?")))
-        final = "Not sure how to continue."
+    elif "FAKE_DONE" in stdin:  # done: no more wake-ups
+        final = "Reached the goal: best lr is 3e-4."
+    elif "FAKE_HELP" in stdin:  # needs a decision: asks, and sets nothing up
+        final = "Not sure how to continue: should I try a bigger model?"
     elif "FAKE_SCRIPT" in stdin:  # submits through its own script: no "sbatch" in the command
         steps = [("ssh hpc 'cd ~/rf && python native7_cli.py submit --gpu a100'",
                   lambda: "native7: building manifest\nSubmitted batch job 7777\n(previous attempt was job 1234)\n")]
@@ -135,7 +129,7 @@ def autopilot_run():
     sys.exit(0)
 
 
-if prog == "claude" and any("Autopilot is ON" in a for a in args):
+if prog == "claude" and any(m in stdin for m in ("FAKE_LOOP", "[Wake-up you set up]", "[Check-in you asked for")):
     autopilot_run()
 
 def fake_outbox():

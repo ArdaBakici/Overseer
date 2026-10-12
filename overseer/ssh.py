@@ -113,6 +113,17 @@ class SSHRunner:
                 truncated = True
                 proc.kill()
                 break
+        if truncated:  # a grandchild may still hold stderr open: don't wait for it
+            try:
+                err = await asyncio.wait_for(err_task, 5)
+            except asyncio.TimeoutError:
+                err_task.cancel()
+                err = b""
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                pass
+            return bytes(out), err, truncated
         err = await err_task
         await proc.wait()
         return bytes(out), err, truncated

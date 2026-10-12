@@ -27,7 +27,6 @@ from telegram.ext import (
 )
 
 from .agent import Agent, Session
-from .autopilot import parse_duration
 from .projects import ProjectError, Projects
 from .richtext import RICH_LIMIT, strip_html
 from .config import BACKENDS, Config
@@ -38,8 +37,16 @@ from .slurm import STATE_EMOJI
 from .ssh import SSHError
 from .sshlink import master_alive
 from .store import ProjectRecord, Store
+from .usage import usage_report
 
 log = logging.getLogger(__name__)
+
+# /auto <goal>: what the agent is asked
+AUTO_PROMPT = """Work on this on your own, over as many runs as it takes: {goal}
+
+Keep the research log up to date (in a project). Submit the runs, `ov watch` them and end your reply: you're woken \
+when they finish (or set `ov wake` timers). Carry on until the goal is reached or nothing sensible is left, then \
+tell me. Ask me when you need a decision."""
 
 HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 
@@ -55,8 +62,9 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /stop — stop the agent's current run
 /update — update Claude Code and Codex now (Overseer also does it once a day, while nothing runs)
 /compact [focus] — compact the conversation now: older turns become a summary, which frees context (as a reply: that conversation). Claude Code takes a focus, e.g. /compact keep the lr sweep results
-/auto [wake-ups] [every 2h] [for 48h] &lt;goal&gt; — autopilot: the agent keeps experimenting on its own, woken by the jobs it watches (as a reply: in that conversation). The agent can also ask for it: you get a card to approve
-/auto — autopilot progress and pending wake-ups · /auto off — stop it
+/auto &lt;goal&gt; — ask the agent to work on it on its own: it watches its jobs and wakes itself (as a reply: in that conversation)
+/auto — pending wake-ups · /auto off — cancel them (here, or as a reply: in that conversation)
+/usage [today|yesterday|week] — tokens and cost of the agent's runs
 /health — connection status
 
 <b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
@@ -425,6 +433,7 @@ class Bot:
         add(CommandHandler("effort", self.cmd_effort, filters=allowed))
         add(CommandHandler("compact", self.cmd_compact, filters=allowed))
         add(CommandHandler("update", self.cmd_update, filters=allowed))
+        add(CommandHandler("usage", self.cmd_usage, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
@@ -693,6 +702,10 @@ class Bot:
             return
         self._spawn(self.agent.compact(session, " ".join(ctx.args or []).strip()))
 
+    async def cmd_usage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        period = (ctx.args or ["today"])[0].lower()
+        await self.reply(update, usage_report(self.store, period))
+
     async def cmd_update(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self.agent.running_sessions():
             await self.reply(update, "The agent is working: /update replaces the CLI it runs, so wait until it's done "
@@ -710,10 +723,10 @@ class Bot:
         err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
         conn = "up" if await master_alive(self.cfg) else "down (reopens on the next poll)"
         running = len(self.agent.running_sessions())
-        auto = self.store.list_autopilots(active_only=True)
+        auto = {w.session_id for w in self.store.watches()}
         await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · SSH connection {conn}\n"
                                  f"last successful poll: {last}{err}\n"
-                                 f"agent runs in progress: {running} · autopilots on: {len(auto)}\n"
+                                 f"agent runs in progress: {running} · conversations with wake-ups pending: {len(auto)}\n"
                                  f"{self._worker_line()}\n"
                                  f"{await self._versions_line()}\n"
                                  f"projects: {len(self.store.list_projects())} · topics "
@@ -788,63 +801,42 @@ class Bot:
         if text and text.strip():
             self._spawn(self._run_agent(chat_id, session, text))
 
+    def _scope_sessions(self, update: Update | None) -> list[str] | None:
+        """The conversations a command applies to: the replied-to one, this thread's, a project topic's, or all."""
+        target = self._replied_session(update)
+        if target:
+            return [target.id]
+        thread = self._thread(update)
+        sid = self.store.thread_session(update.effective_chat.id, thread) if update and thread else None
+        if sid:
+            return [sid]
+        scope = self._scope(update)
+        if scope:
+            return [r.id for r in self.store.list_sessions(10_000) if r.project == scope]
+        return None
+
     async def cmd_auto(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ap = self.agent.autopilot
         if ap is None:
-            await self.reply(update, "Autopilot isn't available.")
+            await self.reply(update, "Wake-ups aren't available.")
             return
         args = list(ctx.args or [])
-        target = self._replied_session(update)
         if not args or args[0].lower() in ("status", "list"):
-            await self.reply(update, ap.describe())
+            await self.reply(update, ap.describe(self._scope_sessions(update)))
             return
-        scope = self._scope(update)
-        if args[0].lower() in ("off", "stop"):
-            if target or scope is None:
-                stopped = ap.stop(target.id if target else None)
-            else:  # in a project's topic: that project's autopilots
-                stopped = [x for a in self.store.list_autopilots(True)
-                           if (sess := self.store.get_session(a.session_id)) and sess.project == scope
-                           for x in ap.stop(a.session_id)]
-            await self.reply(update, f"⏹ Autopilot off for {', '.join(code(x) for x in stopped)}. Jobs keep running "
-                                     "and are still reported." if stopped else "Autopilot wasn't on.")
+        if args[0].lower() in ("off", "stop") and len(args) == 1:
+            cancelled = ap.cancel_all(self._scope_sessions(update))
+            await self.reply(update, f"⏹ Cancelled {len(cancelled)} pending wake-up(s). Jobs keep running and are still "
+                                     "reported." if cancelled else "Nothing was pending.")
             return
-        wakeups, every, hours, i = None, None, None, 0
-        if args[0].isdigit():
-            wakeups, i = int(args[0]), 1
-        while i < len(args):
-            word = args[i].lower()
-            if "=" in word and word.split("=", 1)[0] in ("every", "checkin", "for"):
-                key, value, step = *word.split("=", 1), 1
-            elif word in ("every", "checkin", "for") and i + 1 < len(args):
-                key, value, step = word, args[i + 1], 2
-            else:
-                break
-            d = parse_duration(value)
-            if d is None or (key == "for" and d <= 0):
-                await self.reply(update, f"⛔ {code(value)} isn't a duration: use e.g. 30m, 2h, 1d"
-                                         + (" or off." if key != "for" else "."))
-                return
-            if key == "for":
-                hours = d / 3600
-            else:
-                every = d
-            i += step
-        goal = " ".join(args[i:]).strip()
-        if wakeups is None and every is None and hours is None and not goal:
-            await self.reply(update, "Usage: /auto [wake-ups] [every 2h] [for 48h] &lt;goal&gt;, /auto off, or /auto for "
-                                     "progress.")
-            return
-        session = target or self._here(update)
+        goal = " ".join(args).strip()
+        session = self._replied_session(update) or self._here(update)
         if session is None:
-            session = self.agent.new_conversation(scope)
+            session = self.agent.new_conversation(self._scope(update))
             if self._thread(update):
                 self.store.bind_thread(update.effective_chat.id, self._thread(update), session.id)
-        if wakeups is None and hours is None and not goal and ap.active(session.id):  # only the check-ins change
-            await self.reply(update, ap.set_checkins(session.id, every))
-            return
-        text = await ap.start(session, wakeups or self.cfg.agent.autopilot.default_wakeups, goal, every, hours)
-        await self.notifier.send(Outgoing(text, session_id=session.id, job_id=session.job_id))
+        self._spawn(self._run_agent(update.effective_chat.id if update else self.cfg.telegram.allowed_chat_ids[0],
+                                    session, AUTO_PROMPT.format(goal=goal)))
 
     # ------------------------------------------------------------------ projects
     def _projects_summary(self) -> str:
@@ -858,15 +850,15 @@ class Bot:
                 lines.append(f"🗄 {code(p.name)} (archived) · {code(p.dir)}")
                 continue
             running = [j for j in self.store.project_jobs(p.name, 50) if not j.ended_at]
-            auto = [a for a in self.store.list_autopilots(True)
-                    if (sess := self.store.get_session(a.session_id)) and sess.project == p.name]
+            auto = [w for w in self.store.watches()
+                    if (sess := self.store.get_session(w.session_id)) and sess.project == p.name]
             b = self.agent.backend_of(p.name)
             r = self.agent.runner(b, p.name)
             bits = [f"📁 <b>{esc(p.name)}</b> · {code(p.dir)}", f"{esc(b)} {esc(r.model or 'default model')}"]
             if running:
                 bits.append(f"{len(running)} job(s) active")
             if auto:
-                bits.append("🔁 autopilot on")
+                bits.append(f"⏰ {len(auto)} wake-up(s) pending")
             lines.append(" · ".join(bits) + (f"\n    {esc(p.context[:160])}" if p.context else ""))
         return "\n".join(lines)
 
@@ -941,7 +933,7 @@ class Bot:
                                      "\n(empty - the agent creates it when it learns something worth keeping)"))
         elif sub == "archive":
             self.projects.archive(name)
-            await self.reply(update, f"🗄 Project {code(name)} archived: its autopilot is off and new jobs in its folder "
+            await self.reply(update, f"🗄 Project {code(name)} archived: its pending wake-ups are cancelled and new jobs in its folder "
                                      f"go to the main chat. /project restore {esc(name)} brings it back.")
         elif sub == "restore":
             if not p.archived:
@@ -961,18 +953,18 @@ class Bot:
         if job_id and not args and conv:  # in a conversation's thread: the job becomes part of it
             self.agent._record_job(conv, job_id)
             ap = self.agent.autopilot
-            auto = ap and ap.active(conv.id)
             rec = self.store.get_job(job_id)
-            if auto and rec and not rec.ended_at:  # part of the loop: its end wakes the agent
+            wake = bool(ap and rec and not rec.ended_at)
+            if wake:  # part of the conversation's work: its end wakes the agent
                 ap.add_watch(conv, [job_id])
             await self.reply(update, f"🔗 Job {code(job_id)} is now part of this conversation: its reports come here"
-                                     + (" and autopilot wakes the agent when it ends." if auto else "."))
+                                     + (" and the agent is woken when it ends (/auto off cancels that)." if wake else "."))
             return
         target = args[0].lower() if args else self._scope(update)
         if not job_id or not target:
             await self.reply(update, "Usage: /assign &lt;job id&gt; &lt;project|main&gt; - or reply to a job's message "
                                      "with /assign &lt;project|main&gt;. In a conversation's thread, /assign &lt;job id&gt; "
-                                     "makes the job part of that conversation (with autopilot on, its end wakes the agent).")
+                                     "makes the job part of that conversation (its end wakes the agent).")
             return
         await self._assign(job_id, target, update)
 
@@ -1017,23 +1009,6 @@ class Bot:
             if "not modified" not in str(e).lower():
                 log.warning("could not edit the message (%s)", e)
 
-    async def _approval(self, q, what: str, sid: str) -> None:
-        ap = self.agent.autopilot
-        a = self.store.get_autopilot(sid) if ap else None
-        if not a or a.status != "requested":
-            await self._edit(q, "This request is no longer open." + (f" (autopilot: {esc(a.status)})" if a else ""))
-            return
-        if what == "ok":
-            text = await ap.approve(sid)
-            await self._edit(q, "✅ <b>Approved.</b>\n" + (text or ""))
-        elif what == "no":
-            ap.decline(sid)
-            await self._edit(q, f"❌ <b>Declined</b>: {esc(a.goal)}\nThe agent is told the next time you write to it.")
-        else:
-            a = ap.adjust(sid, what)
-            if a:
-                await self._edit(q, *ap.card(a))
-
     async def on_stranger(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat:
             log.warning("ignored message from unauthorised chat %s", update.effective_chat.id)
@@ -1069,8 +1044,9 @@ class Bot:
             elif action == "assign":
                 job_id, _, name = arg.partition(":")
                 await self._assign(job_id, name or None, update)
-            elif action == "ap":  # the autopilot approval card
-                await self._approval(q, *arg.partition(":")[::2])
+            elif action == "ap":  # an approval card from before wake-ups needed no approval
+                await self._edit(q, "This approval card is no longer used: the agent sets up its wake-ups itself now "
+                                    "(/auto lists them).")
             elif action == "uw":  # ✖ on a one-off wake-up
                 w = self.agent.autopilot.cancel_watch(int(arg)) if self.agent.autopilot and arg.isdigit() else None
                 await self._edit(q, "✖ Cancelled: the agent won't be woken for this." if w else

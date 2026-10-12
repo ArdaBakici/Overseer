@@ -88,21 +88,10 @@ agent:
     web_search: true            # the model's own web search (runs on OpenAI's side)
     extra_config: []            # extra `-c key=value` overrides
 
-  # Autopilot: the agent works on its own, woken when jobs it watches end (`ov watch`) and by timers it sets
-  # (`ov wake`). It asks first with an approval card in Telegram (you can change its limits there), or you
-  # start it with /auto <goal>.
+  # Wake-ups: the agent watches jobs (ov watch) and sets timers (ov wake) on its own, no approval needed.
   autopilot:
-    default_wakeups: 20         # wake-ups per approval (a watched job ending, or a timer); check-ins don't count
-    max_wakeups: 100            # most the card's buttons or /auto allow
-    default_hours: 48           # how long an approval lasts
-    max_hours: 336
-    checkin_minutes: 60         # check-in interval offered when the agent doesn't ask for one
-    min_checkin_minutes: 15     # check-ins on running jobs: never more often than this
-    max_checkins_per_job: 30
-    # Without autopilot the agent may still wake itself once ("look at job X when it ends", "in 2h"):
-    oneoff_max_pending: 3       # per conversation
-    oneoff_max_hours: 168       # how far ahead
-    oneoff_chain: 3             # one-off wake-ups in a row without a message from you; after that it must ask
+    min_checkin_minutes: 15     # check-ins on running jobs and repeating timers: at least this far apart
+    repeat_hours: 24            # a repeating timer stops after this, unless the agent sets --for
 
 # Projects: each gets its own Telegram topic, conversations, jobs, notes (OVERSEER.md in its folder) and agent
 # settings. You can also create them from Telegram: /project new <name> <dir> [what it's about].

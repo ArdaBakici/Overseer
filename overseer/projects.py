@@ -1,7 +1,7 @@
 """Projects: separate contexts (e.g. dreamer, chemistry), each with its own Telegram topic.
 
 A project has a folder on the HPC, standing instructions for the agent, its own conversations,
-jobs, autopilot and agent settings (backend / model / effort, copied from the main chat when the
+jobs, research log and agent settings (backend / model / effort, copied from the main chat when the
 project is created). Projects come from config.yaml (`projects:`) or `/project new` in Telegram.
 
 * Jobs the agent submits in a project's topic belong to that project.
@@ -81,9 +81,9 @@ class Projects:
         p.archived = 1
         self.store.upsert_project(p)
         if self.agent.autopilot:  # an archived project doesn't keep experimenting
-            for sess in self.store.list_sessions(1000):
-                if sess.project == name:
-                    self.agent.autopilot.stop(sess.id)
+            sessions = [sess.id for sess in self.store.list_sessions(10_000) if sess.project == name]
+            if sessions:
+                self.agent.autopilot.cancel_all(sessions)
         return p
 
     def update(self, name: str, *, dir: str | None = None, context: str | None = None) -> ProjectRecord:

@@ -1,6 +1,6 @@
 ---
 name: overseer
-description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, create and manage projects, move or stop tracking jobs, message the researcher, and have yourself woken later (when jobs end, on a timer, or in an approved autopilot loop). Use it whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
+description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, create and manage projects, move or stop tracking jobs, message the researcher, and have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log. Use it whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
 ---
 
 # Overseer and `ov`
@@ -61,79 +61,64 @@ long run.
 
 ## Being woken later
 
-Nothing runs between your turns. Don't sleep, poll in a loop or wait for jobs: have Overseer wake
-you instead.
+Nothing runs between your turns. Don't sleep, poll in a loop or wait for jobs: have Overseer wake you.
+You don't need permission. Each watch or timer is announced to the researcher, who can cancel it.
 
 ```bash
 ov watch 18746955 --note "compare with the baseline in runs/base"   # when it ends
 ov watch 18746955 18746956                    # when both have ended (or as soon as one fails)
-ov wake in 90m "check that eval started"      # at a time
+ov watch 18746955 --every 1h                  # ...plus check-ins while it runs (at least 15 min apart)
+ov wake in 90m "check that eval started"      # once, at a time
+ov wake every 2h --for 12h "summarise the sweep"   # repeatedly (at least 15 min apart; 24h without --for)
 ov watches                                    # what will wake you (ids like w12)
 ov unwatch w12                                # or a job id, or "all"
 ```
 
 When you are woken, the message contains:
-- the final report of each finished job (state, exit code, runtime, memory, issues found, the end
-  of its log);
-- your timer's note;
-- which jobs are still running.
+- the final report of each finished job (state, exit code, runtime, memory, issues found, the end of
+  its log);
+- your timer's or watch's note;
+- which jobs are still running;
+- in a project, the research log's beginning and latest entries.
 
-### Without autopilot: one-off wake-ups
+A check-in shows a running job's progress: metrics and the end of its log.
+- **Healthy:** change nothing and reply in a sentence or two.
+- **Clearly broken, diverging or wasting GPU time:** `scancel` it, note why in the research log,
+  resubmit, and watch the new job.
 
-- Without autopilot, `ov watch` and `ov wake in` wake you once. Use them when you told the
-  researcher you'd follow up ("I'll look at the results when it finishes").
-- The researcher sees each one and can cancel it.
-- Limits:
-  - only a few one-offs can be pending at a time;
-  - after a few one-off wake-ups in a row without the researcher writing, `ov` refuses more.
-    Ask for autopilot then.
-- Check-ins while a job runs (`--every`) and repeating timers (`ov wake every`) need autopilot.
+Every wake-up re-reads the whole conversation and costs real money. Wake yourself when there's
+something to look at, and prefer job ends over frequent check-ins.
 
-## Autopilot: working on your own over many runs
+## Working on your own over many runs
 
-Use autopilot when a task needs several runs, with waiting for results in between: tuning,
-ablations, sweeps, "keep going until the score is above X". Don't use it for a single job.
+For tuning, ablations, sweeps or "keep going until the score is above X", carry on by yourself. No
+mode needs to be switched on.
 
-1. **Ask.** Then end your turn.
-   ```bash
-   ov auto request --goal "crafter seed 1 above score 5 in ~/rf-dreamer; one change per run" \
-       --wakeups 20 --hours 48 --checkins 2h
-   ```
-   The researcher gets an approval card in Telegram. They can start it, decline it, or change the
-   number of wake-ups, the time and the check-in interval first. If they approve, you're woken with
-   the limits they chose. If they decline, you're told the next time they write.
-2. **Start** (the first wake-up):
-   - look at the project and earlier results;
-   - create `RESEARCH_LOG.md` in the project folder on the HPC (goal, baseline, plan);
-   - submit the first experiment, then `ov job add` and `ov watch` it, with `--every 2h` if you want
-     check-ins;
+1. **Start:**
+   - look at the project and earlier results (the research log);
+   - write the goal at the top of the log;
+   - submit the first experiment, then `ov job add` and `ov watch` it;
    - end your reply.
-3. **Each wake-up:**
-   - read the results and update the research log (what changed and why, the job ids, the key
-     results, the next idea);
-   - submit the next experiment and `ov watch` it;
+2. **Each time you're woken:**
+   - read the results;
+   - add an entry to the log: what changed and why, the job ids, the key results, the next idea;
+   - submit the next experiment and watch it;
    - end your reply.
-   - The wake-up message says which one it is ("wake-up 3 of 20 · 41h left"). The last one tells
-     you to wrap up.
-4. **Check-ins** (`ov watch <id> --every 2h`):
-   - while the job runs you're shown its progress (metrics and the end of its log);
-   - if it's healthy, change nothing and reply in a sentence or two;
-   - if it's clearly broken, diverging or wasting GPU time, `scancel` it, note why in the log,
-     resubmit and watch the new job.
-   - Check-ins don't count as wake-ups.
-5. **Finish:**
-   - `ov auto done "best lr 3e-4: score 5.4 (job 18746990)"` when the goal is reached or nothing
-     sensible is left to try;
-   - `ov auto help "should I try the larger model? it needs 2x the GPU hours"` when you need the
-     researcher's decision. They get a notification and your watches stay.
+3. **Stop** when the goal is reached or nothing sensible is left to try. Say so, with the conclusion,
+   and set no more wake-ups (`ov unwatch all` if any are left).
+4. **Ask** when you need the researcher's decision: in your reply, or `ov notify` for something urgent.
+   Don't keep spending runs meanwhile.
 
-`ov wake every 6h "summarise the sweep"` sets a repeating timer, and `ov auto status` shows where
-you are. Jobs you submit during autopilot but forget to watch are watched for you, as a safety
-net. Still: watch them yourself, and group the runs whose results you want to read together.
+If a wake-up fails, the conversation's wake-ups pause until the researcher writes. They can also cancel
+them all (`/auto off`). You're told when they cancel something.
 
-Rules while on autopilot:
+Research log (`RESEARCH_LOG.md` in the project folder):
+- **Structure:** the current goal at the top, then one entry per experiment or wake-up.
+- **Goal changes:** rewrite the goal, keeping a one-line note of the old one.
+- **Size:** keep it compact, well under 200k tokens (~800 KB). When it grows long, condense the old
+  entries into a short summary section.
+
+Rules:
 - Change one thing at a time unless the goal says otherwise.
 - Give every run its own name and output folder, and never delete or overwrite earlier results.
 - Only cancel or change jobs you submitted in this conversation.
-- The researcher can stop you any time (`/auto off`, `/stop`). A failed or stopped wake-up pauses
-  the loop until they resume it.
