@@ -2158,3 +2158,57 @@ def test_no_quota_command(env):
     env.cfg.slurm.quota_command = ""
     system = env.agent.system_prompt()
     assert "not known to Overseer yet (`quota -s` may show them)" in system and "Python on the HPC: uv" in system
+
+
+# ----------------------------------------------------------------------------- CLI errors and updates
+
+async def test_api_error_is_an_error_and_pauses_autopilot(env):
+    """An API error Claude Code reports as its result (here: the CLI is too old for the model) is an error, not
+    an answer - with a hint to /update - and an autopilot wake-up that hits it pauses the loop."""
+    s = env.agent.general_session()
+    assert not await env.agent.handle(s, "hi FORCE_APIERROR")
+    msg = env.notifier.sent[-1].text
+    assert msg.startswith("⚠️ claude: API Error: 400 Claude Code 2.1.197 does not support this model") and "/update" in msg
+    assert not any(m.text.startswith("🤖") for m in env.notifier.sent)
+
+    ap = await make_autopilot(env)
+    await ap.start(s, 3, "tune it FORCE_APIERROR", None)
+    await ap.drain()
+    assert "Autopilot paused" in env.notifier.sent[-1].text and not env.store.get_autopilot(s.id).active
+
+
+async def test_updating_the_clis(env, monkeypatch):
+    from overseer.bot import Bot
+    lines = await env.agent.update_clis()
+    assert lines == ["⬆️ Claude Code updated: 2.1.197 (Claude Code) → 2.1.300 (Claude Code)",
+                     "⬆️ Codex updated: codex-cli 0.150.0 → codex-cli 0.161.0"]
+    assert await env.agent.update_clis() == ["✓ Claude Code 2.1.300 (Claude Code) is up to date",
+                                             "✓ Codex codex-cli 0.161.0 is up to date"]
+    Path(os.environ["FAKE_CLI_LOG"] + ".update-fail").touch()
+    lines = await env.agent.update_clis()
+    assert lines[0].startswith("⚠️ Claude Code: the update failed") and "could not reach the update server" in lines[0]
+    Path(os.environ["FAKE_CLI_LOG"] + ".update-fail").unlink()
+
+    # Not while the agent is working; and runs wait while an update is going on.
+    s = env.agent.general_session()
+    env.agent.updating = True
+    run = asyncio.create_task(env.agent.handle(s, "hi"))
+    await asyncio.sleep(0.3)
+    assert not run.done() and not [c for c in env.cli_log() if c["argv"][:1] not in (["--version"], ["update"])]
+    env.agent.updating = False
+    await run
+
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "reply", reply)
+    monkeypatch.setattr(env.agent, "running_sessions", lambda: [s])
+    await bot.cmd_update(None, NS(args=[]))
+    assert "The agent is working" in replies[-1]
+    assert await env.agent.update_clis() is None
+    monkeypatch.setattr(env.agent, "running_sessions", lambda: [])
+    await bot.cmd_update(None, NS(args=[]))
+    assert replies[-2] == "⬆️ Updating the agent CLIs…" and "is up to date" in replies[-1]

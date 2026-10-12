@@ -236,6 +236,9 @@ class AgentConfig:
     # claude_code or codex. Can be switched at runtime from Telegram with /backend.
     backend: str = "claude_code"
     timeout_minutes: int = 60  # max length of one agent run
+    # Update the agent CLIs (`claude update`, `codex update`) once a day, while no agent run is in progress.
+    # New models often need a recent CLI. /update in Telegram (or `overseer update`) does it now.
+    auto_update: bool = True
     # How the commands the agent runs are reported in Telegram:
     #   summary - one message after each request; live - batched every few seconds; off
     report_commands: str = "summary"

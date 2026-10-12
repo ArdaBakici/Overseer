@@ -38,6 +38,32 @@ def emit(ev):
 if "login" in args:
     print("logged in")
     sys.exit(0)
+
+# The CLI's own version and updater (state in $FAKE_CLI_LOG.<prog>.version; $FAKE_CLI_LOG.update-fail fails it).
+VERSIONS = {"claude": ("2.1.197 (Claude Code)", "2.1.300 (Claude Code)"), "codex": ("codex-cli 0.150.0", "codex-cli 0.161.0")}
+version_file = os.environ["FAKE_CLI_LOG"] + f".{prog}.version"
+if args == ["--version"]:
+    print(open(version_file).read() if os.path.exists(version_file) else VERSIONS[prog][0])
+    sys.exit(0)
+if args == ["update"]:
+    if os.path.exists(os.environ["FAKE_CLI_LOG"] + ".update-fail"):
+        print("Error: could not reach the update server")
+        sys.exit(1)
+    current = open(version_file).read() if os.path.exists(version_file) else VERSIONS[prog][0]
+    if current == VERSIONS[prog][1]:
+        print(f"{prog} is up to date ({current})")
+    else:
+        open(version_file, "w").write(VERSIONS[prog][1])
+        print(f"Successfully updated from {current} to {VERSIONS[prog][1]}")
+    sys.exit(0)
+
+if prog == "claude" and "FORCE_APIERROR" in stdin:  # an API error, reported as the run's result
+    sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-opus-5-5"})
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": True,
+          "result": "API Error: 400 Claude Code 2.1.197 does not support this model; version 2.1.280 or newer is "
+                    "required. Run 'claude update', or update the Claude desktop app, then try again."})
+    sys.exit(1)
 if "FORCE_SLEEP" in stdin:
     time.sleep(60)
 if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):

@@ -53,6 +53,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /model [name|default] — show or set the active agent's model
 /effort [level|default] — show or set the active agent's effort
 /stop — stop the agent's current run
+/update — update Claude Code and Codex now (Overseer also does it once a day, while nothing runs)
 /compact [focus] — compact the conversation now: older turns become a summary, which frees context (as a reply: that conversation). Claude Code takes a focus, e.g. /compact keep the lr sweep results
 /auto [wake-ups] [every 2h] [for 48h] &lt;goal&gt; — autopilot: the agent keeps experimenting on its own, woken by the jobs it watches (as a reply: in that conversation). The agent can also ask for it: you get a card to approve
 /auto — autopilot progress and pending wake-ups · /auto off — stop it
@@ -423,6 +424,7 @@ class Bot:
         add(CommandHandler("model", self.cmd_model, filters=allowed))
         add(CommandHandler("effort", self.cmd_effort, filters=allowed))
         add(CommandHandler("compact", self.cmd_compact, filters=allowed))
+        add(CommandHandler("update", self.cmd_update, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
@@ -691,6 +693,18 @@ class Bot:
             return
         self._spawn(self.agent.compact(session, " ".join(ctx.args or []).strip()))
 
+    async def cmd_update(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if self.agent.running_sessions():
+            await self.reply(update, "The agent is working: /update replaces the CLI it runs, so wait until it's done "
+                                     "(or /stop it).")
+            return
+        await self.reply(update, "⬆️ Updating the agent CLIs…")
+        lines = await self.agent.update_clis()
+        if lines is None:
+            await self.reply(update, "An agent run started meanwhile, or an update is already running: try again later.")
+        else:
+            await self.reply(update, "\n".join(lines) or "No agent CLI is installed.")
+
     async def cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         last = f"{int(time.time() - self.monitor.last_ok)}s ago" if self.monitor.last_ok else "never"
         err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
@@ -701,9 +715,18 @@ class Bot:
                                  f"last successful poll: {last}{err}\n"
                                  f"agent runs in progress: {running} · autopilots on: {len(auto)}\n"
                                  f"{self._worker_line()}\n"
+                                 f"{await self._versions_line()}\n"
                                  f"projects: {len(self.store.list_projects())} · topics "
                                  f"{'on' if getattr(self.notifier, 'topics', False) else 'off (enable threaded mode in BotFather)'}"
                                  f"\n\n{self._agents_summary(self._scope(update))}")
+
+    async def _versions_line(self) -> str:
+        parts = []
+        for backend, name in (("claude_code", "Claude Code"), ("codex", "Codex")):
+            r = self.agent.runner(backend)
+            if r.installed():
+                parts.append(f"{name} {esc(await r.version() or '?')}")
+        return "CLIs: " + (" · ".join(parts) or "none installed") + " (/update)"
 
     def _worker_line(self) -> str:
         w = getattr(self.monitor, "worker", None)

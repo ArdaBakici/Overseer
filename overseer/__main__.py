@@ -6,6 +6,7 @@
     overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
     overseer sessions                   list agent conversations
     overseer open [conversation]        open a conversation in Claude Code / Codex (default: latest)
+    overseer update                     update Claude Code and Codex (the bot also does it once a day)
     overseer watch [conversation]       follow what the agent is doing live: reasoning, commands, output
                                         (default: every conversation; --full for complete outputs)
     overseer check                      verify everything without starting the bot
@@ -68,12 +69,13 @@ def build(cfg: Config):
                         "labelled in the main chat (enable threaded mode for the bot in @BotFather)")
         await ctl.start()  # the agent's `ov` command
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
+        tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
             ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
             ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
-            ("compact", "compact the conversation (free context)"),
+            ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
             ("auto", "autopilot: keep experimenting on its own"), ("project", "projects: list, new, context, notes"),
             ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
@@ -291,9 +293,27 @@ def open_command(cfg: Config, target: str | None) -> int:
     return subprocess.call(argv, env=env, cwd=str(cwd))
 
 
+async def update_command(cfg: Config) -> int:
+    """Update Claude Code and Codex with their own updaters (the bot does it once a day by itself)."""
+    from .runners import make_runner
+    rc = 0
+    for backend in BACKENDS:
+        r = make_runner(cfg, backend)
+        if not r.installed():
+            print(f"{backend}: {r.c.command!r} not installed")
+            continue
+        before = await r.version()
+        print(f"{backend}: {before or 'version unknown'} - updating...")
+        ok, out = await r.update()
+        print(out)
+        print(f"{backend}: {'now ' + (await r.version() or '?') if ok else 'update FAILED'}\n")
+        rc = rc or (0 if ok else 1)
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch"])
+    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update"])
     ap.add_argument("target", nargs="?",
                     help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest); "
                          "watch: conversation (default: all)")
@@ -329,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "watch":
             from .live import watch
             return watch(cfg, args.target, full=args.full)
+        if args.command == "update":
+            return asyncio.run(update_command(cfg))
         app = build(cfg)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)

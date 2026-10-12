@@ -355,6 +355,36 @@ class Runner:
         """Compact the conversation now (summarise its older turns to free context)."""
         raise NotImplementedError
 
+    # ------------------------------------------------------------------ the CLI itself
+    def installed(self) -> bool:
+        return bool(shutil.which(self.c.command))
+
+    async def version(self) -> str:
+        """`<cli> --version`, e.g. "2.1.296 (Claude Code)" / "codex-cli 0.160.1"; "" if it can't be run."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.c.command, "--version", stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (OSError, asyncio.TimeoutError):
+            return ""
+        lines = out.decode(errors="replace").strip().splitlines()
+        return lines[0].strip() if lines else ""
+
+    async def update(self) -> tuple[bool, str]:
+        """The CLI's own updater (`claude update` / `codex update`). It runs with your normal environment, not the
+        agent's: the installers find the installation through HOME, which Overseer's runs point elsewhere."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.c.command, "update", stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            return False, "timed out after 10 minutes"
+        except OSError as e:
+            return False, str(e)
+        return proc.returncode == 0, out.decode(errors="replace").strip()[-1500:]
+
     def login_command(self, extra: list[str]) -> tuple[list[str], dict[str, str]]:
         raise NotImplementedError
 
@@ -481,6 +511,8 @@ class ClaudeCodeRunner(Runner):
                 _claude_usage(ev, result)
 
         stderr = await self._exec(argv, {**self.env(workdir), **activity.env}, workdir, prompt[:MAX_PROMPT], on_event)
+        if result.is_error:  # e.g. an API error: Claude Code reports it as the result, not as an answer
+            raise AgentRunError("claude: " + (result.text or stderr.strip() or "the run failed")[-1500:])
         if not result.text:
             result.text = texts[-1] if texts else ""
         if stderr and not result.text:

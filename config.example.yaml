@@ -63,6 +63,7 @@ agent:
   enabled: true
   backend: claude_code          # claude_code | codex  (switch any time from Telegram: /backend codex)
   timeout_minutes: 60           # max length of one agent run (/stop ends it earlier)
+  auto_update: true             # `claude update` / `codex update` once a day while nothing runs (/update: now)
   report_commands: summary      # summary (after each request) | live (every few seconds) | off
   live_progress: true           # a self-updating "⏳ working" message: latest reasoning, running command
   allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)

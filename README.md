@@ -172,6 +172,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
 | *(while the agent works)* | a live ⏳ preview that updates every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. Its **Stop** button stops the run. It's a Telegram streaming draft, which vanishes when the answer arrives; where drafts aren't available (`telegram.streaming: false`, group chats) it's a message that is edited in place and then removed |
 | `/stop` | stop the agent's current run (kills the whole process group) |
+| `/update` | update Claude Code and Codex now, with their own updaters; `/health` shows their versions. Overseer also does it once a day while no agent run is in progress (`agent.auto_update`), and tells you when a version changed. On the homelab: `uv run overseer update` |
 | `/compact [focus]` | compact the conversation now (below). As a reply to a message, it applies to that conversation |
 | `/auto [wake-ups] [every 2h] [for 48h] <goal>` | autopilot (below). As a reply to a message, it applies to that conversation. `/auto` shows progress and pending wake-ups, `/auto off` stops it |
 | `/health` | SSH connection, last poll, agents with their model and effort |

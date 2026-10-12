@@ -34,6 +34,9 @@ from .store import JobRecord, SessionRecord, Store
 log = logging.getLogger(__name__)
 
 LIVE_FLUSH_SECONDS = 5
+NAMES = {"claude_code": "Claude Code", "codex": "Codex"}
+# The CLI is too old (e.g. for a new model): "version 2.1.280 or newer is required. Run 'claude update'"
+OUTDATED_RE = re.compile(r"or newer is required|(?:claude|codex) update\b|upgrade (?:claude|codex)", re.I)
 
 SYSTEM_PROMPT = """You are Overseer's agent. You help an ML researcher run, debug and fix SLURM jobs on their \
 university HPC cluster. They talk to you through Telegram.
@@ -242,6 +245,7 @@ class Agent:
         self.monitor = None  # set by the app; poked when the agent submits a job
         self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
         self.ctl = None  # set by ControlServer(...): the agent's `ov` command
+        self.updating = False  # the CLIs are being updated (update_clis)
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
 
@@ -492,6 +496,53 @@ class Agent:
     def running_sessions(self) -> list[Session]:
         return [s for s in self.sessions.values() if self.is_running(s)]
 
+    # ------------------------------------------------------------------ keeping the CLIs up to date
+    async def update_clis(self) -> list[str] | None:
+        """Run each installed CLI's own updater. None if agent runs are in progress (a CLI isn't replaced under a
+        running agent); otherwise one line (HTML) per CLI. New runs wait while this runs."""
+        if self.running_sessions() or self.updating:
+            return None
+        self.updating = True
+        lines = []
+        try:
+            for backend in BACKENDS:
+                r = self.runner(backend)
+                if not r.installed():
+                    continue
+                before = await r.version()
+                ok, out = await r.update()
+                after = await r.version()
+                name = NAMES[backend]
+                if not ok:
+                    lines.append(f"⚠️ {name}: the update failed ({esc(before or 'version unknown')}):"
+                                 + pre(out or "(no output)", 600))
+                elif after and after != before:
+                    lines.append(f"⬆️ {name} updated: {esc(before or '?')} → {esc(after)}")
+                else:
+                    lines.append(f"✓ {name} {esc(after or before or '')} is up to date")
+        finally:
+            self.updating = False
+            self.store.set("cli_update_at", str(time.time()))
+        return lines
+
+    async def update_loop(self) -> None:
+        """Once a day: update the CLIs when nothing is running (agent.auto_update). Tells you only about changes."""
+        while True:
+            await asyncio.sleep(600)
+            if not self.cfg.agent.auto_update:
+                continue
+            if time.time() - float(self.store.get("cli_update_at") or 0) < 86400:
+                continue
+            try:
+                lines = await self.update_clis()
+            except Exception:
+                log.exception("updating the agent CLIs failed")
+                self.store.set("cli_update_at", str(time.time()))
+                continue
+            changed = [x for x in lines or [] if not x.startswith("✓")]
+            if changed:
+                await self.notifier.send(Outgoing("\n".join(changed), silent=True))
+
     # ------------------------------------------------------------------ prompts
     def system_prompt(self, session_id: str | None = None) -> str:
         domains = self.cfg.agent.allowed_domains
@@ -579,6 +630,8 @@ class Agent:
             await self.notifier.send(Outgoing("The agent is disabled in the config."))
             return False
         ok = False
+        while self.updating:  # the CLIs are being updated: runs wait until that's done
+            await asyncio.sleep(1)
         async with s.lock:
             s.task = asyncio.current_task()
             s.origin = origin
@@ -590,7 +643,9 @@ class Agent:
             except asyncio.CancelledError:
                 await self.notifier.send(Outgoing("⏹ Stopped.", session_id=s.id, job_id=s.job_id))
             except AgentRunError as e:
-                await self.notifier.send(Outgoing(f"⚠️ {esc(e)}", session_id=s.id, job_id=s.job_id))
+                hint = ("\nOverseer can update it: /update (it also updates the CLIs once a day on its own)."
+                        if OUTDATED_RE.search(str(e)) else "")
+                await self.notifier.send(Outgoing(f"⚠️ {esc(e)}{hint}", session_id=s.id, job_id=s.job_id))
             except Exception as e:
                 log.exception("agent run failed")
                 await self.notifier.send(Outgoing(f"⚠️ Agent error: {esc(type(e).__name__)}: {esc(str(e)[:800])}",
