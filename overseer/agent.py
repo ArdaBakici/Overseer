@@ -830,7 +830,7 @@ class Agent:
                 return  # already registered (ov job add) and announced
             self._record_job(s, job_id)
             asyncio.get_running_loop().create_task(self.notifier.send(Outgoing(
-                f"🚀 Agent submitted job {esc(job_id)} → its card is in the jobs topic" + fold_text(command, 600),
+                f"🚀 Agent submitted job {esc(job_id)}" + fold_text(command, 600),
                 job_id=job_id, session_id=s.id, silent=True)))
 
         activity.on_job = on_job

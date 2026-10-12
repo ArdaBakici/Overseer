@@ -285,7 +285,7 @@ class ControlServer:
                 if not rec.name:  # what SLURM said, until the monitor's next poll
                     rec.name, rec.state, rec.workdir = name, state or rec.state, workdir
                     self.store.upsert_job(rec)
-                await self._announce(session, f"🚀 Agent submitted job {esc(jid)} {esc(name)} → its card is in the jobs topic",
+                await self._announce(session, f"🚀 Agent submitted job {esc(jid)} {esc(name)}",
                                      job_id=jid)
             out.append(f"✓ job {jid} ({name or '?'}, {state or '?'}) is tracked in this conversation"
                        + (" (already was)" if already else "") + ": Overseer reports on it"

@@ -146,7 +146,7 @@ class Monitor:
         if adopted:
             await self.notifier.send(Outgoing(
                 f"👀 <b>Overseer online</b>: tracking {len(adopted)} job(s) - {', '.join(r.job_id for r in adopted[:8])}"
-                + (" …" if len(adopted) > 8 else "") + ". Their cards are in the jobs topics.", silent=True))
+                + (" …" if len(adopted) > 8 else "") + ".", silent=True))
 
         # Jobs we know about that left the queue.
         for rec in self.store.active_jobs():
@@ -430,7 +430,7 @@ class Monitor:
             success = final.state in SUCCESS_STATES and final.exit_code.startswith("0")
             await self.notifier.send(Outgoing(
                 f"{STATE_EMOJI.get(final.state, '🏁')} Job {esc(rec.job_id)} {esc(rec.name)} "
-                f"{'finished' if success else esc(final.state)} → report in the jobs topic",
+                f"{'finished' if success else esc(final.state)}",
                 session_id=rec.session_id, job_id=rec.job_id, silent=True))
         await self._tell_autopilot(rec, context)
 

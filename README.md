@@ -249,7 +249,7 @@ Topics in private chats need the bot's topic mode ("threaded mode"), which you s
   <the decisive log line>
   ▸ details (exit, memory, metrics, log tail - folded)
   ```
-- **In the conversation:** when a job the agent submitted ends and the agent isn't watching it, you get a one-line pointer: "✅ Job 123 … finished → report in the jobs topic". Watched jobs need no pointer, because the agent's reply follows.
+- **In the conversation:** when a job the agent submitted ends and the agent isn't watching it, you get a one-line pointer: "✅ Job 123 … finished". Watched jobs need no pointer, because the agent's reply follows.
 
 **What matters in a job: the agent decides, and sets alerts.** The agent tells Overseer which numbers matter and how to get them, per job, per job-name pattern (a sweep) or as a project default:
 ```bash

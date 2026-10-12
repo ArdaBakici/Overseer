@@ -1851,8 +1851,8 @@ async def test_submissions_through_scripts_are_found(env):
     await ap.drain()
     await asyncio.sleep(0.05)  # the announcements are sent in the background
     announced = [m.text for m in env.notifier.sent if "Agent submitted job" in m.text]
-    assert any("job 7777 →" in t and "native7_cli.py submit" in t for t in announced), announced
-    assert any("job 7778 →" in t and "in the agent's reply" in t for t in announced), announced
+    assert any("job 7777<" in t and "native7_cli.py submit" in t for t in announced), announced
+    assert any("job 7778<" in t and "in the agent's reply" in t for t in announced), announced
     assert not any("job 1234" in t for t in announced)
     assert {j.job_id for j in env.store.session_jobs(s.id)} == {"7777", "7778"}
     reply = next(m.text for m in reversed(env.notifier.sent) if m.text.startswith("🤖"))
@@ -2372,5 +2372,5 @@ async def test_unwatched_agent_job_points_to_the_jobs_topic(env):
     env.set_jobs(**{"4242": {"name": "fixed", "state": "COMPLETED", "exit": "0:0", "workdir": str(proj),
                              "stdout": f"{proj}/slurm-4242.out"}})
     await env.monitor.poll()
-    pointer = next(m for m in env.notifier.sent if "report in the jobs topic" in m.text)
+    pointer = next(m for m in env.notifier.sent if m.session_id == s.id and "Job 4242 fixed finished" in m.text)
     assert pointer.session_id == s.id and pointer.silent and "4242 fixed finished" in pointer.text
