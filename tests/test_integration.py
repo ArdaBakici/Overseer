@@ -2212,3 +2212,55 @@ async def test_updating_the_clis(env, monkeypatch):
     monkeypatch.setattr(env.agent, "running_sessions", lambda: [])
     await bot.cmd_update(None, NS(args=[]))
     assert replies[-2] == "⬆️ Updating the agent CLIs…" and "is up to date" in replies[-1]
+
+
+async def test_job_arrays_are_one_job(env):
+    """sbatch prints the array's id; SLURM lists its tasks (123_1, 123_[2-4]). The array is one job: running while
+    any task is, ended with the worst task state once all are done - never "left the queue" while tasks run."""
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    (proj / "slurm-6100_1.out").write_text("epoch 3 loss=0.4\n")
+    task = {"name": "sweep", "workdir": str(proj), "stdout": str(proj / "slurm-6100_1.out")}
+    env.set_jobs(**{"6100_1": {**task, "state": "RUNNING"}, "6100_[2-4]": {**task, "state": "PENDING"}})
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, ["watch", "6100_3"])  # a task id means its array
+    assert ok and "w1" in text, text
+    assert env.store.get_job("6100") and env.store.get_job("6100_1") is None
+    for _ in range(12):  # many polls: the array id never shows up in squeue, but its tasks do
+        await env.monitor.poll()
+    await ap.drain()
+    rec = env.store.get_job("6100")
+    assert not rec.ended_at and rec.state == "RUNNING", rec
+    assert not any("left the queue" in m.text for m in env.notifier.sent)
+    assert not [j for j in env.store.recent_jobs(50) if "_" in j.job_id]  # tasks aren't jobs of their own
+    status = await env.monitor.status_message(rec, next(j for j in await env.hpc.squeue() if j.job_id == "6100"))
+    assert "📦 job array: 3 PENDING, 1 RUNNING" in status.text
+
+    # All tasks end, one of them failed: the array ends FAILED, once, and wakes the conversation once.
+    n = len([c for c in env.cli_log() if c["prog"] == "claude"])
+    st = env.slurm()
+    st["jobs"] = {k: v for k, v in st["jobs"].items() if not k.startswith("6100")}
+    st["jobs"].update({f"6100_{i}": {**task, "state": "FAILED" if i == 3 else "COMPLETED",
+                                     "exit": "1:0" if i == 3 else "0:0"} for i in range(1, 5)})
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await env.monitor.poll()
+    await env.monitor.poll()
+    await ap.drain()
+    finals = [m.text for m in env.notifier.sent if "Job 6100" in m.text and "ended" in m.text]
+    assert len(finals) == 1 and "FAILED" in finals[0] and "📦 job array: 3 COMPLETED, 1 FAILED" in finals[0], finals
+    stdin = [c for c in env.cli_log() if c["prog"] == "claude"][n]["stdin"]
+    assert "[The wake-up you asked for (one-off)]" in stdin and "job array of 4 tasks: 3 COMPLETED, 1 FAILED" in stdin
+
+
+async def test_a_job_wrongly_taken_as_ended_can_be_tracked_again(env):
+    await make_autopilot(env)
+    s = env.agent.general_session()
+    env.store.upsert_job(JobRecord(job_id="6200", name="sweep", state="UNKNOWN", ended_at=time.time(), ignored=1,
+                                   by_agent=1, session_id=s.id))
+    env.set_jobs(**{"6200_1": {"name": "sweep", "state": "RUNNING"}})
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, ["watch", "6200"])
+    assert ok, text
+    rec = env.store.get_job("6200")
+    assert not rec.ended_at and not rec.ignored and rec.state == "RUNNING"

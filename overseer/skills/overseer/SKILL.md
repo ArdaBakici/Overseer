@@ -28,6 +28,9 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
 - "Delete job X" from the researcher means `ov job delete X`. Cancel it with `scancel` only if they
   also want it stopped.
 - Ids are checked: jobs that SLURM doesn't know as the researcher's are refused.
+- Job arrays are one job to Overseer, under the id sbatch printed (`123`, not `123_4`). It's running while any
+  task is, and it ends when all tasks have ended. Its report gives the task states (e.g. "9 COMPLETED,
+  2 FAILED"); each task has its own log. Watching an array wakes you when all its tasks have ended.
 - `hpc-run`'s shared worker job (`overseer-worker`) is not one of your jobs. Don't register or watch
   it: `hpc-run` starts, reuses and ends it (`hpc-run --stop` ends it early).
 

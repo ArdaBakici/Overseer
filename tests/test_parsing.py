@@ -159,3 +159,15 @@ def test_quota_table():
     assert over(rows, 80) == []
     assert over(rows, 60) == ["/home: 31GB of 50GB (63%)", "/scratch: 301k of 500k files (60%)"]
     assert parse_quota("quota: command not found") == []
+
+
+def test_job_arrays_fold_into_one_job():
+    from overseer.slurm import Job, _task_count, array_parent, fold_arrays
+    assert array_parent("18771337_[2-11%4]") == "18771337" and array_parent("99") == "99"
+    assert _task_count("1_[2-11,15,20-21%4]") == 13 and _task_count("1_4") == 1
+    (a, b) = fold_arrays([Job("1_1", state="RUNNING", elapsed="5:00"), Job("1_[2-11]", state="PENDING"),
+                          Job("2", state="PENDING")])
+    assert (a.job_id, a.state, a.elapsed, a.extra["tasks"]) == ("1", "RUNNING", "5:00", "10 PENDING, 1 RUNNING")
+    assert b.job_id == "2" and not b.extra
+    (c,) = fold_arrays([Job("3_1", state="COMPLETED"), Job("3_2", state="TIMEOUT"), Job("3_3", state="OUT_OF_MEMORY")])
+    assert c.state == "OUT_OF_MEMORY" and c.extra["tasks"] == "1 COMPLETED, 1 TIMEOUT, 1 OUT_OF_MEMORY"

@@ -58,7 +58,7 @@ elif prog == "sacct" and "Submit" in (opt("-o") or ""):  # jobs submitted lately
 elif prog == "sacct":
     sel = opt("-j")
     for jid, j in jobs.items():
-        if sel and jid != sel:
+        if sel and jid != sel and jid.split("_")[0] != sel:  # like sacct: an array's id lists its tasks
             continue
         if "-X" in args:
             print("|".join([jid, j["name"], j["state"], j.get("exit", "0:0"), j.get("elapsed", "00:10:00"),
@@ -70,7 +70,7 @@ elif prog == "sacct":
 elif prog == "scontrol":
     if args[:2] == ["show", "job"]:
         jid = args[-1]
-        j = jobs.get(jid)
+        j = jobs.get(jid) or next((v for k, v in jobs.items() if k.split("_")[0] == jid), None)  # an array's tasks
         if not j:
             sys.exit(1)
         import getpass

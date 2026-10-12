@@ -10,6 +10,7 @@ import re
 import logging
 
 from .slurm import (
+    fold_arrays,
     SACCT_LIST_FORMAT,
     SACCT_STEP_FORMAT,
     SQUEUE_FORMAT,
@@ -88,7 +89,7 @@ class HPC:
     # ------------------------------------------------------------------ SLURM
     async def squeue(self) -> list[Job]:
         res = await self.run(self._slurm(["squeue", "-h", "-u", self.user, "-o", SQUEUE_FORMAT]), check=True)
-        return parse_squeue(res.stdout)
+        return fold_arrays(parse_squeue(res.stdout))  # an array's tasks are one job
 
     async def sacct_recent(self, minutes: int) -> list[Job]:
         res = await self.run(
@@ -96,7 +97,7 @@ class HPC:
                          "-o", SACCT_LIST_FORMAT]),
             check=True,
         )
-        return parse_sacct_list(res.stdout)
+        return fold_arrays(parse_sacct_list(res.stdout))
 
     async def quota(self, command: str) -> str:
         """The output of the cluster's quota command (e.g. myquota), or "" if it fails."""
@@ -128,7 +129,8 @@ class HPC:
 
     async def sacct_job(self, job_id: str) -> Job | None:
         res = await self.run(self._slurm(["sacct", "-X", "-n", "-P", "-j", job_id, "-o", SACCT_LIST_FORMAT]))
-        jobs = [j for j in parse_sacct_list(res.stdout) if j.job_id == job_id]
+        # (for an array's id, sacct lists its tasks: 123_1, 123_[2-9]; folded into one job 123)
+        jobs = [j for j in fold_arrays(parse_sacct_list(res.stdout)) if j.job_id == job_id]
         return jobs[0] if jobs else None
 
     async def sacct_steps(self, job_id: str) -> list[dict[str, str]]:

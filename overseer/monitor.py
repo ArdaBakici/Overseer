@@ -258,6 +258,8 @@ class Monitor:
                 timing += f" ({100 * elapsed // limit}%, {human_seconds(max(0, limit - elapsed))} left)"
             where = f"node {esc(job.reason)}" if state == "RUNNING" else f"waiting: {esc(job.reason)}"
             parts.append(f"{timing} · {where}")
+            if job.extra.get("tasks"):
+                parts.append(f"📦 job array: {esc(job.extra['tasks'])} (times and log: one running task)")
         metrics = extract_metrics(text)
         if metrics:
             parts.append("📈 " + " · ".join(f"{esc(k)} {esc(v)}" for k, v in metrics.items()))
@@ -348,8 +350,11 @@ class Monitor:
         tb = "" if success else extract_traceback(combined)
         metrics = extract_metrics(out_tail)
 
-        context = "\n".join([
+        tasks = final.extra.get("tasks")
+        context = "\n".join(x for x in [
             f"Job {rec.job_id} '{rec.name}' final state {final.state}, exit code {final.exit_code}",
+            (f"It is a job array of {final.extra.get('task_count')} tasks: {tasks}. The state, exit code and times are "
+             "those of its worst task; each task has its own log (the logs below may be one task's)") if tasks else "",
             f"Elapsed {final.elapsed} of limit {final.time_limit}; partition {final.partition}; nodes {final.nodelist}",
             f"Allocated TRES: {final.alloc_tres}",
             f"Step summary: {json.dumps(steps)}",
@@ -358,7 +363,7 @@ class Monitor:
             f"Batch script:\n{rec.batch_script[:6000]}" if rec.batch_script else "",
             f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-15000:]}",
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-10000:]}" if err_tail else "",
-        ])
+        ] if x)
         analysis = await self.reporter.final_analysis(context) if analyze else ""
         # For the agent (autopilot): the facts first, then the end of the logs; it can read the rest itself.
         for_agent = "\n".join(x for x in [
@@ -380,6 +385,8 @@ class Monitor:
             + (f" · peak RAM {esc(steps['max_rss'])}" if steps.get("max_rss") else "")
             + (f" (req {esc(steps['req_mem'])})" if steps.get("req_mem") else ""),
         ]
+        if tasks:
+            parts.append(f"📦 job array: {esc(tasks)}")
         if metrics:
             parts.append("last metrics: " + ", ".join(f"{esc(k)}={esc(v)}" for k, v in metrics.items()))
         if analysis:

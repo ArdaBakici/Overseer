@@ -36,7 +36,7 @@ from .config import Config
 from .notify import Outgoing, code, esc
 from .autopilot import WatchError, human_interval, parse_duration
 from .projects import ProjectError, Projects
-from .slurm import TERMINAL_STATES
+from .slurm import TERMINAL_STATES, array_parent
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -246,7 +246,7 @@ class ControlServer:
 
     async def job_add(self, session, args) -> str:
         out = []
-        for jid in args.ids:
+        for jid in dict.fromkeys(array_parent(x) for x in args.ids):  # a job array is tracked by its id
             try:
                 name, state, workdir = await self._verify(jid)
             except CtlError as e:
@@ -257,9 +257,13 @@ class ControlServer:
                            "watch it (hpc-run starts, reuses and ends it)")
                 continue
             rec = self.store.get_job(jid)
-            already = bool(rec and rec.by_agent and rec.session_id == session.id and not rec.ignored)
-            if rec and rec.ignored:
-                rec.ignored = 0
+            alive = bool(state) and state.split()[0] not in TERMINAL_STATES
+            already = bool(rec and rec.by_agent and rec.session_id == session.id and not rec.ignored
+                           and not (rec.ended_at and alive))
+            if rec and (rec.ignored or (rec.ended_at and alive)):  # deleted, or wrongly taken as ended: track again
+                rec.ignored, rec.missing_polls = 0, 0
+                if alive:
+                    rec.ended_at, rec.state = None, state.split()[0]
                 self.store.upsert_job(rec)
             if not already:
                 self.agent._record_job(session, jid)
@@ -413,15 +417,15 @@ class ControlServer:
     async def watch(self, session, args) -> str:
         ap = self._ap()
         every = self._duration(args.every, "--every") if args.every else 0.0
-        ids = list(dict.fromkeys(args.ids))
+        ids = list(dict.fromkeys(array_parent(x) for x in args.ids))  # a job array is watched by its id
         for jid in ids:
             rec = self.store.get_job(jid)
             if rec and rec.name == WORKER_NAME:
                 raise CtlError(f"job {jid} is hpc-run's shared compute worker, not one of your jobs: there's nothing "
                                "to watch")
-            if rec and rec.ended_at:
+            if rec and rec.ended_at and not rec.ignored and rec.state != "UNKNOWN":
                 raise CtlError(f"job {jid} has already ended ({rec.state}): look at it now (ov job show {jid})")
-            if not rec or rec.ignored:  # not tracked yet: it's one of the agent's jobs
+            if not rec or rec.ignored or rec.ended_at:  # not tracked (yet), or its end wasn't confirmed: ask SLURM
                 name, state, _ = await self._verify(jid)
                 if name == WORKER_NAME:
                     raise CtlError(f"job {jid} is hpc-run's shared compute worker, not one of your jobs: there's "

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 ACTIVE_STATES = {
     "PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "SUSPENDED", "REQUEUED",
@@ -77,6 +77,59 @@ def _split(line: str, n_fields: int, name_idx: int) -> list[str] | None:
         merged = "|".join(parts[name_idx: name_idx + extra + 1])
         parts = parts[:name_idx] + [merged] + parts[name_idx + extra + 1:]
     return parts
+
+
+# ============================================================================ job arrays
+
+def array_parent(job_id: str) -> str:
+    """'18771337_4' / '18771337_[2-11]' -> '18771337' (the id sbatch printed); other ids unchanged."""
+    return job_id.split("_", 1)[0]
+
+
+def _task_count(job_id: str) -> int:
+    """How many tasks an id stands for: '123_[2-11,15%4]' -> 11; '123_4' or '123' -> 1."""
+    m = re.search(r"_\[([^\]]*)\]", job_id)
+    if not m:
+        return 1
+    n = 0
+    for part in m.group(1).split("%")[0].split(","):
+        lo, _, hi = part.partition("-")
+        try:
+            n += int(hi) - int(lo) + 1 if hi else 1
+        except ValueError:
+            n += 1
+    return max(n, 1)
+
+
+# Which final state an array reports when its tasks ended differently (the worst one wins).
+_SEVERITY = ["OUT_OF_MEMORY", "FAILED", "NODE_FAIL", "BOOT_FAIL", "TIMEOUT", "DEADLINE", "PREEMPTED", "CANCELLED",
+             "REVOKED", "COMPLETED"]
+
+
+def fold_arrays(jobs: list[Job]) -> list[Job]:
+    """A job array's tasks as one job under the array's id (the one sbatch printed): active while any task is,
+    then the worst final state of its tasks. extra["tasks"] summarises them, e.g. "1 RUNNING, 10 PENDING"."""
+    groups: dict[str, list[Job]] = {}
+    for j in jobs:
+        groups.setdefault(array_parent(j.job_id), []).append(j)
+    out = []
+    for parent, tasks in groups.items():
+        if len(tasks) == 1 and tasks[0].job_id == parent:
+            out.append(tasks[0])
+            continue
+        counts: dict[str, int] = {}
+        for t in tasks:
+            counts[t.state] = counts.get(t.state, 0) + _task_count(t.job_id)
+        active = [t for t in tasks if not t.is_terminal]
+        if active:  # the running task (for elapsed time, node, check-ins), else a pending one
+            rep = next((t for t in active if t.state == "RUNNING"), active[0])
+        else:
+            rank = {s: i for i, s in enumerate(_SEVERITY)}
+            rep = min(tasks, key=lambda t: rank.get(t.state, len(_SEVERITY) - 1))
+        summary = ", ".join(f"{n} {s}" for s, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+        out.append(replace(rep, job_id=parent, extra={**rep.extra, "tasks": summary,
+                                                      "task_count": str(sum(counts.values()))}))
+    return out
 
 
 def parse_squeue(output: str) -> list[Job]:
