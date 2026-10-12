@@ -29,6 +29,7 @@ from .live import Progress, Transcript
 from .richtext import fold, fold_long, fold_text, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
+from .slurm import array_parent
 from .ssh import SSHError
 from .sshlink import ensure_master
 from .store import JobRecord, SessionRecord, Store
@@ -823,6 +824,7 @@ class Agent:
         buffer: list[str] = []  # live mode: commands not yet sent
 
         def on_job(job_id: str, command: str) -> None:
+            job_id = array_parent(job_id)
             known = self.store.get_job(job_id)
             if known and known.by_agent and known.session_id == s.id and not known.ignored:
                 return  # already registered (ov job add) and announced
@@ -915,6 +917,7 @@ class Agent:
             activity.on_job(jid, command)
 
     def _record_job(self, s: Session, job_id: str) -> None:
+        job_id = array_parent(job_id)  # a job array is tracked under the id sbatch printed
         rec = self.store.get_job(job_id) or JobRecord(job_id=job_id, state="PENDING", first_seen=time.time(),
                                                       last_status_at=time.time())
         rec.by_agent = 1

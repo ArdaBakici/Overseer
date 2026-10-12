@@ -2214,6 +2214,26 @@ async def test_job_arrays_are_one_job(env):
     assert "[Wake-up you set up]" in stdin and "job array of 4 tasks: 3 COMPLETED, 1 FAILED" in stdin
 
 
+async def test_old_records_of_array_tasks_become_the_array(env):
+    """Records of single tasks (6300_2), stored before arrays were tracked as one job, never show up in squeue
+    again: they become the array's record, silently, instead of "left the queue" for each task."""
+    await make_autopilot(env)
+    s = env.agent.general_session()
+    for i in (2, 3):
+        env.store.upsert_job(JobRecord(job_id=f"6300_{i}", name="mepka_ft", state="RUNNING", first_seen=time.time(),
+                                       by_agent=1, session_id=s.id))
+    env.store.add_watch(WatchRecord(session_id=s.id, kind="jobs", jobs="6300_2 6300_3"))
+    env.set_jobs(**{"6300_2": {"name": "mepka_ft", "state": "RUNNING"},
+                    "6300_3": {"name": "mepka_ft", "state": "RUNNING"}})
+    for _ in range(12):
+        await env.monitor.poll()
+    assert not any("left the queue" in m.text for m in env.notifier.sent)
+    assert not [j for j in env.store.active_jobs() if "_" in j.job_id]
+    rec = env.store.get_job("6300")
+    assert rec and rec.state == "RUNNING" and rec.by_agent and rec.session_id == s.id and not rec.ended_at, rec
+    assert [w.jobs for w in env.store.watches(s.id)] == ["6300"]
+
+
 async def test_a_job_wrongly_taken_as_ended_can_be_tracked_again(env):
     await make_autopilot(env)
     s = env.agent.general_session()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import fnmatch
 import json
 import logging
@@ -17,8 +18,8 @@ from .metrics import lines as metric_lines
 from .notify import Notifier, Outgoing, code, esc
 from .quota import parse_quota
 from .richtext import fold_text
-from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, format_gpu_stats, gpus_from_tres, human_seconds,
-                    slurm_seconds, summarize_steps)
+from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
+                    human_seconds, slurm_seconds, summarize_steps)
 from .ssh import SSHError
 from .store import JobRecord, Store
 
@@ -104,6 +105,7 @@ class Monitor:
 
     async def poll(self, first: bool = False) -> None:
         await self.hpc.ensure_connected()
+        self._merge_array_tasks()
         live = await self.hpc.squeue()
         live_by_id = {j.job_id: j for j in live}
         self.worker = None
@@ -188,6 +190,24 @@ class Monitor:
                 if job.is_terminal and self.store.get_job(job.job_id) is None and not self._ignored(job, None):
                     rec = await self._register(job)
                     await self._on_finished(rec, job)
+
+    def _merge_array_tasks(self) -> None:
+        """Records of single array tasks (123_4), from before arrays were tracked as one job: squeue and sacct
+        now only show the array (123), so they would never be seen again. Each becomes its array's record,
+        and watches on a task watch the array instead."""
+        now = time.time()
+        for rec in self.store.active_jobs():
+            if "_" not in rec.job_id:
+                continue
+            parent = array_parent(rec.job_id)
+            if self.store.get_job(parent) is None:
+                self.store.upsert_job(dataclasses.replace(rec, job_id=parent, missing_polls=0, state="PENDING"))
+            rec.ended_at, rec.ignored = now, 1  # silently: the array's record reports on it
+            self.store.upsert_job(rec)
+            for w in self.store.job_watches(rec.job_id):
+                w.jobs = " ".join(dict.fromkeys(array_parent(j) for j in w.job_ids))
+                self.store.update_watch(w)
+            log.info("job %s is a task of array %s: tracked as the array", rec.job_id, parent)
 
     async def _register(self, job: Job) -> JobRecord:
         rec = JobRecord(job_id=job.job_id, state=job.state, first_seen=time.time(), last_status_at=time.time())

@@ -130,7 +130,8 @@ class HPC:
     async def sacct_job(self, job_id: str) -> Job | None:
         res = await self.run(self._slurm(["sacct", "-X", "-n", "-P", "-j", job_id, "-o", SACCT_LIST_FORMAT]))
         # (for an array's id, sacct lists its tasks: 123_1, 123_[2-9]; folded into one job 123)
-        jobs = [j for j in fold_arrays(parse_sacct_list(res.stdout)) if j.job_id == job_id]
+        rows = parse_sacct_list(res.stdout)
+        jobs = [j for j in fold_arrays(rows) if j.job_id == job_id] or [j for j in rows if j.job_id == job_id]
         return jobs[0] if jobs else None
 
     async def sacct_steps(self, job_id: str) -> list[dict[str, str]]:
