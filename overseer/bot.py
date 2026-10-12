@@ -13,7 +13,8 @@ import re
 import secrets
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Message, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Message, ReplyParameters,
+                      Update)
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, EndPointNotFound
 from telegram.ext import (
@@ -119,7 +120,13 @@ class TelegramNotifier:
 
     def _target(self, msg: Outgoing, chat_id: int) -> tuple[int | None, str, bool]:
         """(thread, label, is the conversation's own thread): a conversation's thread first, then
-        its project's topic, then the main chat (labelled with the project if there is one)."""
+        its project's topic, then the main chat (labelled with the project if there is one).
+        Job news (msg.jobs) goes to the jobs topic of the job's project instead."""
+        if msg.jobs:
+            proj = self.project_of(msg)
+            if self.topics:
+                return self.jobs_thread(chat_id, proj.name if proj else None), "", False
+            return None, (f"📁 <b>{esc(proj.name)}</b> · " if proj else ""), False
         if self.topics and not msg.project:
             sess, _ = self._conversation(msg)
             thread = self.store.session_thread(sess.id, chat_id) if sess else None
@@ -175,6 +182,97 @@ class TelegramNotifier:
                 log.exception("telegram send failed (attempt %d)", attempt + 1)
                 await asyncio.sleep(2 * (attempt + 1))
 
+    # ------------------------------------------------------------------ jobs topics and live job cards
+    def jobs_thread(self, chat_id: int, project: str | None) -> int | None:
+        """The topic for job cards and reports: one per project ("📊 dreamer · jobs") and one for the rest."""
+        v = self.store.get(f"jobs_topic:{chat_id}:{project or ''}")
+        return int(v) if v else None
+
+    async def ensure_jobs_topics(self, projects: list[str]) -> None:
+        if not self.topics:
+            return
+        for chat_id in self.chat_ids:
+            for project in [None, *projects]:
+                if not self.jobs_thread(chat_id, project):
+                    await self._create_jobs_topic(chat_id, project)
+
+    async def _create_jobs_topic(self, chat_id: int, project: str | None) -> int | None:
+        name = f"📊 {project} · jobs" if project else "📊 jobs"
+        try:
+            topic = await self.app.bot.create_forum_topic(chat_id, name=name[:128])
+        except Exception:
+            log.warning("could not create the jobs topic %r", name, exc_info=True)
+            return None
+        self.store.set(f"jobs_topic:{chat_id}:{project or ''}", str(topic.message_thread_id))
+        intro = (f"📊 <b>{esc(project)} · jobs</b> - a live card per job of this project, updated in place, and a "
+                 "short report when it ends." if project else
+                 "📊 <b>jobs</b> - a live card per job outside every project, updated in place, and a short report "
+                 "when it ends.")
+        try:
+            await self.app.bot.send_message(chat_id, intro, parse_mode=ParseMode.HTML,
+                                            message_thread_id=topic.message_thread_id, disable_notification=True)
+        except Exception:
+            log.debug("jobs topic intro failed", exc_info=True)
+        return topic.message_thread_id
+
+    async def _jobs_topic_for(self, msg: Outgoing, chat_id: int) -> None:
+        if msg.jobs and self.topics:
+            proj = self.project_of(msg)
+            if not self.jobs_thread(chat_id, proj.name if proj else None):
+                await self._create_jobs_topic(chat_id, proj.name if proj else None)
+
+    async def card(self, job_id: str, text: str, buttons: list[list[tuple[str, str]]]) -> None:
+        """Show a job's live card: edit it where it is, or post it (in the jobs topic) if there's none yet or it's
+        gone. Always silent. Never raises."""
+        if not self.store.get_job(job_id):
+            return
+        refs = self.store.card_refs(job_id)
+        msg = Outgoing(text, job_id=job_id, buttons=buttons, silent=True, jobs=True)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                       for row in buttons]) if buttons else None
+        changed = False
+        for chat_id in self.chat_ids:
+            mid = refs.get(str(chat_id))
+            if mid:
+                try:
+                    await self.app.bot.edit_message_text(text, chat_id=chat_id, message_id=mid,
+                                                         parse_mode=ParseMode.HTML, reply_markup=markup)
+                    continue
+                except BadRequest as e:
+                    if "not modified" in str(e).lower():
+                        continue
+                    log.info("job %s: its card can't be edited (%s); posting a new one", job_id, e)
+                except Exception:
+                    log.warning("job %s: card update failed", job_id, exc_info=True)
+                    continue
+            try:
+                new = await self._post_card(chat_id, msg, markup)
+            except Exception:
+                log.warning("job %s: could not post its card", job_id, exc_info=True)
+                continue
+            if new:
+                refs[str(chat_id)] = new
+                changed = True
+        if changed:
+            self.store.set_card_refs(job_id, refs)
+
+    async def _post_card(self, chat_id: int, msg: Outgoing, markup) -> int | None:
+        await self._jobs_topic_for(msg, chat_id)
+        thread, label, _ = self._target(msg, chat_id)
+        for attempt in range(2):
+            try:
+                sent = await self.app.bot.send_message(chat_id, label + msg.text, parse_mode=ParseMode.HTML,
+                                                       message_thread_id=thread, disable_notification=True,
+                                                       reply_markup=markup)
+                self.store.link_message(chat_id, sent.message_id, msg.job_id, None)
+                return sent.message_id
+            except BadRequest as e:
+                if not (thread and _thread_error(e)) or attempt:
+                    raise
+                proj = self.project_of(msg)  # the jobs topic was deleted: make a new one
+                thread = await self._create_jobs_topic(chat_id, proj.name if proj else None)
+        return None
+
     def general_thread(self, chat_id: int) -> int | None:
         """The "general" topic: everything that belongs to no project."""
         v = self.store.get(f"general_topic:{chat_id}")
@@ -215,6 +313,7 @@ class TelegramNotifier:
     async def _send(self, msg: Outgoing) -> None:
         proj = self.project_of(msg)
         for chat_id in self.chat_ids:
+            await self._jobs_topic_for(msg, chat_id)
             thread, label, own = self._target(msg, chat_id)
             try:
                 await self._deliver_any(chat_id, thread, label, msg)
@@ -233,11 +332,14 @@ class TelegramNotifier:
                             raise
                 # The topic was deleted (or Telegram lost it): make a new one - at most once an hour, so an
                 # outage on Telegram's side can't spawn a topic per message - else use the main chat.
-                key = proj.name if proj else "\0general"
+                key = ("\0jobs:" if msg.jobs else "") + (proj.name if proj else "\0general")
                 log.warning("topic %s unavailable (%s)", proj.name if proj else "general", e)
                 if time.time() - self._recreated.get(key, 0) > 3600:
                     self._recreated[key] = time.time()
-                    new = await (self._create_topic(proj, chat_id) if proj else self._create_general(chat_id))
+                    if msg.jobs:
+                        new = await self._create_jobs_topic(chat_id, proj.name if proj else None)
+                    else:
+                        new = await (self._create_topic(proj, chat_id) if proj else self._create_general(chat_id))
                     proj = (self.store.get_project(proj.name) or proj) if proj else None
                     if new:
                         try:
@@ -284,6 +386,8 @@ class TelegramNotifier:
         if media:
             rich["media"] = media
         kwargs: dict = {"chat_id": chat_id, "rich_message": rich, "disable_notification": msg.silent, **uploads}
+        if msg.reply_to.get(str(chat_id)):
+            kwargs["reply_parameters"] = {"message_id": msg.reply_to[str(chat_id)], "allow_sending_without_reply": True}
         if thread:
             kwargs["message_thread_id"] = thread
         if msg.buttons:
@@ -297,9 +401,12 @@ class TelegramNotifier:
         if msg.buttons:
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in msg.buttons])
         chunks = split_message(text)
+        reply = msg.reply_to.get(str(chat_id))
         for i, chunk in enumerate(chunks):
             last = i == len(chunks) - 1
             kw = dict(disable_notification=msg.silent, reply_markup=markup if last else None, message_thread_id=thread)
+            if reply and i == 0:  # e.g. a job's final report, under its card
+                kw["reply_parameters"] = ReplyParameters(message_id=reply, allow_sending_without_reply=True)
             try:
                 sent = await self.app.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML,
                                                        link_preview_options=None, **kw)
@@ -901,6 +1008,8 @@ class Bot:
             self.store.upsert_project(p)
         if hasattr(self.notifier, "ensure_topic"):
             await self.notifier.ensure_topic(p.name)
+            if hasattr(self.notifier, "ensure_jobs_topics"):
+                await self.notifier.ensure_jobs_topics([p.name])
         verb = "restored" if existing else "created"
         settings = self._agents_summary(p.name)
         where = "this topic" if thread else ("its topic" if self.store.get_project(p.name).thread_map else "the main chat")
@@ -1026,8 +1135,12 @@ class Bot:
                 await self._start_fix(chat.id, arg)
             elif action == "log":
                 await self._send_log(arg, 200)
-            elif action == "status":
-                await self._send_status(arg)
+            elif action == "status":  # on a job's card: refresh it in place
+                rec = self.store.get_job(arg)
+                if rec and not rec.ended_at:
+                    await self.monitor.refresh_card_by_id(arg)
+                else:
+                    await self._send_status(arg)
             elif action == "thread":
                 thread = getattr(q.message, "message_thread_id", None) if q.message else None
                 text = self._pending.pop((chat.id, thread), "")
@@ -1047,9 +1160,13 @@ class Bot:
             elif action == "ap":  # an approval card from before wake-ups needed no approval
                 await self._edit(q, "This approval card is no longer used: the agent sets up its wake-ups itself now "
                                     "(/auto lists them).")
-            elif action == "uw":  # ✖ on a one-off wake-up
+            elif action == "uw":  # ✖ on a wake-up's notice, or on a job's card (its watch)
                 w = self.agent.autopilot.cancel_watch(int(arg)) if self.agent.autopilot and arg.isdigit() else None
-                await self._edit(q, "✖ Cancelled: the agent won't be woken for this." if w else
-                                 "This wake-up has already happened or was cancelled.")
+                if w and w.kind == "jobs":  # the button is on the job's card: update the card
+                    for jid in w.job_ids:
+                        await self.monitor.refresh_card_by_id(jid)
+                else:
+                    await self._edit(q, "✖ Cancelled: the agent won't be woken for this." if w else
+                                     "This wake-up has already happened or was cancelled.")
         except SSHError as e:
             await self.notifier.send(Outgoing(f"⚠️ {esc(e)}"))

@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS watches (
     state TEXT DEFAULT 'active',
     created REAL, fired REAL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS metric_specs (
+    scope TEXT, key TEXT,
+    critical TEXT DEFAULT '', important TEXT DEFAULT '', progress TEXT DEFAULT '',
+    command TEXT DEFAULT '', alerts TEXT DEFAULT '[]',
+    session_id TEXT, updated REAL,
+    PRIMARY KEY (scope, key)
+);
 CREATE TABLE IF NOT EXISTS usage (
     ts REAL, day TEXT,
     session_id TEXT, project TEXT,
@@ -181,6 +188,20 @@ class AutopilotRecord:
     updated: float = 0.0
     hours: float = 0.0  # how long the approval lasts
     expires: float = 0.0  # when it ends (set when it starts)
+
+
+@dataclass
+class MetricSpec:
+    """What matters in a job, as the agent said (`ov metrics set`): for one job, a job-name pattern, or a project."""
+    scope: str  # job | pattern | project
+    key: str  # job id, glob on the job name, or project name
+    critical: str = ""  # "metric=label,metric" - the card's first line
+    important: str = ""  # its second line
+    progress: str = ""  # "step/5000000": progress as that metric out of a total
+    command: str = ""  # a quick command on the HPC that prints name=value lines or a JSON object
+    alerts: str = "[]"  # JSON list of {"when": "score < 1 after 2h", "wake": bool}
+    session_id: str | None = None  # the conversation that set it (woken by `wake` alerts)
+    updated: float = 0.0
 
 
 @dataclass
@@ -357,6 +378,40 @@ class Store:
 
     def job_watches(self, job_id: str) -> list[WatchRecord]:
         return [w for w in self.watches() if w.kind == "jobs" and job_id in w.job_ids]
+
+    # ---------------------------------------------------------------- a job's live card in Telegram
+    # (kept apart from JobRecord, which callers hold and save while the card is being posted)
+    def card_refs(self, job_id: str) -> dict[str, int]:
+        try:
+            return {str(k): int(v) for k, v in json.loads(self.get(f"card:{job_id}") or "{}").items()}
+        except (ValueError, TypeError):
+            return {}
+
+    def set_card_refs(self, job_id: str, refs: dict[str, int]) -> None:
+        self.set(f"card:{job_id}", json.dumps(refs))
+
+    # ---------------------------------------------------------------- what the agent said matters in a job
+    def get_metric_spec(self, scope: str, key: str) -> MetricSpec | None:
+        row = self.db.execute("SELECT * FROM metric_specs WHERE scope=? AND key=?", (scope, key)).fetchone()
+        return _row(MetricSpec, row) if row else None
+
+    def set_metric_spec(self, spec: MetricSpec) -> None:
+        spec.updated = time.time()
+        d = spec.__dict__
+        self.db.execute(f"INSERT OR REPLACE INTO metric_specs ({','.join(d)}) VALUES ({','.join('?' * len(d))})",
+                        tuple(d.values()))
+        self.db.commit()
+
+    def delete_metric_spec(self, scope: str, key: str) -> bool:
+        cur = self.db.execute("DELETE FROM metric_specs WHERE scope=? AND key=?", (scope, key))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    def metric_specs(self, scope: str | None = None) -> list[MetricSpec]:
+        q, args = "SELECT * FROM metric_specs", []
+        if scope:
+            q, args = q + " WHERE scope=?", [scope]
+        return [_row(MetricSpec, r) for r in self.db.execute(q + " ORDER BY updated DESC", args).fetchall()]
 
     # ---------------------------------------------------------------- token usage
     def add_usage(self, *, session_id: str, project: str | None, backend: str, model: str | None, origin: str,

@@ -24,7 +24,7 @@ ssh:
 
 slurm:
   poll_interval: 60             # seconds
-  status_interval_minutes: 60   # periodic progress message for running jobs (0 = off)
+  status_interval_minutes: 10   # how often a running job's live card is refreshed (silently) and alerts checked
   track: all                    # "all" of your jobs, or only the ones the agent submitted ("agent")
   notify_queued: true
   log_tail_lines: 12            # lines of the (training) log shown in status messages

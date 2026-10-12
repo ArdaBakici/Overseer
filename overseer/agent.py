@@ -26,7 +26,7 @@ from .autopilot import human_interval
 from .ctl import TOKEN_ENV
 from .quota import Quota, limits_line, over
 from .live import Progress, Transcript
-from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
+from .richtext import fold, fold_long, fold_text, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
 from .ssh import SSHError
@@ -88,6 +88,13 @@ Overseer tracks jobs, reports on them to the researcher, and wakes you up. The l
 directly and answers at once. The `overseer` skill has the full reference (or run `ov help`). The essentials:
 - After every job you submit, whichever way (sbatch, a script, a CLI, an array): `ov job add <id>`. Overseer \
 checks the id with SLURM and reports on the job to the researcher.
+- Each job has a live card in Telegram. Say what matters in it: `ov metrics set <job id | --pattern '<name glob>' | \
+--project> --critical "<metric=label>" --important "<metric=label,...>" [--progress step/<total>]` - the 1-2 \
+numbers that tell whether the run works go in --critical. If the log doesn't show them, add `--command` (a quick \
+command printing name=value lines or a JSON object, e.g. reading the last line of a metrics.jsonl). Add alerts \
+for what would make a run worth stopping: `--alert "<metric> < 1 after 2h"` pings the researcher, `--wake-on \
+"loss is nan"` / `"step stalled 30m"` also wakes you. Set it once per kind of experiment (a pattern or the \
+project default covers repeats) and check it with `ov metrics show <job id>`.
 - When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
 (`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
 
@@ -821,7 +828,8 @@ class Agent:
                 return  # already registered (ov job add) and announced
             self._record_job(s, job_id)
             asyncio.get_running_loop().create_task(self.notifier.send(Outgoing(
-                f"🚀 <b>Agent submitted job {esc(job_id)}</b>\n{pre(command, 600)}", job_id=job_id, session_id=s.id)))
+                f"🚀 Agent submitted job {esc(job_id)} → its card is in the jobs topic" + fold_text(command, 600),
+                job_id=job_id, session_id=s.id, silent=True)))
 
         activity.on_job = on_job
         live = None

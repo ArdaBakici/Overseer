@@ -12,7 +12,9 @@ from .compute import WORKER_NAME
 from .config import Config
 from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, find_log_paths, tqdm_cleanup
 from .hpc import HPC
-from .notify import Notifier, Outgoing, code, esc, pre
+from .metrics import check_alerts, fired_alerts, resolve, run_command
+from .metrics import lines as metric_lines
+from .notify import Notifier, Outgoing, code, esc
 from .quota import parse_quota
 from .richtext import fold_text
 from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, format_gpu_stats, gpus_from_tres, human_seconds,
@@ -121,25 +123,28 @@ class Monitor:
                 rec = await self._register(job)
                 if first:
                     adopted.append(rec)
-                elif job.state == "RUNNING":
-                    await self._on_started(rec, job)
-                elif self.cfg.slurm.notify_queued:
-                    await self._on_queued(rec, job)
+                if job.state == "RUNNING" or self.cfg.slurm.notify_queued:
+                    rec.last_status_at = time.time()
+                    self.store.upsert_job(rec)
+                    await self.refresh_card(rec, job)
                 continue
             if not rec.stdout:  # submitted by the agent: fill in details on first sight
                 await self._fill(rec, job)
             prev = rec.state
             rec.state = job.state
             rec.missing_polls = 0
-            if prev != "RUNNING" and job.state == "RUNNING":
-                await self._on_started(rec, job)
+            if prev != "RUNNING" and job.state == "RUNNING":  # started: its card says so
+                rec.last_status_at = time.time()
+                self.store.upsert_job(rec)
+                await self.refresh_card(rec, job)
             elif job.state == "RUNNING":
                 await self._maybe_status(rec, job)
             self.store.upsert_job(rec)
 
         if adopted:
-            lines = [f"{STATE_EMOJI.get(r.state, '•')} {code(r.job_id)} {esc(r.name)} — {esc(r.state)}" for r in adopted]
-            await self.notifier.send(Outgoing("👀 <b>Overseer online.</b> Tracking:\n" + "\n".join(lines), silent=True))
+            await self.notifier.send(Outgoing(
+                f"👀 <b>Overseer online</b>: tracking {len(adopted)} job(s) - {', '.join(r.job_id for r in adopted[:8])}"
+                + (" …" if len(adopted) > 8 else "") + ". Their cards are in the jobs topics.", silent=True))
 
         # Jobs we know about that left the queue.
         for rec in self.store.active_jobs():
@@ -217,55 +222,125 @@ class Monitor:
         origin = " (submitted by the agent)" if rec.by_agent else ""
         return f"{emoji} <b>Job {esc(rec.job_id)}</b> {esc(rec.name)} {verb}{origin}"
 
-    async def _on_queued(self, rec: JobRecord, job: Job) -> None:
-        gres = f" · {esc(job.gres)}" if job.gres and job.gres != "N/A" else ""
-        await self.notifier.send(Outgoing(
-            f"{self._header(rec, '📥', 'queued')}\npartition {esc(job.partition)} · limit {esc(job.time_limit)}{gres}\nreason: {esc(job.reason)}",
-            job_id=rec.job_id, silent=True, buttons=self._assign_buttons(rec)))
-
-    async def _on_started(self, rec: JobRecord, job: Job) -> None:
-        rec.state = "RUNNING"
-        rec.last_status_at = time.time()
+    # ------------------------------------------------------------------ the live job card
+    async def _view(self, rec: JobRecord) -> dict:
+        """What a card or report needs: the (training) log's tail, the metrics found in it, the agent's metric
+        spec and the values of its command."""
+        log_path = await progress_log(self.hpc, rec)
         self.store.upsert_job(rec)
-        gres = f" · {esc(job.gres)}" if job.gres and job.gres != "N/A" else ""
-        text = (f"{self._header(rec, '🚀', 'started')}\nnode(s) {esc(job.reason)} · partition {esc(job.partition)} · "
-                f"limit {esc(job.time_limit)}{gres}\nlog: {code(rec.stdout)}")
-        await self.notifier.send(Outgoing(text, job_id=rec.job_id,
-                                          buttons=[[("📜 Log", f"log:{rec.job_id}"), ("📊 Status", f"status:{rec.job_id}"),
-                                                    ("📈 Plot", f"plot:{rec.job_id}")]] + self._assign_buttons(rec)))
+        source = log_path or rec.stdout
+        text = tqdm_cleanup(await self.hpc.try_tail(source, 200)) if source else ""
+        auto = extract_metrics(text)
+        spec = resolve(self.store, rec)
+        values, err = (await run_command(self.hpc, rec, spec.command)) if spec and spec.command else ({}, "")
+        return {"text": text, "log_path": log_path, "auto": auto, "spec": spec, "values": {**auto, **values},
+                "err": err}
+
+    def _card_text(self, rec: JobRecord, job: Job | None, view: dict, final: Job | None = None) -> str:
+        state = final.state if final else (job.state if job else rec.state)
+        head = f"{STATE_EMOJI.get(state, '•')} <b>{esc(rec.job_id)}</b> {esc(rec.name)}"
+        if final:
+            success = final.state in SUCCESS_STATES and final.exit_code.startswith("0")
+            head += f" · {'finished' if success else esc(final.state) + ' after'} {esc(final.elapsed)}"
+        elif job and state == "RUNNING":
+            head += f" · {esc(job.reason)}"
+        elif job:
+            head += f" · ⏳ {esc(state.lower())}: {esc(job.reason)}"
+        lines = [head]
+        critical, important, progress = metric_lines(view["spec"], view["values"], view["auto"])
+        if job and not final and state == "RUNNING":
+            elapsed, limit = slurm_seconds(job.elapsed), slurm_seconds(job.time_limit)
+            timing = f"⏱ {esc(job.elapsed)} / {esc(job.time_limit)}"
+            if elapsed is not None and limit:
+                timing += f" ({100 * elapsed // limit}%, {human_seconds(max(0, limit - elapsed))} left)"
+            lines.append(timing + (f" · {esc(progress)}" if progress else ""))
+        if critical:
+            lines.append(f"🎯 <b>{esc(critical)}</b>")
+        if important:
+            lines.append(f"📈 {esc(important)}")
+        tasks = (final or job).extra.get("tasks") if (final or job) else None
+        if tasks:
+            lines.append(f"📦 array: {esc(tasks)}")
+        if not final:
+            watches = self.store.job_watches(rec.job_id)
+            if watches:
+                every = min((w.every for w in watches if w.every), default=0)
+                lines.append("⏰ agent watching" + (f" (check-ins every {human_seconds(int(every))})" if every else ""))
+            if view["err"]:
+                lines.append(f"⚠️ metrics command: {esc(view['err'][:160])}")
+        for a in fired_alerts(self.store, rec)[:3]:
+            lines.append(f"🚨 {esc(a)}")
+        return "\n".join(lines)
+
+    def _card_buttons(self, rec: JobRecord, ended: bool = False) -> list[list[tuple[str, str]]]:
+        row = [("📜 Log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]
+        if not ended:
+            row.insert(0, ("📊 Status", f"status:{rec.job_id}"))
+            watches = self.store.job_watches(rec.job_id)
+            if watches:
+                row.append(("✖ watch", f"uw:{watches[0].id}"))
+        return [row] + self._assign_buttons(rec)
+
+    async def refresh_card(self, rec: JobRecord, job: Job | None = None) -> None:
+        """Update the job's live card (in its jobs topic, silently), and act on the agent's alerts."""
+        try:
+            view = await self._view(rec)
+        except (SSHError, OSError) as e:
+            log.warning("job %s: could not read its logs for the card (%s)", rec.job_id, e)
+            view = {"text": "", "log_path": "", "auto": {}, "spec": resolve(self.store, rec), "values": {}, "err": ""}
+        if job and job.state == "RUNNING":
+            await self._check_alerts(rec, job, view)
+        text = self._card_text(rec, job, view)
+        if self.cfg.slurm.gpu_stats and job and job.state == "RUNNING":
+            stats = await self.hpc.gpu_stats(rec.job_id)
+            text += "".join(f"\n🎮 {esc(g)}" for g in format_gpu_stats(stats))
+        await self._show_card(rec, text, self._card_buttons(rec))
+
+    async def refresh_card_by_id(self, job_id: str) -> None:
+        """After something outside the poll changed what the card shows (a watch was set or cancelled)."""
+        rec = self.store.get_job(job_id)
+        if not rec or rec.ignored:
+            return
+        if rec.ended_at:
+            return  # an ended job's card is final
+        try:
+            live = {j.job_id: j for j in await self.hpc.squeue()}
+        except (SSHError, OSError):
+            live = {}
+        await self.refresh_card(rec, live.get(job_id))
+
+    async def _show_card(self, rec: JobRecord, text: str, buttons: list[list[tuple[str, str]]]) -> None:
+        if hasattr(self.notifier, "card"):
+            await self.notifier.card(rec.job_id, text, buttons)
+        else:  # a notifier without cards: a (silent) message each time
+            await self.notifier.send(Outgoing(text, job_id=rec.job_id, buttons=buttons, silent=True, jobs=True))
+
+    async def _check_alerts(self, rec: JobRecord, job: Job, view: dict) -> None:
+        fired = check_alerts(self.store, rec, view["spec"], view["values"], slurm_seconds(job.elapsed))
+        for alert, value in fired:
+            await self.notifier.send(Outgoing(
+                f"🚨 <b>{esc(rec.job_id)}</b> {esc(rec.name)}: {code(alert.text)} (now {esc(value)})"
+                + (" - waking the agent" if alert.wake else ""),
+                job_id=rec.job_id, jobs=True, reply_to=self.store.card_refs(rec.job_id)))
+            if alert.wake and self.autopilot:
+                session = (view["spec"].session_id if view["spec"] else None) or rec.session_id
+                if session:
+                    await self.autopilot.alert_wake(session, rec, alert.text, value)
 
     async def _maybe_status(self, rec: JobRecord, job: Job) -> None:
         interval = self.cfg.slurm.status_interval_minutes * 60
         if interval <= 0 or time.time() - rec.last_status_at < interval:
             return
         rec.last_status_at = time.time()
-        await self.notifier.send(await self.status_message(rec, job))
+        await self.refresh_card(rec, job)
 
     async def status_message(self, rec: JobRecord, job: Job | None = None, gpu: bool | None = None) -> Outgoing:
-        """Where the job stands: time used/left, metrics, GPU use, and the last few lines of its
-        (training) log. `gpu`: query nvidia-smi on the node (default: slurm.gpu_stats)."""
-        log_path = await progress_log(self.hpc, rec)
-        self.store.upsert_job(rec)
-        source = log_path or rec.stdout
-        text = tqdm_cleanup(await self.hpc.try_tail(source, max(200, self.cfg.slurm.log_tail_lines)))
-        shown = "\n".join(text.rstrip("\n").split("\n")[-self.cfg.slurm.log_tail_lines:])
+        """On request (/job): the card's content plus the last lines of the (training) log. `gpu`: query
+        nvidia-smi on the node (default: slurm.gpu_stats)."""
+        view = await self._view(rec)
+        text = view["text"]
         state = job.state if job else rec.state
-        parts = [f"📊 <b>Job {esc(rec.job_id)}</b> {esc(rec.name)} — {esc(state)}"]
-        if job:
-            elapsed, limit = slurm_seconds(job.elapsed), slurm_seconds(job.time_limit)
-            timing = f"⏱ {esc(job.elapsed)} of {esc(job.time_limit)}"
-            if elapsed is not None and limit:
-                timing += f" ({100 * elapsed // limit}%, {human_seconds(max(0, limit - elapsed))} left)"
-            where = f"node {esc(job.reason)}" if state == "RUNNING" else f"waiting: {esc(job.reason)}"
-            parts.append(f"{timing} · {where}")
-            if job.extra.get("tasks"):
-                parts.append(f"📦 job array: {esc(job.extra['tasks'])} (times and log: one running task)")
-        metrics = extract_metrics(text)
-        if metrics:
-            parts.append("📈 " + " · ".join(f"{esc(k)} {esc(v)}" for k, v in metrics.items()))
-        line = await self.reporter.status_line(text)
-        if line:
-            parts.append(f"🧠 {esc(line)}")
+        parts = [self._card_text(rec, job, view)]
         if (self.cfg.slurm.gpu_stats if gpu is None else gpu) and state == "RUNNING":
             stats = await self.hpc.gpu_stats(rec.job_id)
             parts += [f"🎮 {esc(g)}" for g in format_gpu_stats(stats)] if stats else ["🎮 (GPU usage unavailable)"]
@@ -273,9 +348,10 @@ class Monitor:
             err = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 60))
             for f in find_issues(err)[:3]:  # only real problems; warnings are noise here
                 parts.append(f"⚠️ stderr: <b>{esc(f.category)}</b> {code(f.evidence[:200])}")
-        label = code(log_path.rsplit("/", 1)[-1]) if log_path else "stdout"
+        shown = "\n".join(text.rstrip("\n").split("\n")[-self.cfg.slurm.log_tail_lines:])
+        label = code(view["log_path"].rsplit("/", 1)[-1]) if view["log_path"] else "stdout"
         if shown.strip():
-            parts.append(f"📄 {label}, last lines:" + pre(shown, 1500))
+            parts.append(f"📄 {label}, last lines:" + fold_text(shown, 1500))
         return Outgoing("\n".join(p for p in parts if p), job_id=rec.job_id, silent=True,
                         buttons=[[("📈 Plot", f"plot:{rec.job_id}"), ("📜 Log", f"log:{rec.job_id}")]])
 
@@ -317,14 +393,25 @@ class Monitor:
         self.store.upsert_job(rec)  # mark ended first so a crash below can't cause duplicate reports
         # A watched job is analysed by the agent itself right after: skip the one-shot LLM summary.
         analyze = not (self.autopilot and self.autopilot.handles(rec))
+        watched_here = bool(rec.session_id) and any(w.session_id == rec.session_id
+                                                    for w in self.store.job_watches(rec.job_id))
         try:
-            msg, context = await self.final_report(rec, final, analyze=analyze)
+            msg, context, card = await self.final_report(rec, final, analyze=analyze)
         except (SSHError, OSError) as e:
-            msg = Outgoing(f"{self._header(rec, STATE_EMOJI.get(final.state, '🏁'), final.state)}\n"
-                           f"(could not build full report: {esc(e)})", job_id=rec.job_id)
+            msg = Outgoing(f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} "
+                           f"{esc(final.state)} (could not build the full report: {esc(e)})", job_id=rec.job_id)
+            card = f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} · {esc(final.state)}"
             context = (f"Job {rec.job_id} final state {final.state}, exit code {final.exit_code}, elapsed "
                        f"{final.elapsed} of {final.time_limit}. (Overseer couldn't read its logs: {e})")
+        await self._show_card(rec, card, self._card_buttons(rec, ended=True))
+        msg.jobs, msg.reply_to = True, self.store.card_refs(rec.job_id)  # the report goes under the card
         await self.notifier.send(msg)
+        if rec.by_agent and rec.session_id and not watched_here:  # results the agent isn't following
+            success = final.state in SUCCESS_STATES and final.exit_code.startswith("0")
+            await self.notifier.send(Outgoing(
+                f"{STATE_EMOJI.get(final.state, '🏁')} Job {esc(rec.job_id)} {esc(rec.name)} "
+                f"{'finished' if success else esc(final.state)} → report in the jobs topic",
+                session_id=rec.session_id, job_id=rec.job_id, silent=True))
         await self._tell_autopilot(rec, context)
 
     async def _tell_autopilot(self, rec: JobRecord, report: str) -> None:
@@ -334,21 +421,22 @@ class Monitor:
             except Exception:
                 log.exception("autopilot wake-up failed")
 
-    async def final_report(self, rec: JobRecord, final: Job, analyze: bool = True) -> tuple[Outgoing, str]:
-        """The Telegram report, and the same facts as compact plain text (for the agent)."""
+    async def final_report(self, rec: JobRecord, final: Job, analyze: bool = True) -> tuple[Outgoing, str, str]:
+        """(the short Telegram report, the same facts as plain text for the agent, the card's final text)."""
         steps = summarize_steps(await self.hpc.sacct_steps(rec.job_id))
         seff = await self.hpc.seff(rec.job_id)
         out_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 200))
         err_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 120)) if rec.stderr and rec.stderr != rec.stdout else ""
-        log_path = await progress_log(self.hpc, rec)
+        view = await self._view(rec)
+        log_path = view["log_path"]
         if log_path:  # the program's own log: its metrics and its traceback, if it crashed
-            out_tail = (f"{out_tail}\n--- {log_path} ---\n"
-                        + tqdm_cleanup(await self.hpc.try_tail(log_path, 200)))
+            out_tail = f"{out_tail}\n--- {log_path} ---\n{view['text']}"
         combined = out_tail + "\n" + err_tail
         success = final.state in SUCCESS_STATES and final.exit_code.startswith("0")
         findings = [] if success else find_issues(combined, final.state)
         tb = "" if success else extract_traceback(combined)
-        metrics = extract_metrics(out_tail)
+        metrics = view["values"]
+        critical, important, _ = metric_lines(view["spec"], metrics, view["auto"])
 
         tasks = final.extra.get("tasks")
         context = "\n".join(x for x in [
@@ -365,10 +453,11 @@ class Monitor:
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-10000:]}" if err_tail else "",
         ] if x)
         analysis = await self.reporter.final_analysis(context) if analyze else ""
-        # For the agent (autopilot): the facts first, then the end of the logs; it can read the rest itself.
+        # For the agent: the facts first, then the end of the logs; it can read the rest itself.
         for_agent = "\n".join(x for x in [
             context.split("\nBatch script:")[0].split("\n--- stdout")[0],
-            f"Last metrics: {metrics}" if metrics else "",
+            f"Your metrics: {critical}" + (f" · {important}" if important else "") if critical or important else "",
+            f"Last metrics: {dict(list(metrics.items())[:12])}" if metrics else "",
             f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-7000:]}",
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-3000:]}" if err_tail.strip() else "",
         ] if x)
@@ -376,33 +465,35 @@ class Monitor:
         self.store.upsert_job(rec)
 
         emoji = STATE_EMOJI.get(final.state, "🏁")
-        verb = "finished" if success else f"ended: {final.state}"
-        gpus = gpus_from_tres(final.alloc_tres)
-        parts = [
-            self._header(rec, emoji, verb),
-            f"exit {esc(final.exit_code)} · elapsed {esc(final.elapsed)} / {esc(final.time_limit)}"
-            + (f" · {gpus} GPU" if gpus else "")
-            + (f" · peak RAM {esc(steps['max_rss'])}" if steps.get("max_rss") else "")
-            + (f" (req {esc(steps['req_mem'])})" if steps.get("req_mem") else ""),
-        ]
-        if tasks:
-            parts.append(f"📦 job array: {esc(tasks)}")
-        if metrics:
-            parts.append("last metrics: " + ", ".join(f"{esc(k)}={esc(v)}" for k, v in metrics.items()))
+        mem = (f"peak RAM {steps['max_rss']}" + (f" of {steps['req_mem']}" if steps.get("req_mem") else "")
+               if steps.get("max_rss") else "")
+        head = (f"{emoji} <b>{esc(rec.job_id)}</b> {esc(rec.name)} "
+                + (f"finished · {esc(final.elapsed)}" if success else f"{esc(final.state)} after {esc(final.elapsed)}")
+                + (f" · {esc(critical)}" if critical else "")
+                + (f" ({esc(mem)})" if mem and not success and "OUT_OF_MEMORY" in final.state else ""))
+        parts = [head]
         if analysis:
-            parts.append(f"\n🧠 {esc(analysis)}")
+            parts.append(f"🧠 {esc(analysis)}")
         elif findings:
-            parts.append("\n".join(f"⚠️ <b>{esc(f.category)}</b>: {esc(f.hint)}" for f in findings))
-        # Logs fold away: the first lines show, the rest on tap (the full tail is attached on failure).
-        if tb:
-            parts.append("Traceback:" + fold_text(tb, 2500))
-        elif combined.strip():
-            parts.append("End of the log:" + fold_text(combined.strip(), 2500))
-        buttons = [[("📜 Full log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]]
+            parts.append(f"⚠️ <b>{esc(findings[0].category)}</b>: {esc(findings[0].hint)}")
+        if not success:  # the decisive line, always visible
+            decisive = findings[0].evidence if findings else (tb.strip().splitlines()[-1] if tb.strip() else "")
+            if decisive:
+                parts.append(code(decisive[:300]))
+        gpus = gpus_from_tres(final.alloc_tres)
+        facts = [f"exit {final.exit_code} · elapsed {final.elapsed} / {final.time_limit}"
+                 + (f" · {gpus} GPU" if gpus else "") + (f" · {mem}" if mem else ""),
+                 f"array: {tasks}" if tasks else "",
+                 f"{critical} · {important}".strip(" ·") if view["spec"] and (critical or important) else "",
+                 ("metrics: " + ", ".join(f"{k}={v}" for k, v in list(metrics.items())[:12])) if metrics else "",
+                 "\n".join(f"⚠️ {f.category}: {f.hint}" for f in findings[1:4]),
+                 "--- " + ("traceback" if tb else "end of the log") + " ---\n" + (tb or combined.strip())[-1500:]
+                 if (tb or combined.strip()) else ""]
+        parts.append("▸ details" + fold_text("\n".join(x for x in facts if x), 3000))
+        buttons = [[("📜 Log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]]
         if not success:
             buttons[0].insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
         buttons += self._assign_buttons(rec)
-        files = []
-        if out_tail.strip() and not success:
-            files.append((f"job-{rec.job_id}-stdout-tail.log", out_tail.encode()))
-        return Outgoing("\n".join(parts), job_id=rec.job_id, buttons=buttons, files=files), for_agent
+        card = self._card_text(rec, None, view, final=final)
+        return Outgoing("\n".join(parts), job_id=rec.job_id, buttons=buttons, silent=success), for_agent, card
+

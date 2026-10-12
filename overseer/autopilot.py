@@ -245,13 +245,6 @@ class Autopilot:
         rec.report = report[-MAX_REPORT:]
         self.store.upsert_job(rec)
         for sid in dict.fromkeys(w.session_id for w in watches):
-            if rec.state in SUCCESS_STATES:
-                waiting = [j for w in watches if w.session_id == sid for j in w.job_ids
-                           if j != rec.job_id and (r := self.store.get_job(j)) and not r.ended_at]
-                if waiting:
-                    await self.notifier.send(Outgoing(
-                        f"👁 Job {esc(rec.job_id)} finished; waking the agent when {esc(', '.join(waiting))} "
-                        f"{'have' if len(waiting) > 1 else 'has'} finished too.", session_id=sid, silent=True))
             await self.check(sid)
 
     async def check(self, session_id: str) -> None:
@@ -289,9 +282,7 @@ class Autopilot:
                                                         jobs=" ".join(r.job_id for r in running)))
                 undo.append((rest.id, "cancelled", rest.due, rest.fired))  # undone if this wake-up fails
         prompt = await self._wake_prompt(s, fired)
-        what = ", ".join(f"{r.job_id} {r.state}" for _, e, _ in fired for r in e) or ", ".join(
-            f"timer{(': ' + w.note[:80]) if w.note else ''}" for w, _, _ in fired if w.kind == "timer")
-        self._spawn(self._run(s, prompt, f"⏰ <b>Waking the agent</b>: {esc(what)}", "wakeup", undo=undo))
+        self._spawn(self._run(s, prompt, None, "wakeup", undo=undo))  # (the agent's reply is the notice)
 
     def turn_ended(self, s: Session) -> None:
         """After any turn: jobs may have ended or timers come due while it ran."""
@@ -376,8 +367,17 @@ class Autopilot:
             "Check whether they are healthy (read more of the logs or metrics files if you need to). If they are, "
             "change nothing: reply in one or two sentences. If a run is clearly broken, diverging or wasting GPU "
             "time, scancel it, note why in the research log, fix and resubmit, and `ov watch` the new job.")
-        elapsed = ", ".join(f"{rec.job_id} running {job.elapsed}" for rec, job in due)
-        await self._run(s, prompt, notice=f"🔎 Check-in: {esc(elapsed)}", kind="checkin", quiet=True)
+        await self._run(s, prompt, notice=None, kind="checkin", quiet=True)
+
+    async def alert_wake(self, session_id: str, rec: JobRecord, alert: str, value: str) -> None:
+        """An alert the agent set (`ov metrics set --wake-on`) matched: wake its conversation about the job."""
+        s = self.agent.get(session_id)
+        if not s or self.paused(session_id):
+            return
+        prompt = (f"[Alert you set up] Job {rec.job_id} ({rec.name}): `{alert}` matched (now {value}).\n\n"
+                  f"stdout: {rec.stdout}\n\nLook at the job now (its logs or metrics) and decide: let it run, or "
+                  "scancel it, fix and resubmit. Note it in the research log.")
+        self._spawn(self._run(s, prompt, None, "wakeup"))
 
     # ------------------------------------------------------------------ running a wake-up
     async def _run(self, s: Session, prompt: str, notice: str | None, kind: str,

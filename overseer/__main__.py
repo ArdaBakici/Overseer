@@ -64,6 +64,7 @@ def build(cfg: Config):
             await notifier.ensure_general_topic()
             for proj in projects.active():
                 await notifier.ensure_topic(proj.name)
+            await notifier.ensure_jobs_topics([p.name for p in projects.active()])  # live job cards
         elif projects.active():
             log.warning("projects are defined but the bot has no topics in private chats: their messages are "
                         "labelled in the main chat (enable threaded mode for the bot in @BotFather)")

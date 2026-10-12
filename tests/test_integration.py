@@ -41,11 +41,16 @@ class LocalRunner(SSHRunner):
 class FakeNotifier:
     def __init__(self):
         self.sent = []
+        self.cards = {}  # job id -> versions of its card: [(text, buttons)]
         self.live = {}  # handle -> list of versions of a self-updating message
         self.deleted = []
 
     async def send(self, msg):
         self.sent.append(msg)
+
+    async def card(self, job_id, text, buttons):
+        """A job's live card: every version of it, by job."""
+        self.cards.setdefault(job_id, []).append((text, buttons))
 
     async def post_live(self, msg):
         handle = len(self.live) + 1
@@ -60,6 +65,9 @@ class FakeNotifier:
 
     def texts(self):
         return "\n".join(m.text for m in self.sent)
+
+    def card_text(self, job_id) -> str:
+        return self.cards[job_id][-1][0] if job_id in self.cards else ""
 
 
 def make_cfg(tmp_path, short_tmp):
@@ -740,24 +748,29 @@ async def test_monitor_lifecycle(env):
                            "script": "#!/bin/bash\npython train.py\n"}})
     await env.monitor.poll(first=True)
     assert "Overseer online" in env.notifier.texts()
+    assert "⏳ pending" in env.notifier.card_text("77")  # its live card
 
+    n = len(env.notifier.sent)
     env.set_jobs(**{"77": {**env.slurm()["jobs"]["77"], "state": "RUNNING"}})
     await env.monitor.poll()
-    assert "🚀" in env.notifier.sent[-1].text
+    assert env.notifier.card_text("77").startswith("🏃 <b>77</b> train") and len(env.notifier.sent) == n  # edited
+    assert ("📊 Status", "status:77") in env.notifier.cards["77"][-1][1][0]
 
     log.write_text("epoch 1/3 loss 1.0\nTraceback (most recent call last):\n  File \"train.py\", line 1\n"
                    "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4 GiB\n")
     env.set_jobs(**{"77": {**env.slurm()["jobs"]["77"], "state": "FAILED", "exit": "1:0"}})
     await env.monitor.poll()
     final = env.notifier.sent[-1]
-    assert "FAILED" in final.text and "OK report" in final.text  # LLM analysis via the agent backend
-    assert ("🔧 Ask agent to fix", "fix:77") in final.buttons[0]
+    assert "FAILED after" in final.text and "OK report" in final.text  # LLM analysis via the agent backend
+    assert "CUDA out of memory" in final.text and "▸ details" in final.text  # the decisive line, then folded details
+    assert final.jobs and not final.silent and ("🔧 Ask agent to fix", "fix:77") in final.buttons[0]
+    assert "FAILED after" in env.notifier.card_text("77")  # the card shows the end too
     rec = env.store.get_job("77")
     assert rec.ended_at and rec.batch_script.startswith("#!/bin/bash")
 
     env.set_jobs(**{"78": {"name": "quick", "state": "COMPLETED", "workdir": proj, "stdout": str(log)}})
     await env.monitor.poll()
-    assert "Job 78" in env.notifier.sent[-1].text and "finished" in env.notifier.sent[-1].text
+    assert "<b>78</b> quick finished" in env.notifier.sent[-1].text and env.notifier.sent[-1].silent
 
 
 async def test_monitor_fills_in_agent_submitted_jobs(env):
@@ -766,8 +779,7 @@ async def test_monitor_fills_in_agent_submitted_jobs(env):
     proj = str(env.home / "proj")
     env.set_jobs(**{"4242": {"name": "fixed", "state": "RUNNING", "workdir": proj, "stdout": f"{proj}/slurm-4242.out"}})
     await env.monitor.poll()
-    started = env.notifier.sent[-1]
-    assert "Job 4242" in started.text and "started" in started.text and "submitted by the agent" in started.text
+    assert env.notifier.card_text("4242").startswith("🏃 <b>4242</b> fixed")
     rec = env.store.get_job("4242")
     assert rec.stdout == f"{proj}/slurm-4242.out" and rec.name == "fixed" and rec.session_id == s.id
 
@@ -902,15 +914,17 @@ async def test_working_alone_over_many_runs(env):
     assert "Autopilot is ON" not in system and "ov auto" not in system
     (j1,) = agent_jobs(env, s)
     assert watched(env, s) == [("jobs", j1, 0)]
-    note = next(m for m in env.notifier.sent if f"will look at job {j1} when it ends" in m.text)
-    assert note.silent and note.buttons[0][0][0] == "✖ Cancel"
+    await asyncio.gather(*list(env.ctl._bg))
+    card, buttons = env.notifier.cards[j1][-1]  # the job's card says it's watched, with a ✖ to cancel that
+    w = env.store.watches(s.id)[0]
+    assert "⏰ agent watching" in card and ("✖ watch", f"uw:{w.id}") in buttons[0]
     assert f"⏰ Waiting for: job {j1}" in env.notifier.sent[-1].text
 
     # Job 1 finishes: the conversation is woken with its report; no one-shot LLM summary.
     await run_job(env, j1)
-    final = next(m.text for m in env.notifier.sent if f"Job {j1}" in m.text and "finished" in m.text)
+    final = next(m.text for m in env.notifier.sent if f"<b>{j1}</b>" in m.text and "finished" in m.text)
     assert "OK report" not in final
-    assert any(f"Waking the agent</b>: {j1} COMPLETED" in m.text for m in env.notifier.sent)
+    assert not any("Waking the agent" in m.text for m in env.notifier.sent)  # the agent's reply is the notice
     call = claude_calls(env)[-1]
     assert "[Wake-up you set up]" in call["stdin"] and f"<job id='{j1}'" in call["stdin"]
     assert "loss=0.50" in call["stdin"] and "final state COMPLETED" in call["stdin"]
@@ -935,7 +949,7 @@ async def test_batches_and_early_wakeup_on_failure(env):
     assert watched(env, s) == [("jobs", f"{j1} {j2}", 0)]  # one batch
     n = len(claude_calls(env))
     await run_job(env, j1)  # the first finishes: wait for the other one
-    assert len(claude_calls(env)) == n and f"waking the agent when {j2} has finished too" in env.notifier.sent[-1].text
+    assert len(claude_calls(env)) == n
     await run_job(env, j2)
     stdin = claude_calls(env)[-1]["stdin"]
     assert f"<job id='{j1}'" in stdin and f"<job id='{j2}'" in stdin
@@ -1119,12 +1133,20 @@ async def test_cancel_button_and_old_cards(env):
     await env.agent.handle(s, "FAKE_OV ov watch 5001 --note 'compare the loss'\nFAKE_OV ov wake in 30m look at the eval")
     bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
               notifier=env.notifier)
-    w = env.store.watches(s.id)[0]
-    q = FakeQuery(f"uw:{w.id}")
+    w, timer = env.store.watches(s.id)
+    await asyncio.gather(*list(env.ctl._bg))
+    assert "⏰ agent watching" in env.notifier.card_text("5001")
+    q = FakeQuery(f"uw:{w.id}")  # ✖ on the job's card: the card is updated, not replaced
     await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
-    assert "Cancelled" in q.edits[-1][0] and env.store.get_watch(w.id).state == "cancelled"
+    assert not q.edits and env.store.get_watch(w.id).state == "cancelled"
+    assert "agent watching" not in env.notifier.card_text("5001")
     await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
     assert "already happened or was cancelled" in q.edits[-1][0]
+    note = next(m for m in env.notifier.sent if "look again in 30m" in m.text)  # a timer: its own one-line notice
+    assert note.silent and note.buttons == [[("✖ Cancel", f"uw:{timer.id}")]]
+    q = FakeQuery(f"uw:{timer.id}")
+    await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
+    assert "Cancelled" in q.edits[-1][0]
     await env.agent.handle(s, "hi")
     assert f"cancelled your wake-up w{w.id}" in claude_calls(env)[-1]["stdin"]
     q = FakeQuery(f"ap:ok:{s.id}")  # an approval card from before
@@ -1203,8 +1225,8 @@ async def test_status_follows_the_training_log(env):
               notifier=env.notifier)
     await bot._send_status("18743802")
     text = env.notifier.sent[-1].text
-    assert "⏱ 1:00:00 of 4:00:00 (25%, 3h00m left) · node cn257" in text
-    assert "📈 step 12000 · episode/score 3.1 · train/loss/dyn 0.42" in text
+    assert "🏃 <b>18743802</b> bench-dreamerv3-mixed-s0 · cn257\n⏱ 1:00:00 / 4:00:00 (25%, 3h00m left)" in text
+    assert "📈 step 12k · score 3.1 · dyn 0.42" in text, text
     assert "🎮 GPU 0 A100-SXM4-80GB: 87% busy · 30.5/80 GB" in text
     assert "<code>train_18743802.log</code>, last lines:" in text and "Step 12000" in text
     assert "pygame" not in text and "UserWarning" not in text  # the preamble and harmless warnings stay out
@@ -1227,7 +1249,7 @@ async def test_status_follows_the_training_log(env):
         fh.write("Traceback (most recent call last):\n  File \"dreamer.py\", line 9\nValueError: bad replay ratio\n")
     env.set_jobs(**{"18743802": {**job, "state": "FAILED", "exit": "1:0"}})
     await env.monitor.poll()
-    final = next(m for m in env.notifier.sent if "Job 18743802" in m.text and "FAILED" in m.text)
+    final = next(m for m in env.notifier.sent if "<b>18743802</b>" in m.text and "FAILED" in m.text)
     assert "ValueError: bad replay ratio" in final.text
 
 
@@ -1313,9 +1335,9 @@ async def test_jobs_are_assigned_to_projects_by_folder(env):
     assert env.store.get_job("301").project == "dreamer"
     assert env.store.get_job("302").project == "dreamer-a100"  # the deepest folder wins
     assert env.store.get_job("303").project is None
-    started = {m.job_id: m for m in env.notifier.sent if "started" in m.text}
-    assert ("📁 dreamer", "assign:303:dreamer") in [b for row in started["303"].buttons for b in row]
-    assert all(not d.startswith("assign:") for row in started["301"].buttons for _, d in row)
+    cards = {jid: versions[-1][1] for jid, versions in env.notifier.cards.items()}  # (buttons)
+    assert ("📁 dreamer", "assign:303:dreamer") in [b for row in cards["303"] for b in row]
+    assert all(not d.startswith("assign:") for row in cards["301"] for _, d in row)
 
 
 async def test_project_conversation_context(env):
@@ -1368,7 +1390,22 @@ class FakeTelegram:
         if message_thread_id in self.dead_threads:
             raise BadRequest("Message thread not found")
         self.sent.append((chat_id, message_thread_id, text))
+        if kw.get("reply_parameters"):
+            self.replies = (self.replies or {}) | {len(self.sent): kw["reply_parameters"].message_id}
         return NS(message_id=len(self.sent))
+
+    replies: dict = None  # message number -> the message it replies to
+    edits: list = None  # (chat_id, message_id, text)
+    gone: set = None  # messages that can't be edited any more (deleted)
+
+    async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
+        from telegram.error import BadRequest
+        if message_id in (self.gone or set()):
+            raise BadRequest("Message to edit not found")
+        if self.edits and self.edits[-1][1:] == (message_id, text):
+            raise BadRequest("Message is not modified")
+        self.edits = (self.edits or []) + [(chat_id, message_id, text)]
+        return True
 
     async def send_document(self, chat_id, document, filename, message_thread_id=None, **kw):
         self.sent.append((chat_id, message_thread_id, f"<file {filename}>"))
@@ -1814,8 +1851,8 @@ async def test_submissions_through_scripts_are_found(env):
     await ap.drain()
     await asyncio.sleep(0.05)  # the announcements are sent in the background
     announced = [m.text for m in env.notifier.sent if "Agent submitted job" in m.text]
-    assert any("job 7777</b>" in t and "native7_cli.py submit" in t for t in announced), announced
-    assert any("job 7778</b>" in t and "in the agent's reply" in t for t in announced), announced
+    assert any("job 7777 →" in t and "native7_cli.py submit" in t for t in announced), announced
+    assert any("job 7778 →" in t and "in the agent's reply" in t for t in announced), announced
     assert not any("job 1234" in t for t in announced)
     assert {j.job_id for j in env.store.session_jobs(s.id)} == {"7777", "7778"}
     reply = next(m.text for m in reversed(env.notifier.sent) if m.text.startswith("🤖"))
@@ -1847,7 +1884,7 @@ async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
     (proj / "x.out").write_text("done\n")
     await env.monitor.poll()
     await ap.drain()
-    assert any("Waking the agent</b>: 18746955 COMPLETED" in m.text for m in env.notifier.sent)
+    assert "[Wake-up you set up]" in claude_calls(env)[-1]["stdin"] and "18746955" in claude_calls(env)[-1]["stdin"]
 
 
 async def test_general_topic(env, monkeypatch):
@@ -2158,7 +2195,7 @@ async def test_job_arrays_are_one_job(env):
     assert not any("left the queue" in m.text for m in env.notifier.sent)
     assert not [j for j in env.store.recent_jobs(50) if "_" in j.job_id]  # tasks aren't jobs of their own
     status = await env.monitor.status_message(rec, next(j for j in await env.hpc.squeue() if j.job_id == "6100"))
-    assert "📦 job array: 3 PENDING, 1 RUNNING" in status.text
+    assert "📦 array: 3 PENDING, 1 RUNNING" in status.text
 
     # All tasks end, one of them failed: the array ends FAILED, once, and wakes the conversation once.
     n = len([c for c in env.cli_log() if c["prog"] == "claude"])
@@ -2170,8 +2207,9 @@ async def test_job_arrays_are_one_job(env):
     await env.monitor.poll()
     await env.monitor.poll()
     await ap.drain()
-    finals = [m.text for m in env.notifier.sent if "Job 6100" in m.text and "ended" in m.text]
-    assert len(finals) == 1 and "FAILED" in finals[0] and "📦 job array: 3 COMPLETED, 1 FAILED" in finals[0], finals
+    finals = [m.text for m in env.notifier.sent if "<b>6100</b>" in m.text and "FAILED after" in m.text]
+    assert len(finals) == 1 and "array: 3 COMPLETED, 1 FAILED" in finals[0], finals
+    assert "📦 array: 3 COMPLETED, 1 FAILED" in env.notifier.card_text("6100")
     stdin = [c for c in env.cli_log() if c["prog"] == "claude"][n]["stdin"]
     assert "[Wake-up you set up]" in stdin and "job array of 4 tasks: 3 COMPLETED, 1 FAILED" in stdin
 
@@ -2187,3 +2225,132 @@ async def test_a_job_wrongly_taken_as_ended_can_be_tracked_again(env):
     assert ok, text
     rec = env.store.get_job("6200")
     assert not rec.ended_at and not rec.ignored and rec.state == "RUNNING"
+
+
+# ----------------------------------------------------------------------------- live job cards, metrics, alerts
+
+async def test_job_cards_in_jobs_topics(env):
+    """Each job has one card in its project's jobs topic, edited in place; its report replies to it."""
+    from overseer.bot import TelegramNotifier
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    env.monitor.notifier = notifier
+    projects = make_projects(env)
+    proj = env.home / "proj"
+    projects.create("dreamer", str(proj))
+    await notifier.ensure_jobs_topics(["dreamer"])
+    assert [name for _, name, _ in tg.created] == ["📊 jobs", "📊 dreamer · jobs"]
+    dreamer_jobs = notifier.jobs_thread(1, "dreamer")
+
+    log = proj / "slurm-501.out"
+    log.write_text("step 100 loss=0.9\n")
+    job = {"name": "train", "state": "RUNNING", "workdir": str(proj), "stdout": str(log)}
+    env.set_jobs(**{"501": job})
+    await env.monitor.poll()
+    card_msg = len(tg.sent)
+    assert tg.sent[-1][1] == dreamer_jobs and tg.sent[-1][2].startswith("🏃 <b>501</b> train")
+    n = len(tg.sent)
+    log.write_text("step 200 loss=0.5\n")
+    rec = env.store.get_job("501")
+    rec.last_status_at = 0  # due for a refresh
+    env.store.upsert_job(rec)
+    await env.monitor.poll()
+    assert len(tg.sent) == n and "loss 0.5" in tg.edits[-1][2] and tg.edits[-1][1] == card_msg  # edited in place
+
+    tg.gone = {card_msg}  # the card was deleted: a new one is posted
+    rec = env.store.get_job("501")
+    rec.last_status_at = 0
+    env.store.upsert_job(rec)
+    await env.monitor.poll()
+    assert len(tg.sent) == n + 1 and env.store.card_refs("501") == {"1": n + 1}
+
+    env.set_jobs(**{"501": {**job, "state": "COMPLETED", "exit": "0:0"}})
+    await env.monitor.poll()
+    assert "finished" in tg.edits[-1][2]  # the card shows the end
+    report = len(tg.sent)
+    assert tg.sent[-1][1] == dreamer_jobs and "<b>501</b> train finished" in tg.sent[-1][2]
+    assert tg.replies[report] == n + 1  # under the card
+
+
+async def test_agent_defined_metrics_and_alerts(env, tmp_path):
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    (proj / "metrics.jsonl").write_text('{"step": 1200000, "eval": {"score": 0.4}, "loss": 0.3}\n')
+    log = proj / "slurm-601.out"
+    log.write_text("crl/train_episode/score 0.5 / train/loss/value 0.82\n")
+    job = {"name": "bench-dreamerv3-s1", "state": "RUNNING", "workdir": str(proj), "stdout": str(log),
+           "elapsed": "3:00:00"}
+    env.set_jobs(**{"601": job})
+    await env.monitor.poll()
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, [
+        "metrics", "set", "--pattern", "bench-dreamerv3-*", "--critical", "score=score",
+        "--important", "train/loss/value=value-loss,loss", "--progress", "step/5000000",
+        "--command", "tail -n1 {workdir}/metrics.jsonl", "--alert", "score < 1 after 2h",
+        "--wake-on", "loss is nan"])
+    assert ok and "cards updated: 601" in text, text
+    await asyncio.gather(*list(env.ctl._bg))
+    card = env.notifier.card_text("601")
+    assert "step 1.2M / 5M (24%)" in card  # progress from the command's values
+    assert "🎯 <b>score 0.5</b>" in card or "🎯 <b>score 0.4</b>" in card
+    assert "📈 value-loss 0.82 · loss 0.3" in card, card
+    ok, text = await env.ctl.handle(token, ["metrics", "show", "601"])
+    assert ok and "metrics from pattern bench-dreamerv3-*" in text and "eval/score=0.4" in text and "  ok" in text
+    ok, text = await env.ctl.handle(token, ["metrics", "set", "601", "--alert", "score is high"])
+    assert not ok and "can't read the alert" in text
+
+    # The alert fires once (it has run 3h > 2h and score < 1): you're pinged, under the card.
+    rec = env.store.get_job("601")
+    rec.last_status_at = 0
+    env.store.upsert_job(rec)
+    await env.monitor.poll()
+    alerts = [m for m in env.notifier.sent if m.text.startswith("🚨")]
+    assert len(alerts) == 1 and "score &lt; 1 after 2h" in alerts[0].text and not alerts[0].silent and alerts[0].jobs
+    assert "🚨 score &lt; 1 after 2h" in env.notifier.card_text("601")
+    rec = env.store.get_job("601")
+    rec.last_status_at = 0
+    env.store.upsert_job(rec)
+    await env.monitor.poll()
+    assert len([m for m in env.notifier.sent if m.text.startswith("🚨")]) == 1  # once per job
+
+    # A --wake-on alert wakes the conversation that set it.
+    (proj / "metrics.jsonl").write_text('{"step": 1300000, "loss": "nan"}\n')
+    rec = env.store.get_job("601")
+    rec.last_status_at = 0
+    env.store.upsert_job(rec)
+    await env.monitor.poll()
+    await ap.drain()
+    assert "[Alert you set up] Job 601" in claude_calls(env)[-1]["stdin"]
+    assert "loss is nan" in claude_calls(env)[-1]["stdin"]
+
+    # A broken command: the card says so and falls back to the log.
+    await env.ctl.handle(token, ["metrics", "set", "601", "--command", "cat /nonexistent/metrics.json"])
+    await asyncio.gather(*list(env.ctl._bg))
+    assert "⚠️ metrics command: exit 1" in env.notifier.card_text("601")
+
+
+def test_stalled_alert(env):
+    from overseer.metrics import check_alerts, parse_alert
+    from overseer.store import MetricSpec
+    spec = MetricSpec(scope="job", key="1", alerts=json.dumps([{"when": "step stalled 30m", "wake": False}]))
+    rec = JobRecord(job_id="1")
+    assert check_alerts(env.store, rec, spec, {"step": "100"}, 600) == []
+    st = json.loads(env.store.get("mstate:1"))
+    st["last"]["step"][1] -= 1900  # unchanged for 31 minutes
+    env.store.set("mstate:1", json.dumps(st))
+    (a, v), = check_alerts(env.store, rec, spec, {"step": "100"}, 2500)
+    assert a.text == "step stalled 30m" and v == "100"
+    assert parse_alert("x >= 3").op == ">="
+
+
+async def test_unwatched_agent_job_points_to_the_jobs_topic(env):
+    s = env.agent.general_session()
+    await env.agent.handle(s, "submit it")  # fake claude "submits" 4242 (and doesn't watch it)
+    proj = env.home / "proj"
+    env.set_jobs(**{"4242": {"name": "fixed", "state": "COMPLETED", "exit": "0:0", "workdir": str(proj),
+                             "stdout": f"{proj}/slurm-4242.out"}})
+    await env.monitor.poll()
+    pointer = next(m for m in env.notifier.sent if "report in the jobs topic" in m.text)
+    assert pointer.session_id == s.id and pointer.silent and "4242 fixed finished" in pointer.text

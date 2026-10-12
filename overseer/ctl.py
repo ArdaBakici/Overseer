@@ -35,8 +35,10 @@ from .compute import WORKER_NAME
 from .config import Config
 from .notify import Outgoing, code, esc
 from .autopilot import WatchError, human_interval, parse_duration
+from .metrics import SpecError, check_progress, parse_alert
 from .projects import ProjectError, Projects
 from .slurm import TERMINAL_STATES, array_parent
+from .store import MetricSpec
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -82,6 +84,20 @@ def _parser() -> _Parser:
     proj.add_parser("archive", add_help=False).add_argument("name")
     conv = sub.add_parser("conversation", add_help=False).add_subparsers(dest="action")
     conv.add_parser("move", add_help=False).add_argument("project")
+    met = sub.add_parser("metrics", add_help=False).add_subparsers(dest="action")
+    for name in ("set", "clear"):
+        a = met.add_parser(name, add_help=False)
+        a.add_argument("job", nargs="?")
+        a.add_argument("--pattern")
+        a.add_argument("--project", nargs="?", const="")
+        if name == "set":
+            for opt in ("--critical", "--important", "--progress", "--command"):
+                a.add_argument(opt)
+            a.add_argument("--alert", action="append", default=[])
+            a.add_argument("--wake-on", dest="wake_on", action="append", default=[])
+            a.add_argument("--clear-alerts", action="store_true")
+    met.add_parser("show", add_help=False).add_argument("job")
+    met.add_parser("list", add_help=False)
     a = sub.add_parser("watch", add_help=False)
     a.add_argument("ids", nargs="+")
     a.add_argument("--every")
@@ -116,6 +132,15 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov notify <text>                 send the researcher a message now
   ov status                        this conversation: project, its jobs, what will wake you
 
+What matters in a job (shown on its live card in Telegram; alerts ping the researcher or wake you):
+  ov metrics set <job id> | --pattern '<job name glob>' | --project [name]
+      [--critical "metric=label,..."] [--important "metric=label,..."] [--progress step/5000000]
+      [--command "<quick command printing name=value lines or a JSON object>"]
+      [--alert "score < 1 after 2h"] [--wake-on "loss is nan"] [--wake-on "step stalled 30m"] [--clear-alerts]
+                                   {job_id} {workdir} {stdout} {name} in --command are filled in
+  ov metrics show <job id>         what its card shows now (and whether --command works)
+  ov metrics list | clear <job id> | --pattern ... | --project ...
+
 Being woken (you only run when someone writes to you - or when something you set up wakes you; no
 permission needed, but each wake-up costs a run, and the researcher sees each one and can cancel it):
   ov watch <id> [<id>...] [--every 30m] [--note "what to do then"]
@@ -137,6 +162,7 @@ class ControlServer:
         self.notifier = notifier
         self.hpc = hpc
         self.tokens: dict[str, str] = {}  # token -> conversation
+        self._bg: set[asyncio.Task] = set()  # card refreshes in flight
         self.server: asyncio.AbstractServer | None = None
         agent.ctl = self
 
@@ -196,6 +222,8 @@ class ControlServer:
                 return True, await getattr(self, f"project_{args.action}")(session, args)
             if area == "conversation" and args.action == "move":
                 return True, await self.conversation_move(session, args)
+            if area == "metrics" and args.action:
+                return True, await getattr(self, f"metrics_{args.action}")(session, args)
             if area in ("watch", "unwatch", "watches", "wake"):
                 return True, await getattr(self, area)(session, args)
             if area == "auto":
@@ -207,7 +235,7 @@ class ControlServer:
             if area == "status":
                 return True, self.status(session)
             return False, HELP
-        except (CtlError, ProjectError, WatchError, ValueError) as e:
+        except (CtlError, ProjectError, WatchError, SpecError, ValueError) as e:
             return False, str(e)
 
     async def _announce(self, session, text: str, **kw) -> None:
@@ -257,7 +285,7 @@ class ControlServer:
                 if not rec.name:  # what SLURM said, until the monitor's next poll
                     rec.name, rec.state, rec.workdir = name, state or rec.state, workdir
                     self.store.upsert_job(rec)
-                await self._announce(session, f"🚀 <b>Agent submitted job {esc(jid)}</b> {esc(name)} ({esc(state)})",
+                await self._announce(session, f"🚀 Agent submitted job {esc(jid)} {esc(name)} → its card is in the jobs topic",
                                      job_id=jid)
             out.append(f"✓ job {jid} ({name or '?'}, {state or '?'}) is tracked in this conversation"
                        + (" (already was)" if already else "") + ": Overseer reports on it"
@@ -328,6 +356,8 @@ class ControlServer:
         p = self.projects.create(args.name, args.dir, args.about, "agent")
         if hasattr(self.notifier, "ensure_topic"):
             await self.notifier.ensure_topic(p.name)
+            if hasattr(self.notifier, "ensure_jobs_topics"):
+                await self.notifier.ensure_jobs_topics([p.name])
         await self._announce(None, f"📁 The agent created project {code(p.name)}: {code(p.dir)}"
                                    + (f"\n{esc(p.context)}" if p.context else ""), project=p.name)
         msg = f"✓ project {p.name} created ({p.dir})"
@@ -359,6 +389,106 @@ class ControlServer:
                                       + (f"project {code(project)}." if project else "no project."))
         return (f"✓ this conversation is now in {project or 'no project'}"
                 + (" (the project's notes and context apply from your next run)" if project else ""))
+
+    # ---- what matters in a job: its card's metrics, and alerts
+    def _spec_scope(self, session, args) -> tuple[str, str]:
+        given = [x for x in (args.job, args.pattern, args.project) if x is not None]
+        if len(given) != 1:
+            raise CtlError("say what it's for: a job id, --pattern '<job name glob>' or --project [name]")
+        if args.job is not None:
+            jid = array_parent(args.job)
+            if not jid.isdigit():
+                raise CtlError(f"{args.job!r} isn't a job id")
+            return "job", jid
+        if args.pattern is not None:
+            if not args.pattern.strip():
+                raise CtlError("--pattern needs a glob on job names, e.g. 'bench-dreamerv3-*'")
+            return "pattern", args.pattern.strip()
+        project = (args.project or session.project or "").strip().lower()
+        if not project or not self.store.get_project(project):
+            raise CtlError("--project: this conversation has no project; give its name (ov project list)")
+        return "project", project
+
+    def _affected(self, scope: str, key: str) -> list[str]:
+        import fnmatch
+        out = []
+        for rec in self.store.active_jobs():
+            if (scope == "job" and rec.job_id == key) or (scope == "pattern" and fnmatch.fnmatch(rec.name or "", key)) \
+                    or (scope == "project" and rec.project == key):
+                out.append(rec.job_id)
+        return out
+
+    async def metrics_set(self, session, args) -> str:
+        scope, key = self._spec_scope(session, args)
+        spec = self.store.get_metric_spec(scope, key) or MetricSpec(scope=scope, key=key)
+        for field in ("critical", "important", "command"):
+            value = getattr(args, field)
+            if value is not None:
+                setattr(spec, field, value.strip())
+        if args.progress is not None:
+            spec.progress = check_progress(args.progress)
+        alerts = [] if args.clear_alerts else json.loads(spec.alerts or "[]")
+        for text, wake in [(t, False) for t in args.alert] + [(t, True) for t in args.wake_on]:
+            a = parse_alert(text, wake)
+            alerts = [x for x in alerts if x.get("when") != a.text] + [{"when": a.text, "wake": wake}]
+        spec.alerts = json.dumps(alerts)
+        spec.session_id = session.id
+        self.store.set_metric_spec(spec)
+        affected = self._affected(scope, key)
+        self._refresh_cards(affected)
+        what = {"job": f"job {key}", "pattern": f"jobs named {key}", "project": f"project {key}'s jobs"}[scope]
+        lines = [f"✓ metrics for {what}" + (f" (cards updated: {', '.join(affected[:8])})" if affected else "")]
+        lines += [f"  {k}: {v}" for k, v in (("critical", spec.critical), ("important", spec.important),
+                                              ("progress", spec.progress), ("command", spec.command)) if v]
+        for a in alerts:
+            lines.append(f"  alert: {a['when']}" + ("  (wakes you)" if a.get("wake") else "  (pings the researcher)"))
+        if scope == "job" or affected:
+            lines.append(f"Check what the card shows: ov metrics show {key if scope == 'job' else affected[0]}")
+        return "\n".join(lines)
+
+    async def metrics_show(self, session, args) -> str:
+        jid = array_parent(args.job)
+        rec = self.store.get_job(jid)
+        if not rec:
+            raise CtlError(f"Overseer doesn't track job {jid} (ov job add {jid})")
+        monitor = getattr(self.agent, "monitor", None)
+        if not monitor:
+            raise CtlError("the monitor isn't running")
+        from .metrics import lines as metric_lines
+        view = await monitor._view(rec)
+        spec = view["spec"]
+        critical, important, progress = metric_lines(spec, view["values"], view["auto"])
+        out = [f"job {jid} {rec.name}: " + (f"metrics from {spec.scope} {spec.key}" if spec else
+                                             "no metrics set (ov metrics set): the card shows what the log has")]
+        out += [f"card 🎯 {critical}" if critical else "", f"card 📈 {important}" if important else "",
+                f"progress: {progress}" if progress else ""]
+        if spec and spec.command:
+            out.append(f"command: {spec.command}")
+            out.append(f"  error: {view['err']}" if view["err"] else "  ok")
+        out.append("values: " + (", ".join(f"{k}={v}" for k, v in list(view["values"].items())[:30]) or "(none found)"))
+        if spec and json.loads(spec.alerts or "[]"):
+            from .metrics import fired_alerts
+            fired = fired_alerts(self.store, rec)
+            for a in json.loads(spec.alerts):
+                out.append(f"alert: {a['when']}" + (" (wakes you)" if a.get("wake") else "")
+                           + (" - FIRED" if a["when"] in fired else ""))
+        return "\n".join(x for x in out if x)
+
+    async def metrics_list(self, session, args) -> str:
+        specs = self.store.metric_specs()
+        if not specs:
+            return "No metrics set (ov metrics set <job id> | --pattern '<glob>' | --project ...)."
+        return "\n".join(f"{s.scope} {s.key}: critical={s.critical or '-'} important={s.important or '-'}"
+                         + (f" progress={s.progress}" if s.progress else "") + (" command" if s.command else "")
+                         + (f" alerts={len(json.loads(s.alerts or '[]'))}" if json.loads(s.alerts or "[]") else "")
+                         for s in specs[:40])
+
+    async def metrics_clear(self, session, args) -> str:
+        scope, key = self._spec_scope(session, args)
+        if not self.store.delete_metric_spec(scope, key):
+            raise CtlError(f"no metrics set for {scope} {key}")
+        self._refresh_cards(self._affected(scope, key))
+        return f"✓ metrics for {scope} {key} removed"
 
     # ---- other
     async def notify(self, session, text: str) -> str:
@@ -410,11 +540,18 @@ class ControlServer:
                 await self.job_add(session, argparse.Namespace(ids=[jid]))
         w, remark = ap.add_watch(session, ids, every, args.note)
         what = f"job{'s' if len(ids) > 1 else ''} {', '.join(ids)}"
-        await self._announce_watch(session, w, f"look at {what} when {'they end' if len(ids) > 1 else 'it ends'}"
-                                   + (f", checking in every {human_interval(w.every)} meanwhile" if w.every else ""))
+        self._refresh_cards(ids)  # the cards show "⏰ agent watching", with a ✖ to cancel it
         return (f"✓ w{w.id}: you'll be woken when {what} {'have' if len(ids) > 1 else 'has'} ended"
                 + (" (or as soon as one fails)" if len(ids) > 1 else "")
                 + (f", with check-ins every {human_interval(w.every)} while running" if w.every else "") + remark)
+
+    def _refresh_cards(self, job_ids: list[str]) -> None:
+        monitor = getattr(self.agent, "monitor", None)
+        if monitor and hasattr(monitor, "refresh_card_by_id"):
+            for jid in job_ids:
+                task = asyncio.get_running_loop().create_task(monitor.refresh_card_by_id(jid))
+                self._bg.add(task)
+                task.add_done_callback(self._bg.discard)
 
     async def _announce_watch(self, session, w, what: str) -> None:
         note = f"\n{esc(w.note)}" if w.note else ""

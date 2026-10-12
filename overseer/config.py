@@ -141,7 +141,9 @@ class ComputeConfig:
 @dataclass
 class SlurmConfig:
     poll_interval: int = 60  # seconds between squeue/sacct polls
-    status_interval_minutes: int = 60  # periodic progress update for running jobs; 0 = off
+    # How often a running job's live card is refreshed (edited in place, silently) and the agent's alerts on it
+    # are checked; 0 = only when it starts and ends.
+    status_interval_minutes: int = 10
     # "all": every job of your user. "agent": only jobs the agent submitted.
     track: str = "all"
     notify_queued: bool = True

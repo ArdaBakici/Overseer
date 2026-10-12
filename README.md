@@ -3,8 +3,8 @@
 Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watches your jobs on the university HPC over SSH. When one fails, you hand it to **Claude Code** or **OpenAI Codex**: they get a real shell and full access to your HPC account, and fix and resubmit the job themselves.
 
 - **Monitoring.** No LLM is involved, and checks run every minute.
-  - **Job lifecycle:** you get messages when a job is 📥 **queued** and 🚀 **started** (which node), plus 📊 hourly **status** (elapsed time, latest metrics, log tail).
-  - **Final report:** when a job ends you get ✅/❌, with the state, exit code, runtime against the limit and peak memory.
+  - **A live card per job:** each job gets one message in its project's "📊 jobs" topic, edited in place and silently as it goes from queued to running. It shows the node, time used and left, progress, and the metrics that matter.
+  - **Final report:** when a job ends, the card shows the end and a short report is posted under it: ✅/❌, runtime, the key result and a one-line verdict, with exit code, memory and the log tail folded away. Only failures make a sound.
   - **Why it failed:** heuristics flag CUDA OOM, host OOM, time limits, NCCL errors, missing modules, NaNs and similar. An LLM root-cause summary is added on top.
 - **Job arrays.** An array is one job, under the id `sbatch` printed. It's running while any task is, and its report gives the task states ("📦 job array: 9 COMPLETED, 2 FAILED"). It ends with the worst task's state once all its tasks have ended.
 - **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
@@ -159,13 +159,13 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 
 | | |
 |---|---|
-| *(automatic)* | 📥 queued · 🚀 started · 📊 hourly status · ✅/❌ final report with analysis |
+| *(automatic)* | a live card per job in its jobs topic (queued → running → ended, edited in place) · ✅/❌ short final report under it |
 | **🔧 Ask agent to fix** button | the agent investigates the failed job, fixes it and resubmits |
 | *reply to any job message* | talk to the agent about that job ("lower the lr to 1e-4 and resubmit", "why is it slow?") |
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
 | `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
 | **📈 Plot** button | the agent finds the job's metrics, plots them on the HPC and sends the picture with a short description of the trend |
-| **📊 Status** / **📜 Log** buttons | Status: time used and left, latest metrics, GPU use, problems on stderr and the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and check-ins too |
+| **📊 Status** / **📜 Log** buttons | Status (on a job's card): refreshes the card now; `/job <id>` shows the card's content plus the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and check-ins too |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
@@ -232,6 +232,41 @@ Each project gets a topic in your chat with the bot, so the main chat stays uncl
 
 Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
 
+**Job cards and the jobs topics.** Job news lives apart from your conversations, so the agent's replies don't get buried:
+- **Where:** with topics on, each project has a "📊 dreamer · jobs" topic, and one "📊 jobs" topic holds the jobs that belong to no project.
+- **One card per job:** each job has a single card there, edited in place and silently: queued, running, and refreshed every 10 minutes (`slurm.status_interval_minutes`). 📊 Status refreshes it now.
+  ```
+  🏃 18756118 bench-dreamerv3-mixed-s1 · cn015
+  ⏱ 16:08 / 24:00 (67%, 7h51m left) · step 2.85M / 5M (57%)
+  🎯 score 4.1
+  📈 value-loss 0.82 · dyn-loss 3.67
+  ⏰ agent watching (check-ins every 2h)
+  ```
+- **When it ends:** the card shows the final state, and a short report is posted as a reply to it:
+  ```
+  ❌ 18771337 pka-ft OUT_OF_MEMORY after 2h03m (peak RAM 31.8G of 32G)
+  🧠 Host OOM while loading the full split; ask for --mem 64G.
+  <the decisive log line>
+  ▸ details (exit, memory, metrics, log tail - folded)
+  ```
+- **In the conversation:** when a job the agent submitted ends and the agent isn't watching it, you get a one-line pointer: "✅ Job 123 … finished → report in the jobs topic". Watched jobs need no pointer, because the agent's reply follows.
+
+**What matters in a job: the agent decides, and sets alerts.** The agent tells Overseer which numbers matter and how to get them, per job, per job-name pattern (a sweep) or as a project default:
+```bash
+ov metrics set --pattern "bench-dreamerv3-*" --critical "crl/train_episode/score=score" \
+    --important "train/loss/value=value-loss,train/loss/dyn=dyn-loss" --progress "step/5000000" \
+    --command 'tail -n1 {workdir}/runs/seed1/metrics.jsonl' \
+    --alert "score < 1 after 2h" --wake-on "train/loss/value is nan" --wake-on "step stalled 30m"
+```
+- **The card's lines:** the critical values are its 🎯 line (also in the report's headline), the important ones its 📈 line, and progress the steps done out of the total.
+- **Where values come from:** the job's log by default. `--command` is a quick command on the HPC that prints `name=value` lines or a JSON object, for values the log doesn't show.
+- **Without a setting:** Overseer shows the 3 most informative metrics it finds in the log.
+- **Alerts:**
+  - forms: comparisons (`score < 1 after 2h`), `is nan`, and `stalled 30m`;
+  - when: checked at every card refresh;
+  - how often: each fires once per job.
+  - `--alert` pings you with a 🚨 reply under the card. `--wake-on` also wakes the agent, with the job's details, so it can stop or fix the run.
+
 **Working on its own: watches and wake-ups.** The agent only runs when you write to it, or when something it set up wakes it. It needs no approval:
 - `ov watch <jobs>`: woken when those jobs have ended (all of them, or as soon as one fails), with their final reports: state, exit code, runtime, peak memory, findings and the end of the log. `--every 30m` adds check-ins while they run.
 - `ov wake in 90m` / `ov wake every 2h [--for 12h]`: woken by a timer, once or repeatedly.
@@ -240,7 +275,7 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
 ```
 /auto Get crafter seed 1 above score 5 in /scratch/me/rf-dreamer. One change per run, a100 or h100, whichever starts first.
 ```
-- **You see every one:** each new watch or timer is announced quietly in the conversation's topic ("⏰ The agent will look at job 18746955 when it ends"), with a ✖ Cancel button. Replies end with what the agent is waiting for, and `/auto` lists everything pending.
+- **You see every one:** a watched job's card says "⏰ agent watching", with a ✖ watch button that cancels it; a timer is announced quietly in the conversation's topic, with a ✖ Cancel button. Replies end with what the agent is waiting for, and `/auto` lists everything pending.
 - **Turning it off:** `/auto off` cancels the pending wake-ups (in that thread or topic, or as a reply: that conversation), and the agent is told. `/stop` stops a run.
 - **Limits:** check-ins and repeating timers are at least 15 minutes apart, and a repeating timer ends (after 24 hours unless the agent sets `--for`). There is no limit on the number of wake-ups. `/usage` shows what they cost.
 - **Pauses on problems:** a wake-up that fails or is `/stop`ped pauses that conversation's wake-ups until you write to it there.
@@ -296,6 +331,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).
 - `slurm.quota_command`, `quota_check_hours`, `quota_warn_percent`: the disk quota check (above). The command's output must be a table like `myquota`'s: size, quota (%), files, quota (%). Set it to `""` to turn the check off.
 - `slurm.compute`: the partition, cores, memory and hours of the shared worker, how long it may stay idle, how long `hpc-run` waits for a node, the GPU partition and gres for `--gpu`, extra `sbatch` flags (e.g. an account), the login-node CPU limit (`login_cpu_seconds`, 0 = off) and the warning threshold.
+- `slurm.status_interval_minutes`: how often a running job's card is refreshed and the agent's alerts on it checked (10).
 - `agent.autopilot`: the shortest interval for check-ins and repeating timers (`min_checkin_minutes`, 15), and how long a repeating timer lasts when the agent doesn't say (`repeat_hours`, 24). Settings from the old approval-based autopilot are ignored.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
 - `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
@@ -323,6 +359,7 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
 | `autopilot.py` | watches and timers that wake conversations, check-ins, pausing after a failed wake-up |
+| `metrics.py` | what matters in a job (`ov metrics`): critical/important metrics, progress, the extraction command, alerts |
 | `usage.py` | `/usage`: tokens and cost per day, by origin, backend and conversation |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
 | `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches and timers, notifications); installs the `overseer` skill |

@@ -141,10 +141,10 @@ def tqdm_cleanup(text: str) -> str:
 REPORT_SYSTEM = """You write short job reports for an ML researcher, delivered as Telegram messages.
 You are given SLURM accounting data and the tail of the job's logs for a job on a university HPC cluster.
 
-Write plain text (no Markdown headings, no tables), at most ~12 lines:
-- First line: one-sentence verdict.
-- If it succeeded: the key final metrics you can find (loss/accuracy/etc.), runtime and resource efficiency if notable.
-- If it failed: the root cause, quoting the decisive log line, then 1-3 concrete next steps (exact flags/code changes when you can tell).
+Write plain text, at most 2 short sentences (it sits under a compact job card; the details are shown elsewhere):
+- If it succeeded: the verdict and the key final result (e.g. "Converged; score plateaued at 5.2 after step 3.1M.").
+- If it failed: the root cause and the fix (exact flag or change when you can tell), e.g. "Host OOM while loading the
+  full split; ask for --mem 64G."
 Only state facts supported by the data; say when the logs are inconclusive."""
 
 STATUS_SYSTEM = """Summarise the progress of a running ML training job in ONE short line for a Telegram status update

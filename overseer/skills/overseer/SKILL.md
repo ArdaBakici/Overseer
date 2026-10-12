@@ -34,6 +34,43 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
 - `hpc-run`'s shared worker job (`overseer-worker`) is not one of your jobs. Don't register or watch
   it: `hpc-run` starts, reuses and ends it (`hpc-run --stop` ends it early).
 
+## What matters in a job: its card, and alerts
+
+Every job has a live card in the project's "📊 jobs" topic. Overseer keeps editing that card until the
+job ends, and then posts a short report under it. Tell Overseer what the card should show and what's
+worth an alert:
+
+```bash
+ov metrics set 18756118 --critical "crl/train_episode/score=score" \
+    --important "train/loss/value=value-loss,train/loss/dyn=dyn-loss" --progress "step/5000000"
+ov metrics set --pattern "bench-dreamerv3-*" ...     # every run of a sweep
+ov metrics set --project ...                         # the default for this project's jobs
+ov metrics set 18756118 --command 'tail -n1 {workdir}/runs/seed1/metrics.jsonl'
+ov metrics set 18756118 --alert "score < 1 after 2h" --wake-on "train/loss/value is nan" --wake-on "step stalled 30m"
+ov metrics show 18756118     # what the card shows now, and whether the command works
+ov metrics list | clear ...
+```
+
+- **`--critical`**: the 1–2 numbers that tell whether the run works. They're the card's first line
+  and appear in the report's headline.
+- **`--important`**: up to ~4 more, on the card's second line.
+- **Names and labels:** use `metric=label` for a short label. A name matches the metric exactly, or by
+  its last part ("score" finds "crl/train_episode/score").
+- **`--progress metric/total`**: shows progress as steps done out of the total, which is more meaningful
+  than time used.
+- **`--command`** is for when the values aren't in the log. It must be quick, because it runs on the
+  login node at every card refresh (about every 10 minutes) with a 20 s limit.
+  - It prints `name=value` lines or one JSON object; nested keys are joined with `/`.
+  - Placeholders: `{job_id}`, `{workdir}`, `{stdout}`, `{name}`.
+- **Alerts:**
+  - forms: `<metric> < 1 after 2h` (also `<=`, `>`, `>=`, `==`, `!=`), `<metric> is nan`, and
+    `<metric> stalled 30m` (unchanged for that long);
+  - when: checked at every card refresh;
+  - how often: each fires once per job;
+  - who hears: `--alert` pings the researcher, and `--wake-on` also wakes you with the job's details.
+- **Which setting applies:** a job's own setting, else the newest matching `--pattern`, else the project
+  default. Set it once per kind of experiment.
+
 ## Projects
 
 ```bash

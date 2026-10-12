@@ -22,6 +22,8 @@ class Outgoing:
     # Telegram Rich Markdown version of the message, used when rich messages are available
     # (`text` is the fallback). Pictures and files are embedded in it.
     markdown: str | None = None
+    jobs: bool = False  # job news: goes to the jobs topic of the job's project (or the general jobs topic)
+    reply_to: dict[str, int] = field(default_factory=dict)  # chat id -> message to reply to (e.g. the job's card)
 
 
 class Notifier(Protocol):
