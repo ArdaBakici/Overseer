@@ -172,6 +172,56 @@ MAX_FILE = 50 * 1024 * 1024
 MAX_ATTACHMENTS = 10
 
 
+INBOX = "inbox"  # where the researcher's files go, in the agent's working dir
+
+
+def _size(n: int) -> str:
+    return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{max(1, round(n / 1e3))} KB"
+
+
+def _upload_name(name: str) -> str:
+    name = re.sub(r"[^\w.\-]+", "_", Path(name or "").name).strip("._-") or "file"
+    return name[-100:]
+
+
+def deliver_uploads(workdir: Path, files: list[tuple[str, Path]]) -> list[tuple[str, int]]:
+    """Move the researcher's files (name, staged path) into the agent's ./inbox: [(path for the agent, size)].
+    The agent can write its working dir, so ./inbox is opened without following links (Overseer isn't
+    sandboxed: a symlinked inbox must not make it write elsewhere), and existing files are never replaced."""
+    inbox = workdir / INBOX
+    try:
+        if not stat.S_ISDIR(os.lstat(inbox).st_mode):
+            inbox.unlink()
+            raise FileNotFoundError
+    except FileNotFoundError:
+        inbox.mkdir(mode=0o700)
+    fd = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    out = []
+    try:
+        taken = set(os.listdir(fd))
+        for name, src in files:
+            base = _upload_name(name)
+            stem, dot, ext = base.rpartition(".") if "." in base else (base, "", "")
+            candidate, i = base, 1
+            while candidate in taken:
+                candidate, i = f"{stem}-{i}{dot}{ext}", i + 1
+            size = src.stat().st_size
+            os.rename(src, candidate, dst_dir_fd=fd)
+            taken.add(candidate)
+            out.append((f"./{INBOX}/{candidate}", size))
+    finally:
+        os.close(fd)
+    return out
+
+
+def uploads_note(items: list[tuple[str, int]], backend: str) -> str:
+    look = "your view_image tool" if backend == "codex" else "your Read tool (it shows images and PDFs)"
+    listing = ", ".join(f"{p} ({_size(n)})" for p, n in items)
+    return (f"[The researcher sent {'a file' if len(items) == 1 else f'{len(items)} files'} with this message, saved "
+            f"in your working directory: {listing}. Look at images with {look}. To use a file on the HPC, copy it "
+            "there with scp.]")
+
+
 def collect_outbox(folder: Path) -> tuple[list[tuple[str, bytes]], list[tuple[str, bytes]], list[str]]:
     """Take the files the agent left in its outbox: (pictures, documents, notes about skipped files).
     Overseer isn't sandboxed, so only regular files are read - never symlinks or hard links, which
@@ -706,10 +756,12 @@ class Agent:
         ] if x)
 
     # ------------------------------------------------------------------ running a request
-    async def handle(self, s: Session, user_text: str, quiet: bool = False, origin: str = "user") -> bool:
+    async def handle(self, s: Session, user_text: str, quiet: bool = False, origin: str = "user",
+                     files: list[tuple[str, Path]] | None = None) -> bool:
         """Run one request in a conversation. True if the agent answered. `quiet`: send the answer
         without a notification sound (check-ins). `origin`: who asked - the researcher (user), or a
-        wake-up the agent set up (wakeup, checkin)."""
+        wake-up the agent set up (wakeup, checkin). `files`: what the researcher sent with it (name, staged
+        path), moved into the agent's ./inbox."""
         if not self.cfg.agent.enabled:
             await self.notifier.send(Outgoing("The agent is disabled in the config."))
             return False
@@ -722,6 +774,9 @@ class Agent:
             if origin == "user" and self.autopilot:
                 self.autopilot.user_turn(s)
             try:
+                if files:  # (moved while no run of this conversation can touch its inbox)
+                    items = deliver_uploads(self.runner(project=s.project).workdir(s.id), files)
+                    user_text = f"{user_text}\n\n{uploads_note(items, self.backend_of(s.project))}".strip()
                 await self._turn(s, user_text, quiet)
                 ok = True
             except asyncio.CancelledError:

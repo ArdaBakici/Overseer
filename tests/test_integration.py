@@ -800,7 +800,7 @@ async def test_bot_routing_and_commands(env, monkeypatch):
               notifier=env.notifier)
     started = []
 
-    async def fake_run_agent(chat_id, session, text):
+    async def fake_run_agent(chat_id, session, text, files=None):
         started.append((session.id, text))
 
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
@@ -1495,7 +1495,7 @@ async def test_project_commands(env, monkeypatch):
     async def reply(update, text):
         replies.append(text)
 
-    async def fake_run_agent(chat_id, session, text):
+    async def fake_run_agent(chat_id, session, text, files=None):
         started.append((session.id, text))
 
     monkeypatch.setattr(bot, "reply", reply)
@@ -1602,7 +1602,7 @@ async def test_plot_button(env, monkeypatch):
               notifier=env.notifier)
     started = []
 
-    async def fake_run_agent(chat_id, session, text):
+    async def fake_run_agent(chat_id, session, text, files=None):
         started.append((session.id, text))
 
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
@@ -1671,7 +1671,7 @@ async def test_threads_are_conversations(env, monkeypatch):
               notifier=notifier, projects=projects)
     started = []
 
-    async def fake_run_agent(chat_id, session, text):
+    async def fake_run_agent(chat_id, session, text, files=None):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
 
@@ -1912,7 +1912,7 @@ async def test_general_topic(env, monkeypatch):
               notifier=notifier)
     started, replies = [], []
 
-    async def fake_run_agent(chat_id, session, text):
+    async def fake_run_agent(chat_id, session, text, files=None):
         started.append((session.id, text))
 
     async def reply(update, text):
@@ -2374,3 +2374,98 @@ async def test_unwatched_agent_job_points_to_the_jobs_topic(env):
     await env.monitor.poll()
     pointer = next(m for m in env.notifier.sent if m.session_id == s.id and "Job 4242 fixed finished" in m.text)
     assert pointer.session_id == s.id and pointer.silent and "4242 fixed finished" in pointer.text
+
+
+# ----------------------------------------------------------------------------- files sent to the agent
+
+def file_update(message_id, *, photo=None, document=None, caption=None, thread=None, group=None, size=None):
+    """A Telegram message with a picture (photo=bytes) or a file (document=(name, bytes))."""
+    data = photo if photo is not None else document[1]
+
+    async def get_file():
+        async def download_to_drive(path):
+            Path(path).write_bytes(data)
+        return NS(download_to_drive=download_to_drive)
+    media = NS(file_size=size or len(data), get_file=get_file,
+               file_name=document[0] if document else None)
+    msg = NS(message_id=message_id, photo=[NS(file_size=1, get_file=None), media] if photo is not None else [],
+             document=media if document else None, caption=caption, media_group_id=group, reply_to_message=None,
+             message_thread_id=thread, is_topic_message=thread is not None, text=None)
+    return NS(effective_message=msg, effective_chat=NS(id=1))
+
+
+async def test_files_sent_to_the_agent(env, monkeypatch):
+    """A file goes with its caption, or with the next message; an album is one message; each lands in the agent's
+    ./inbox and the agent is told where."""
+    import overseer.bot as botmod
+    from overseer.bot import Bot
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    started, replies = [], []
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        started.append((session.id, text, [n for n, _ in files or []], files))
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(bot, "reply", reply)
+    monkeypatch.setattr(botmod, "UPLOAD_WAIT", 0.3)
+    monkeypatch.setattr(botmod, "ALBUM_WAIT", 0.05)
+    main = env.agent.general_session().id
+
+    # A screenshot, then a few words about it: one message.
+    await bot.on_file(file_update(10, photo=b"\x89PNG one"), None)
+    assert "📎 Got it" in replies[-1] and not started
+    await bot.on_text(NS(effective_message=NS(text="why is this curve flat?", reply_to_message=None),
+                         effective_chat=NS(id=1)), None)
+    await asyncio.sleep(0)
+    assert started[-1][:3] == (main, "why is this curve flat?", ["photo-10.jpg"]), started
+    await asyncio.sleep(0.4)
+    assert len(started) == 1  # the timer was cancelled
+
+    # A file with a caption, and an album: one message each, without waiting for more.
+    await bot.on_file(file_update(11, document=("my config.yaml", b"lr: 1"), caption="use this config"), None)
+    await asyncio.sleep(0.1)
+    assert started[-1][1:3] == ("use this config", ["my config.yaml"])
+    await bot.on_file(file_update(12, photo=b"a", caption="compare these", group="g1"), None)
+    await bot.on_file(file_update(13, photo=b"b", group="g1"), None)
+    await asyncio.sleep(0.1)
+    assert started[-1][1:3] == ("compare these", ["photo-12.jpg", "photo-13.jpg"])
+
+    # Nothing written about it: after a while it goes on its own.
+    await bot.on_file(file_update(14, photo=b"c"), None)
+    await asyncio.sleep(0.4)
+    assert started[-1][1:3] == ("", ["photo-14.jpg"])
+
+    # Too big for the Bot API: refused, with what to do instead.
+    n = len(started)
+    await bot.on_file(file_update(15, document=("ckpt.pt", b"x"), size=botmod.MAX_DOWNLOAD + 1), None)
+    assert "too big" in replies[-1] and len(started) == n
+
+    # The agent gets the files in ./inbox and is told about them; names are cleaned, nothing is overwritten.
+    s = env.agent.general_session()
+    files = started[1][3]
+    workdir = env.agent.runner(project=None).workdir(s.id)
+    (workdir / "inbox").mkdir(parents=True, exist_ok=True)
+    (workdir / "inbox" / "my_config.yaml").write_text("the agent's own")
+    await env.agent.handle(s, "use this config", files=files)
+    stdin = [c for c in env.cli_log() if c["prog"] == "claude"][-1]["stdin"]
+    assert "use this config" in stdin and "./inbox/my_config-1.yaml (1 KB)" in stdin and "Read tool" in stdin, stdin
+    assert (workdir / "inbox" / "my_config-1.yaml").read_text() == "lr: 1"
+    assert (workdir / "inbox" / "my_config.yaml").read_text() == "the agent's own"
+
+
+async def test_a_symlinked_inbox_is_not_followed(env, tmp_path):
+    """The agent can write its working dir: an inbox it replaced with a link must not make Overseer write elsewhere."""
+    from overseer.agent import deliver_uploads
+    workdir, elsewhere = tmp_path / "work", tmp_path / "elsewhere"
+    workdir.mkdir()
+    elsewhere.mkdir()
+    (workdir / "inbox").symlink_to(elsewhere)
+    staged = tmp_path / "staged"
+    staged.write_bytes(b"data")
+    items = deliver_uploads(workdir, [("../../x.png", staged)])
+    assert items == [("./inbox/x.png", 4)]
+    assert not list(elsewhere.iterdir()) and (workdir / "inbox").is_dir() and not (workdir / "inbox").is_symlink()
+    assert (workdir / "inbox" / "x.png").read_bytes() == b"data"

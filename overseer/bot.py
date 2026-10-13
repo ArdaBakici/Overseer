@@ -12,6 +12,7 @@ import logging
 import re
 import secrets
 import time
+from pathlib import Path
 
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Message, ReplyParameters,
                       Update)
@@ -41,6 +42,12 @@ from .store import ProjectRecord, Store
 from .usage import usage_report
 
 log = logging.getLogger(__name__)
+
+# Files you send the agent: a file without a caption waits this long for your message about it; with a caption,
+# only for the rest of its album (whose pictures arrive as separate messages).
+UPLOAD_WAIT = 30
+ALBUM_WAIT = 2
+MAX_DOWNLOAD = 20 * 1024 * 1024  # the largest file the Bot API lets bots download
 
 # /auto <goal>: what the agent is asked
 AUTO_PROMPT = """Work on this on your own, over as many runs as it takes: {goal}
@@ -74,6 +81,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /assign &lt;job&gt; &lt;project|main&gt; — move a job (or reply to its message: /assign &lt;project&gt;)
 
 Reply to any job message to talk to the agent about that job.
+Send pictures and files too (up to 20 MB): with a caption, or followed by a message about them.
 The agent has full access to your HPC account; you'll see every command it runs and every job it submits."""
 
 
@@ -524,6 +532,8 @@ class Bot:
         self.notifier = notifier
         self._tasks: set[asyncio.Task] = set()
         self._pending: dict[tuple[int, int | None], str] = {}  # new thread -> its first message, until a project is picked
+        self._pending_files: dict[tuple[int, int | None], list[tuple[str, Path]]] = {}  # ...and the files sent with it
+        self._uploads: dict[tuple[int, int | None], dict] = {}  # files received, not yet given to the agent
 
     def register(self) -> None:
         allowed = filters.Chat(chat_id=self.cfg.telegram.allowed_chat_ids)
@@ -550,6 +560,7 @@ class Bot:
         add(TypeHandler(Update, self.on_raw_update), group=-1)
         add(CallbackQueryHandler(self.on_button))
         add(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, self.on_text))
+        add(MessageHandler(allowed & (filters.PHOTO | filters.Document.ALL), self.on_file))
         add(MessageHandler(~allowed, self.on_stranger))
 
     # ------------------------------------------------------------------ helpers
@@ -600,7 +611,8 @@ class Bot:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _run_agent(self, chat_id: int, session: Session, text: str) -> None:
+    async def _run_agent(self, chat_id: int, session: Session, text: str,
+                         files: list[tuple[str, Path]] | None = None) -> None:
         if self.agent.is_running(session):
             await self.notifier.send(Outgoing("⏳ The agent is still working on the previous message in this "
                                               "conversation; yours is queued. /stop cancels the current run.",
@@ -616,7 +628,7 @@ class Bot:
 
         t = asyncio.create_task(typing())
         try:
-            await self.agent.handle(session, text)
+            await self.agent.handle(session, text, files=files)
         finally:
             t.cancel()
 
@@ -869,44 +881,100 @@ class Bot:
 
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         text = update.effective_message.text
+        files: list[tuple[str, Path]] = []
+        up = self._uploads.pop((update.effective_chat.id, self._thread(update)), None)
+        if up:  # files sent just before: they go with this message
+            up["timer"].cancel()
+            text, files = "\n\n".join([*up["captions"], text]), up["files"]
+        await self._route(update, text, files)
+
+    async def _route(self, update: Update, text: str, files: list[tuple[str, Path]]) -> None:
         session = self._replied_session(update) or self._here(update)
         if session is None:  # a thread the user just started
-            await self._new_thread(update, text)
+            await self._new_thread(update, text, files)
             return
         proj = self.store.get_project(session.project)
         if proj and proj.archived:
+            for _, path in files:
+                path.unlink(missing_ok=True)
             await self.reply(update, f"Project {code(proj.name)} is archived. /project restore {esc(proj.name)} "
                                      "brings it back.")
             return
-        self._spawn(self._run_agent(update.effective_chat.id, session, text))
+        self._spawn(self._run_agent(update.effective_chat.id, session, text, files))
+
+    # ------------------------------------------------------------------ files sent to the agent
+    async def on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """A picture or file for the agent. It's saved in the agent's ./inbox and goes with the caption, or with
+        the next message (a picture without a caption, then a few words about it); after UPLOAD_WAIT without one,
+        on its own. An album is one message."""
+        msg = update.effective_message
+        if msg.photo:
+            media, name = msg.photo[-1], f"photo-{msg.message_id}.jpg"  # the largest size
+        elif msg.document:
+            media, name = msg.document, msg.document.file_name or f"file-{msg.message_id}"
+        else:
+            return
+        if (media.file_size or 0) > MAX_DOWNLOAD:
+            await self.reply(update, f"📎 {esc(name)} is too big: Telegram lets bots download files up to "
+                                     f"{MAX_DOWNLOAD >> 20} MB. Put it on the HPC and tell the agent where it is.")
+            return
+        staging = self.cfg.local.tmp("uploads")
+        staging.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = staging / secrets.token_hex(8)
+        try:
+            await (await media.get_file()).download_to_drive(path)
+        except Exception as e:
+            log.warning("could not download %s", name, exc_info=True)
+            await self.reply(update, f"📎 Could not download {esc(name)}: {esc(type(e).__name__)}: {esc(str(e)[:200])}")
+            return
+        key = (update.effective_chat.id, self._thread(update))
+        up = self._uploads.setdefault(key, {"update": update, "files": [], "captions": [], "timer": None})
+        up["files"].append((name, path))
+        if msg.caption:
+            up["captions"].append(msg.caption)
+        if up["timer"]:
+            up["timer"].cancel()
+        wait = ALBUM_WAIT if up["captions"] else UPLOAD_WAIT
+        if wait == UPLOAD_WAIT and len(up["files"]) == 1 and not msg.media_group_id:
+            await self.reply(update, f"📎 Got it. Write what it's about, or in {UPLOAD_WAIT} s the agent looks at it "
+                                     "as is.")
+        up["timer"] = asyncio.create_task(self._send_uploads(key, wait))
+
+    async def _send_uploads(self, key: tuple[int, int | None], wait: float) -> None:
+        await asyncio.sleep(wait)
+        up = self._uploads.pop(key, None)
+        if up:
+            await self._route(up["update"], "\n\n".join(up["captions"]), up["files"])
 
     # ------------------------------------------------------------------ threads
-    async def _new_thread(self, update: Update, text: str) -> None:
+    async def _new_thread(self, update: Update, text: str, files: list[tuple[str, Path]] | None = None) -> None:
         """Each Telegram thread is its own conversation. A new one asks which project it's about
         (unless the message starts with "<project>: …" or there are no projects)."""
         chat_id, thread = update.effective_chat.id, self._thread(update)
         projects = self.store.list_projects()
         m = re.match(r"^\s*([a-z0-9][a-z0-9_-]{0,31})\s*:\s*(\S.*)$", text or "", re.S | re.I)
         if m and self.store.get_project(m.group(1).lower()) and not self.store.get_project(m.group(1).lower()).archived:
-            await self._start_thread(chat_id, thread, m.group(1).lower(), m.group(2))
+            await self._start_thread(chat_id, thread, m.group(1).lower(), m.group(2), files)
             return
         if not projects:
-            await self._start_thread(chat_id, thread, None, text)
+            await self._start_thread(chat_id, thread, None, text, files)
             return
         self._pending[(chat_id, thread)] = text
+        self._pending_files[(chat_id, thread)] = files or []
         buttons = [(f"📁 {p.name}", f"thread:{p.name}") for p in projects[:8]] + [("💬 No project", "thread:")]
         rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
         markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
         await update.effective_message.reply_text("New conversation. Which project is it about?", reply_markup=markup)
 
-    async def _start_thread(self, chat_id: int, thread: int | None, project: str | None, text: str) -> None:
+    async def _start_thread(self, chat_id: int, thread: int | None, project: str | None, text: str,
+                            files: list[tuple[str, Path]] | None = None) -> None:
         session = self.agent.new_conversation(project)
         if thread:
             self.store.bind_thread(chat_id, thread, session.id)
             if project and hasattr(self.notifier, "rename_topic"):  # Telegram named it after the first message
-                await self.notifier.rename_topic(chat_id, thread, f"{project} · {' '.join(text.split())[:60]}")
-        if text and text.strip():
-            self._spawn(self._run_agent(chat_id, session, text))
+                await self.notifier.rename_topic(chat_id, thread, f"{project} · {' '.join((text or '').split())[:60] or (files[0][0] if files else '')}")
+        if (text and text.strip()) or files:
+            self._spawn(self._run_agent(chat_id, session, text, files))
 
     def _scope_sessions(self, update: Update | None) -> list[str] | None:
         """The conversations a command applies to: the replied-to one, this thread's, a project topic's, or all."""
@@ -1144,6 +1212,7 @@ class Bot:
             elif action == "thread":
                 thread = getattr(q.message, "message_thread_id", None) if q.message else None
                 text = self._pending.pop((chat.id, thread), "")
+                files = self._pending_files.pop((chat.id, thread), [])
                 project = arg or None
                 if project and not self.store.get_project(project):
                     project = None
@@ -1151,7 +1220,7 @@ class Bot:
                     await q.edit_message_text(f"📁 {project}" if project else "💬 No project")
                 except Exception:
                     pass
-                await self._start_thread(chat.id, thread, project, text)
+                await self._start_thread(chat.id, thread, project, text, files)
             elif action == "plot":
                 await self._start_plot(chat.id, arg)
             elif action == "assign":

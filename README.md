@@ -194,6 +194,10 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - **Fallback:** if rich messages aren't available or Telegram rejects one, the regular formatted message goes out instead. Bold, lists, code and tables become aligned text, long answers keep their first paragraph and fold the rest, and pictures and files follow as separate messages. `telegram.rich_messages: false` always uses that path.
   - **No library change:** python-telegram-bot doesn't wrap the new methods yet, so Overseer calls them directly through its generic API call.
 - **Folding:** the list of commands the agent ran, and the log tail or traceback in job reports, show their first lines and expand on tap.
+- **Sending the agent files:** send pictures or files (screenshots, configs, PDFs, up to 20 MB, the Bot API's download limit) in any conversation.
+  - **With a caption** they go to the agent at once; an album is one message.
+  - **Without one,** Overseer waits 30 s for your message about them and sends them together, or on their own after that.
+  - **Where they go:** `./inbox/` in the agent's working folder. The agent is told the paths, looks at pictures and PDFs with its own tools (Claude Code's Read, Codex's view_image), and copies files to the HPC with `scp` when they're needed there.
 - **Files and plots:** anything the agent puts in `./outbox/` in its working folder is sent with its reply. Pictures arrive as photos (an album if several, up to 10 per reply, 10 MB each); other files as documents (up to 50 MB).
   - **Where plots are made:** on the HPC, where the data is (e.g. "plot reward vs step for seeds 0-2"). The agent writes a small plotting script, runs it there and copies the PNG back with `scp`, so Overseer needs no plotting libraries.
   - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
