@@ -203,7 +203,9 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
 - **Fallback:** if Telegram ever rejects the formatting, the message is resent as plain text.
 
-**Threads: each one is a conversation.** With topics enabled, the chat with the bot works like an AI chat app:
+**Writing outside the topics ("All") is blocked by default.** Such a message reaches no agent. Telegram makes a topic of its own for it, which Overseer deletes, and a note in 💬 general says to write in a project's topic or in general, quoting your message so you can paste it there. Files sent there are refused the same way. Each 📊 jobs topic talks to its project's agent. Set `telegram.new_threads: true` to have such messages start conversations of their own, as below.
+
+**Threads: each one is a conversation** (with `telegram.new_threads: true`). With topics enabled, the chat with the bot works like an AI chat app:
 - **New thread:** a message from the ✏️ composer starts a new thread, which is its own conversation. If you have projects, Overseer asks which one it's about (📁 dreamer / 📁 chem / 💬 no project) and renames the thread, e.g. "dreamer · plot the reward curves". Starting the message with `dreamer: …` skips the question.
 - **Continuing:** write in an existing thread to continue that conversation.
 - **Commands:** `/new` gives the thread a fresh conversation, and `/ask`, `/auto` and `/stop` act on the thread they're sent in.

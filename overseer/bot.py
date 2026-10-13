@@ -196,6 +196,14 @@ class TelegramNotifier:
         v = self.store.get(f"jobs_topic:{chat_id}:{project or ''}")
         return int(v) if v else None
 
+    def jobs_topic_owner(self, chat_id: int, thread: int | None) -> tuple[bool, str | None]:
+        """(is it a jobs topic, of which project): writing there talks to that project's agent."""
+        if thread:
+            for project in [None, *(p.name for p in self.store.list_projects(include_archived=True))]:
+                if self.jobs_thread(chat_id, project) == thread:
+                    return True, project
+        return False, None
+
     async def ensure_jobs_topics(self, projects: list[str]) -> None:
         if not self.topics:
             return
@@ -601,7 +609,38 @@ class Bot:
         p = self.store.project_for_thread(chat_id, thread)
         if p:
             return self.agent.general_session(project=p.name)
+        is_jobs, project = (self.notifier.jobs_topic_owner(chat_id, thread)
+                            if hasattr(self.notifier, "jobs_topic_owner") else (False, None))
+        if is_jobs:  # a jobs topic: its project's conversation
+            return self.agent.general_session(project=project)
         return self.agent.get(self.store.thread_session(chat_id, thread))
+
+    def _outside_topics(self, update: Update) -> bool:
+        """Written in Telegram's "All" view rather than in a topic, while new threads are off: Telegram either
+        makes the message a topic of its own (one nobody assigned yet) or sends it with no topic at all."""
+        if self.cfg.telegram.new_threads or not getattr(self.notifier, "topics", False):
+            return False
+        if self._replied_session(update):  # a reply to one of Overseer's messages: that conversation
+            return False
+        thread = self._thread(update)
+        return not thread or self._here(update) is None
+
+    async def _refuse_outside_topics(self, update: Update, text: str, files: list[tuple[str, Path]]) -> None:
+        for _, path in files:
+            path.unlink(missing_ok=True)
+        chat_id, thread = update.effective_chat.id, self._thread(update)
+        quoted = (f"\nYour message:<blockquote expandable>{esc(text[:3000])}</blockquote>" if text and text.strip()
+                  else "")
+        notice = ("✋ Messages outside the topics don't go to the agent. Write in a project's topic, or in 💬 general "
+                  "for anything else." + (f" ({len(files)} file(s) not sent.)" if files else "") + quoted)
+        if thread:  # the topic Telegram made for the message: removed, so the chat keeps only Overseer's topics
+            try:
+                await self.app.bot.delete_forum_topic(chat_id, thread)
+            except Exception:
+                log.debug("could not delete topic %s", thread, exc_info=True)
+                await self.reply(update, notice)
+                return
+        await self.notifier.send(Outgoing(notice))
 
     def _where(self, scope: str | None) -> str:
         return f"project {code(scope)}" if scope else "the main chat"
@@ -889,6 +928,9 @@ class Bot:
         await self._route(update, text, files)
 
     async def _route(self, update: Update, text: str, files: list[tuple[str, Path]]) -> None:
+        if self._outside_topics(update):
+            await self._refuse_outside_topics(update, text, files)
+            return
         session = self._replied_session(update) or self._here(update)
         if session is None:  # a thread the user just started
             await self._new_thread(update, text, files)
@@ -908,6 +950,9 @@ class Bot:
         the next message (a picture without a caption, then a few words about it); after UPLOAD_WAIT without one,
         on its own. An album is one message."""
         msg = update.effective_message
+        if self._outside_topics(update):
+            await self._refuse_outside_topics(update, msg.caption or "", [])
+            return
         if msg.photo:
             media, name = msg.photo[-1], f"photo-{msg.message_id}.jpg"  # the largest size
         elif msg.document:

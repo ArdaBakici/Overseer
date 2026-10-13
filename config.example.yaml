@@ -58,6 +58,7 @@ telegram:
   allowed_chat_ids: [123456789]
   rich_messages: true           # Telegram's native rich messages for agent replies (tables, formulas, plots inline)
   streaming: true               # live progress as a streaming draft with a Stop button
+  new_threads: false            # true: a message outside the topics ("All") starts a conversation of its own
 
 agent:
   enabled: true

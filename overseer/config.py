@@ -175,6 +175,9 @@ class TelegramConfig:
     # Stream the agent's progress as a live draft with a Stop button (private chats), instead of
     # a message that is edited every few seconds.
     streaming: bool = True
+    # With topics: a message written outside them (Telegram's "All" view) starts a new conversation of its own.
+    # Off: it's refused, with a note to write in a project's topic or in "general".
+    new_threads: bool = False
 
     @property
     def token(self) -> str:
