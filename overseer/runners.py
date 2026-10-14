@@ -51,11 +51,20 @@ SBATCH_PARSABLE_RE = re.compile(_SBATCH + r"[^;&|\n]*\s--parsable(?![\w-])")  # 
 SCANCEL_RE = re.compile(r"(?:^|[\s;&|(`'\"/])scancel(?![\w.-])([^;&|\n]*)")
 SLURM_QUERY_RE = re.compile(r"(?:^|[\s;&|(`'\"/])(?:sacct|squeue|scontrol|seff|sinfo)(?![\w.-])")
 
+# Claude Code tools that can't work in a run that ends with the turn: wake-ups and schedules (Overseer's `ov wake` /
+# `ov watch` do that), background workflows, messages to other sessions, and tools for its own UIs. (Cron tools
+# and background subagents/commands are turned off with environment variables, see ClaudeCodeRunner.env.)
+CLAUDE_DISALLOWED_TOOLS = ["ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Workflow", "SendMessage",
+                           "ListAgents", "TaskStop", "Monitor", "PushNotification", "RemoteTrigger", "EnterWorktree",
+                           "ExitWorktree", "ReportFindings"]
+
 # Codex features with tools that act outside the shell sandbox or aren't useful headless.
 CODEX_DISABLED_FEATURES = [
     "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser", "computer_use",
     "image_generation", "apps", "plugins", "remote_plugin", "in_app_local_automation", "tool_suggest",
     "skill_mcp_dependency_install", "workspace_dependencies", "memories", "goals", "hooks",
+    # Subagents: always asynchronous (spawn, then wait), so a turn that ends first loses them.
+    "multi_agent",
 ]
 
 
@@ -417,6 +426,10 @@ class ClaudeCodeRunner(Runner):
         env["CLAUDE_CONFIG_DIR"] = str(self.home())
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         env["DISABLE_AUTOUPDATER"] = "1"
+        # The CLI exits when the turn ends, so nothing it runs "in the background" survives to report back.
+        # Subagents and commands run in the foreground; follow-ups go through Overseer (`ov wake`, `ov watch`).
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+        env["CLAUDE_CODE_DISABLE_CRON"] = "1"
         return env
 
     def settings(self, workdir: Path) -> dict[str, Any]:
@@ -444,7 +457,8 @@ class ClaudeCodeRunner(Runner):
         return _merge(self.c.extra_settings, enforced)
 
     def _common(self, workdir: Path) -> list[str]:
-        argv = [self.c.command, "-p", "--settings", json.dumps(self.settings(workdir)), "--strict-mcp-config"]
+        argv = [self.c.command, "-p", "--settings", json.dumps(self.settings(workdir)), "--strict-mcp-config",
+                "--disallowedTools", ",".join(CLAUDE_DISALLOWED_TOOLS)]
         if self.model:
             argv += ["--model", self.model]
         if self.effort:

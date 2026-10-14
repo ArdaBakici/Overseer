@@ -233,6 +233,8 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         # Web search: Claude's WebSearch/WebFetch tools, Codex's live web_search.
         main = next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"]))
         tools = main.get("tools") or []
+        if os.environ.get("OVERSEER_E2E_DUMP"):
+            Path(os.environ["OVERSEER_E2E_DUMP"], f"{backend}.json").write_text(json.dumps(main, indent=1))
         if backend == "codex":
             assert {"type": "web_search", "external_web_access": True} in tools, tools
         else:
@@ -333,3 +335,46 @@ async def test_compaction_end_to_end(hpc, backend, cli_name):
         events = [json.loads(line) for line in
                   (cfg.local.state("transcripts") / f"{s.id}.jsonl").read_text().splitlines()]
         assert [e["trigger"] for e in events if e["kind"] == "compact"] == ["auto", "manual"], events
+
+
+# The tools each CLI offers the model. Anything that would outlive the turn (wake-ups, schedules, background
+# commands or subagents, messages to other sessions) is off: the CLI exits when the turn ends, so it would never
+# report back. A CLI update that adds a tool fails here, to be looked at.
+EXPECTED_TOOLS = {
+    "claude_code": {"Agent", "Bash", "Edit", "NotebookEdit", "Read", "Skill", "WebFetch", "WebSearch", "Write"},
+    "codex": {"exec_command", "write_stdin", "request_user_input", "view_image", "web_search"},
+}
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_only_tools_that_work_within_a_turn(hpc, backend, cli_name):
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    if backend == "codex":  # asks the user a question: there's nobody to answer in a headless run
+        script = [{"tool": "request_user_input", "args": {"questions": [
+            {"id": "lr", "header": "LR", "question": "Which learning rate?",
+             "options": [{"label": "1e-4", "description": "safe"}, {"label": "1e-3", "description": "fast"}]}]}},
+            "echo STILL-RUNNING"]
+    else:
+        script = ["echo STILL-RUNNING"]
+    with FakeModel(script) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent.set_backend(backend)
+        await asyncio.wait_for(agent.handle(agent.general_session(), "Run the checks."), 180)
+        main = next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"]))
+        tools = main.get("tools") or []
+        names = {t.get("name") or t.get("type") for t in tools}
+        assert names == EXPECTED_TOOLS[backend], sorted(names)
+        if backend == "claude_code":  # subagents and commands run in the foreground
+            for t in tools:
+                assert "run_in_background" not in json.dumps(t.get("input_schema")), t["name"]
+        outs = fm.outputs
+        if backend == "codex":  # refused, and the run goes on
+            assert "unavailable in Default mode" in outs[0], outs
+        assert "STILL-RUNNING" in outs[-1], outs
+        assert notes.sent[-1].text.startswith("🤖"), notes.texts()

@@ -129,7 +129,11 @@ class FakeModel:
         usage = {"input_tokens": self._tokens(), "output_tokens": 1}
         msg = {"id": f"msg_{n}", "type": "message", "role": "assistant", "model": body.get("model", "fake"),
                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}
-        if decision[0] == "call":
+        if decision[0] == "call" and isinstance(decision[1], dict):  # {"tool": name, "args": {...}}: another tool
+            block = {"type": "tool_use", "id": f"toolu_{n}", "name": decision[1]["tool"], "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": json.dumps(decision[1]["args"])}
+            stop = "tool_use"
+        elif decision[0] == "call":
             block = {"type": "tool_use", "id": f"toolu_{n}", "name": "Bash", "input": {}}
             delta = {"type": "input_json_delta", "partial_json": json.dumps({"command": decision[1], "description": "step"})}
             stop = "tool_use"
@@ -190,7 +194,10 @@ class FakeModel:
         shell = next((n for n in ("exec_command", "shell_command", "shell") if n in tools), None)
         decision = self._next(len(outputs), shell is not None, body)
         n = len(self.requests)
-        if decision[0] == "call":
+        if decision[0] == "call" and isinstance(decision[1], dict):  # {"tool": name, "args": {...}}: another tool
+            item = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": decision[1]["tool"],
+                    "arguments": json.dumps(decision[1]["args"]), "status": "completed"}
+        elif decision[0] == "call":
             if shell == "exec_command":
                 args = {"cmd": decision[1]}
             elif shell == "shell_command":
