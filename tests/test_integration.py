@@ -2971,27 +2971,29 @@ async def test_results_and_findings_commands(env, monkeypatch):
 # ----------------------------------------------------------------------------- graphs and the order of job cards
 
 class MediaTelegram(FakeTelegram):
-    """FakeTelegram plus pictures in albums, editing a picture, and deleting messages."""
+    """FakeTelegram plus photo cards: a photo with a caption and buttons, its caption or picture edited, deletions."""
     deleted: set = None
-    media_edits: list = None
+    media_edits: list = None  # (message id, file name, caption)
+    caption_edits: list = None  # (message id, caption)
+    markups: dict = None  # message id -> its buttons (as (text, data) rows)
+
+    def _keep(self, mid, markup):
+        rows = [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard] if markup else []
+        self.markups = (self.markups or {}) | {mid: rows}
 
     async def send_photo(self, chat_id, photo, filename, message_thread_id=None, **kw):
-        m = await super().send_photo(chat_id, photo, filename, message_thread_id)
-        if kw.get("reply_parameters"):
-            self.replies = (self.replies or {}) | {m.message_id: kw["reply_parameters"].message_id}
-        return m
+        self.sent.append((chat_id, message_thread_id, f"<photo {filename}> {kw.get('caption', '')}"))
+        self._keep(len(self.sent), kw.get("reply_markup"))
+        return NS(message_id=len(self.sent))
 
-    async def send_media_group(self, chat_id, media, message_thread_id=None, **kw):
-        out = []
-        for item in media:
-            self.sent.append((chat_id, message_thread_id, f"<photo {item.media.filename}>"))
-            out.append(NS(message_id=len(self.sent)))
-        if kw.get("reply_parameters"):
-            self.replies = (self.replies or {}) | {out[0].message_id: kw["reply_parameters"].message_id}
-        return out
+    async def edit_message_caption(self, chat_id=None, message_id=None, caption=None, **kw):
+        self.caption_edits = (self.caption_edits or []) + [(message_id, caption)]
+        self._keep(message_id, kw.get("reply_markup"))
+        return True
 
-    async def edit_message_media(self, chat_id, message_id, media, **kw):
-        self.media_edits = (self.media_edits or []) + [(message_id, media.media.filename)]
+    async def edit_message_media(self, chat_id=None, message_id=None, media=None, **kw):
+        self.media_edits = (self.media_edits or []) + [(message_id, media.media.filename, media.caption)]
+        self._keep(message_id, kw.get("reply_markup"))
         return True
 
     async def delete_message(self, chat_id, message_id):
@@ -2999,63 +3001,67 @@ class MediaTelegram(FakeTelegram):
         return True
 
 
-async def test_graphs_under_cards_and_running_cards_at_the_bottom(env):
-    """The agent's plotting command makes the graphs under a job's card: posted when the job ends, refreshed in place
-    hourly while it runs. When a job ends, running cards above it move to the bottom of the jobs topic."""
-    from overseer.bot import TelegramNotifier
+async def test_graphs_carousel_in_cards_and_running_cards_at_the_bottom(env):
+    """Once the agent's plotting command produced graphs, a job's card becomes a photo card: status refreshes edit its
+    caption, new graphs replace the picture, ◀ ▶ page through them - all in place. When a job ends, running cards
+    above it move to the bottom."""
+    from overseer.bot import Bot, TelegramNotifier
     tg = MediaTelegram()
     notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
     await notifier.detect_topics()
     await notifier.ensure_jobs_topics([])
     env.monitor.notifier = notifier
     proj = env.home / "proj"
-    plot = ("printf '\\x89PNG {job_id}' > {out}/loss.png && printf '\\x89PNG' > {out}/score.png")
-    env.store.set_metric_spec(MetricSpec(scope="pattern", key="sweep-*", plot=plot))
+    env.store.set_metric_spec(MetricSpec(scope="pattern", key="sweep-*", plot=(
+        "printf '\\x89PNG {job_id}' > {out}/loss.png && printf '\\x89PNG' > {out}/score.png")))
     jobs = {jid: {"name": f"sweep-{jid}", "state": "RUNNING", "workdir": str(proj), "stdout": str(proj / "o.out")}
-            for jid in ("A1", "B2")}
-    for jid in jobs:
-        (proj / "o.out").write_text("step 1 loss=1\n")
-    env.set_jobs(**{"901": jobs["A1"], "902": jobs["B2"]})
-    await env.monitor.poll()
-    await env.monitor.drain()
-    a_card, b_card = env.store.card_refs("901")["1"], env.store.card_refs("902")["1"]
-    assert a_card < b_card  # 901 started first: its card is higher up
+            for jid in ("901", "902")}
+    (proj / "o.out").write_text("step 1 loss=1\n")
 
-    # Hourly while it runs: the graphs appear under the card, then are replaced in place.
-    rec = env.store.get_job("901")
-    rec.last_status_at = 0
-    env.store.upsert_job(rec)
-    await env.monitor.poll()
-    await env.monitor.drain()
-    graphs = json.loads(env.store.get("plotrefs:901"))["1"]
-    assert len(graphs) == 2 and tg.replies[graphs[0]] == a_card, tg.replies
-    assert [t for _, _, t in tg.sent[-2:]] == ["<photo loss.png>", "<photo score.png>"]
+    async def poll(due=()):
+        for jid in due:  # a status refresh due (and, unless just made, its graphs)
+            rec = env.store.get_job(jid)
+            rec.last_status_at = 0
+            env.store.upsert_job(rec)
+        await env.monitor.poll()
+        await env.monitor.drain()
+
+    env.set_jobs(**jobs)
+    await poll()
+    text_card = env.store.card_refs("901")["1"]
+    assert text_card < env.store.card_refs("902")["1"]
+
+    # The first graphs: the card is posted again as a photo card (graph + card text + buttons); the text card goes.
+    await poll(due=["901"])
+    card = env.store.card_refs("901")["1"]
+    assert tg.sent[card - 1][2].startswith("<photo loss.png> 🏃 <b>901</b> sweep-901") and text_card in tg.deleted
+    assert tg.markups[card][0] == [("◀", "pg:901:1"), ("📈 1/2", "noop:"), ("▶", "pg:901:1")], tg.markups[card]
     n = len(tg.sent)
-    rec = env.store.get_job("901")
-    rec.last_status_at = 0
-    env.store.upsert_job(rec)
+    # A status refresh edits its caption; new graphs replace the picture: nothing new is posted.
+    env.store.set("plot_at:901", str(time.time()))
+    await poll(due=["901"])
+    assert len(tg.sent) == n and tg.caption_edits[-1][0] == card and "🏃 <b>901</b>" in tg.caption_edits[-1][1]
     env.store.set("plot_at:901", "0")
-    await env.monitor.poll()
-    await env.monitor.drain()
-    assert len(tg.sent) == n and tg.media_edits[-2:] == [(graphs[0], "loss.png"), (graphs[1], "score.png")]
+    await poll(due=["901"])
+    assert len(tg.sent) == n and tg.media_edits[-1][:2] == (card, "loss.png")
+    # ▶: the next graph, in place.
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    q = NS(data="pg:901:1", message=NS(message_thread_id=None), answer=_noop, edit_message_text=_noop)
+    await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
+    assert tg.media_edits[-1][:2] == (card, "score.png") and tg.markups[card][0][1] == ("📈 2/2", "noop:")
 
-    # 902 (lower down) ends: its card is edited in place, its graphs posted under it. 901 is still running and its
-    # card and graphs sit above 902's: they move to the bottom.
-    env.set_jobs(**{"901": jobs["A1"], "902": {**jobs["B2"], "state": "COMPLETED", "exit": "0:0"}})
-    await env.monitor.poll()
-    await env.monitor.drain()
-    assert "finished" in tg.edits[-1][2] or any("finished" in e[2] for e in tg.edits[-4:])
-    new_a = env.store.card_refs("901")["1"]
-    assert new_a > max(json.loads(env.store.get("plotrefs:902"))["1"]) and {a_card, *graphs} <= tg.deleted
-    new_graphs = json.loads(env.store.get("plotrefs:901"))["1"]
-    assert min(new_graphs) > new_a and tg.replies[new_graphs[0]] == new_a
-    assert "🏃 <b>901</b> sweep-A1" in [t for _, _, t in tg.sent if t.startswith("🏃")][-1]
-    # Nothing to move when the job that ends is already the lowest.
-    n = len(tg.sent)
-    env.set_jobs(**{"901": {**jobs["A1"], "state": "COMPLETED", "exit": "0:0"}})
-    await env.monitor.poll()
-    await env.monitor.drain()
-    assert env.store.card_refs("901")["1"] == new_a
+    # 902 ends: its card becomes a photo card with its final graphs, at the bottom; 901 is still running and now
+    # above it, so 901's photo card is posted again below it (still on its 2nd graph).
+    env.set_jobs(**{"901": jobs["901"], "902": {**jobs["902"], "state": "COMPLETED", "exit": "0:0"}})
+    await poll()
+    c902 = env.store.card_refs("902")["1"]
+    assert "finished" in tg.sent[c902 - 1][2] and tg.sent[c902 - 1][2].startswith("<photo")
+    new = env.store.card_refs("901")["1"]
+    assert new > c902 and card in tg.deleted and tg.sent[new - 1][2].startswith("<photo score.png> 🏃 <b>901</b>")
+    # 901 ends: it's the lowest already; its caption becomes the final card, in place.
+    env.set_jobs(**{"901": {**jobs["901"], "state": "COMPLETED", "exit": "0:0"}})
+    await poll()
+    assert env.store.card_refs("901")["1"] == new and any(m == new and "finished" in c for m, c in tg.caption_edits)
 
 
 async def test_ov_plots(env):
@@ -3220,3 +3226,13 @@ async def test_skills_are_proposed_approved_and_installed(env, tmp_path):
     write_skills(run, (".agents", "skills"), {"x": "data"})
     assert not list(outside.iterdir()) and (run / ".agents" / "skills" / "x" / "SKILL.md").read_text() == "data"
     await env.ctl.stop()
+
+
+def test_card_captions_fit_telegram():
+    """A photo card's caption holds 1024 characters: whole lines go from the end, GPU and alert lines first."""
+    from overseer.bot import TelegramNotifier
+    text = "\n".join(["🏃 <b>901</b> sweep", "🎯 <b>score 4.1</b>", "🎮 " + "g" * 600, "📈 " + "m" * 500, "🚨 x"])
+    out = TelegramNotifier._caption(text)
+    assert out.startswith("🏃 <b>901</b> sweep\n🎯 <b>score 4.1</b>") and "🎮" not in out and "🚨" not in out
+    assert "📈" in out and len(out) <= 1000
+    assert TelegramNotifier._caption("short\ncard") == "short\ncard"

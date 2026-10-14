@@ -420,8 +420,8 @@ class Monitor:
         return [(p.name.split("-", 1)[-1], p.read_bytes()) for p in sorted(cache.glob("*.png"))]
 
     async def _restack(self, finished: JobRecord) -> None:
-        """Running jobs' cards stay below finished ones in the jobs topic: a running card (and its graphs) above the
-        one that just ended moves to the bottom."""
+        """Running jobs' cards stay below finished ones in the jobs topic: a running card above the one that just
+        ended moves to the bottom (a photo card with its graphs)."""
         if not hasattr(self.notifier, "move_card"):
             return
         last = self.notifier.last_message_ids(finished.job_id)  # {chat: id of its card or graphs, the lowest down}
@@ -430,10 +430,7 @@ class Monitor:
         for r in running:
             refs = self.store.card_refs(r.job_id)
             if any(chat in last and mid < last[chat] for chat, mid in refs.items()):
-                await self.notifier.move_card(r.job_id)
-                images = self.cached_plots(r.job_id)
-                if images:
-                    await self.notifier.show_plots(r.job_id, images, repost=True)
+                await self.notifier.move_card(r.job_id, self.cached_plots(r.job_id))
 
     async def status_message(self, rec: JobRecord, job: Job | None = None, gpu: bool | None = None) -> Outgoing:
         """On request (/job): the card's content plus the last lines of the (training) log. `gpu`: query

@@ -47,6 +47,8 @@ from .usage import usage_report
 
 log = logging.getLogger(__name__)
 
+CAPTION_LIMIT = 1000  # Telegram: a photo's caption holds 1024 characters
+
 # Files you send the agent: a file without a caption waits this long for your message about it; with a caption,
 # only for the rest of its album (whose pictures arrive as separate messages).
 UPLOAD_WAIT = 30
@@ -308,16 +310,61 @@ class TelegramNotifier:
             if not self.jobs_thread(chat_id, proj.name if proj else None):
                 await self._create_jobs_topic(chat_id, proj.name if proj else None)
 
+    # ------------------------------------------------------------------ a job's card: text, or a photo with its graphs
+    # A job's card is a text message until the agent's plotting command produced graphs (plots.py). Then it becomes a
+    # photo message - the graph, the card's text as its caption, the buttons - and stays one: status refreshes edit the
+    # caption, new graphs replace the picture, and ◀ n/N ▶ pages through the graphs, all in place.
+    def _markup(self, buttons):
+        return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                     for row in buttons]) if buttons else None
+
+    def _card_state(self, job_id: str) -> dict:
+        try:
+            st = json.loads(self.store.get(f"cardstate:{job_id}") or "{}")
+            return st if isinstance(st, dict) else {}
+        except ValueError:
+            return {}
+
+    def _set_card_state(self, job_id: str, **kw) -> None:
+        self.store.set(f"cardstate:{job_id}", json.dumps({**self._card_state(job_id), **kw}))
+
+    def _view(self, job_id: str) -> tuple[str, list]:
+        try:
+            text, buttons = json.loads(self.store.get(f"cardview:{job_id}") or "null")
+            return text, buttons
+        except (ValueError, TypeError):
+            return "", []
+
+    def _photo_buttons(self, job_id: str, buttons: list) -> list:
+        st = self._card_state(job_id)
+        n, i = int(st.get("pages", 1)), int(st.get("page", 0))
+        if n <= 1:
+            return buttons
+        nav = [("◀", f"pg:{job_id}:{(i - 1) % n}"), (f"📈 {i + 1}/{n}", "noop:"), ("▶", f"pg:{job_id}:{(i + 1) % n}")]
+        return [nav, *buttons]
+
+    @staticmethod
+    def _caption(text: str, limit: int = CAPTION_LIMIT) -> str:
+        """The card's text as a photo caption (Telegram allows 1024 characters): whole lines are dropped from the end,
+        GPU and alert lines first, until it fits."""
+        lines = text.split("\n")
+        while len(strip_html("\n".join(lines))) > limit and len(lines) > 1:
+            drop = next((k for k in range(len(lines) - 1, 0, -1) if lines[k].startswith(("🎮", "🚨"))), len(lines) - 1)
+            lines.pop(drop)
+        return "\n".join(lines)
+
     async def card(self, job_id: str, text: str, buttons: list[list[tuple[str, str]]]) -> None:
         """Show a job's live card: edit it where it is, or post it (in the jobs topic) if there's none yet or it's
         gone. Always silent. Never raises."""
         if not self.store.get_job(job_id):
             return
         self.store.set(f"cardview:{job_id}", json.dumps([text, buttons]))  # to post it again further down (move_card)
+        if self._card_state(job_id).get("kind") == "photo":
+            await self._edit_photo_caption(job_id, text, buttons)
+            return
         refs = self.store.card_refs(job_id)
         msg = Outgoing(text, job_id=job_id, buttons=buttons, silent=True, jobs=True)
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
-                                       for row in buttons]) if buttons else None
+        markup = self._markup(buttons)
         changed = False
         for chat_id in self.chat_ids:
             mid = refs.get(str(chat_id))
@@ -344,97 +391,142 @@ class TelegramNotifier:
         if changed:
             self.store.set_card_refs(job_id, refs)
 
-    # ------------------------------------------------------------------ a job's graphs, and the order of the cards
-    def _plot_refs(self, job_id: str) -> dict[str, list[int]]:
+    async def _edit_photo_caption(self, job_id: str, text: str, buttons: list) -> None:
+        markup = self._markup(self._photo_buttons(job_id, buttons))
+        for chat_id, mid in self.store.card_refs(job_id).items():
+            try:
+                await self.app.bot.edit_message_caption(chat_id=int(chat_id), message_id=mid, caption=self._caption(text),
+                                                        parse_mode=ParseMode.HTML, reply_markup=markup)
+            except BadRequest as e:
+                if "not modified" not in str(e).lower():
+                    log.info("job %s: its card's caption can't be edited (%s)", job_id, e)
+            except Exception:
+                log.warning("job %s: card update failed", job_id, exc_info=True)
+
+    async def show_plots(self, job_id: str, images: list[tuple[str, bytes]], repost: bool = False) -> None:
+        """A job's graphs, in its card: the first time (or with `repost`) the card is posted again as a photo card,
+        then the picture is replaced in place (on the page it was on). Never raises."""
+        if not images or not self.store.get_job(job_id):
+            return
+        st = self._card_state(job_id)
+        page = min(int(st.get("page", 0)), len(images) - 1)
+        self._set_card_state(job_id, pages=len(images), page=page)
+        if st.get("kind") != "photo" or repost:
+            await self._post_photo_card(job_id, images)
+            return
+        if not await self._edit_photo(job_id, images[page]):
+            await self._post_photo_card(job_id, images)  # (the card is gone, or can't be edited: a new one)
+
+    async def page(self, job_id: str, page: int, images: list[tuple[str, bytes]]) -> None:
+        """◀ / ▶ on a photo card: show another of its graphs, in place."""
+        if not images:
+            return
+        page %= len(images)
+        self._set_card_state(job_id, pages=len(images), page=page)
+        await self._edit_photo(job_id, images[page])
+
+    async def _edit_photo(self, job_id: str, image: tuple[str, bytes]) -> bool:
+        text, buttons = self._view(job_id)
+        markup = self._markup(self._photo_buttons(job_id, buttons))
+        ok = True
+        for chat_id, mid in self.store.card_refs(job_id).items():
+            name, data = image
+            try:
+                await self.app.bot.edit_message_media(
+                    chat_id=int(chat_id), message_id=mid, reply_markup=markup,
+                    media=InputMediaPhoto(media=data, filename=name, caption=self._caption(text),
+                                          parse_mode=ParseMode.HTML))
+            except BadRequest as e:
+                if "not modified" not in str(e).lower():
+                    log.info("job %s: its graph can't be replaced (%s)", job_id, e)
+                    ok = False
+            except Exception:
+                log.warning("job %s: graph update failed", job_id, exc_info=True)
+                ok = False
+        return ok
+
+    async def _retire(self, chat_id: int, mid: int, job_id: str) -> None:
+        """Remove an old card (where Telegram won't delete it, say it moved)."""
+        try:
+            await self.app.bot.delete_message(chat_id, mid)
+        except Exception:
+            try:
+                await self.app.bot.edit_message_text(f"↓ <b>{esc(job_id)}</b>: its card moved to the bottom",
+                                                     chat_id=chat_id, message_id=mid, parse_mode=ParseMode.HTML)
+            except Exception:
+                log.debug("could not retire the old card of %s", job_id, exc_info=True)
+
+    async def _post_photo_card(self, job_id: str, images: list[tuple[str, bytes]]) -> None:
+        """Post the card as a photo card (at the bottom of its jobs topic) and remove the previous card - and graphs
+        sent under it by an older Overseer."""
+        text, buttons = self._view(job_id)
+        st = self._card_state(job_id)
+        page = min(int(st.get("page", 0)), len(images) - 1)
+        name, data = images[page]
+        msg = Outgoing(text, job_id=job_id, jobs=True, silent=True)
+        markup = self._markup(self._photo_buttons(job_id, buttons))
+        old, refs = self.store.card_refs(job_id), {}
+        legacy = self._legacy_plot_refs(job_id)
+        for chat_id in self.chat_ids:
+            await self._jobs_topic_for(msg, chat_id)
+            thread, _, _ = self._target(msg, chat_id)
+            try:
+                sent = await self.app.bot.send_photo(chat_id, photo=data, filename=name, caption=self._caption(text),
+                                                     parse_mode=ParseMode.HTML, reply_markup=markup,
+                                                     disable_notification=True, message_thread_id=thread)
+            except Exception:
+                log.warning("job %s: could not post its card with graphs", job_id, exc_info=True)
+                if old.get(str(chat_id)):
+                    refs[str(chat_id)] = old[str(chat_id)]  # keep the text card
+                continue
+            refs[str(chat_id)] = sent.message_id
+            self.store.link_message(chat_id, sent.message_id, job_id, None)
+            if old.get(str(chat_id)):
+                await self._retire(chat_id, old[str(chat_id)], job_id)
+            for mid in legacy.get(str(chat_id), []):
+                await self._retire(chat_id, mid, job_id)
+        self.store.set_card_refs(job_id, refs)
+        self.store.unset(f"plotrefs:{job_id}")
+        if any(refs.get(c) != old.get(c) for c in refs):
+            self._set_card_state(job_id, kind="photo")
+
+    def _legacy_plot_refs(self, job_id: str) -> dict[str, list[int]]:
+        """Graphs an older Overseer sent as separate messages under the card."""
         try:
             return {str(k): [int(x) for x in v] for k, v in json.loads(self.store.get(f"plotrefs:{job_id}") or "{}").items()}
         except (ValueError, TypeError):
             return {}
 
-    async def show_plots(self, job_id: str, images: list[tuple[str, bytes]], repost: bool = False) -> None:
-        """A job's graphs, under its card: the previous ones are replaced in place (or, with `repost`, or when their
-        number changed, deleted and sent again). Silent. Never raises."""
-        refs, card = self._plot_refs(job_id), self.store.card_refs(job_id)
-        msg = Outgoing("", job_id=job_id, jobs=True, silent=True)
-        bot, new_refs = self.app.bot, {}
-        for chat_id in self.chat_ids:
-            old = refs.get(str(chat_id), [])
-            if old and not repost and len(old) == len(images):
-                try:
-                    for mid, (name, data) in zip(old, images):
-                        try:
-                            await bot.edit_message_media(chat_id=chat_id, message_id=mid,
-                                                         media=InputMediaPhoto(media=data, filename=name, caption=name))
-                        except BadRequest as e:
-                            if "not modified" not in str(e).lower():
-                                raise
-                    new_refs[str(chat_id)] = old
-                    continue
-                except Exception as e:
-                    log.info("job %s: its graphs can't be edited (%s); sending them again", job_id, e)
-            for mid in old:
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception:
-                    log.debug("could not delete graph %s", mid, exc_info=True)
-            await self._jobs_topic_for(msg, chat_id)
-            thread, _, _ = self._target(msg, chat_id)
-            reply = (ReplyParameters(message_id=card[str(chat_id)], allow_sending_without_reply=True)
-                     if card.get(str(chat_id)) else None)
-            try:
-                if len(images) == 1:
-                    name, data = images[0]
-                    sent = [await bot.send_photo(chat_id, photo=data, filename=name, caption=name,
-                                                 disable_notification=True, message_thread_id=thread,
-                                                 reply_parameters=reply)]
-                else:
-                    sent = list(await bot.send_media_group(
-                        chat_id, media=[InputMediaPhoto(media=d, filename=n, caption=n) for n, d in images],
-                        disable_notification=True, message_thread_id=thread, reply_parameters=reply))
-            except Exception:
-                log.warning("job %s: could not send its graphs", job_id, exc_info=True)
-                continue
-            new_refs[str(chat_id)] = [m.message_id for m in sent]
-            for m in sent:
-                self.store.link_message(chat_id, m.message_id, job_id, None)
-        self.store.set(f"plotrefs:{job_id}", json.dumps(new_refs))
-
     def last_message_ids(self, job_id: str) -> dict[str, int]:
-        """Per chat, the lowest-down message of a job in its jobs topic: its card, or its graphs below it."""
+        """Per chat, the lowest-down message of a job in its jobs topic."""
         out = dict(self.store.card_refs(job_id))
-        for chat, mids in self._plot_refs(job_id).items():
+        for chat, mids in self._legacy_plot_refs(job_id).items():
             out[chat] = max([out.get(chat, 0), *mids])
         return out
 
-    async def move_card(self, job_id: str) -> None:
-        """Post a (running) job's card again at the bottom of its jobs topic and remove the old one (where Telegram
-        won't delete it, it says the card moved). Never raises."""
-        try:
-            text, buttons = json.loads(self.store.get(f"cardview:{job_id}") or "null")
-        except (ValueError, TypeError):
+    async def move_card(self, job_id: str, images: list[tuple[str, bytes]] | None = None) -> None:
+        """Post a (running) job's card again at the bottom of its jobs topic - as a photo card when it is one - and
+        remove the old one. Never raises."""
+        if self._card_state(job_id).get("kind") == "photo" and images:
+            await self._post_photo_card(job_id, images)
             return
+        text, buttons = self._view(job_id)
+        if not text:
+            return
+        self._set_card_state(job_id, kind="text")
         refs = self.store.card_refs(job_id)
         msg = Outgoing(text, job_id=job_id, buttons=buttons, silent=True, jobs=True)
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
-                                       for row in buttons]) if buttons else None
         for chat_id in self.chat_ids:
             old = refs.get(str(chat_id))
-            if old:
-                try:
-                    await self.app.bot.delete_message(chat_id, old)
-                except Exception:
-                    try:
-                        await self.app.bot.edit_message_text(f"↓ <b>{esc(job_id)}</b>: its card moved to the bottom",
-                                                             chat_id=chat_id, message_id=old, parse_mode=ParseMode.HTML)
-                    except Exception:
-                        log.debug("could not retire the old card of %s", job_id, exc_info=True)
             try:
-                new = await self._post_card(chat_id, msg, markup)
+                new = await self._post_card(chat_id, msg, self._markup(buttons))
             except Exception:
                 log.warning("job %s: could not post its card again", job_id, exc_info=True)
                 continue
             if new:
                 refs[str(chat_id)] = new
+                if old:
+                    await self._retire(chat_id, old, job_id)
         self.store.set_card_refs(job_id, refs)
 
     async def _post_card(self, chat_id: int, msg: Outgoing, markup) -> int | None:
@@ -1669,6 +1761,12 @@ class Bot:
                 result = await (subs.approve(arg) if action == "plan" else subs.decline(arg))
                 if result.startswith("This "):  # already answered: the card says so
                     await self._edit(q, result)
+            elif action == "pg":  # ◀ / ▶ on a job's card: another of its graphs, in place
+                job_id, _, page = arg.rpartition(":")
+                if page.isdigit() and hasattr(self.notifier, "page"):
+                    await self.notifier.page(job_id, int(page), self.monitor.cached_plots(job_id))
+            elif action == "noop":
+                pass
             elif action == "fb" and getattr(self.agent, "feedback", None):  # 👀 Noted / ✅ Fixed / ✖ Won't fix
                 fid, _, status = arg.partition(":")
                 if not (fid.isdigit() and await self.agent.feedback.set_status(int(fid), status)):

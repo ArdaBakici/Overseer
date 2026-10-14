@@ -91,8 +91,10 @@ ov plots show 18801933 | clear ...
   - write PNGs into `{out}` (an empty folder): up to 4, each under 10 MB;
   - finish within 90 s, because it runs on the login node at low priority.
   - **Placeholders:** `{job_id}`, `{name}`, `{workdir}`, `{stdout}` and `{project}` (the project's folder).
-- **Good graphs:** the main metrics against step or time, the job id in the title, a few panels if useful, readable
-  on a phone (e.g. dpi 150). Look at the `ov plots test` copies before you're done.
+- **How they're shown:** the graphs appear inside the job's card, one at a time, and the researcher pages through them
+  with ◀ ▶. The first one by file name is shown first, so put the most telling one first (e.g. `00-overview.png`).
+- **Good graphs:** the main metrics against step or time, the job id in the title, readable on a phone (e.g. dpi 150).
+  Prefer one clear multi-panel figure, or a few (at most 4). Look at the `ov plots test` copies before you're done.
 - **If the researcher presses 📈 Plot and there's no command yet,** you're asked to write one. Register it for the kind
   of job (`--pattern` or `--project`), not just the one job, so later runs get graphs too.
 

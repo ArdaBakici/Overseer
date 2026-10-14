@@ -164,7 +164,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 
 | | |
 |---|---|
-| *(automatic)* | a live card per job in its jobs topic (queued → running → ended, edited in place; running cards stay at the bottom) · its graphs under it |
+| *(automatic)* | a live card per job in its jobs topic (queued → running → ended, edited in place; running cards stay at the bottom), with its graphs inside it (◀ ▶) |
 | **🔧 Ask agent to fix** button | the agent investigates the failed job, fixes it and resubmits |
 | *reply to any job message* | talk to the agent about that job ("lower the lr to 1e-4 and resubmit", "why is it slow?") |
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
@@ -266,8 +266,8 @@ Topics in private chats need the bot's topic mode ("threaded mode"), which you s
   ```
 - **Graphs:** the agent writes a small plotting script in the project folder and registers it for a job, a sweep or the whole project (`ov plots set … --command "python {project}/plots/x.py --log {stdout} --out {out}"`).
   - **When it runs:** Overseer runs it on the HPC when the job ends, every hour while it runs (`slurm.plot_interval_minutes`), and when you press 📈 Plot.
-  - **What you see:** up to 4 PNGs under the card, replaced in place when they're refreshed. No model is involved, so this costs nothing.
-- **Running jobs stay at the bottom:** when a job ends, any running job's card (and its graphs) above it is posted again at the bottom, and the old one is deleted. If Telegram won't delete it, it is edited to say it moved.
+  - **What you see:** the graphs inside the card. Once a job has graphs, its card becomes a photo card: the graph, the card text as its caption, and the buttons, with **◀ 1/3 ▶** to page through up to 4 graphs. Everything is edited in place: status refreshes change the caption, new graphs replace the picture, and nothing is posted under the card. No model is involved, so this costs nothing.
+- **Running jobs stay at the bottom:** when a job ends, any running job's card above it is posted again at the bottom (still with its graphs), and the old one is deleted. If Telegram won't delete it, it is edited to say it moved. A card also moves once when it first gets graphs, since a text message can't become a photo.
 - **In the conversation:** when a job the agent submitted ends and the agent isn't watching it, you get a one-line pointer: "✅ Job 123 … finished". Watched jobs need no pointer, because the agent's reply follows.
 
 **What matters in a job: the agent decides, and sets alerts.** The agent tells Overseer which numbers matter and how to get them, per job, per job-name pattern (a sweep) or as a project default:
