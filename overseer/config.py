@@ -227,6 +227,19 @@ class AutopilotConfig:
 
 
 @dataclass
+class SubagentsConfig:
+    """Planner mode: a conversation plans and delegates to subagents (cheaper models), each in its own thread.
+    Off unless you turn it on (/subagents on) or approve an agent's proposal (`ov propose`)."""
+    max_running: int = 3  # subagents running at once; more are queued
+    # The planner's model when the mode is on, per backend (the conversation keeps its backend).
+    planner: dict[str, str] = field(default_factory=lambda: {"claude_code": "claude-opus-5-5", "codex": "gpt-6-astra"})
+    # The models subagents may use, per backend; the first is the default.
+    workers: dict[str, list[str]] = field(default_factory=lambda: {
+        "claude_code": ["claude-sonnet-5-5"], "codex": ["gpt-6.1-sol", "gpt-6-luna"]})
+    worker_effort: str | None = None  # None = the model's default
+
+
+@dataclass
 class AgentConfig:
     enabled: bool = True
     # claude_code or codex. Can be switched at runtime from Telegram with /backend.
@@ -253,6 +266,7 @@ class AgentConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
     autopilot: AutopilotConfig = field(default_factory=AutopilotConfig)
+    subagents: SubagentsConfig = field(default_factory=SubagentsConfig)
 
 
 BACKENDS = ("claude_code", "codex")

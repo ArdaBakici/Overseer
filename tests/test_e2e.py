@@ -378,3 +378,70 @@ async def test_only_tools_that_work_within_a_turn(hpc, backend, cli_name):
             assert "unavailable in Default mode" in outs[0], outs
         assert "STILL-RUNNING" in outs[-1], outs
         assert notes.sent[-1].text.startswith("🤖"), notes.texts()
+
+
+@pytest.mark.parametrize("planner,worker,worker_model,planner_model", [
+    ("claude_code", "codex", "gpt-6-luna", "claude-opus-5-5"),
+    ("codex", "claude_code", "claude-sonnet-5-5", "gpt-6-astra"),
+])
+async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, planner_model):
+    """With the real CLIs: the agent proposes planner mode (`ov propose`); once approved, a subagent on the other
+    backend and a worker model runs its task in the sandbox, and the planner - now on its planner model - is woken
+    with its report."""
+    clis = {b: find_cli("claude" if b == "claude_code" else "codex") for b in ("claude_code", "codex")}
+    if not all(clis.values()):
+        pytest.skip("needs both claude and codex")
+    cfg, remote, state, app = hpc
+    plan = {"goal": "check the cluster from a subagent", "why": "e2e",
+            "subagents": [{"name": "grid", "task": "check things", "backend": worker, "model": worker_model}]}
+    scripts = [
+        ("[Subagents you started have finished]", ["ov agents"]),
+        ("[Task from your planner", ["echo WORKER-RAN", "ov status"]),
+        ("Run the checks.", [f"ov propose '{json.dumps(plan)}'"]),
+    ]
+    with FakeModel([], scripts=scripts) as fm:
+        for b in ("claude_code", "codex"):
+            configure_backend(cfg, b, clis[b], fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent.set_backend(planner)
+        from overseer.autopilot import Autopilot
+        from overseer.ctl import ControlServer
+        from overseer.projects import Projects
+        from overseer.subagents import Subagents
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
+        await ctl.start()
+        Autopilot(cfg, store, agent, notes, agent.hpc)
+        subs = Subagents(cfg, store, agent, notes)
+        s = agent.general_session()
+        try:
+            await asyncio.wait_for(agent.handle(s, "Run the checks."), 180)
+            pending = subs.pending(s.id)
+            assert pending, notes.texts()[-3000:]
+            card = next(m for m in notes.sent if m.text.startswith("🧭"))
+            assert "check the cluster from a subagent" in card.text and worker_model.split("-")[-1] in card.text.lower()
+            assert "✓ plan" in " ".join(fm.by_marker.get("Run the checks.", [])), fm.by_marker
+            await subs.approve(pending["id"])
+            for _ in range(3):  # the subagent's run, then the planner's wake-up
+                await asyncio.wait_for(subs.drain(), 240)
+        finally:
+            await ctl.stop()
+        detail = f"\n\nTELEGRAM:\n{notes.texts()[-4000:]}\n\nBY SCRIPT:\n{json.dumps(fm.by_marker, indent=1)[-4000:]}"
+        if os.environ.get("OVERSEER_E2E_DUMP"):
+            Path(os.environ["OVERSEER_E2E_DUMP"], f"planner-{planner}.json").write_text(json.dumps(
+                [r["body"] for r in fm.requests], indent=1))
+        worker_outs = fm.by_marker.get("[Task from your planner", [])
+        assert len(worker_outs) == 2 and "WORKER-RAN" in worker_outs[0], detail
+        assert "you are subagent grid" in worker_outs[1], detail   # `ov` works from the subagent's sandbox
+        planner_outs = fm.by_marker.get("[Subagents you started have finished]", [])
+        assert planner_outs and "grid: ✅ done" in planner_outs[0] and "planner mode: on" in planner_outs[0], detail
+        # Each ran on its model: the subagent on the worker model, the woken planner on the planner model.
+        # (models in codex's code mode get their tools in an "additional_tools" input item, not in "tools")
+        bodies = [r["body"] for r in fm.requests if r["body"].get("tools") or '"additional_tools"' in json.dumps(r["body"])]
+        worker_req = next(b for b in bodies if "[Task from your planner" in json.dumps(b))
+        planner_req = next(b for b in bodies if "[Subagents you started have finished]" in json.dumps(b))
+        assert worker_req.get("model") == worker_model, worker_req.get("model")
+        assert planner_req.get("model") == planner_model, planner_req.get("model")
+        rec = store.subagents(parent=s.id)[0]
+        assert rec.state == "done" and rec.delivered and "WORKER-RAN" in rec.report, rec

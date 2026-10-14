@@ -39,6 +39,7 @@ from .slurm import STATE_EMOJI
 from .ssh import SSHError
 from .sshlink import master_alive
 from .store import ProjectRecord, Store
+from .subagents import ENDED
 from .usage import usage_report
 
 log = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /compact [focus] — compact the conversation now: older turns become a summary, which frees context (as a reply: that conversation). Claude Code takes a focus, e.g. /compact keep the lr sweep results
 /auto &lt;goal&gt; — ask the agent to work on it on its own: it watches its jobs and wakes itself (as a reply: in that conversation)
 /auto — pending wake-ups · /auto off — cancel them (here, or as a reply: in that conversation)
+/subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents, each in a thread
 /usage [today|yesterday|week] — tokens and cost of the agent's runs
 /health — connection status
 
@@ -182,6 +184,60 @@ class TelegramNotifier:
             await self.app.bot.edit_forum_topic(chat_id, message_thread_id=thread_id, name=name[:128])
         except Exception:
             log.debug("could not rename topic %s", thread_id, exc_info=True)
+
+    # ------------------------------------------------------------------ a message edited later; subagent threads
+    async def post(self, msg: Outgoing) -> dict[str, int]:
+        """Send a short message (with buttons) that is edited later (`edit`): {chat id: message id}. Never raises."""
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                       for row in msg.buttons]) if msg.buttons else None
+        refs: dict[str, int] = {}
+        for chat_id in self.chat_ids:
+            thread, label, _ = self._target(msg, chat_id)
+            try:
+                sent = await self.app.bot.send_message(chat_id, (label + msg.text)[:TG_LIMIT], parse_mode=ParseMode.HTML,
+                                                       message_thread_id=thread, reply_markup=markup,
+                                                       disable_notification=msg.silent)
+            except Exception:
+                log.warning("could not send a message", exc_info=True)
+                continue
+            refs[str(chat_id)] = sent.message_id
+            self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+        return refs
+
+    async def edit(self, refs: dict[str, int], text: str) -> None:
+        """Replace a posted message's text (its buttons go away). Never raises."""
+        for chat_id, mid in refs.items():
+            try:
+                await self.app.bot.edit_message_text(text[:TG_LIMIT], chat_id=int(chat_id), message_id=mid,
+                                                     parse_mode=ParseMode.HTML)
+            except Exception:
+                log.debug("could not edit message %s", mid, exc_info=True)
+
+    async def open_thread(self, session_id: str, name: str) -> None:
+        """A thread of its own for a conversation (a subagent). Without topics its messages go to its project's."""
+        if not self.topics:
+            return
+        for chat_id in self.chat_ids:
+            try:
+                topic = await self.app.bot.create_forum_topic(chat_id, name=name[:128])
+            except Exception:
+                log.warning("could not create a thread for %s", session_id, exc_info=True)
+                continue
+            self.store.bind_thread(chat_id, topic.message_thread_id, session_id)
+
+    async def close_thread(self, session_id: str, done_name: str) -> bool:
+        """Delete a conversation's threads (a finished subagent's). Where Telegram refuses, the thread is renamed
+        (e.g. "✅ cosine (done)") instead. True if all were deleted."""
+        deleted = True
+        for chat_id, thread in self.store.session_threads(session_id):
+            try:
+                await self.app.bot.delete_forum_topic(chat_id, thread)
+                self.store.unbind_thread(chat_id, thread)
+            except Exception:
+                log.info("could not delete thread %s; renaming it", thread, exc_info=True)
+                deleted = False
+                await self.rename_topic(chat_id, thread, done_name)
+        return deleted
 
     async def send(self, msg: Outgoing) -> None:
         """Deliver a message. Never raises: a Telegram hiccup must not break monitoring."""
@@ -568,6 +624,7 @@ class Bot:
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
+        add(CommandHandler("subagents", self.cmd_subagents, filters=allowed))
         add(CommandHandler(["project", "projects"], self.cmd_project, filters=allowed))
         add(CommandHandler("assign", self.cmd_assign, filters=allowed))
         # Updates python-telegram-bot doesn't know yet (e.g. the Stop button of a streaming draft).
@@ -756,7 +813,7 @@ class Bot:
         session = self.agent.session_for_job(job_id)
         text = instr or (f"Job {job_id} failed. Find out why, fix it, and resubmit it if the fix is clear. "
                          "If it needs a decision from me, explain the options instead.")
-        await self.notifier.send(Outgoing(f"🔧 {esc(self.agent.backend_of(session.project))} is working on job {code(job_id)}…",
+        await self.notifier.send(Outgoing(f"🔧 {esc(self.agent.session_backend(session))} is working on job {code(job_id)}…",
                                           job_id=job_id, session_id=session.id, silent=True))
         self._spawn(self._run_agent(chat_id, session, text))
 
@@ -773,7 +830,7 @@ class Bot:
                 "few panels if useful, the job id in the title. Copy it to ./outbox/ and describe the trend in two "
                 "or three sentences.")
         session = self.agent.session_for_job(job_id)
-        await self.notifier.send(Outgoing(f"📈 {esc(self.agent.backend_of(session.project))} is plotting job "
+        await self.notifier.send(Outgoing(f"📈 {esc(self.agent.session_backend(session))} is plotting job "
                                           f"{code(job_id)}…", job_id=job_id, session_id=session.id, silent=True))
         self._spawn(self._run_agent(chat_id, session, text))
 
@@ -951,6 +1008,8 @@ class Bot:
             await self.reply(update, f"Project {code(proj.name)} is archived. /project restore {esc(proj.name)} "
                                      "brings it back.")
             return
+        if self.agent.subagents:  # writing while the agent's plan is open declines it: the agent gets your message
+            text = await self.agent.subagents.reject_by_reply(session, text)
         self._spawn(self._run_agent(update.effective_chat.id, session, text, files))
 
     # ------------------------------------------------------------------ runs cut off by a restart
@@ -1061,6 +1120,72 @@ class Bot:
         if scope:
             return [r.id for r in self.store.list_sessions(10_000) if r.project == scope]
         return None
+
+    async def cmd_subagents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/subagents [on|off|planner <model>|workers [backend] <m1,m2>|clean]: planner mode here (a project, or the
+        main chat), its models, and its subagents."""
+        subs = self.agent.subagents
+        if not subs:
+            await self.reply(update, "Subagents aren't available in this Overseer.")
+            return
+        scope, args = self._scope(update), list(ctx.args or [])
+        backend = self.agent.backend_of(scope)
+        where = self._where(scope)
+        if args[:1] == ["on"] or args[:1] == ["off"]:
+            on = args[0] == "on"
+            self.agent._set_setting("subagents", "on" if on else None, scope)
+            if not on:  # also conversations switched on by an approved plan
+                for sid in self.store.planner_sessions(scope):
+                    s = self.agent.get(sid)
+                    s.rec.planner = 0
+                    self.store.upsert_session(s.rec)
+            await self.reply(update, (
+                f"🧭 Planner mode is <b>on</b> in {where}: its conversations plan on "
+                f"{code(self.agent.planner_model(backend, scope) or '?')} and start subagents on "
+                f"{esc(', '.join(self.agent.worker_models(backend, scope)))}." if on else
+                f"Planner mode is <b>off</b> in {where}: conversations use your /model again. Running subagents "
+                "finish their work and report back."))
+            return
+        if args[:1] == ["planner"] and len(args) == 2:
+            self.agent._set_setting(f"sub_planner:{backend}", None if args[1] == "default" else args[1], scope)
+            await self.reply(update, f"Planner model for {esc(backend)} in {where}: "
+                                     f"{code(self.agent.planner_model(backend, scope) or '?')}")
+            return
+        if args[:1] == ["workers"] and len(args) in (2, 3):
+            b = args[1] if len(args) == 3 else backend
+            if b not in BACKENDS:
+                await self.reply(update, f"Backend must be one of {', '.join(BACKENDS)}.")
+                return
+            self.agent._set_setting(f"sub_workers:{b}", None if args[-1] == "default" else args[-1], scope)
+            await self.reply(update, f"Subagent models for {esc(b)} in {where}: "
+                                     f"{esc(', '.join(self.agent.worker_models(b, scope)))}")
+            return
+        if args[:1] == ["clean"]:
+            done = [r for r in self.store.subagents(project=scope, states=ENDED) if self.store.session_threads(r.id)]
+            kept = [r.name for r in done if not await self.notifier.close_thread(r.id, f"✅ {r.name} (done)")]
+            await self.reply(update, f"🗑 Deleted the threads of {len(done) - len(kept)} finished subagent(s)"
+                                     + (f"; renamed (Telegram refused): {esc(', '.join(kept))}" if kept else "") + ".")
+            return
+        if args:
+            await self.reply(update, "Usage: /subagents [on | off | planner &lt;model&gt; | workers [backend] "
+                                     "&lt;model,model&gt; | clean]")
+            return
+        on = self.agent._setting("subagents", scope) == "on"
+        here = self._here(update)
+        lines = [f"🧭 <b>Planner mode</b> in {where}: <b>{'on' if on else 'off'}</b>"
+                 + ("" if on or not (here and here.rec.planner) else " (on in this conversation: you approved a plan)")]
+        for b in BACKENDS:
+            lines.append(f"{esc(b)}: planner {code(self.agent.planner_model(b, scope) or '?')} · subagents "
+                         f"{esc(', '.join(self.agent.worker_models(b, scope)) or '?')}")
+        recs = self.store.subagents(project=scope)
+        active = [r for r in recs if r.state not in ENDED]
+        recent = [r for r in recs if r.state in ENDED][-5:]
+        if active or recent:
+            lines.append("")
+            lines += [esc(x) for x in subs.describe(active + recent)]
+        lines.append("\n/subagents on|off · planner &lt;model&gt; · workers [backend] &lt;models&gt; · clean (delete "
+                     "finished subagents' threads). Agents can also propose it: you approve or decline their plan.")
+        await self.reply(update, "\n".join(lines))
 
     async def cmd_auto(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ap = self.agent.autopilot
@@ -1290,10 +1415,31 @@ class Bot:
                     for _, path in rec.get("files") or []:
                         Path(path).unlink(missing_ok=True)
                     await self._edit(q, f"✖ Dismissed: {esc(_preview(rec))}")
+                    if session.rec.is_worker and session.rec.state == "running" and self.agent.subagents:
+                        await self.agent.subagents.stop(session, by="researcher")  # its planner is told
                 else:
                     await self._edit(q, f"▶️ Continuing: {esc(_preview(rec))}")
                     text, files = self.agent.continue_prompt(rec)
                     self._spawn(self._run_agent(chat.id, session, text, files))
+            elif action in ("plan", "planx") and self.agent.subagents:  # a proposed plan: ✅ Approve / ✖ No
+                subs = self.agent.subagents
+                result = await (subs.approve(arg) if action == "plan" else subs.decline(arg))
+                if result.startswith("This "):  # already answered: the card says so
+                    await self._edit(q, result)
+            elif action in ("subdel", "subkeep"):  # a finished subagent's thread: 🗑 Delete / Keep
+                rec = self.store.get_session(arg)
+                if not rec or not rec.is_worker:
+                    await self._edit(q, "This subagent no longer exists.")
+                elif action == "subkeep":
+                    try:
+                        await q.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                elif rec.state not in ENDED:
+                    await self._edit(q, f"{esc(rec.name)} is working again: /stop it here first, or keep the thread.")
+                elif not await self.notifier.close_thread(rec.id, f"✅ {rec.name} (done)"):
+                    await self._edit(q, "Telegram didn't let me delete this thread, so I renamed it "
+                                        f"“✅ {esc(rec.name)} (done)”. You can delete it from the chat's topic list.")
             elif action == "thread":
                 thread = getattr(q.message, "message_thread_id", None) if q.message else None
                 text = self._pending.pop((chat.id, thread), "")

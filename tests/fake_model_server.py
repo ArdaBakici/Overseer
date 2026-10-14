@@ -21,8 +21,13 @@ COMPACTION_PROMPTS = ("create a detailed summary of the conversation", "CONTEXT 
 
 
 class FakeModel:
-    def __init__(self, script, think: bool = False, input_tokens: int = 1):
+    def __init__(self, script, think: bool = False, input_tokens: int = 1, scripts=None):
         self.script = list(script)
+        # Several conversations at once (a planner and its subagents): [(marker, script)], the first marker found in
+        # a request picks its script, and only the outputs of the calls made for that script count.
+        self.scripts = [(m, list(sc)) for m, sc in scripts or []]
+        self.issued: dict[str, set] = {}
+        self.by_marker: dict[str, list[str]] = {}
         self.think = think
         # reported per request (an int, or a function of the request number): a big number makes the CLIs compact
         self.input_tokens = input_tokens
@@ -99,7 +104,31 @@ class FakeModel:
         t = self.input_tokens
         return int(t(len(self.requests)) if callable(t) else t)
 
-    def _next(self, n_outputs: int, has_tools: bool, body=None):
+    def _pick(self, body) -> str | None:
+        if not self.scripts:
+            return None
+        text = json.dumps(body)
+        return next((m for m, _ in self.scripts if m in text), None)
+
+    def _scripted(self, key, calls: list[tuple[str, str]]) -> list[str]:
+        """The outputs that count for this request: all of them, or (scripts) those of its script's calls."""
+        if not self.scripts:
+            return [out for _, out in calls]
+        outs = [out for cid, out in calls if cid in self.issued.setdefault(key, set())]
+        if len(outs) >= len(self.by_marker.get(key, [])):
+            self.by_marker[key] = outs
+        return outs
+
+    def _next(self, n_outputs: int, has_tools: bool, body=None, key=None):
+        if self.scripts:
+            if body is not None and any(marker in json.dumps(body) for marker in COMPACTION_PROMPTS):
+                return ("text", "<summary>scripted run</summary>")
+            if not has_tools:
+                return ("text", "OK")
+            script = dict(self.scripts).get(key, [])
+            if n_outputs < len(script):
+                return ("call", script[n_outputs])
+            return ("text", "DONE\n" + "\n---\n".join(self.by_marker.get(key, [])))
         if body is not None and any(marker in json.dumps(body) for marker in COMPACTION_PROMPTS):
             return ("text", "<analysis>Ran the scripted commands.</analysis>\n<summary>The agent ran the scripted "
                             "commands; nothing else is pending.</summary>")
@@ -111,7 +140,7 @@ class FakeModel:
 
     # ---------------------------------------------------------------- Anthropic Messages (Claude Code)
     def anthropic(self, body):
-        outputs = []
+        calls = []
         for m in body.get("messages") or []:
             if m.get("role") != "user" or not isinstance(m.get("content"), list):
                 continue
@@ -120,12 +149,16 @@ class FakeModel:
                     c = b.get("content")
                     if isinstance(c, list):
                         c = "\n".join(x.get("text", "") for x in c if isinstance(x, dict))
-                    outputs.append(str(c))
+                    calls.append((b.get("tool_use_id"), str(c)))
+        key = self._pick(body)
+        outputs = self._scripted(key, calls)
         tools = [t.get("name") for t in body.get("tools") or []]
         if outputs and len(outputs) > len(self.outputs):
             self.outputs = outputs
-        decision = self._next(len(outputs), "Bash" in tools, body)
+        decision = self._next(len(outputs), "Bash" in tools, body, key)
         n = len(self.requests)
+        if decision[0] == "call" and self.scripts:
+            self.issued.setdefault(key, set()).add(f"toolu_{n}")
         usage = {"input_tokens": self._tokens(), "output_tokens": 1}
         msg = {"id": f"msg_{n}", "type": "message", "role": "assistant", "model": body.get("model", "fake"),
                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}
@@ -176,7 +209,7 @@ class FakeModel:
 
     # ---------------------------------------------------------------- OpenAI Responses (Codex)
     def responses(self, body):
-        outputs = []
+        calls = []
         for item in body.get("input") or []:
             if isinstance(item, dict) and item.get("type") in ("function_call_output", "custom_tool_call_output"):
                 out = item.get("output")
@@ -184,7 +217,9 @@ class FakeModel:
                     out = "".join(p.get("text", "") for p in out if isinstance(p, dict))
                 elif isinstance(out, dict):
                     out = out.get("content") or json.dumps(out)
-                outputs.append(str(out))
+                calls.append((item.get("call_id"), str(out)))
+        key = self._pick(body)
+        outputs = self._scripted(key, calls)
         if outputs and len(outputs) > len(self.outputs):
             self.outputs = outputs
         tools = {}
@@ -192,11 +227,21 @@ class FakeModel:
             if t.get("name"):
                 tools[t["name"]] = t
         shell = next((n for n in ("exec_command", "shell_command", "shell") if n in tools), None)
-        decision = self._next(len(outputs), shell is not None, body)
+        if shell is None and any(isinstance(it, dict) and it.get("type") == "additional_tools"
+                                 and '"name": "exec"' in json.dumps(it.get("tools")) for it in body.get("input") or []):
+            shell = "code_mode"  # models with tool_mode code_mode_only (gpt-6-*): commands go through a JS `exec` tool
+        decision = self._next(len(outputs), shell is not None, body, key)
         n = len(self.requests)
+        if decision[0] == "call" and self.scripts:
+            self.issued.setdefault(key, set()).add(f"call_{n}")
         if decision[0] == "call" and isinstance(decision[1], dict):  # {"tool": name, "args": {...}}: another tool
             item = {"type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}", "name": decision[1]["tool"],
                     "arguments": json.dumps(decision[1]["args"]), "status": "completed"}
+        elif decision[0] == "call" and shell == "code_mode":
+            js = (f"const r = await tools.exec_command({{cmd: {json.dumps(decision[1])}}});\n"
+                  "text(typeof r === 'string' ? r : JSON.stringify(r));")
+            item = {"type": "custom_tool_call", "id": f"ctc_{n}", "call_id": f"call_{n}", "name": "exec", "input": js,
+                    "status": "completed"}
         elif decision[0] == "call":
             if shell == "exec_command":
                 args = {"cmd": decision[1]}

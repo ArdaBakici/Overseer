@@ -93,6 +93,14 @@ agent:
   autopilot:
     min_checkin_minutes: 15     # check-ins on running jobs and repeating timers: at least this far apart
     repeat_hours: 24            # a repeating timer stops after this, unless the agent sets --for
+  # Planner mode (off unless you turn it on with /subagents on, or approve an agent's plan): the conversation plans
+  # on a strong model and delegates to subagents on cheaper ones, each in its own thread.
+  subagents:
+    max_running: 3              # subagents running at once; more are queued
+    planner: {claude_code: claude-opus-5-5, codex: gpt-6-astra}
+    workers:                    # models subagents may use; the first is the default
+      claude_code: [claude-sonnet-5-5]
+      codex: [gpt-6.1-sol, gpt-6-luna]
 
 # Projects: each gets its own Telegram topic, conversations, jobs, notes (OVERSEER.md in its folder) and agent
 # settings. You can also create them from Telegram: /project new <name> <dir> [what it's about].

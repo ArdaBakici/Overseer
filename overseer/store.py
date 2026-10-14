@@ -103,6 +103,19 @@ ADDED_COLUMNS = [
     ("autopilot", "hours", "REAL DEFAULT 0"),
     ("autopilot", "expires", "REAL DEFAULT 0"),
     ("watches", "until", "REAL DEFAULT 0"),
+    # subagents (planner mode)
+    ("sessions", "planner", "INTEGER DEFAULT 0"),
+    ("sessions", "parent", "TEXT"),
+    ("sessions", "role", "TEXT DEFAULT ''"),
+    ("sessions", "name", "TEXT DEFAULT ''"),
+    ("sessions", "agent_backend", "TEXT DEFAULT ''"),
+    ("sessions", "model", "TEXT DEFAULT ''"),
+    ("sessions", "state", "TEXT DEFAULT ''"),
+    ("sessions", "task", "TEXT DEFAULT ''"),
+    ("sessions", "report", "TEXT DEFAULT ''"),
+    ("sessions", "started", "REAL DEFAULT 0"),
+    ("sessions", "finished", "REAL DEFAULT 0"),
+    ("sessions", "delivered", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -147,6 +160,24 @@ class SessionRecord:
     created: float = 0.0
     updated: float = 0.0
     project: str | None = None  # None = the main chat
+    planner: int = 0  # planner mode: this conversation delegates to subagents
+    # A subagent (role "worker"): its planner's conversation, name, backend and model, what it was asked, and
+    # where it is: queued | running | waiting (for its jobs / timers) | done | failed | stopped.
+    parent: str | None = None
+    role: str = ""
+    name: str = ""
+    agent_backend: str = ""
+    model: str = ""
+    state: str = ""
+    task: str = ""
+    report: str = ""  # its final reply
+    started: float = 0.0
+    finished: float = 0.0
+    delivered: int = 0  # its report reached the planner
+
+    @property
+    def is_worker(self) -> bool:
+        return self.role == "worker"
 
 
 @dataclass
@@ -440,6 +471,32 @@ class Store:
     def list_sessions(self, limit: int = 20) -> list[SessionRecord]:
         rows = self.db.execute("SELECT * FROM sessions ORDER BY updated DESC LIMIT ?", (limit,)).fetchall()
         return [_row(SessionRecord, r) for r in rows]
+
+    def subagents(self, parent: str | None = None, states: tuple[str, ...] = (),
+                  project: str | None | bool = False) -> list[SessionRecord]:
+        """Subagents, oldest first: of a planner, in some states, of a project (None = the main chat)."""
+        q, args = "SELECT * FROM sessions WHERE role='worker'", []
+        if parent:
+            q, args = q + " AND parent=?", args + [parent]
+        if states:
+            q, args = q + f" AND state IN ({','.join('?' * len(states))})", args + list(states)
+        if project is not False:
+            q, args = (q + " AND project=?", args + [project]) if project else (q + " AND project IS NULL", args)
+        return [_row(SessionRecord, r) for r in self.db.execute(q + " ORDER BY created", args).fetchall()]
+
+    def planner_sessions(self, project: str | None) -> list[str]:
+        """Conversations of a project (None = the main chat) switched to planner mode by an approved plan."""
+        q = "SELECT id FROM sessions WHERE planner=1 AND " + ("project=?" if project else "project IS NULL")
+        return [r["id"] for r in self.db.execute(q, (project,) if project else ()).fetchall()]
+
+    def session_threads(self, session_id: str) -> list[tuple[int, int]]:
+        """(chat id, thread) of every Telegram thread a conversation has."""
+        rows = self.db.execute("SELECT chat_id, thread_id FROM threads WHERE session_id=?", (session_id,)).fetchall()
+        return [(r["chat_id"], r["thread_id"]) for r in rows]
+
+    def session_cost(self, session_id: str) -> float:
+        row = self.db.execute("SELECT SUM(cost) AS c FROM usage WHERE session_id=?", (session_id,)).fetchone()
+        return float(row["c"] or 0.0)
 
     def session_for_job(self, job_id: str) -> SessionRecord | None:
         row = self.db.execute("SELECT * FROM sessions WHERE job_id=? ORDER BY updated DESC LIMIT 1", (job_id,)).fetchone()

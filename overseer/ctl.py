@@ -39,6 +39,7 @@ from .metrics import SpecError, check_progress, parse_alert
 from .projects import ProjectError, Projects
 from .slurm import TERMINAL_STATES, array_parent
 from .store import MetricSpec
+from .subagents import ENDED, STATE_LABEL, SubagentError, model_label
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -110,6 +111,20 @@ def _parser() -> _Parser:
     a.add_argument("--for", dest="for_", help="every: how long to keep waking (default: agent.autopilot.repeat_hours)")
     a.add_argument("note", nargs="*")
     sub.add_parser("auto", add_help=False).add_argument("rest", nargs=argparse.REMAINDER)  # (no longer used)
+    sub.add_parser("propose", add_help=False).add_argument("plan")
+    a = sub.add_parser("spawn", add_help=False)
+    a.add_argument("name")
+    a.add_argument("task", nargs="+")
+    a.add_argument("--model")
+    a.add_argument("--backend")
+    sub.add_parser("agents", add_help=False)
+    ag = sub.add_parser("agent", add_help=False).add_subparsers(dest="action")
+    ag.add_parser("show", add_help=False).add_argument("name")
+    ag.add_parser("stop", add_help=False).add_argument("name")
+    a = ag.add_parser("send", add_help=False)
+    a.add_argument("name")
+    a.add_argument("text", nargs="+")
+    sub.add_parser("planner", add_help=False).add_argument("mode", choices=["off"])
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
     sub.add_parser("status", add_help=False)
     sub.add_parser("help", add_help=False)
@@ -130,6 +145,15 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+
+Subagents (planner mode, off unless the researcher turned it on or approved your plan):
+  ov propose plan.json             propose planner mode: {"goal", "why", "subagents": [{"name", "task", "model"?,
+                                   "backend"?}]}. The researcher approves or declines it (then end your reply).
+  ov spawn <name> <task...> [--model M] [--backend claude_code|codex]   (planner mode) start a subagent
+  ov agents                        your subagents and their state
+  ov agent show|stop <name>        its task and report / stop it
+  ov agent send <name> <text...>   a message to a subagent
+  ov planner off                   end planner mode (the goal is reached)
   ov status                        this conversation: project, its jobs, what will wake you
 
 What matters in a job (shown on its live card in Telegram; alerts ping the researcher or wake you):
@@ -230,13 +254,77 @@ class ControlServer:
                 return False, ("Autopilot no longer needs approval and has no separate mode: watch your jobs "
                                "(ov watch) and set wake-ups (ov wake) yourself. To finish, set no more wake-ups (ov "
                                "unwatch all) and say so; to ask the researcher, ask in your reply or ov notify.")
+            if area in ("propose", "spawn", "agents", "planner"):
+                return True, await getattr(self, area)(session, args)
+            if area == "agent" and args.action:
+                return True, await getattr(self, f"agent_{args.action}")(session, args)
             if area == "notify":
                 return True, await self.notify(session, " ".join(args.text))
             if area == "status":
                 return True, self.status(session)
             return False, HELP
-        except (CtlError, ProjectError, WatchError, SpecError, ValueError) as e:
+        except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ValueError) as e:
             return False, str(e)
+
+    # ---- planner mode and subagents (subagents.py)
+    def _subs(self):
+        if not self.agent.subagents:
+            raise CtlError("subagents aren't available in this Overseer")
+        return self.agent.subagents
+
+    async def propose(self, session, args) -> str:
+        try:
+            plan = json.loads(args.plan)
+        except ValueError as e:
+            raise CtlError(f"the plan isn't valid JSON ({e}). Format: {{\"goal\": ..., \"why\": ..., \"subagents\": "
+                           "[{\"name\": ..., \"task\": ..., \"model\": ..., \"backend\": ...}]}")
+        p = await self._subs().propose(session, plan)
+        return (f"✓ plan {p['id']} sent to the researcher: {len(p['subagents'])} subagent(s), planner "
+                f"{p['planner']}. They approve it with a button (the subagents then start as listed and you're woken "
+                "with their reports) or decline it, possibly with a message for you. End your reply now and wait: "
+                "set no wake-ups for this.")
+
+    async def spawn(self, session, args) -> str:
+        rec = await self._subs().spawn(session, args.name, " ".join(args.task), args.backend, args.model)
+        where = "started" if rec.state == "running" else "queued (it starts when one of the running ones is done)"
+        return (f"✓ subagent {rec.name} ({rec.model}, {rec.agent_backend}) {where}. It has its own thread the "
+                "researcher can follow. You're woken with its report when it's done (with the others, if several "
+                "are running).")
+
+    async def agents(self, session, args) -> str:
+        subs = self._subs()
+        if session.rec.is_worker:
+            return (f"You are subagent {session.rec.name} ({session.rec.model}); your planner reads your final reply. "
+                    "Subagents can't start subagents.")
+        mode = "on" if self.agent.planner_on(session) else "off"
+        recs = self.store.subagents(parent=session.id)
+        lines = [f"planner mode: {mode}" + (f" ({self.agent.session_runner(session).model})" if mode == "on" else ""),
+                 f"running: {subs.running()} of {subs.c.max_running} at once (all conversations)"]
+        lines += [f"  {x}" for x in subs.describe(recs)] or ["  (no subagents in this conversation)"]
+        return "\n".join(lines)
+
+    async def agent_show(self, session, args) -> str:
+        w = self._subs().find(session, args.name)
+        r = w.rec
+        report = r.report if r.state in ENDED else "(not done yet)"
+        return (f"{r.name}: {STATE_LABEL.get(r.state, r.state)} · {model_label(r.model)} ({r.agent_backend})\n"
+                f"notes: {self._subs().notes_path(r)}\ntask:\n{r.task}\n\nreport:\n{report}")
+
+    async def agent_stop(self, session, args) -> str:
+        w = self._subs().find(session, args.name)
+        if w.rec.state in ENDED:
+            return f"{args.name} has already ended ({w.rec.state})"
+        await self._subs().stop(w, by="planner")
+        return f"✓ stopped {args.name} (its run, its wake-ups or its place in the queue)"
+
+    async def agent_send(self, session, args) -> str:
+        w = self._subs().find(session, args.name)
+        await self._subs().send(w, " ".join(args.text))
+        return (f"✓ sent to {args.name}" + (" (it reads it when it starts)" if w.rec.state == "queued" else
+                                             ": it works on it and reports again when done"))
+
+    async def planner(self, session, args) -> str:
+        return "✓ " + self._subs().planner_off(session)
 
     async def _announce(self, session, text: str, **kw) -> None:
         await self.notifier.send(Outgoing(text, session_id=session.id if session else None, silent=True, **kw))
@@ -501,6 +589,16 @@ class ControlServer:
                  "running jobs of this conversation: " + (", ".join(f"{j.job_id} ({j.state})" for j in jobs) or "none")]
         if self.agent.autopilot:
             lines.append("what will wake you:\n" + self.agent.autopilot.watch_lines(session.id))
+        if self.agent.subagents:
+            if session.rec.is_worker:
+                lines.append(f"you are subagent {session.rec.name} ({session.rec.model}); your final reply is your "
+                             "report to your planner")
+            else:
+                on = self.agent.planner_on(session)
+                lines.append(f"planner mode: {'on' if on else 'off'}")
+                recs = self.store.subagents(parent=session.id)
+                if recs:
+                    lines += ["subagents:"] + [f"  {x}" for x in self.agent.subagents.describe(recs)]
         return "\n".join(lines)
 
     # ---- being woken
@@ -597,6 +695,15 @@ token = os.environ.get("OVERSEER_CTL", "")
 # Folders are on the HPC: an unquoted ~/x was expanded by the local shell to this machine's home - undo that.
 home = os.environ.get("HOME", "").rstrip("/")
 argv = [("~" + a[len(home):]) if home and (a == home or a.startswith(home + "/")) else a for a in sys.argv[1:]]
+# A plan (ov propose plan.json) and long texts ("-": read from stdin) are read here, with the agent's own access.
+if argv[:1] == ["propose"] and len(argv) == 2 and not argv[1].lstrip().startswith("{"):
+    try:
+        argv[1] = sys.stdin.read() if argv[1] == "-" else open(os.path.expanduser(sys.argv[2])).read()
+    except OSError as e:
+        sys.stderr.write("ov: can't read the plan: %s\n" % e)
+        sys.exit(1)
+elif "-" in argv[1:] and argv[:1] in (["spawn"], ["agent"]):
+    argv[argv.index("-")] = sys.stdin.read()
 try:
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(120)

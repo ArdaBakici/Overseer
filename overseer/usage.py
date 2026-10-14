@@ -7,7 +7,8 @@ import time
 from .notify import code, esc
 from .store import Store
 
-ORIGINS = {"user": "from you", "wakeup": "wake-ups", "checkin": "check-ins", "compact": "compactions"}
+ORIGINS = {"user": "from you", "wakeup": "wake-ups", "checkin": "check-ins", "compact": "compactions",
+           "subagent": "subagent tasks"}
 
 
 def _n(x: float) -> str:
@@ -59,6 +60,14 @@ def usage_report(store: Store, period: str = "today") -> str:
             f"{esc(b)} {_n(sum(x['input'] + x['output'] for x in rs))}"
             + (f" ${sum(x['cost'] or 0 for x in rs):.2f}" if any(x["cost"] is not None for x in rs) else "")
             for b, rs in backends.items()))
+    workers = {sid for sid in {r["session_id"] for r in rows} if (s := store.get_session(sid)) and s.is_worker}
+    if workers:  # planner mode: what the subagents cost, apart from your conversations (and their planners)
+        def part(rs: list) -> str:
+            c = sum(x["cost"] or 0 for x in rs)
+            return f"{_n(sum(x['input'] + x['output'] for x in rs))}" + (f" ${c:.2f}" if c else "")
+        sub_rows = [r for r in rows if r["session_id"] in workers]
+        lines.append(f"subagents ({len(workers)}): {part(sub_rows)} · conversations and planners: "
+                     f"{part([r for r in rows if r['session_id'] not in workers])}")
     if unpriced:
         lines.append("(Codex doesn't report a cost: its runs are in the tokens only)")
     convs: dict[str, list] = {}

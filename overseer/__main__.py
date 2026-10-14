@@ -70,6 +70,7 @@ def build(cfg: Config):
                         "labelled in the main chat (enable threaded mode for the bot in @BotFather)")
         await ctl.start()  # the agent's `ov` command
         await bot.offer_cut_off_runs()  # runs the last Overseer didn't finish: ▶️ Continue / ✖ Dismiss
+        subagents.resume()  # queued subagents get their turn
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
         await app.bot.set_my_commands([
@@ -78,7 +79,8 @@ def build(cfg: Config):
             ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
-            ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"), ("project", "projects: list, new, context, notes"),
+            ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
+            ("subagents", "planner mode: on/off, models, threads"), ("project", "projects: list, new, context, notes"),
             ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
 
@@ -113,6 +115,8 @@ def build(cfg: Config):
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     agent.monitor = monitor
     monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
+    from .subagents import Subagents
+    subagents = Subagents(cfg, store, agent, notifier)  # planner mode (off unless turned on or approved)
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)

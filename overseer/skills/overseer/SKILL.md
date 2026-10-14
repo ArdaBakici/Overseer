@@ -1,6 +1,6 @@
 ---
 name: overseer
-description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, create and manage projects, move or stop tracking jobs, message the researcher, and have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log. Use it whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
+description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, create and manage projects, move or stop tracking jobs, message the researcher, have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log, and propose or run planner mode (you plan, subagents on cheaper models do the work). Use it when you are a planner or a subagent, and whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
 ---
 
 # Overseer and `ov`
@@ -149,7 +149,7 @@ mode needs to be switched on.
 If a wake-up fails, the conversation's wake-ups pause until the researcher writes. They can also cancel
 them all (`/auto off`). You're told when they cancel something.
 
-Research log (`RESEARCH_LOG.md` in the project folder):
+Research log (`RESEARCH_LOG.md` in the project folder; in planner mode only the planner writes it):
 - **Structure:** the current goal at the top, then one entry per experiment or wake-up.
 - **Goal changes:** rewrite the goal, keeping a one-line note of the old one.
 - **Size:** keep it compact, well under 200k tokens (~800 KB). When it grows long, condense the old
@@ -159,3 +159,75 @@ Rules:
 - Change one thing at a time unless the goal says otherwise.
 - Give every run its own name and output folder, and never delete or overwrite earlier results.
 - Only cancel or change jobs you submitted in this conversation.
+
+## Planner mode: subagents
+
+Planner mode is off unless the researcher turns it on (`/subagents on`) or approves a plan you propose. When it's on,
+you run on a strong planner model and delegate the hands-on work to subagents on cheaper models. Each subagent is a
+conversation of its own, in its own Telegram thread, with the same sandbox, HPC access and `ov`.
+
+| Backend | Planner | Subagents |
+|---|---|---|
+| Claude Code | `claude-opus-5-5` | `claude-sonnet-5-5` |
+| Codex | `gpt-6-astra` | `gpt-6.1-sol` (default), `gpt-6-luna` (simple, mechanical tasks) |
+
+The researcher can change these; your prompt and `ov agents` show the current ones.
+
+### Proposing it
+
+Propose planner mode when the work has several independent lines (ablations, competing ideas, a sweep plus its
+analysis) or is a long experiment that separate workers would keep focused. Don't propose it for a single job, a quick
+fix or a question, and propose at most once per task unless the researcher asks for a revision.
+
+```bash
+cat > plan.json <<'PLAN'
+{"goal": "find an LR schedule that beats the baseline (score 5.2), 3 seeds each",
+ "why": "three independent schedules can run side by side",
+ "subagents": [
+   {"name": "cosine", "task": "Self-contained brief: goal, paths, constraints, output folder, what to report."},
+   {"name": "warmup", "task": "...", "model": "claude-sonnet-5-5"},
+   {"name": "grid", "task": "...", "backend": "codex", "model": "gpt-6-luna"}]}
+PLAN
+ov propose plan.json
+```
+
+- **The planner model** is the one for your current backend. You keep your backend, and with it this conversation.
+- **The researcher sees a card** with the goal, the planner and each subagent, and answers in one of three ways:
+  - **Approve:** planner mode goes on for this conversation, and the subagents start exactly as listed. You're told in
+    a note, and woken with their reports.
+  - **No:** you're told it was declined. Carry on in normal mode.
+  - **They write to you instead:** that declines the plan, and you get their message. Revise and propose again if it
+    still makes sense.
+- **After proposing, end your reply.** Set no wake-ups for it: the researcher's answer brings you back.
+
+### As the planner
+
+```bash
+ov spawn cosine "brief..." [--model claude-sonnet-5-5] [--backend codex]   # start a subagent (or queue it)
+ov agents                     # your subagents and their state
+ov agent show cosine          # its task and report
+ov agent send cosine "also try warmup 1k"   # it works on that and reports again
+ov agent stop cosine
+ov planner off                # the goal is reached: back to normal mode
+```
+
+- **Briefs are self-contained.** A subagent doesn't see your conversation: give the goal, context, exact paths,
+  constraints, its own output folder (so subagents never overwrite each other's results), and what to report.
+- **Pick the cheapest model that can do the task.**
+- **At most 3 subagents run at once**, across all conversations. More wait their turn.
+- **You're woken with their reports** once all the subagents you're waiting for are done, or as soon as one fails or
+  is stopped. Subagents watch their own jobs: don't watch theirs.
+- **The research log is yours alone.** Record each subagent's results and link its `NOTES.md`.
+- **When the goal is reached,** say so and run `ov planner off`. Running subagents still finish and report.
+
+### As a subagent
+
+Your prompt says when you are one, and what your task and notes file are.
+
+- **Do the task on your own:** submit jobs, watch them, wake yourself.
+- **Notes:** keep your detailed notes (commands, intermediate results, dead ends) in your `NOTES.md`.
+- **Use your own output folder.** Don't write the research log; your planner records your results.
+- **Your final reply is your report to the planner:** what you did, the key numbers, where the results are (at most
+  ~15 lines). If you're blocked or the task turns out wrong, say so there rather than guessing.
+- **You can't start subagents or propose planner mode.** The researcher may write to you in your thread: answer them
+  there.

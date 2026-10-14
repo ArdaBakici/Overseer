@@ -63,6 +63,21 @@ class FakeNotifier:
     async def delete_live(self, handle):
         self.deleted.append(handle)
 
+    # messages edited later (a plan's card), and subagents' threads
+    async def post(self, msg):
+        self.sent.append(msg)
+        return {"1": len(self.sent)}
+
+    async def edit(self, refs, text):
+        self.edits = getattr(self, "edits", []) + [(refs, text)]
+
+    async def open_thread(self, session_id, name):
+        self.threads = {**getattr(self, "threads", {}), session_id: name}
+
+    async def close_thread(self, session_id, done_name):
+        self.closed = getattr(self, "closed", []) + [session_id]
+        return True
+
     def texts(self):
         return "\n".join(m.text for m in self.sent)
 
@@ -2638,4 +2653,181 @@ async def test_a_wake_up_cut_off_by_a_restart(env):
     notice = env.notifier.sent[-1]
     assert "was working on a wake-up it had set up" in notice.text and "[Wake-up you set up]" in notice.text
     assert notice.buttons[0][0][0] == "▶️ Continue"
+    await env.ctl.stop()
+
+
+# ----------------------------------------------------------------------------- planner mode: subagents
+
+async def make_subagents(env):
+    from overseer.subagents import Subagents
+    ap = await make_autopilot(env)
+    return Subagents(env.cfg, env.store, env.agent, env.notifier), ap
+
+
+def claude_runs(env):
+    return [c for c in env.cli_log() if c["prog"] == "claude" and "--output-format" in c["argv"]
+            and c["argv"][c["argv"].index("--output-format") + 1] == "stream-json"]
+
+
+def model_of(call) -> str:
+    return call["argv"][call["argv"].index("--model") + 1] if "--model" in call["argv"] else ""
+
+
+PLAN = {"goal": "beat the baseline score 5.2", "why": "independent schedules",
+        "subagents": [{"name": "cosine", "task": "try a cosine schedule, 3 seeds"},
+                      {"name": "warmup", "task": "linear warmup 1k vs 5k"},
+                      {"name": "grid", "task": "launch the 6-run grid", "backend": "codex", "model": "gpt-6-luna"},
+                      {"name": "plots", "task": "plot the curves"}]}
+
+
+async def test_a_proposed_plan_approved_runs_subagents_and_wakes_the_planner(env):
+    """The agent proposes planner mode; nothing starts until it's approved. Then the subagents run on their worker
+    models in their own threads (3 at once, the 4th queued), and the planner, now on its planner model, is woken
+    once with all their reports."""
+    subs, ap = await make_subagents(env)
+    s = env.agent.general_session()
+    assert "ov propose" in env.agent.system_prompt(s.id) and "Planner mode:" not in env.agent.system_prompt(s.id)
+    await env.agent.handle(s, f"FAKE_OV ov propose '{json.dumps(PLAN)}'")
+    assert "✓ plan" in env.notifier.sent[-1].text, env.notifier.texts()[-2000:]
+    card = next(m for m in env.notifier.sent if m.text.startswith("🧭"))
+    assert "beat the baseline score 5.2" in card.text and "Opus 5.5" in card.text and "Sonnet 5.5" in card.text
+    assert "grid</b> · gpt-6-luna (codex)" in card.text and "3 run at a time" in card.text
+    (approve, pid), _ = card.buttons[0]
+    assert approve == "✅ Approve" and not env.store.subagents()  # nothing started yet
+
+    n_runs = len(claude_runs(env))
+    await subs.approve(pid.split(":", 1)[1])
+    assert env.agent.planner_on(s) and "approved" in env.notifier.edits[-1][1].lower()
+    recs = {r.name: r for r in env.store.subagents(parent=s.id)}
+    assert set(recs) == {"cosine", "warmup", "grid", "plots"}
+    assert [r.name for r in env.store.subagents(states=("queued",))] == ["plots"]  # 3 at once
+    assert set(env.notifier.threads.values()) >= {"🤖 cosine", "🤖 grid"}
+    await subs.drain()
+    await ap.drain()
+    await subs.drain()
+    recs = {r.name: r for r in env.store.subagents(parent=s.id)}
+    assert all(r.state == "done" and r.report for r in recs.values()), {n: r.state for n, r in recs.items()}
+    runs = claude_runs(env)[n_runs:]
+    workers = [c for c in runs if "[Task from your planner" in c["stdin"]]
+    assert sorted(model_of(c) for c in workers) == ["claude-sonnet-5-5"] * 3
+    codex = [c for c in env.cli_log() if c["prog"] == "codex" and "[Task from your planner" in c["stdin"]]
+    assert len(codex) == 1 and "gpt-6-luna" in json.dumps(codex[0]["argv"])
+    planner = [c for c in runs if "[Subagents you started have finished]" in c["stdin"]]
+    assert len(planner) == 1 and model_of(planner[0]) == "claude-opus-5-5", [c["stdin"][:80] for c in runs]
+    stdin = planner[0]["stdin"]
+    assert all(f"name='{n}'" in stdin for n in recs) and "Fixed the batch size" in stdin
+    assert "The researcher approved your plan" in stdin  # the note, delivered with the reports
+    # Each finished subagent's thread: its summary line, with Delete / Keep.
+    ends = [m for m in env.notifier.sent if m.buttons and m.buttons[0][0][0] == "🗑 Delete thread"]
+    assert len(ends) == 4 and "finished" in ends[0].text
+    # The planner's instructions; a subagent's (no research log, no spawning).
+    assert "Planner mode: you plan" in env.agent.system_prompt(s.id)
+    w = env.agent.get(recs["cosine"].id)
+    wp = env.agent.system_prompt(w.id)
+    assert 'You are a subagent: "cosine"' in wp and "ov propose" not in wp and "Planner mode: you plan" not in wp
+    await env.ctl.stop()
+
+
+async def test_writing_to_the_agent_declines_its_plan(env, monkeypatch):
+    """A message while a plan is open declines it and reaches the agent with what you wrote; ✖ declines it without
+    comment; a newer plan replaces the old one."""
+    from overseer.bot import Bot
+    subs, ap = await make_subagents(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    s = env.agent.general_session()
+    p1 = await subs.propose(s, PLAN)
+    p2 = await subs.propose(s, {**PLAN, "goal": "a smaller plan", "subagents": PLAN["subagents"][:1]})
+    assert "Replaced by a newer plan" in env.notifier.edits[-1][1]
+    assert (await subs.approve(p1["id"])).startswith("This plan was already")  # only the newest counts
+    await bot.on_text(NS(effective_message=NS(text="use 2 seeds, not 3", reply_to_message=None),
+                         effective_chat=NS(id=1)), None)
+    for t in list(bot._tasks):
+        await t
+    assert "Declined</b>: you replied “use 2 seeds, not 3”" in env.notifier.edits[-1][1]
+    stdin = claude_runs(env)[-1]["stdin"]
+    assert "[The researcher declined your proposed plan (goal: a smaller plan) and replied:]\nuse 2 seeds" in stdin
+    assert not env.agent.planner_on(s) and not env.store.subagents()
+    assert (await subs.approve(p2["id"])).startswith("This plan was already")
+    # ✖ No: the agent is told at its next run; nothing runs now.
+    p3 = await subs.propose(s, PLAN)
+    n = len(claude_runs(env))
+    await subs.decline(p3["id"])
+    assert "Declined." in env.notifier.edits[-1][1] and len(claude_runs(env)) == n
+    await env.agent.handle(s, "ok, what next?")
+    assert "declined your plan" in claude_runs(env)[-1]["stdin"]
+    await env.ctl.stop()
+
+
+async def test_subagent_rules(env):
+    """What's refused, and what each command does."""
+    from overseer.subagents import SubagentError
+    subs, ap = await make_subagents(env)
+    s = env.agent.general_session()
+    with pytest.raises(SubagentError, match="planner mode is off"):
+        await subs.spawn(s, "a", "task")
+    with pytest.raises(SubagentError, match="isn't a subagent model"):
+        await subs.propose(s, {**PLAN, "subagents": [{"name": "a", "task": "t", "model": "claude-fable-5-1"}]})
+    with pytest.raises(SubagentError, match="the planner here is claude-opus-5-5"):
+        await subs.propose(s, {**PLAN, "planner": "gpt-6-astra"})
+    with pytest.raises(SubagentError, match="name"):
+        await subs.propose(s, {**PLAN, "subagents": [{"name": "Bad Name", "task": "t"}]})
+    env.agent._set_setting("subagents", "on", None)  # /subagents on (main chat)
+    assert env.agent.planner_on(s) and env.agent.session_runner(s).model == "claude-opus-5-5"
+    with pytest.raises(SubagentError, match="already on"):
+        await subs.propose(s, PLAN)
+    rec = await subs.spawn(s, "probe", "FORCE_SLEEP look around")
+    w = env.agent.get(rec.id)
+    with pytest.raises(SubagentError, match="already a subagent named"):
+        await subs.spawn(s, "probe", "again")
+    with pytest.raises(SubagentError, match="can't start subagents"):
+        await subs.spawn(w, "nested", "task")
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if env.agent.is_running(w):
+            break
+    await subs.stop(w)  # by the planner: it isn't woken for it
+    await subs.drain()
+    assert w.rec.state == "stopped" and not [c for c in claude_runs(env) if "[Subagents you started" in c["stdin"]]
+    # A subagent waiting for its jobs isn't done yet; when its watch fires and it answers, it is.
+    rec = await subs.spawn(s, "watcher", "FAKE_LOOP train and watch")
+    await subs.drain()
+    w = env.agent.get(rec.id)
+    assert w.rec.state == "waiting" and env.store.watches(w.id), w.rec.state
+    env.agent._set_setting("subagents", None, None)
+    assert not env.agent.planner_on(s) and env.agent.session_runner(s).model != "claude-opus-5-5"
+    await env.ctl.stop()
+
+
+async def test_subagent_threads_and_the_subagents_command(env, monkeypatch):
+    from overseer.bot import Bot
+    subs, ap = await make_subagents(env)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "reply", reply)
+    await bot.cmd_subagents(None, NS(args=["on"]))
+    assert "Planner mode is <b>on</b>" in replies[-1] and "claude-opus-5-5" in replies[-1]
+    s = env.agent.general_session()
+    rec = await subs.spawn(s, "cosine", "try cosine")
+    await subs.drain()
+    await bot.cmd_subagents(None, NS(args=[]))
+    assert "cosine: ✅ done · Sonnet 5.5" in replies[-1], replies[-1]
+    edits = []
+
+    async def press(data):
+        async def edit_message_text(text, **kw):
+            edits.append(text)
+        q = NS(data=data, message=NS(message_thread_id=None), answer=_noop, edit_message_text=edit_message_text,
+               edit_message_reply_markup=_noop)
+        await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
+    await press(f"subdel:{rec.id}")
+    assert env.notifier.closed == [rec.id]
+    await bot.cmd_subagents(None, NS(args=["workers", "codex", "gpt-6-luna"]))
+    assert env.agent.worker_models("codex", None) == ["gpt-6-luna"]
+    await bot.cmd_subagents(None, NS(args=["off"]))
+    assert not env.agent.planner_on(s) and "off" in replies[-1]
     await env.ctl.stop()

@@ -154,12 +154,54 @@ This conversation belongs to the project in `{dir}` on the HPC. Work there unles
 Project notes: `{notes}` holds durable notes for this project - how to run things, environments, data \
 locations, conventions, known issues. It is shown to you at the start of each conversation. When you learn \
 something future conversations here should know, add it there (keep it short and current; create it if missing).
-Research log: `{log}` is this project's experiment history. Whenever you run experiments here, keep it up to \
-date: at the top the current goal (rewrite it when the goal changes, with a one-line note of the old one), then \
-one entry per experiment or wake-up - what you changed and why, the job ids, the key results, the next idea. \
+{log_rule}"""
+
+LOG_RULE = """Research log: `{log}` is this project's experiment history. Whenever you run experiments here, keep it \
+up to date: at the top the current goal (rewrite it when the goal changes, with a one-line note of the old one), \
+then one entry per experiment or wake-up - what you changed and why, the job ids, the key results, the next idea. \
 Overseer shows you its beginning and latest entries when a conversation starts and when you are woken. Keep it \
 compact, well under 200k tokens (~800 KB): when it grows long, condense the old entries into a short summary \
 section at the top."""
+
+WORKER_LOG_RULE = """Research log: `{log}` is written by your planner only - don't edit it (read it if useful). Your \
+detailed notes go in your own NOTES.md (below); your planner records the results from your report."""
+
+# Normal mode: the agent may propose planner mode (subagents.py); the researcher approves or declines.
+PROPOSE_SECTION = """
+
+## Proposing planner mode (subagents)
+For work with several independent lines (ablations, competing ideas, a sweep plus its analysis) or long experiments, \
+you may propose planner mode: you would plan and review on {planner}, and subagents on cheaper models \
+({workers}) would do the hands-on work, each in its own thread. Write the plan as JSON and run \
+`ov propose plan.json` - {{"goal": ..., "why": "what splitting it gains", "subagents": [{{"name": "cosine", "task": \
+"a self-contained brief", "model": ..., "backend": ...}}]}} (model and backend are optional). The researcher sees \
+it and approves or declines it; if they write to you instead, that declines it and you get their message - revise \
+and propose again if it still makes sense. After proposing, end your reply and set no wake-ups for it. Don't propose \
+it for a single job, a quick fix or a question, and at most once per task unless asked."""
+
+PLANNER_SECTION = """
+
+## Planner mode: you plan, subagents do the work
+You run on a strong model; subagents on cheaper ones ({workers}). Plan, delegate the hands-on work (running and \
+watching experiments, debugging a job, writing analysis or plotting scripts, reading logs), review the results and \
+decide the next step. Start one with `ov spawn <name> "<brief>" [--model M] [--backend claude_code|codex]` (at most \
+{max_running} run at once across all conversations; more wait their turn). A subagent doesn't see this \
+conversation: make each brief self-contained - goal, context, exact paths, constraints, its own output folder \
+(so subagents never overwrite each other's results), and what to report back. Pick the cheapest model that can do \
+the task. You're woken with their reports once all the subagents you're waiting for are done (or as soon as one \
+fails or is stopped); subagents watch their own jobs, so don't watch theirs. `ov agents`, `ov agent show|stop \
+<name>`, `ov agent send <name> <text>`. In a project, you alone write the research log: record each subagent's \
+results (link its NOTES.md). When the goal is reached, say so and run `ov planner off`."""
+
+WORKER_SECTION = """
+
+## You are a subagent: "{name}"
+A planner (another conversation, on a stronger model) gave you a task; the researcher can follow you in your own \
+Telegram thread and write to you there. Do the task on your own - submit jobs, watch them, wake yourself - and \
+keep your detailed notes in `{notes}`. Use your own output folder; never overwrite other runs' results. Don't \
+start subagents or propose planner mode. When the task is done, your final reply is your report to the planner: \
+what you did, the key numbers, where the results are (at most ~15 lines). If you're blocked or the task turns out \
+wrong, say so in that report rather than guessing."""
 
 NOTES_FILE = "OVERSEER.md"
 LOG_FILE = "RESEARCH_LOG.md"
@@ -308,7 +350,9 @@ class Session:
     rec: SessionRecord
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     task: asyncio.Task | None = None
-    origin: str = "user"  # what started the current turn: user | wakeup | checkin
+    origin: str = "user"  # what started the current turn: user | wakeup | checkin | subagent
+    last_reply: str = ""  # the agent's last answer (a subagent's report)
+    last_status: str = ""  # how its last run ended: done | error | stopped
 
     @property
     def id(self) -> str:
@@ -331,6 +375,7 @@ class Agent:
         self.hpc = hpc
         self.monitor = None  # set by the app; poked when the agent submits a job
         self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
+        self.subagents = None  # set by Subagents(...): planner mode
         self.ctl = None  # set by ControlServer(...): the agent's `ov` command
         self.updating = False  # the CLIs are being updated (update_clis)
         self.shutting_down = False  # Overseer is stopping: runs cut off now are offered again at the next start
@@ -396,6 +441,40 @@ class Agent:
         r.effort_override = self._setting(f"effort:{b}", project)
         return r
 
+    # ------------------------------------------------------------------ a conversation's own backend and model
+    # A subagent runs on the backend and model it was given; a planner (planner mode) on the planner model of its
+    # backend; any other conversation on its project's settings (/backend, /model, /effort).
+    def planner_on(self, s: Session) -> bool:
+        if s.rec.is_worker:
+            return False
+        return bool(s.rec.planner) or self._setting("subagents", s.project) == "on"
+
+    def planner_model(self, backend: str, project: str | None) -> str | None:
+        return self._setting(f"sub_planner:{backend}", project) or self.cfg.agent.subagents.planner.get(backend)
+
+    def worker_models(self, backend: str, project: str | None) -> list[str]:
+        v = self._setting(f"sub_workers:{backend}", project)
+        return [m for m in (v or "").split(",") if m] or list(self.cfg.agent.subagents.workers.get(backend, []))
+
+    def session_backend(self, s: Session) -> str:
+        b = s.rec.agent_backend
+        return b if b in BACKENDS else self.backend_of(s.project)
+
+    def session_runner(self, s: Session) -> Runner:
+        b = self.session_backend(s)
+        if s.rec.is_worker:
+            model, effort = s.rec.model or None, self.cfg.agent.subagents.worker_effort
+        elif self.planner_on(s):
+            model, effort = self.planner_model(b, s.project), self._setting(f"effort:{b}", s.project)
+        else:
+            return self.runner(b, s.project)
+        key = f"{b}@{s.project or ''}#{model}#{effort}"  # its own runner: the model never changes under a run
+        if key not in self._runners:
+            self._runners[key] = make_runner(self.cfg, b)
+        r = self._runners[key]
+        r.model_override, r.effort_override = model, effort
+        return r
+
     def set_model(self, name: str, backend: str | None = None, project: str | None = None) -> None:
         """Set the model for a backend; "default" goes back to config.yaml."""
         b = backend or self.backend_of(project)
@@ -453,8 +532,8 @@ class Agent:
                              input=res.input_tokens, cached=res.cached_tokens, output=res.output_tokens,
                              cost=res.cost_usd)
 
-    def footer(self, backend: str, res, project: str | None = None) -> str:
-        r = self.runner(backend, project)
+    def footer(self, backend: str, res, project: str | None = None, runner: Runner | None = None) -> str:
+        r = runner or self.runner(backend, project)
         parts = [backend, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
         tokens = res.input_tokens + res.output_tokens
         if tokens:
@@ -535,7 +614,7 @@ class Agent:
 
     async def compact(self, s: Session, focus: str = "") -> bool:
         """Compact the conversation now (the researcher's /compact): the CLI summarises its older turns."""
-        backend = self.backend_of(s.project)
+        backend = self.session_backend(s)
         if not s.rec.cli_session_id or s.rec.backend != backend:
             await self.notifier.send(Outgoing(f"🗜 Nothing to compact: this conversation has no history with "
                                               f"{esc(backend)} yet.", session_id=s.id, job_id=s.job_id))
@@ -544,7 +623,7 @@ class Agent:
             await self.notifier.send(Outgoing("The agent is working in this conversation: send /compact when it's "
                                               "done (or /stop it first).", session_id=s.id, job_id=s.job_id))
             return False
-        runner = self.runner(backend, s.project)
+        runner = self.session_runner(s)
         async with s.lock:
             s.task = asyncio.current_task()
             transcript = Transcript(self.cfg, s.id)
@@ -671,12 +750,26 @@ class Agent:
         prompt += self._storage_section() + PYTHON_SECTION
         sess = self.get(session_id)
         proj = self.store.get_project(sess.project) if sess else None
+        worker = bool(sess and sess.rec.is_worker)
         if proj:
             context = f"\n\nAbout this project, from the researcher:\n{proj.context.strip()}" if proj.context.strip() else ""
+            log = f"{proj.dir.rstrip('/')}/{LOG_FILE}"
             prompt += PROJECT_SECTION.format(name=proj.name, dir=proj.dir, context=context,
                                              notes=f"{proj.dir.rstrip('/')}/{NOTES_FILE}",
-                                             log=f"{proj.dir.rstrip('/')}/{LOG_FILE}")
+                                             log_rule=(WORKER_LOG_RULE if worker else LOG_RULE).format(log=log))
+        if self.ctl and self.subagents and sess:
+            prompt += self._subagent_section(sess)
         return prompt
+
+    def _subagent_section(self, s: Session) -> str:
+        """Planner mode: how to propose it (normal mode), how to plan (planner), or how to work (subagent)."""
+        if s.rec.is_worker:
+            return WORKER_SECTION.format(name=s.rec.name, notes=self.subagents.notes_path(s.rec))
+        b = self.session_backend(s)
+        workers = ", ".join(m for bb in BACKENDS for m in self.worker_models(bb, s.project))
+        if self.planner_on(s):
+            return PLANNER_SECTION.format(workers=workers, max_running=self.cfg.agent.subagents.max_running)
+        return PROPOSE_SECTION.format(planner=self.planner_model(b, s.project) or "a stronger model", workers=workers)
 
     def _quota_rows(self) -> list:
         try:
@@ -788,18 +881,21 @@ class Agent:
                 self.autopilot.user_turn(s)
             try:
                 if files:  # (moved while no run of this conversation can touch its inbox)
-                    items = deliver_uploads(self.runner(project=s.project).workdir(s.id), files)
-                    user_text = f"{user_text}\n\n{uploads_note(items, self.backend_of(s.project))}".strip()
+                    items = deliver_uploads(self.session_runner(s).workdir(s.id), files)
+                    user_text = f"{user_text}\n\n{uploads_note(items, self.session_backend(s))}".strip()
                 self._run_update(run, text=user_text, files=[], started=time.time())
+                s.last_status = "running"
                 await self._turn(s, user_text, quiet)
-                ok = True
+                ok, s.last_status = True, "done"
             except asyncio.CancelledError:
                 if self.shutting_down:  # not stopped by the researcher: offered again at the next start
                     raise
+                s.last_status = "stopped"
                 await self.notifier.send(Outgoing("⏹ Stopped.", session_id=s.id, job_id=s.job_id))
             except Exception as e:
                 if self.shutting_down:  # its CLI was stopped with Overseer: offered again at the next start
                     raise
+                s.last_status, s.last_reply = "error", str(e)[:1500]
                 if isinstance(e, AgentRunError):
                     await self._run_failed(s, e)
                 else:
@@ -812,6 +908,8 @@ class Agent:
         self.store.unset(RUN_KEY + run)  # (not reached when the run is cut off by Overseer stopping)
         if self.autopilot:
             self.autopilot.turn_ended(s)
+        if self.subagents and s.rec.is_worker:  # done, waiting for its jobs, failed or stopped: its planner hears
+            self.subagents.turn_ended(s)
         return ok
 
     async def _run_failed(self, s: Session, e: AgentRunError) -> None:
@@ -870,8 +968,8 @@ class Agent:
         return (CONTINUE_PROMPT + rec.get("text", "")), files
 
     async def _turn(self, s: Session, user_text: str, quiet: bool = False) -> None:
-        backend = self.backend_of(s.project)
-        runner = self.runner(backend, s.project)
+        backend = self.session_backend(s)
+        runner = self.session_runner(s)
         resume = s.rec.cli_session_id if s.rec.backend == backend else None
         parts = []
         if resume is None and s.project:  # a new CLI session: give it the project's notes
@@ -939,7 +1037,8 @@ class Agent:
         if res.effort:
             self.store.set(f"last_effort:{backend}", res.effort)
         self._usage_delta(backend, res, resumed=resume is not None)
-        footer = self.footer(backend, res, s.project)
+        footer = self.footer(backend, res, s.project, runner)
+        s.last_reply = res.text or ""
         self._record_usage(s, backend, res)
         text, autopilot_line = res.text, ""
         if self.autopilot:
@@ -999,7 +1098,7 @@ class Agent:
                                                   session_id=s.id, job_id=s.job_id, silent=True))
             return
         if activity.blocked:
-            lines = [f"⚠️ <b>{len(activity.blocked)} command(s) were refused by {esc(self.backend_of(s.project))} itself</b> "
+            lines = [f"⚠️ <b>{len(activity.blocked)} command(s) were refused by {esc(self.session_backend(s))} itself</b> "
                      "(not by Overseer - there is no approval step):"]
             for cmd, reason in activity.blocked[:10]:
                 lines.append(pre(cmd, 300) + f"→ {esc(reason)}")
