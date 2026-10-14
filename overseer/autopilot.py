@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from .config import Config
 from .diagnose import extract_metrics, tqdm_cleanup
 from .hpc import HPC
+from .results import context as results_context
 from .monitor import progress_log
 from .notify import Notifier, Outgoing, code, esc
 from .slurm import SUCCESS_STATES, Job
@@ -427,7 +428,9 @@ class Autopilot:
                          "you're woken now).")
         if s.project:
             parts.append(await self.agent.research_log(s.project))
-        parts.append("Read the results (open the logs or metrics files for more) and update the research log. If the "
-                     "work goes on, submit the next run and `ov watch` it; if the goal is reached or nothing sensible is "
-                     "left, say so and set no more wake-ups; if you need the researcher's decision, ask.")
+        parts.append(results_context(self.store, s.project, s.id))
+        parts.append("Read the results (open the logs or metrics files for more), record what each showed (`ov result "
+                     "<job> --verdict ... --conclusion ...`; a lasting lesson: `ov finding`) and update the research log. "
+                     "If the work goes on, submit the next run and `ov watch` it; if the goal is reached or nothing "
+                     "sensible is left, say so and set no more wake-ups; if you need the researcher's decision, ask.")
         return "\n\n".join(p for p in parts if p)

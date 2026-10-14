@@ -1,6 +1,6 @@
 ---
 name: overseer
-description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, create and manage projects, move or stop tracking jobs, message the researcher, have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log, and propose or run planner mode (you plan, subagents on cheaper models do the work). Use it when you are a planner or a subagent, and whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
+description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, record and query experiment results and findings (insights, dead ends), create and manage projects, move or stop tracking jobs, message the researcher, have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log, and propose or run planner mode (you plan, subagents on cheaper models do the work). Use it when you are a planner or a subagent, and whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
 ---
 
 # Overseer and `ov`
@@ -96,6 +96,57 @@ ov status                        # this conversation: project, autopilot, jobs, 
 Your final reply is sent to the researcher anyway. Use `ov notify` for news in the middle of a
 long run.
 
+## Results and findings
+
+**Results** are the project's record of experiments: one row per finished job, plus any result you add by hand.
+Overseer fills in what it knows when a job ends: state, runtime, and its key metrics (your `ov metrics` critical and
+important ones first, then others from the log). You add what it means:
+
+```bash
+ov result 18756118 --hypothesis "cosine schedule beats step decay"        # when you submit it
+ov result 18756118 --verdict promising --conclusion "+0.4 score over baseline, stable across seeds"
+ov result 18756119 --verdict no-gain --conclusion "warmup 5k = 1k" --tags warmup,ablation
+ov result add --name "sample quality, run 7 vs 5" --verdict worse --conclusion "more artifacts at high cfg" \
+    --metric "artifacts=more"                      # a result that isn't a job: an evaluation by eye, a comparison
+ov result 18756120 --dead-end --conclusion "fp16 diverges with this optimizer"   # also records a dead end
+ov result show 18756118
+```
+
+- **Verdicts:** `baseline`, `promising`, `no-gain`, `worse`, `broken`, `dead-end`, `inconclusive`. A verdict needs no
+  number: it's your judgement, and qualitative work is recorded the same way. Give every result you're responsible
+  for one; your prompt lists those still missing.
+- **A run of results without gain** (3 or more `no-gain`/`worse`/... since the last `promising` or `baseline`) is
+  pointed out to you. Treat it as a cue to try something materially different, check the findings, or ask.
+
+```bash
+ov results                                   # this project's, newest first
+ov results --sort score                      # by a metric, highest first (--asc for loss-like ones)
+ov results --verdict promising,baseline --since 7d
+ov results --name "bench-*" --tag ablation --search cosine
+ov results --todo                            # finished, no verdict or conclusion yet
+ov results --format md                       # a Markdown table, ready to give the researcher
+ov results --format csv > outbox/results.csv # a file sent with your reply
+ov results --columns id,name,score,value-loss,verdict --limit 10
+ov results --all-projects | --project chem
+```
+
+When the researcher asks how experiments went, which run was best or what was tried, read them with
+`ov results`, sort and filter them for the question, and answer with the table (or a CSV) plus your reading of it.
+
+**Findings** are the project's lasting lessons. Unlike the research log, which gets condensed, they are kept whole
+and shown to every conversation in the project when it starts or is woken.
+
+```bash
+ov finding dead-end "lr above 3e-4 diverges with the 1B model, any schedule" --job 18756120
+ov finding insight "eval score tracks train/loss/dyn closely: watch it instead of waiting for evals"
+ov findings                                  # all of them (F1, F2, ...)
+ov finding rm F3                             # no longer true
+```
+
+- **Dead ends:** record one whenever an approach failed in a way that shouldn't be retried.
+- **Insights:** record one when something holds beyond a single run.
+- **Before you try something,** check the findings for it.
+
 ## Being woken later
 
 Nothing runs between your turns. Don't sleep, poll in a loop or wait for jobs: have Overseer wake you.
@@ -138,6 +189,8 @@ mode needs to be switched on.
    - end your reply.
 2. **Each time you're woken:**
    - read the results;
+   - give each finished job its verdict and conclusion (`ov result`), and record a finding if it taught
+     something lasting (`ov finding`);
    - add an entry to the log: what changed and why, the job ids, the key results, the next idea;
    - submit the next experiment and watch it;
    - end your reply.

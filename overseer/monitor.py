@@ -17,6 +17,7 @@ from .metrics import check_alerts, fired_alerts, resolve, run_command
 from .metrics import lines as metric_lines
 from .notify import Notifier, Outgoing, code, esc
 from .quota import parse_quota
+from .results import record_job, snapshot
 from .richtext import fold_text
 from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
                     human_seconds, slurm_seconds, summarize_steps)
@@ -418,6 +419,8 @@ class Monitor:
         try:
             msg, context, card = await self.final_report(rec, final, analyze=analyze)
         except (SSHError, OSError) as e:
+            if rec.name != WORKER_NAME:
+                record_job(self.store, rec, final, {})
             msg = Outgoing(f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} "
                            f"{esc(final.state)} (could not build the full report: {esc(e)})", job_id=rec.job_id)
             card = f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} · {esc(final.state)}"
@@ -457,6 +460,8 @@ class Monitor:
         tb = "" if success else extract_traceback(combined)
         metrics = view["values"]
         critical, important, _ = metric_lines(view["spec"], metrics, view["auto"])
+        if rec.name != WORKER_NAME:  # its row in the project's results (the agent adds what it means)
+            record_job(self.store, rec, final, snapshot(view["spec"], metrics))
 
         tasks = final.extra.get("tasks")
         context = "\n".join(x for x in [

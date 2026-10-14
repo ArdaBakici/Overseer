@@ -2831,3 +2831,125 @@ async def test_subagent_threads_and_the_subagents_command(env, monkeypatch):
     await bot.cmd_subagents(None, NS(args=["off"]))
     assert not env.agent.planner_on(s) and "off" in replies[-1]
     await env.ctl.stop()
+
+
+# ----------------------------------------------------------------------------- results and findings
+
+async def test_results_are_recorded_annotated_and_queried(env):
+    """A finished job gets its row (state, runtime, key metrics by the agent's labels); the agent adds what it showed,
+    records results without jobs, sorts and filters them, and gives them as Markdown or CSV."""
+    await make_autopilot(env)
+    projects = make_projects(env)
+    proj = env.home / "proj"
+    projects.create("dreamer", str(proj))
+    s = env.agent.general_session(project="dreamer")
+    token = env.ctl.open(s.id)
+
+    async def ov(*argv):
+        ok, text = await env.ctl.handle(token, list(argv))
+        return ok, text
+
+    for jid, score, loss in (("601", "4.1", "0.9"), ("602", "5.3", "0.4"), ("603", "3.0", "1.2")):
+        (proj / f"slurm-{jid}.out").write_text(f"step 1000 episode/score={score} train/loss={loss}\n")
+        env.store.upsert_job(JobRecord(job_id=jid, name=f"bench-{jid}", state="RUNNING", by_agent=1, session_id=s.id,
+                                       project="dreamer", first_seen=time.time()))
+    ok, text = await ov("result", "601", "--hypothesis", "baseline config")
+    assert ok and "601" in text, text
+    await ov("metrics", "set", "--project", "--critical", "episode/score=score", "--important", "train/loss=loss")
+    env.set_jobs(**{jid: {"name": f"bench-{jid}", "state": "COMPLETED", "exit": "0:0", "workdir": str(proj),
+                          "stdout": str(proj / f"slurm-{jid}.out")} for jid in ("601", "602", "603")})
+    await env.monitor.poll()
+    r = env.store.get_result("601")
+    assert r and r.state == "COMPLETED" and r.success and r.project == "dreamer" and r.hypothesis == "baseline config"
+    assert json.loads(r.metrics)["score"] == "4.1" and json.loads(r.metrics)["loss"] == "0.9", r.metrics
+
+    assert (await ov("result", "601", "--verdict", "baseline", "--conclusion", "reference"))[0]
+    assert (await ov("result", "602", "--verdict", "promising", "--conclusion", "cosine helps", "--tags", "lr,cosine"))[0]
+    ok, text = await ov("result", "603", "--dead-end", "--conclusion", "fp16 diverges")
+    assert ok and "dead end F1" in text, text
+    ok, text = await ov("result", "add", "--name", "sample quality 602 vs 601", "--verdict", "promising",
+                        "--metric", "artifacts=fewer", "--conclusion", "cleaner textures")
+    assert ok and "result r1" in text, text
+    assert not (await ov("result", "601", "--verdict", "great"))[0]  # not a verdict
+    assert not (await ov("result", "999", "--verdict", "worse"))[0]  # not a tracked job
+    assert not (await ov("result", "r9", "--verdict", "worse"))[0]  # no such result
+
+    ok, table = await ov("results", "--sort", "score")
+    lines = table.splitlines()
+    assert ok and lines[0].split()[:4] == ["id", "name", "state", "verdict"], table
+    assert [ln.split()[0] for ln in lines[1:]] == ["602", "601", "603", "r1"], table  # by score; no score last
+    ok, table = await ov("results", "--sort", "loss", "--asc", "--columns", "id,loss")
+    assert [ln.split() for ln in table.splitlines()[1:4]] == [["602", "0.4"], ["601", "0.9"], ["603", "1.2"]]
+    ok, table = await ov("results", "--verdict", "promising", "--format", "md")
+    assert table.startswith("| id |") and "602" in table and "r1" in table and "603" not in table, table
+    ok, csv_text = await ov("results", "--format", "csv")
+    header = csv_text.splitlines()[0]
+    assert header.startswith("id,job_id,name,state") and "score" in header and "artifacts" in header, header
+    ok, table = await ov("results", "--search", "cosine")
+    assert "602" in table and "601" not in table
+    ok, text = await ov("result", "show", "602")
+    assert "verdict: ✅ promising" in text and "score=5.3" in text and "tags: lr,cosine" in text
+
+    # Findings: recorded, listed, removed; dead ends are announced.
+    ok, text = await ov("finding", "insight", "score tracks train loss closely")
+    assert ok and "F2" in text and "Insight</b> recorded" in env.notifier.sent[-1].text
+    ok, text = await ov("findings")
+    assert "⛔ F1 dead-end: bench-603: fp16 diverges (job 603)" in text and "💡 F2 insight" in text, text
+    assert (await ov("finding", "rm", "F2"))[0] and "F2" not in (await ov("findings"))[1]
+    await env.ctl.stop()
+
+
+async def test_agents_see_findings_and_stalls(env):
+    """A new conversation and every wake-up get the project's findings and latest results; a run of results without
+    gain is pointed out, and the agent's own results still waiting for a verdict are listed."""
+    from overseer.results import context
+    from overseer.store import FindingRecord, ResultRecord
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    env.store.add_finding(FindingRecord(project=None, kind="dead-end", text="lr 1e-3 diverges"))
+    for i, v in enumerate(["promising", "no-gain", "worse", "no-gain", ""]):
+        env.store.save_result(ResultRecord(id=f"70{i}", job_id=f"70{i}", name=f"run{i}", session_id=s.id,
+                                           state="COMPLETED", ended=time.time() + i, verdict=v))
+    ctx = context(env.store, None, s.id)
+    assert "⛔ F1 dead-end: lr 1e-3 diverges" in ctx
+    assert "Your last 3 results brought no gain (no-gain, worse, no-gain)" in ctx, ctx
+    assert "Results of yours without a verdict yet: 704 (run4)" in ctx
+    await env.agent.handle(s, "hello")  # a new CLI session: they're in its first prompt
+    assert "lr 1e-3 diverges" in claude_runs(env)[-1]["stdin"]
+    w, _ = ap.add_timer(s, 60, note="look again")
+    w.due = time.time() - 1
+    env.store.update_watch(w)
+    await ap.tick({})
+    await ap.drain()
+    stdin = claude_runs(env)[-1]["stdin"]
+    assert "[Wake-up you set up]" in stdin and "brought no gain" in stdin and "ov result <job>" in stdin
+    await env.ctl.stop()
+
+
+async def test_results_and_findings_commands(env, monkeypatch):
+    from overseer.bot import Bot
+    from overseer.store import FindingRecord, ResultRecord
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(bot, "reply", reply)
+    await bot.cmd_results(None, NS(args=[]))
+    assert "No results yet" in replies[-1]
+    for jid, score, verdict in (("801", "2", "baseline"), ("802", "9", "promising"), ("803", "5", "no-gain")):
+        env.store.save_result(ResultRecord(id=jid, job_id=jid, name=f"r{jid}", state="COMPLETED", ended=time.time(),
+                                           verdict=verdict, metrics=json.dumps({"score": score})))
+    await bot.cmd_results(None, NS(args=["score"]))
+    msg = env.notifier.sent[-1]
+    assert "by score" in msg.text and msg.markdown.index("802") < msg.markdown.index("803") < msg.markdown.index("801")
+    assert "| id | name | state | verdict | score | conclusion |" in msg.markdown
+    await bot.cmd_results(None, NS(args=["promising"]))
+    assert "802" in env.notifier.sent[-1].markdown and "801" not in env.notifier.sent[-1].markdown
+    await bot.cmd_results(None, NS(args=["csv"]))
+    (name, data), = env.notifier.sent[-1].files
+    assert name == "results.csv" and data.decode().count("\n") == 4
+    env.store.add_finding(FindingRecord(project=None, kind="insight", text="bigger batch helps"))
+    await bot.cmd_findings(None, NS(args=[]))
+    assert "💡 F1 insight: bigger batch helps" in replies[-1]

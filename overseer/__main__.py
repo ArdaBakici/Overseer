@@ -80,7 +80,8 @@ def build(cfg: Config):
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
             ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
-            ("subagents", "planner mode: on/off, models, threads"), ("project", "projects: list, new, context, notes"),
+            ("subagents", "planner mode: on/off, models, threads"),
+            ("results", "experiments and what each showed"), ("findings", "insights and dead ends"), ("project", "projects: list, new, context, notes"),
             ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
 

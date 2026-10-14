@@ -39,6 +39,7 @@ from .slurm import STATE_EMOJI
 from .ssh import SSHError
 from .sshlink import master_alive
 from .store import ProjectRecord, Store
+from . import results as R
 from .subagents import ENDED
 from .usage import usage_report
 
@@ -73,6 +74,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /compact [focus] — compact the conversation now: older turns become a summary, which frees context (as a reply: that conversation). Claude Code takes a focus, e.g. /compact keep the lr sweep results
 /auto &lt;goal&gt; — ask the agent to work on it on its own: it watches its jobs and wakes itself (as a reply: in that conversation)
 /auto — pending wake-ups · /auto off — cancel them (here, or as a reply: in that conversation)
+/results [project] [sort] [N] [csv] — experiments and what each showed · /findings — insights and dead ends
 /subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents, each in a thread
 /usage [today|yesterday|week] — tokens and cost of the agent's runs
 /health — connection status
@@ -625,6 +627,8 @@ class Bot:
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
         add(CommandHandler("subagents", self.cmd_subagents, filters=allowed))
+        add(CommandHandler("results", self.cmd_results, filters=allowed))
+        add(CommandHandler("findings", self.cmd_findings, filters=allowed))
         add(CommandHandler(["project", "projects"], self.cmd_project, filters=allowed))
         add(CommandHandler("assign", self.cmd_assign, filters=allowed))
         # Updates python-telegram-bot doesn't know yet (e.g. the Stop button of a streaming draft).
@@ -1120,6 +1124,61 @@ class Bot:
         if scope:
             return [r.id for r in self.store.list_sessions(10_000) if r.project == scope]
         return None
+
+    def _results_scope(self, update: Update, args: list[str]) -> tuple[str | None | bool, list[str]]:
+        """A project named in the args ("all": every project, "main": the main chat), else this topic's."""
+        rest, scope = [], self._scope(update)
+        for a in args:
+            if a == "all":
+                scope = False
+            elif a == "main":
+                scope = None
+            elif self.store.get_project(a):
+                scope = a
+            else:
+                rest.append(a)
+        return scope, rest
+
+    async def cmd_results(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/results [project|all] [sort key, e.g. score] [asc] [N] [csv]: the experiments and what each showed."""
+        scope, rest = self._results_scope(update, list(ctx.args or []))
+        want_csv, asc, limit, sort, verdicts = False, None, 15, "", []
+        for a in rest:
+            if a == "csv":
+                want_csv = True
+            elif a in ("asc", "desc"):
+                asc = a == "asc"
+            elif a.isdigit():
+                limit = int(a)
+            elif a in R.VERDICTS:
+                verdicts.append(a)
+            else:
+                sort = a
+        rs = R.select(self.store.results(scope), sort=sort, asc=asc, verdicts=verdicts,
+                      limit=0 if want_csv else limit)
+        where = "all projects" if scope is False else (f"project {scope}" if scope else "the main chat")
+        if not rs:
+            await self.reply(update, f"No results yet in {esc(where)}. Every finished job gets one; the agent adds "
+                                     "what it showed (`ov result`).")
+            return
+        title = f"📊 Results in {where}" + (f", by {sort}" if sort else ", newest first")
+        if want_csv:
+            await self.notifier.send(Outgoing(f"{esc(title)}: {len(rs)} rows", project=scope or None,
+                                              files=[("results.csv", R.render(rs, "csv").encode())]))
+            return
+        total = len(self.store.results(scope))
+        more = f"\n{len(rs)} of {total}: /results [project] [sort] [N] [verdict] [csv]" if total > len(rs) else ""
+        await self.notifier.send(Outgoing(
+            f"<b>{esc(title)}</b>\n<pre>{esc(R.render(rs, 'table'))}</pre>{esc(more)}",
+            markdown=f"**{title}**\n\n{R.render(rs, 'md')}{more}", project=scope or None))
+
+    async def cmd_findings(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/findings [project|all]: the insights and dead ends the agents recorded."""
+        scope, _ = self._results_scope(update, list(ctx.args or []))
+        fs = self.store.findings(scope)
+        where = "all projects" if scope is False else (f"project {scope}" if scope else "the main chat")
+        await self.reply(update, f"<b>Findings in {esc(where)}</b>\n" + "\n".join(esc(x) for x in R.finding_lines(fs))
+                         if fs else f"No findings yet in {esc(where)}. Agents record them with `ov finding`.")
 
     async def cmd_subagents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/subagents [on|off|planner <model>|workers [backend] <m1,m2>|clean]: planner mode here (a project, or the

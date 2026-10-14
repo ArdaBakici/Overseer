@@ -25,6 +25,7 @@ import uuid
 from .autopilot import human_interval
 from .config import BACKENDS, Config
 from .notify import Notifier, Outgoing, code, esc
+from .results import context as results_context
 from .store import SessionRecord, Store
 
 log = logging.getLogger(__name__)
@@ -231,8 +232,13 @@ class Subagents:
         if active:
             parts.append("Still working: " + ", ".join(f"{r.name} ({r.state})" for r in active)
                          + ". You'll be woken when they're done.")
-        parts.append("Record the results in the research log, then decide: start more subagents, end planner mode "
-                     "(`ov planner off`) when the goal is reached, or ask the researcher.")
+        if ended:
+            ctx = results_context(self.store, ended[0].project)
+            if ctx:
+                parts.append(ctx)
+        parts.append("Record the results in the research log (their rows: `ov results`, and give each a verdict if its "
+                     "subagent didn't), then decide: start more subagents, end planner mode (`ov planner off`) when the "
+                     "goal is reached, or ask the researcher.")
         return "\n\n".join(parts)
 
     async def stop(self, w, by: str = "planner") -> None:

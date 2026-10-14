@@ -29,6 +29,7 @@ from .live import Progress, Transcript
 from .richtext import fold, fold_long, fold_text, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
+from .results import context as results_context
 from .slurm import array_parent
 from .ssh import SSHError
 from .sshlink import ensure_master
@@ -98,6 +99,13 @@ for what would make a run worth stopping: `--alert "<metric> < 1 after 2h"` ping
 project default covers repeats) and check it with `ov metrics show <job id>`.
 - When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
 (`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
+- Results: Overseer records each finished job (state, runtime, its key metrics). Say what it showed: \
+`ov result <job> --verdict <baseline|promising|no-gain|worse|broken|dead-end|inconclusive> --conclusion "..."` \
+(also `--hypothesis` when you submit it; `ov result add --name ...` for an evaluation that isn't a job - a verdict \
+needs no number). `ov results` lists, filters and sorts them (`--sort <metric>`, `--verdict`, `--format md|csv`): \
+use it when the researcher asks how experiments went, and give them the table (or a CSV in ./outbox/).
+- Findings: lasting lessons of the project, kept whole and shown at every start and wake-up - \
+`ov finding dead-end "..."` for what failed and mustn't be retried, `ov finding insight "..."` for what holds.
 
 
 ## Working over time: watches and wake-ups
@@ -161,7 +169,7 @@ up to date: at the top the current goal (rewrite it when the goal changes, with 
 then one entry per experiment or wake-up - what you changed and why, the job ids, the key results, the next idea. \
 Overseer shows you its beginning and latest entries when a conversation starts and when you are woken. Keep it \
 compact, well under 200k tokens (~800 KB): when it grows long, condense the old entries into a short summary \
-section at the top."""
+section at the top - the findings (`ov finding`) keep what must never be lost."""
 
 WORKER_LOG_RULE = """Research log: `{log}` is written by your planner only - don't edit it (read it if useful). Your \
 detailed notes go in your own NOTES.md (below); your planner records the results from your report."""
@@ -198,7 +206,8 @@ WORKER_SECTION = """
 ## You are a subagent: "{name}"
 A planner (another conversation, on a stronger model) gave you a task; the researcher can follow you in your own \
 Telegram thread and write to you there. Do the task on your own - submit jobs, watch them, wake yourself - and \
-keep your detailed notes in `{notes}`. Use your own output folder; never overwrite other runs' results. Don't \
+keep your detailed notes in `{notes}`. Give each of your jobs its verdict and conclusion (`ov result`). Use your \
+own output folder; never overwrite other runs' results. Don't \
 start subagents or propose planner mode. When the task is done, your final reply is your report to the planner: \
 what you did, the key numbers, where the results are (at most ~15 lines). If you're blocked or the task turns out \
 wrong, say so in that report rather than guessing."""
@@ -976,6 +985,8 @@ class Agent:
             parts.append(await self._project_notes(s.project))
         if resume is None and s.job_id:
             parts.append(await self._job_context(s.job_id))
+        if resume is None:  # a new CLI session: the project's findings and latest results
+            parts.append(results_context(self.store, s.project, s.id))
         warning = self._storage_warning()
         if warning:
             parts.append(warning)

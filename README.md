@@ -178,6 +178,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/stop` | stop the agent's current run (kills the whole process group) |
 | `/update` | update Claude Code and Codex now, with their own updaters; `/health` shows their versions. Overseer also does it once a day while no agent run is in progress (`agent.auto_update`), and tells you when a version changed. On the homelab: `uv run overseer update` |
 | `/compact [focus]` | compact the conversation now (below). As a reply to a message, it applies to that conversation |
+| `/results [project] [sort] [N] [csv]`, `/findings` | each experiment's outcome and what it showed, sorted as you like; the project's insights and dead ends (below) |
 | `/subagents [on\|off]` | planner mode in this project: the agent plans and delegates to subagents on cheaper models (below). The agent can also propose it for one conversation, and you approve or decline |
 | `/auto <goal>` | ask the agent to work on a goal on its own (below). As a reply to a message, it applies to that conversation. `/auto` lists pending wake-ups, `/auto off` cancels them (in this thread, topic, or replied-to conversation) |
 | `/usage [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
@@ -296,6 +297,18 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
   - **What the agent sees:** Overseer shows it the log's beginning and latest entries when a conversation starts and at every wake-up, so it keeps the thread across long gaps and compaction.
   - **Size:** the agent keeps it well under 200k tokens; past about 600 KB, Overseer asks it to condense the older entries.
 - **Cost:** each wake-up re-sends the conversation so far, and wake-ups are often hours apart, after the provider's prompt cache has expired. The agent is told to wake itself only when there is something to look at.
+
+**Results and findings: what each experiment showed.** Every project keeps a record of its experiments.
+- **Results:** one row per finished job.
+  - **Overseer fills in** its state, runtime and key metrics (the ones the agent named with `ov metrics`, then others from the log).
+  - **The agent adds what it means:** hypothesis, conclusion and a verdict (`baseline`, `promising`, `no-gain`, `worse`, `broken`, `dead-end`, `inconclusive`).
+  - **No numeric goal is needed.** The verdict carries the judgement, so qualitative work fits too, and the agent can record results that aren't jobs (an evaluation by eye, a comparison).
+  - **Stalls:** after 3 or more results in a row without gain, the agent is told to try something materially different or to ask you.
+- **Findings:** the project's insights and dead ends ("lr above 3e-4 diverges with the 1B model"). The research log gets condensed as it grows; findings are kept whole and shown to every conversation in the project when it starts or is woken, so agents don't retry what failed.
+- **Asking the agent:** "which runs were best?" or "what did we try for the schedule?". It reads the results with `ov results` (filter by verdict, name, tag, time or text; sort by any metric) and answers with a table, or a CSV file.
+- **Reading them yourself:**
+  - `/results [project|all] [sort key] [N] [verdict] [csv]`, e.g. `/results score`, `/results promising`, `/results csv`;
+  - `/findings [project|all]`.
 
 **Planner mode: subagents (off by default).** A conversation can plan and delegate: it runs on a strong planner model, and subagents on cheaper models do the hands-on work. Each subagent is a conversation of its own, in its own thread.
 

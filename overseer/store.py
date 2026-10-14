@@ -83,6 +83,19 @@ CREATE TABLE IF NOT EXISTS metric_specs (
     session_id TEXT, updated REAL,
     PRIMARY KEY (scope, key)
 );
+CREATE TABLE IF NOT EXISTS results (
+    id TEXT PRIMARY KEY,
+    project TEXT, session_id TEXT, job_id TEXT,
+    name TEXT DEFAULT '', state TEXT DEFAULT '', success INTEGER DEFAULT 0,
+    elapsed TEXT DEFAULT '', ended REAL DEFAULT 0, metrics TEXT DEFAULT '{}',
+    hypothesis TEXT DEFAULT '', conclusion TEXT DEFAULT '', verdict TEXT DEFAULT '', tags TEXT DEFAULT '',
+    hidden INTEGER DEFAULT 0, created REAL, updated REAL
+);
+CREATE TABLE IF NOT EXISTS findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT, kind TEXT, text TEXT, job_id TEXT DEFAULT '', session_id TEXT,
+    created REAL, removed INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS usage (
     ts REAL, day TEXT,
     session_id TEXT, project TEXT,
@@ -233,6 +246,42 @@ class MetricSpec:
     alerts: str = "[]"  # JSON list of {"when": "score < 1 after 2h", "wake": bool}
     session_id: str | None = None  # the conversation that set it (woken by `wake` alerts)
     updated: float = 0.0
+
+
+@dataclass
+class ResultRecord:
+    """One experiment's outcome: a finished job (id = its job id, filled in by Overseer when it ends) or one the
+    agent recorded without a job (id r1, r2, ...). The agent adds what it means: hypothesis, conclusion, verdict."""
+    id: str
+    project: str | None = None
+    session_id: str | None = None
+    job_id: str | None = None
+    name: str = ""
+    state: str = ""
+    success: int = 0
+    elapsed: str = ""
+    ended: float = 0.0
+    metrics: str = "{}"  # JSON {label: value}: the job's critical/important metrics, then others from its log
+    hypothesis: str = ""
+    conclusion: str = ""
+    verdict: str = ""  # baseline | promising | no-gain | worse | broken | dead-end | inconclusive
+    tags: str = ""  # comma-separated
+    hidden: int = 0
+    created: float = 0.0
+    updated: float = 0.0
+
+
+@dataclass
+class FindingRecord:
+    """A lasting lesson of a project: an insight, or a dead end not to retry. Never condensed."""
+    project: str | None
+    kind: str  # insight | dead-end
+    text: str
+    job_id: str = ""
+    session_id: str | None = None
+    created: float = 0.0
+    removed: int = 0
+    id: int | None = None
 
 
 @dataclass
@@ -493,6 +542,56 @@ class Store:
         """(chat id, thread) of every Telegram thread a conversation has."""
         rows = self.db.execute("SELECT chat_id, thread_id FROM threads WHERE session_id=?", (session_id,)).fetchall()
         return [(r["chat_id"], r["thread_id"]) for r in rows]
+
+    # ---------------------------------------------------------------- results and findings (results.py)
+    def get_result(self, rid: str) -> ResultRecord | None:
+        row = self.db.execute("SELECT * FROM results WHERE id=?", (rid,)).fetchone()
+        return _row(ResultRecord, row) if row else None
+
+    def save_result(self, r: ResultRecord) -> None:
+        r.created = r.created or time.time()
+        r.updated = time.time()
+        self._upsert("results", "id", r)
+
+    def results(self, project: str | None | bool = False, hidden: bool = False) -> list[ResultRecord]:
+        """Results, oldest first: of a project (None = the main chat), or all (False)."""
+        q, args = "SELECT * FROM results WHERE 1=1", []
+        if project is not False:
+            q, args = (q + " AND project=?", args + [project]) if project else (q + " AND project IS NULL", args)
+        if not hidden:
+            q += " AND NOT hidden"
+        return [_row(ResultRecord, r) for r in self.db.execute(q + " ORDER BY COALESCE(NULLIF(ended, 0), created)",
+                                                                args).fetchall()]
+
+    def next_result_id(self) -> str:
+        n = 1 + max([int(r["id"][1:]) for r in self.db.execute("SELECT id FROM results WHERE id LIKE 'r%'").fetchall()
+                     if r["id"][1:].isdigit()] or [0])
+        return f"r{n}"
+
+    def add_finding(self, f: FindingRecord) -> FindingRecord:
+        f.created = f.created or time.time()
+        d = {k: v for k, v in f.__dict__.items() if k != "id"}
+        cur = self.db.execute(f"INSERT INTO findings ({','.join(d)}) VALUES ({','.join('?' * len(d))})",
+                              tuple(d.values()))
+        self.db.commit()
+        f.id = cur.lastrowid
+        return f
+
+    def findings(self, project: str | None | bool = False, removed: bool = False) -> list[FindingRecord]:
+        q, args = "SELECT * FROM findings WHERE 1=1", []
+        if project is not False:
+            q, args = (q + " AND project=?", args + [project]) if project else (q + " AND project IS NULL", args)
+        if not removed:
+            q += " AND NOT removed"
+        return [_row(FindingRecord, r) for r in self.db.execute(q + " ORDER BY id", args).fetchall()]
+
+    def get_finding(self, fid: int) -> FindingRecord | None:
+        row = self.db.execute("SELECT * FROM findings WHERE id=?", (fid,)).fetchone()
+        return _row(FindingRecord, row) if row else None
+
+    def remove_finding(self, fid: int) -> None:
+        self.db.execute("UPDATE findings SET removed=1 WHERE id=?", (fid,))
+        self.db.commit()
 
     def session_cost(self, session_id: str) -> float:
         row = self.db.execute("SELECT SUM(cost) AS c FROM usage WHERE session_id=?", (session_id,)).fetchone()

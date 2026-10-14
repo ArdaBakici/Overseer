@@ -40,6 +40,8 @@ from .projects import ProjectError, Projects
 from .slurm import TERMINAL_STATES, array_parent
 from .store import MetricSpec
 from .subagents import ENDED, STATE_LABEL, SubagentError, model_label
+from . import results as R
+from .results import ResultError
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -111,6 +113,48 @@ def _parser() -> _Parser:
     a.add_argument("--for", dest="for_", help="every: how long to keep waking (default: agent.autopilot.repeat_hours)")
     a.add_argument("note", nargs="*")
     sub.add_parser("auto", add_help=False).add_argument("rest", nargs=argparse.REMAINDER)  # (no longer used)
+    res = sub.add_parser("result", add_help=False).add_subparsers(dest="action")
+    for name in ("set", "add"):
+        a = res.add_parser(name, add_help=False)
+        if name == "set":
+            a.add_argument("id")
+        a.add_argument("--name")
+        a.add_argument("--verdict")
+        a.add_argument("--hypothesis")
+        a.add_argument("--conclusion")
+        a.add_argument("--tags")
+        a.add_argument("--metric", action="append", default=[])
+        a.add_argument("--dead-end", action="store_true", dest="dead_end")
+        if name == "set":
+            a.add_argument("--hide", action="store_true")
+            a.add_argument("--unhide", action="store_true")
+    res.add_parser("show", add_help=False).add_argument("id")
+    a = sub.add_parser("results", add_help=False)
+    a.add_argument("--project")
+    a.add_argument("--all-projects", action="store_true", dest="all_projects")
+    a.add_argument("--sort", default="")
+    a.add_argument("--asc", action="store_true")
+    a.add_argument("--desc", action="store_true")
+    a.add_argument("--verdict", default="")
+    a.add_argument("--name", default="")
+    a.add_argument("--tag", default="")
+    a.add_argument("--state", default="")
+    a.add_argument("--since", default="")
+    a.add_argument("--search", default="")
+    a.add_argument("--todo", action="store_true")
+    a.add_argument("--hidden", action="store_true")
+    a.add_argument("--limit", type=int, default=0)
+    a.add_argument("--format", default="table", choices=["table", "md", "csv", "json"])
+    a.add_argument("--columns", default="")
+    fnd = sub.add_parser("finding", add_help=False).add_subparsers(dest="action")
+    for kind in ("insight", "dead-end"):
+        a = fnd.add_parser(kind, add_help=False)
+        a.add_argument("text", nargs="+")
+        a.add_argument("--job", default="")
+    fnd.add_parser("rm", add_help=False).add_argument("id")
+    a = sub.add_parser("findings", add_help=False)
+    a.add_argument("--project")
+    a.add_argument("--all-projects", action="store_true", dest="all_projects")
     sub.add_parser("propose", add_help=False).add_argument("plan")
     a = sub.add_parser("spawn", add_help=False)
     a.add_argument("name")
@@ -145,6 +189,16 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+
+Results and findings (each experiment's outcome; the project's lasting lessons):
+  ov result <job> [--verdict V] [--hypothesis ...] [--conclusion ...] [--tags a,b] [--metric name=value] [--dead-end]
+                                   V: baseline | promising | no-gain | worse | broken | dead-end | inconclusive
+  ov result add --name "..." [same options]   a result that isn't a job (an evaluation by eye, a comparison)
+  ov result show <id>
+  ov results [--sort <metric>|name|verdict|elapsed] [--asc] [--verdict promising,baseline] [--name 'glob']
+             [--tag t] [--since 7d] [--search text] [--todo] [--limit N] [--format table|md|csv|json]
+             [--columns id,name,score,...] [--project p | --all-projects]
+  ov finding insight|dead-end "..." [--job ID]   ov findings   ov finding rm F3
 
 Subagents (planner mode, off unless the researcher turned it on or approved your plan):
   ov propose plan.json             propose planner mode: {"goal", "why", "subagents": [{"name", "task", "model"?,
@@ -237,6 +291,8 @@ class ControlServer:
             return False, "This conversation no longer exists."
         if not argv or argv[0] in ("help", "-h", "--help"):
             return True, HELP
+        if argv[0] == "result" and len(argv) > 1 and argv[1] not in ("set", "add", "show"):
+            argv = ["result", "set", *argv[1:]]  # ov result <id> --verdict ...
         try:
             args = _parser().parse_args(argv)
             area = args.area
@@ -254,6 +310,12 @@ class ControlServer:
                 return False, ("Autopilot no longer needs approval and has no separate mode: watch your jobs "
                                "(ov watch) and set wake-ups (ov wake) yourself. To finish, set no more wake-ups (ov "
                                "unwatch all) and say so; to ask the researcher, ask in your reply or ov notify.")
+            if area == "result" and args.action:
+                return True, await getattr(self, f"result_{args.action}")(session, args)
+            if area == "finding" and args.action:
+                return True, await self.finding(session, args)
+            if area in ("results", "findings"):
+                return True, await getattr(self, area)(session, args)
             if area in ("propose", "spawn", "agents", "planner"):
                 return True, await getattr(self, area)(session, args)
             if area == "agent" and args.action:
@@ -263,8 +325,102 @@ class ControlServer:
             if area == "status":
                 return True, self.status(session)
             return False, HELP
-        except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ValueError) as e:
+        except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ResultError, ValueError) as e:
             return False, str(e)
+
+    # ---- results and findings (results.py)
+    def _scope(self, session, args) -> str | None | bool:
+        """Which project's results: this conversation's, --project (main = the main chat), or all."""
+        if getattr(args, "all_projects", False):
+            return False
+        p = getattr(args, "project", None)
+        if p:
+            if p == "main":
+                return None
+            if not self.store.get_project(p):
+                raise CtlError(f"no project {p!r} (ov project list)")
+            return p
+        return session.project
+
+    async def result_set(self, session, args) -> str:
+        rid = array_parent(args.id) if args.id[:1].isdigit() else args.id
+        job = self.store.get_job(rid) if rid.isdigit() else None
+        if job is None and self.store.get_result(rid) is None:
+            raise CtlError(f"Overseer doesn't track a job {rid} (ov job add {rid} first)" if rid.isdigit() else
+                           f"no result {rid!r}: `ov results` lists them; `ov result add --name ...` records a new one")
+        return self._annotated(session, args, rid, job)
+
+    async def result_add(self, session, args) -> str:
+        if not args.name:
+            raise CtlError("a result without a job needs --name (what was evaluated)")
+        return self._annotated(session, args, self.store.next_result_id(), None)
+
+    def _annotated(self, session, args, rid: str, job) -> str:
+        verdict = "dead-end" if args.dead_end else args.verdict
+        r = R.annotate(self.store, rid, session_id=session.id, project=session.project, job=job,
+                       hypothesis=args.hypothesis, conclusion=args.conclusion, verdict=verdict, tags=args.tags,
+                       metrics=R.parse_metric_args(args.metric), name=args.name,
+                       hidden=True if getattr(args, "hide", False) else False if getattr(args, "unhide", False)
+                       else None)
+        out = f"✓ result {r.id} ({r.name or 'unnamed'}): " + (f"{r.verdict}" if r.verdict else "no verdict yet")
+        if args.dead_end:
+            text = r.conclusion or r.hypothesis or r.name
+            f = R.add_finding(self.store, r.project, "dead-end", f"{r.name}: {text}" if r.name else text, session.id,
+                              job_id=r.job_id or "")
+            out += f"; dead end F{f.id} added to the project's findings"
+        return out
+
+    async def result_show(self, session, args) -> str:
+        r = self.store.get_result(args.id)
+        if not r:
+            raise CtlError(f"no result {args.id!r} (ov results lists them)")
+        m = R._metrics(r)
+        return "\n".join(x for x in [
+            f"{r.id}: {r.name} · {r.state or 'no job'}" + (f" · {r.elapsed}" if r.elapsed else "")
+            + (f" · project {r.project}" if r.project else ""),
+            f"verdict: {R.VERDICTS.get(r.verdict, '')} {r.verdict}" if r.verdict else "verdict: (none yet)",
+            f"hypothesis: {r.hypothesis}" if r.hypothesis else "",
+            f"conclusion: {r.conclusion}" if r.conclusion else "",
+            f"tags: {r.tags}" if r.tags else "",
+            "metrics: " + ", ".join(f"{k}={v}" for k, v in m.items()) if m else "",
+        ] if x)
+
+    async def results(self, session, args) -> str:
+        from .autopilot import parse_duration
+        scope = self._scope(session, args)
+        since = None
+        if args.since:
+            d = parse_duration(args.since)
+            if not d:
+                raise CtlError(f"--since {args.since!r}: use e.g. 3d, 12h")
+            since = time.time() - d
+        asc = True if args.asc else False if args.desc else None
+        rs = R.select(self.store.results(scope, hidden=args.hidden), sort=args.sort, asc=asc,
+                      verdicts=[v for v in args.verdict.split(",") if v], name=args.name, tag=args.tag,
+                      state=args.state, since=since, text=args.search, annotated=False if args.todo else None,
+                      limit=args.limit or (40 if args.format in ("table", "md") else 0))
+        if not rs:
+            return "no results match" + ("" if args.all_projects else
+                                         f" in {'project ' + scope if scope else 'the main chat'}") + "."
+        cols = [c.strip() for c in args.columns.split(",") if c.strip()] or None
+        return R.render(rs, args.format, cols)
+
+    async def finding(self, session, args) -> str:
+        if args.action == "rm":
+            fid = int(args.id.lstrip("Ff")) if args.id.lstrip("Ff").isdigit() else -1
+            f = self.store.get_finding(fid)
+            if not f or f.project != session.project:
+                raise CtlError(f"no finding {args.id} in this project (ov findings)")
+            self.store.remove_finding(fid)
+            return f"✓ removed F{fid}"
+        f = R.add_finding(self.store, session.project, args.action, " ".join(args.text), session.id, args.job)
+        await self._announce(session, f"{R.FINDING_KINDS[f.kind]} <b>{'Dead end' if f.kind == 'dead-end' else 'Insight'}"
+                                      f"</b> recorded: {esc(f.text)}")
+        return f"✓ F{f.id} ({f.kind}) recorded: shown to every conversation in this project from now on"
+
+    async def findings(self, session, args) -> str:
+        fs = self.store.findings(self._scope(session, args))
+        return "\n".join(R.finding_lines(fs)) or "no findings yet (ov finding insight|dead-end \"...\")"
 
     # ---- planner mode and subagents (subagents.py)
     def _subs(self):
