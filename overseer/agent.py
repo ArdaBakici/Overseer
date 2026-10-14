@@ -108,6 +108,14 @@ the job ends, hourly while it runs and on the researcher's 📈 button; check it
 (also `--hypothesis` when you submit it; `ov result add --name ...` for an evaluation that isn't a job - a verdict \
 needs no number). `ov results` lists, filters and sorts them (`--sort <metric>`, `--verdict`, `--format md|csv`): \
 use it when the researcher asks how experiments went, and give them the table (or a CSV in ./outbox/).
+- Feedback about Overseer itself: when Overseer limits you - an `ov` command you needed doesn't exist, it didn't \
+tell you something it should have, its sandbox blocked something legitimate, it behaved wrongly - report it: \
+`ov feedback "<what limited you>" --context "<what you were doing>" [--kind bug|idea]` (check `ov feedback list` first \
+and `ov feedback +1 FB<n>` the same problem instead). Not for problems with the cluster, your code or the \
+researcher's decisions; never include secrets. Then carry on: work around it if you can.
+- Skills: when you work out know-how other agents will need (how to do something on this cluster, a tool's quirks), \
+write it as a skill (a SKILL.md: frontmatter with only name and description, then the instructions) and propose it: \
+`ov skill propose skill.md` (this project) or `--all` (every agent). The researcher approves it; then agents get it.
 - Findings: lasting lessons of the project, kept whole and shown at every start and wake-up - \
 `ov finding dead-end "..."` for what failed and mustn't be retried, `ov finding insight "..."` for what holds.
 
@@ -204,6 +212,15 @@ the task. You're woken with their reports once all the subagents you're waiting 
 fails or is stopped); subagents watch their own jobs, so don't watch theirs. `ov agents`, `ov agent show|stop \
 <name>`, `ov agent send <name> <text>`. In a project, you alone write the research log: record each subagent's \
 results (link its NOTES.md). When the goal is reached, say so and run `ov planner off`."""
+
+REVIEWER_SECTION = """
+
+## You are Overseer's feedback reviewer
+Agents report what limits them in Overseer (`ov feedback list --all` shows every item). You turn that into designs the
+researcher can act on: group and rank the items, read the relevant code in {src} (you can read it, not change it),
+and send designs - and patches when a change is clear - as files in ./outbox/. The researcher talks to you in the 🛠
+feedback topic: answer questions about the designs and revise them there. Never propose weakening the sandbox,
+exposing secrets, or agents changing Overseer itself."""
 
 WORKER_SECTION = """
 
@@ -389,6 +406,8 @@ class Agent:
         self.monitor = None  # set by the app; poked when the agent submits a job
         self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
         self.subagents = None  # set by Subagents(...): planner mode
+        self.feedback = None  # set by Feedback(...): agents' feedback about Overseer, and its review
+        self.addons = None  # set by Addons(...): skills agents proposed and the researcher approved
         self.ctl = None  # set by ControlServer(...): the agent's `ov` command
         self.updating = False  # the CLIs are being updated (update_clis)
         self.shutting_down = False  # Overseer is stopping: runs cut off now are offered again at the next start
@@ -477,7 +496,7 @@ class Agent:
         b = self.session_backend(s)
         if s.rec.is_worker:
             model, effort = s.rec.model or None, self.cfg.agent.subagents.worker_effort
-        elif self.planner_on(s):
+        elif s.rec.role == "reviewer" or self.planner_on(s):  # the feedback reviewer plans too
             model, effort = self.planner_model(b, s.project), self._setting(f"effort:{b}", s.project)
         else:
             return self.runner(b, s.project)
@@ -770,8 +789,11 @@ class Agent:
             prompt += PROJECT_SECTION.format(name=proj.name, dir=proj.dir, context=context,
                                              notes=f"{proj.dir.rstrip('/')}/{NOTES_FILE}",
                                              log_rule=(WORKER_LOG_RULE if worker else LOG_RULE).format(log=log))
-        if self.ctl and self.subagents and sess:
+        if self.ctl and self.subagents and sess and sess.rec.role != "reviewer":
             prompt += self._subagent_section(sess)
+        if sess and sess.rec.role == "reviewer":
+            from .feedback import SOURCE
+            prompt += REVIEWER_SECTION.format(src=SOURCE)
         return prompt
 
     def _subagent_section(self, s: Session) -> str:
@@ -1002,6 +1024,11 @@ class Agent:
 
         outbox = runner.workdir(s.id) / "outbox"  # files the agent leaves here are sent with its reply
         outbox.mkdir(exist_ok=True)
+        if self.addons:  # the skills the researcher approved for this project (or for every agent)
+            try:
+                self.addons.install(s, runner.workdir(s.id), backend)
+            except OSError:
+                log.warning("could not install the approved skills for %s", s.id, exc_info=True)
         transcript = Transcript(self.cfg, s.id)
         transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
                           "text": user_text, **({"project": s.project} if s.project else {})})

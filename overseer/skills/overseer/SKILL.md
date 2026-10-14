@@ -1,6 +1,6 @@
 ---
 name: overseer
-description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, record and query experiment results and findings (insights, dead ends), create and manage projects, move or stop tracking jobs, message the researcher, have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log, and propose or run planner mode (you plan, subagents on cheaper models do the work). Use it when you are a planner or a subagent, and whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
+description: How to talk to Overseer with the `ov` command - register SLURM jobs you submit, record and query experiment results and findings (insights, dead ends), report feedback about Overseer and propose skills, create and manage projects, move or stop tracking jobs, message the researcher, have yourself woken later (when jobs end, on a timer, or with check-ins) to work on your own over many runs, with a research log, and propose or run planner mode (you plan, subagents on cheaper models do the work). Use it when you are a planner or a subagent, and whenever you submit a job, when the researcher asks about projects or job tracking, when you want to follow up on something later, or for multi-run experiments.
 ---
 
 # Overseer and `ov`
@@ -120,6 +120,50 @@ ov status                        # this conversation: project, autopilot, jobs, 
 
 Your final reply is sent to the researcher anyway. Use `ov notify` for news in the middle of a
 long run.
+
+## Feedback about Overseer, and skills
+
+**Feedback.** When Overseer itself limits you, report it. The researcher sees each item in a 🛠 feedback topic, and an
+agent there turns them into designs for improving Overseer.
+
+```bash
+ov feedback list                 # what's already reported (open items, most +1s first)
+ov feedback +1 FB7               # the same problem: add a +1 rather than a new item
+ov feedback "ov results can't filter by array task" --context "comparing 40 sweep tasks" [--kind bug|idea]
+```
+
+- **What to report:**
+  - an `ov` command or option you needed that doesn't exist;
+  - something Overseer should have told you but didn't;
+  - the sandbox blocking something legitimate;
+  - Overseer behaving wrongly (`--kind bug`);
+  - a clear improvement (`--kind idea`).
+- **What not to report:** problems with the cluster, your code, or decisions that are the researcher's. Never include
+  secrets or tokens.
+- **Limits:** at most 3 new items per conversation per day, and +1s are unlimited.
+- **Then carry on:** work around the limitation if you can. You're told when the researcher fixes it or decides not to.
+
+**Skills.** When you work out know-how other agents will need (how to do something on this cluster, a tool's quirks, a
+procedure that took trial and error), write it as a skill and propose it. Once the researcher approves it, every agent
+in the project (or every agent, with `--all`) gets it from its next run.
+
+```bash
+cat > skill.md <<'SKILL'
+---
+name: cluster-long-jobs
+description: How to run jobs longer than 24 h on this cluster (the qos, checkpointing, requeue). Use when a job needs more than 24 h.
+---
+Jobs over 24 h need `--qos long` (max 7 days) ...
+SKILL
+ov skill propose skill.md        # this project's agents; --all: every agent
+ov skill list                    # installed skills, and proposals waiting for the researcher
+ov skill show cluster-long-jobs
+```
+
+- **The frontmatter holds only `name` and `description`.** Any other field is refused, because it could change what
+  agents may do.
+- **Keep it focused:** one subject, under 30 KB, written for an agent that has never seen this cluster.
+- **Proposing a skill again** with the same name, once approved, replaces the old version.
 
 ## Results and findings
 

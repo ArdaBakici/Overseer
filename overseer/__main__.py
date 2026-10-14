@@ -65,6 +65,7 @@ def build(cfg: Config):
             for proj in projects.active():
                 await notifier.ensure_topic(proj.name)
             await notifier.ensure_jobs_topics([p.name for p in projects.active()])  # live job cards
+            await notifier.ensure_feedback_topic()  # agents' feedback about Overseer
         elif projects.active():
             log.warning("projects are defined but the bot has no topics in private chats: their messages are "
                         "labelled in the main chat (enable threaded mode for the bot in @BotFather)")
@@ -81,7 +82,8 @@ def build(cfg: Config):
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
             ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
             ("subagents", "planner mode: on/off, models, threads"),
-            ("results", "experiments and what each showed"), ("findings", "insights and dead ends"), ("project", "projects: list, new, context, notes"),
+            ("results", "experiments and what each showed"), ("findings", "insights and dead ends"),
+            ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"), ("project", "projects: list, new, context, notes"),
             ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
 
@@ -118,6 +120,10 @@ def build(cfg: Config):
     monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
     from .subagents import Subagents
     subagents = Subagents(cfg, store, agent, notifier)  # planner mode (off unless turned on or approved)
+    from .addons import Addons
+    from .feedback import Feedback
+    Feedback(cfg, store, agent, notifier)  # agents' feedback about Overseer, in the 🛠 feedback topic
+    Addons(store, agent, notifier)  # skills agents proposed and the researcher approved
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)

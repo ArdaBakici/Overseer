@@ -3086,3 +3086,137 @@ async def test_ov_plots(env):
     assert (await ov("plots", "clear", "950"))[0] and (await ov("plots", "clear", "--pattern", "eval-*"))[0]
     assert env.store.get_metric_spec("pattern", "eval-*") is None
     await env.ctl.stop()
+
+
+# ----------------------------------------------------------------------------- feedback, its review, skills
+
+async def make_feedback(env):
+    from overseer.addons import Addons
+    from overseer.feedback import Feedback
+    await make_autopilot(env)
+    return Feedback(env.cfg, env.store, env.agent, env.notifier), Addons(env.store, env.agent, env.notifier)
+
+
+async def test_feedback_cards_votes_and_answers(env, monkeypatch):
+    """An agent reports what limited it; the card goes to the feedback topic; another agent adds a +1; the researcher
+    answers with a button, and the agents that reported it are told."""
+    from overseer.bot import Bot, TelegramNotifier
+    fb, _ = await make_feedback(env)
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    fb.notifier = notifier
+    s1, s2 = env.agent.general_session(), env.agent.new_conversation()
+    t1, t2 = env.ctl.open(s1.id), env.ctl.open(s2.id)
+    ok, text = await env.ctl.handle(t1, ["feedback", "ov results can't filter by array task",
+                                         "--context", "comparing 40 sweep tasks"])
+    assert ok and "FB1" in text, text
+    thread = notifier.feedback_thread(1)
+    assert thread and ("🛠 feedback" in [n for _, n, _ in tg.created])
+    card = [t for _, th, t in tg.sent if th == thread][-1]
+    assert "🧱 <b>FB1</b> · limitation" in card and "while: comparing 40 sweep tasks" in card, card
+    ok, text = await env.ctl.handle(t2, ["feedback", "+1", "FB1"])
+    assert ok and "+1 on FB1" in text and "1 other conversation(s)" in tg.edits[-1][2]
+    for i in range(2):
+        assert (await env.ctl.handle(t1, ["feedback", f"another limitation number {i}", "--kind", "idea"]))[0]
+    ok, text = await env.ctl.handle(t1, ["feedback", "a fourth one today is too many"])
+    assert not ok and "already reported 3" in text
+    assert not (await env.ctl.handle(t1, ["feedback", "x", "--kind", "rant"]))[0]
+    ok, text = await env.ctl.handle(t1, ["feedback", "list"])
+    assert text.splitlines()[0].startswith("🧱 FB1 limitation · +1"), text  # most +1s first
+
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    q = NS(data="fb:1:fixed", message=NS(message_thread_id=thread), answer=_noop, edit_message_text=_noop)
+    await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
+    assert env.store.get_feedback(1).status == "fixed" and "✅ fixed" in tg.edits[-1][2]
+    for s in (s1, s2):  # both conversations hear about it at their next run
+        assert any("FB1" in n and "fixed it" in n for n in env.agent.take_notes(s.id))
+    await env.ctl.stop()
+
+
+async def test_feedback_review_runs_in_the_feedback_topic(env, monkeypatch):
+    """/feedback review: the reviewer (planner model) gets the open items and Overseer's source path; writing in the
+    feedback topic talks to it."""
+    from overseer.bot import Bot, TelegramNotifier
+    from overseer.feedback import SOURCE
+    fb, _ = await make_feedback(env)
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    await notifier.ensure_feedback_topic()
+    fb.notifier = notifier
+    s = env.agent.general_session()
+    await fb.report(s, "no way to see a job's GPU memory over time", "idea", "debugging an OOM")
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    await bot.cmd_feedback(None, NS(args=["review", "GPU", "things"]))
+    for t in list(bot._tasks):
+        await t
+    call = claude_runs(env)[-1]
+    assert "[Feedback review]" in call["stdin"] and "Focus on: GPU things" in call["stdin"]
+    assert "GPU memory over time" in call["stdin"] and str(SOURCE) in call["stdin"] and model_of(call) == "claude-opus-5-5"
+    reviewer = fb.reviewer()
+    assert reviewer.rec.role == "reviewer" and "feedback reviewer" in env.agent.system_prompt(reviewer.id)
+    # Its reply lands in the feedback topic; writing there talks to it.
+    thread = notifier.feedback_thread(1)
+    assert env.store.session_thread(reviewer.id, 1) == thread
+    assert bot._here(topic_update("why not a plot?", thread=thread)).id == reviewer.id
+    await env.ctl.stop()
+
+
+SKILL_TEXT = ("---\nname: cluster-long-jobs\ndescription: How to run jobs longer than 24 h on this cluster (qos long, "
+              "checkpointing). Use for jobs over 24 h.\n---\nUse --qos long (max 7 days).\n")
+
+
+def test_skill_files_are_checked():
+    from overseer.addons import SkillError, parse_skill
+    assert parse_skill(SKILL_TEXT) == ("cluster-long-jobs", "How to run jobs longer than 24 h on this cluster (qos long, "
+                                                            "checkpointing). Use for jobs over 24 h.")
+    for bad, why in [(SKILL_TEXT.replace("description:", "allowed-tools: Bash\ndescription:"), "only name and"),
+                     (SKILL_TEXT.replace("cluster-long-jobs", "Cluster Jobs"), "lowercase"),
+                     (SKILL_TEXT.replace("cluster-long-jobs", "overseer"), "Overseer's own"),
+                     ("no frontmatter", "starts with frontmatter"),
+                     (SKILL_TEXT.split("---\nUse")[0] + "---\n", "no body")]:
+        with pytest.raises(SkillError, match=why):
+            parse_skill(bad)
+
+
+async def test_skills_are_proposed_approved_and_installed(env, tmp_path):
+    """An agent proposes a skill; once approved it's in every run of its project (only), where the CLI finds it;
+    removed, it's gone at the next run. Links in the run's folder are never followed."""
+    from overseer.addons import write_skills
+    _, addons = await make_feedback(env)
+    projects = make_projects(env)
+    projects.create("dreamer", str(env.home / "proj"))
+    s = env.agent.general_session(project="dreamer")
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, ["skill", "propose", SKILL_TEXT])
+    assert ok and "for project dreamer" in text, text
+    card = env.notifier.sent[-1]
+    assert "🧩 <b>Skill proposal: cluster-long-jobs</b> · for project dreamer" in card.text
+    (install, data), _ = card.buttons[0]
+    workdir = env.agent.session_runner(s).workdir(s.id)
+    await env.agent.handle(s, "hello")
+    assert not (workdir / ".claude" / "skills" / "cluster-long-jobs").exists()  # not before it's approved
+    await addons.approve(int(data.split(":")[1]))
+    assert "installed your skill cluster-long-jobs" in " ".join(env.agent.take_notes(s.id))
+    await env.agent.handle(s, "hello again")
+    installed = workdir / ".claude" / "skills" / "cluster-long-jobs" / "SKILL.md"
+    assert installed.read_text() == SKILL_TEXT
+    other = env.agent.general_session()  # the main chat: not its project
+    await env.agent.handle(other, "hi")
+    assert not (env.agent.session_runner(other).workdir(other.id) / ".claude" / "skills" / "cluster-long-jobs").exists()
+    ok, text = await env.ctl.handle(token, ["skill", "list"])
+    assert "cluster-long-jobs (project dreamer)" in text
+    addons.remove(env.store.skills()[0].id)
+    await env.agent.handle(s, "and again")
+    assert not installed.parent.exists()
+
+    # A link planted where a skill goes is replaced, never written through.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run = tmp_path / "run"
+    (run / ".agents").mkdir(parents=True)
+    (run / ".agents" / "skills").symlink_to(outside)
+    write_skills(run, (".agents", "skills"), {"x": "data"})
+    assert not list(outside.iterdir()) and (run / ".agents" / "skills" / "x" / "SKILL.md").read_text() == "data"
+    await env.ctl.stop()

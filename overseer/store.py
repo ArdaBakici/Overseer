@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS findings (
     project TEXT, kind TEXT, text TEXT, job_id TEXT DEFAULT '', session_id TEXT,
     created REAL, removed INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created REAL, updated REAL, session_id TEXT, project TEXT, backend TEXT, model TEXT,
+    kind TEXT, text TEXT, context TEXT DEFAULT '', status TEXT DEFAULT 'open',
+    voters TEXT DEFAULT '[]', refs TEXT DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS skills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, project TEXT DEFAULT '', description TEXT, content TEXT,
+    status TEXT DEFAULT 'proposed', session_id TEXT, created REAL, updated REAL, refs TEXT DEFAULT '{}'
+);
 CREATE TABLE IF NOT EXISTS usage (
     ts REAL, day TEXT,
     session_id TEXT, project TEXT,
@@ -283,6 +294,46 @@ class FindingRecord:
     session_id: str | None = None
     created: float = 0.0
     removed: int = 0
+    id: int | None = None
+
+
+@dataclass
+class FeedbackRecord:
+    """An agent's feedback about Overseer: a limitation it ran into, a bug, an idea (feedback.py)."""
+    kind: str
+    text: str
+    context: str = ""
+    session_id: str | None = None
+    project: str | None = None
+    backend: str = ""
+    model: str = ""
+    status: str = "open"  # open | noted | fixed | wontfix
+    voters: str = "[]"  # JSON: conversations that said "me too"
+    refs: str = "{}"  # JSON {chat: message id} of its card in the feedback topic
+    created: float = 0.0
+    updated: float = 0.0
+    id: int | None = None
+
+    @property
+    def votes(self) -> list[str]:
+        try:
+            return list(json.loads(self.voters or "[]"))
+        except ValueError:
+            return []
+
+
+@dataclass
+class SkillRecord:
+    """A skill an agent proposed (addons.py): installed for every agent, or a project's, once approved."""
+    name: str
+    description: str
+    content: str  # the whole SKILL.md
+    project: str = ""  # "" = every conversation
+    status: str = "proposed"  # proposed | installed | declined | removed | replaced
+    session_id: str | None = None
+    refs: str = "{}"
+    created: float = 0.0
+    updated: float = 0.0
     id: int | None = None
 
 
@@ -594,6 +645,53 @@ class Store:
     def remove_finding(self, fid: int) -> None:
         self.db.execute("UPDATE findings SET removed=1 WHERE id=?", (fid,))
         self.db.commit()
+
+    # ---------------------------------------------------------------- feedback and skills
+    def _insert(self, table: str, obj) -> int:
+        obj.created = obj.created or time.time()
+        obj.updated = time.time()
+        d = {k: v for k, v in obj.__dict__.items() if k != "id"}
+        cur = self.db.execute(f"INSERT INTO {table} ({','.join(d)}) VALUES ({','.join('?' * len(d))})",
+                              tuple(d.values()))
+        self.db.commit()
+        obj.id = cur.lastrowid
+        return obj.id
+
+    def add_feedback(self, f: FeedbackRecord) -> FeedbackRecord:
+        self._insert("feedback", f)
+        return f
+
+    def save_feedback(self, f: FeedbackRecord) -> None:
+        f.updated = time.time()
+        self._upsert("feedback", "id", f)
+
+    def get_feedback(self, fid: int) -> FeedbackRecord | None:
+        row = self.db.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone()
+        return _row(FeedbackRecord, row) if row else None
+
+    def feedback(self, statuses: tuple[str, ...] = ()) -> list[FeedbackRecord]:
+        q, args = "SELECT * FROM feedback", []
+        if statuses:
+            q, args = q + f" WHERE status IN ({','.join('?' * len(statuses))})", list(statuses)
+        return [_row(FeedbackRecord, r) for r in self.db.execute(q + " ORDER BY id", args).fetchall()]
+
+    def add_skill(self, k: SkillRecord) -> SkillRecord:
+        self._insert("skills", k)
+        return k
+
+    def save_skill(self, k: SkillRecord) -> None:
+        k.updated = time.time()
+        self._upsert("skills", "id", k)
+
+    def get_skill(self, sid: int) -> SkillRecord | None:
+        row = self.db.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
+        return _row(SkillRecord, row) if row else None
+
+    def skills(self, statuses: tuple[str, ...] = ("installed",)) -> list[SkillRecord]:
+        q, args = "SELECT * FROM skills", []
+        if statuses:
+            q, args = q + f" WHERE status IN ({','.join('?' * len(statuses))})", list(statuses)
+        return [_row(SkillRecord, r) for r in self.db.execute(q + " ORDER BY name, project", args).fetchall()]
 
     def session_cost(self, session_id: str) -> float:
         row = self.db.execute("SELECT SUM(cost) AS c FROM usage WHERE session_id=?", (session_id,)).fetchone()

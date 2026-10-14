@@ -42,6 +42,8 @@ from .store import MetricSpec
 from .subagents import ENDED, STATE_LABEL, SubagentError, model_label
 from . import results as R
 from .results import ResultError
+from .feedback import FeedbackError
+from .addons import SkillError
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -165,6 +167,17 @@ def _parser() -> _Parser:
     a = sub.add_parser("findings", add_help=False)
     a.add_argument("--project")
     a.add_argument("--all-projects", action="store_true", dest="all_projects")
+    a = sub.add_parser("feedback", add_help=False)
+    a.add_argument("words", nargs="*")
+    a.add_argument("--kind", default="limitation")
+    a.add_argument("--context", default="")
+    a.add_argument("--all", action="store_true")
+    sk = sub.add_parser("skill", add_help=False).add_subparsers(dest="action")
+    a = sk.add_parser("propose", add_help=False)
+    a.add_argument("text")
+    a.add_argument("--all", action="store_true")
+    sk.add_parser("list", add_help=False)
+    sk.add_parser("show", add_help=False).add_argument("name")
     sub.add_parser("propose", add_help=False).add_argument("plan")
     a = sub.add_parser("spawn", add_help=False)
     a.add_argument("name")
@@ -216,6 +229,12 @@ Results and findings (each experiment's outcome; the project's lasting lessons):
              [--tag t] [--since 7d] [--search text] [--todo] [--limit N] [--format table|md|csv|json]
              [--columns id,name,score,...] [--project p | --all-projects]
   ov finding insight|dead-end "..." [--job ID]   ov findings   ov finding rm F3
+
+Feedback about Overseer itself (what limited you; shown in the researcher's 🛠 feedback topic):
+  ov feedback "<what limited you>" [--kind limitation|bug|idea] [--context "what you were doing"]
+  ov feedback list [--all]         ov feedback +1 FB7    (same problem: add a +1 instead of a new item)
+Skills (know-how for agents, installed once the researcher approves):
+  ov skill propose skill.md [--all]   (--all: every agent, not just this project)   ov skill list | show <name>
 
 Subagents (planner mode, off unless the researcher turned it on or approved your plan):
   ov propose plan.json             propose planner mode: {"goal", "why", "subagents": [{"name", "task", "model"?,
@@ -333,6 +352,10 @@ class ControlServer:
                 return True, await getattr(self, f"result_{args.action}")(session, args)
             if area == "finding" and args.action:
                 return True, await self.finding(session, args)
+            if area == "feedback":
+                return True, await self.feedback_cmd(session, args)
+            if area == "skill" and args.action:
+                return True, await getattr(self, f"skill_{args.action}")(session, args)
             if area in ("results", "findings"):
                 return True, await getattr(self, area)(session, args)
             if area in ("propose", "spawn", "agents", "planner"):
@@ -344,8 +367,54 @@ class ControlServer:
             if area == "status":
                 return True, self.status(session)
             return False, HELP
-        except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ResultError, ValueError) as e:
+        except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ResultError, FeedbackError, SkillError,
+                ValueError) as e:
             return False, str(e)
+
+    # ---- feedback about Overseer (feedback.py) and skills as addons (addons.py)
+    async def feedback_cmd(self, session, args) -> str:
+        fb = getattr(self.agent, "feedback", None)
+        if not fb:
+            raise CtlError("feedback isn't available in this Overseer")
+        words = args.words
+        if not words or words[0] == "list":
+            items = fb.listing(None if args.all else ("open", "noted"))
+            return "\n".join(fb.lines(items)) or "no open feedback yet"
+        if words[0] in ("+1", "vote", "me-too"):
+            ids = [w.upper().lstrip("FB") for w in words[1:]]
+            if not ids or not all(i.isdigit() for i in ids):
+                raise CtlError("which one? ov feedback +1 FB7")
+            for i in ids:
+                await fb.vote(session, int(i))
+            return f"✓ +1 on {', '.join('FB' + i for i in ids)}"
+        f = await fb.report(session, " ".join(words), args.kind, args.context)
+        return (f"✓ FB{f.id} sent to the researcher's 🛠 feedback topic. You're told if they fix it or decide not "
+                "to. Carry on with your task meanwhile: work around the limitation if you can.")
+
+    def _addons(self):
+        addons = getattr(self.agent, "addons", None)
+        if not addons:
+            raise CtlError("skills aren't available in this Overseer")
+        return addons
+
+    async def skill_propose(self, session, args) -> str:
+        k = await self._addons().propose(session, args.text, everyone=args.all)
+        return (f"✓ skill {k.name} proposed for {'every agent' if not k.project else 'project ' + k.project}: the "
+                "researcher approves or declines it in Telegram. Agents get it from their next run once installed.")
+
+    async def skill_list(self, session, args) -> str:
+        installed = self._addons().for_project(session.project)
+        pending = [k for k in self.store.skills(("proposed",)) if k.project in ("", session.project or "")]
+        lines = [f"{k.name} ({'every agent' if not k.project else 'project ' + k.project}): {k.description}"
+                 for k in installed] or ["no skills installed (besides overseer)"]
+        lines += [f"proposed, waiting for the researcher: {k.name}" for k in pending]
+        return "\n".join(lines)
+
+    async def skill_show(self, session, args) -> str:
+        for k in self._addons().for_project(session.project):
+            if k.name == args.name:
+                return k.content
+        raise CtlError(f"no installed skill {args.name!r} (ov skill list)")
 
     # ---- results and findings (results.py)
     def _scope(self, session, args) -> str | None | bool:
@@ -953,6 +1022,12 @@ if argv[:1] == ["propose"] and len(argv) == 2 and not argv[1].lstrip().startswit
         argv[1] = sys.stdin.read() if argv[1] == "-" else open(os.path.expanduser(sys.argv[2])).read()
     except OSError as e:
         sys.stderr.write("ov: can't read the plan: %s\n" % e)
+        sys.exit(1)
+elif argv[:2] == ["skill", "propose"] and len(argv) >= 3 and not argv[2].lstrip().startswith("---"):
+    try:
+        argv[2] = sys.stdin.read() if argv[2] == "-" else open(os.path.expanduser(sys.argv[3])).read()
+    except OSError as e:
+        sys.stderr.write("ov: can't read the skill: %s\n" % e)
         sys.exit(1)
 elif "-" in argv[1:] and argv[:1] in (["spawn"], ["agent"]):
     argv[argv.index("-")] = sys.stdin.read()

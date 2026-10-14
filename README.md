@@ -180,6 +180,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/update` | update Claude Code and Codex now, with their own updaters; `/health` shows their versions. Overseer also does it once a day while no agent run is in progress (`agent.auto_update`), and tells you when a version changed. On the homelab: `uv run overseer update` |
 | `/compact [focus]` | compact the conversation now (below). As a reply to a message, it applies to that conversation |
 | `/results [project] [sort] [N] [csv]`, `/findings` | each experiment's outcome and what it showed, sorted as you like; the project's insights and dead ends (below) |
+| `/feedback [all\|review [focus]]`, `/skills` | what agents reported about Overseer (in the 🛠 feedback topic); review: an agent groups it and designs fixes. Skills agents proposed and you installed (below) |
 | `/subagents [on\|off]` | planner mode in this project: the agent plans and delegates to subagents on cheaper models (below). The agent can also propose it for one conversation, and you approve or decline |
 | `/auto <goal>` | ask the agent to work on a goal on its own (below). As a reply to a message, it applies to that conversation. `/auto` lists pending wake-ups, `/auto off` cancels them (in this thread, topic, or replied-to conversation) |
 | `/usage [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
@@ -314,6 +315,21 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
 - **Reading them yourself:**
   - `/results [project|all] [sort key] [N] [verdict] [csv]`, e.g. `/results score`, `/results promising`, `/results csv`;
   - `/findings [project|all]`.
+
+**Feedback about Overseer, its review, and skills as addons.** Agents report what Overseer itself stops them from doing, and their know-how becomes skills for other agents.
+- **Feedback:** `ov feedback "…"` (a limitation, `--kind bug` or `--kind idea`) posts a card in a 🛠 feedback topic, e.g. "🧱 FB7 · limitation · dreamer · claude-opus-5-5".
+  - **Duplicates:** agents check `ov feedback list` first, and add a +1 to an item that's already there rather than filing it again. The card counts them.
+  - **Your answer:** each card has 👀 Noted, ✅ Fixed and ✖ Won't fix buttons. The agents that reported it are told when it's fixed or won't be.
+  - **Limits:** at most 3 new items per conversation per day. `/feedback [all]` lists them, most +1s first.
+- **Review:** `/feedback review [focus]` starts the reviewer, a conversation on the planner model that lives in the feedback topic, so you can talk to it there.
+  - **What it does:** it groups and ranks the items, reads the relevant parts of Overseer's source, and sends a design (`DESIGN-<date>.md`). When a change is clear it also sends a patch, made and tested on a copy of the source, ready for `git apply`.
+  - **What it can't do:** change Overseer. Its sandbox only writes its scratch folder, and Overseer holds the SSH key and starts the sandboxes, so applying a design or patch is up to you (or a development session).
+- **Skills as addons:** much of what limits agents is missing know-how ("jobs over 24 h need `--qos long` here").
+  - **Proposing:** an agent writes a skill (a `SKILL.md` with only a name and a description in its frontmatter) and proposes it with `ov skill propose` for its project, or with `--all` for every agent.
+  - **Approving:** you get a card with the skill to ✅ Install or ✖ decline.
+  - **Using:** installed skills reach agents from their next run: Claude Code finds them in `.claude/skills/`, Codex in `.agents/skills/`.
+  - **What a skill can't do:** grant permissions (any other frontmatter field is refused). Agents stay in their sandboxes.
+  - **Managing them:** `/skills` lists them, with a 🗑 button each.
 
 **Planner mode: subagents (off by default).** A conversation can plan and delegate: it runs on a strong planner model, and subagents on cheaper models do the hands-on work. Each subagent is a conversation of its own, in its own thread.
 

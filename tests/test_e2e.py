@@ -445,3 +445,28 @@ async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, plann
         assert planner_req.get("model") == planner_model, planner_req.get("model")
         rec = store.subagents(parent=s.id)[0]
         assert rec.state == "done" and rec.delivered and "WORKER-RAN" in rec.report, rec
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_installed_skills_reach_the_cli(hpc, backend, cli_name):
+    """A skill the researcher approved (addons.py) is installed into the run's folder, where the real CLI finds it and
+    offers it to the model - next to Overseer's own skill."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    from overseer.addons import Addons
+    from overseer.store import SkillRecord
+    with FakeModel(["echo hi"]) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent.set_backend(backend)
+        Addons(store, agent, notes)
+        text = ("---\nname: cluster-long-jobs\ndescription: How to run jobs longer than 24 h on this cluster "
+                "(qos long, checkpointing). Use when a job needs more than 24 h.\n---\nUse --qos long.\n")
+        store.add_skill(SkillRecord(name="cluster-long-jobs", description="x", content=text, status="installed"))
+        await asyncio.wait_for(agent.handle(agent.general_session(), "Run the checks."), 120)
+        body = json.dumps(next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"])))
+        assert "cluster-long-jobs" in body and "jobs longer than 24 h on this cluster" in body, body[:3000]

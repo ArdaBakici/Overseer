@@ -24,6 +24,7 @@ class Outgoing:
     markdown: str | None = None
     jobs: bool = False  # job news: goes to the jobs topic of the job's project (or the general jobs topic)
     reply_to: dict[str, int] = field(default_factory=dict)  # chat id -> message to reply to (e.g. the job's card)
+    topic: str | None = None  # "feedback": the 🛠 feedback topic (agents' feedback about Overseer)
 
 
 class Notifier(Protocol):

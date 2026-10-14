@@ -77,6 +77,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /auto &lt;goal&gt; — ask the agent to work on it on its own: it watches its jobs and wakes itself (as a reply: in that conversation)
 /auto — pending wake-ups · /auto off — cancel them (here, or as a reply: in that conversation)
 /results [project] [sort] [N] [csv] — experiments and what each showed · /findings — insights and dead ends
+/feedback [all|review] — what agents reported about Overseer; review: an agent designs fixes · /skills — installed skills
 /subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents, each in a thread
 /usage [today|yesterday|week] — tokens and cost of the agent's runs
 /health — connection status
@@ -147,6 +148,8 @@ class TelegramNotifier:
             if self.topics:
                 return self.jobs_thread(chat_id, proj.name if proj else None), "", False
             return None, (f"📁 <b>{esc(proj.name)}</b> · " if proj else ""), False
+        if msg.topic == "feedback":
+            return (self.feedback_thread(chat_id) if self.topics else None), ("" if self.topics else "🛠 "), False
         if self.topics and not msg.project:
             sess, _ = self._conversation(msg)
             thread = self.store.session_thread(sess.id, chat_id) if sess else None
@@ -208,12 +211,14 @@ class TelegramNotifier:
             self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
         return refs
 
-    async def edit(self, refs: dict[str, int], text: str) -> None:
-        """Replace a posted message's text (its buttons go away). Never raises."""
+    async def edit(self, refs: dict[str, int], text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
+        """Replace a posted message's text (and its buttons: none unless given). Never raises."""
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                       for row in buttons]) if buttons else None
         for chat_id, mid in refs.items():
             try:
                 await self.app.bot.edit_message_text(text[:TG_LIMIT], chat_id=int(chat_id), message_id=mid,
-                                                     parse_mode=ParseMode.HTML)
+                                                     parse_mode=ParseMode.HTML, reply_markup=markup)
             except Exception:
                 log.debug("could not edit message %s", mid, exc_info=True)
 
@@ -478,6 +483,35 @@ class TelegramNotifier:
             log.debug("general topic intro failed", exc_info=True)
         return topic.message_thread_id
 
+    # ------------------------------------------------------------------ the 🛠 feedback topic (feedback.py)
+    def feedback_thread(self, chat_id: int) -> int | None:
+        v = self.store.get(f"feedback_topic:{chat_id}")
+        return int(v) if v else None
+
+    async def ensure_feedback_topic(self) -> None:
+        if not self.topics:
+            return
+        for chat_id in self.chat_ids:
+            if not self.feedback_thread(chat_id):
+                await self._create_feedback(chat_id)
+
+    async def _create_feedback(self, chat_id: int) -> int | None:
+        try:
+            topic = await self.app.bot.create_forum_topic(chat_id, name="🛠 feedback")
+        except Exception:
+            log.warning("could not create the feedback topic", exc_info=True)
+            return None
+        self.store.set(f"feedback_topic:{chat_id}", str(topic.message_thread_id))
+        try:
+            await self.app.bot.send_message(
+                chat_id, "🛠 <b>feedback</b> - what agents ran into with Overseer itself: limitations, bugs, ideas. "
+                "/feedback lists them; /feedback review has an agent group them and design fixes, and you can talk "
+                "to that reviewer here. Skills agents propose (/skills) are approved where they're proposed.",
+                parse_mode=ParseMode.HTML, message_thread_id=topic.message_thread_id, disable_notification=True)
+        except Exception:
+            log.debug("feedback topic intro failed", exc_info=True)
+        return topic.message_thread_id
+
     def _route(self, proj: ProjectRecord | None, chat_id: int) -> tuple[int | None, str]:
         """(topic to post in, label to prefix): a project without a topic gets labelled; no project means
         the general topic (or the main chat without topics)."""
@@ -724,6 +758,8 @@ class Bot:
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
         add(CommandHandler("subagents", self.cmd_subagents, filters=allowed))
         add(CommandHandler("results", self.cmd_results, filters=allowed))
+        add(CommandHandler("feedback", self.cmd_feedback, filters=allowed))
+        add(CommandHandler("skills", self.cmd_skills, filters=allowed))
         add(CommandHandler("findings", self.cmd_findings, filters=allowed))
         add(CommandHandler(["project", "projects"], self.cmd_project, filters=allowed))
         add(CommandHandler("assign", self.cmd_assign, filters=allowed))
@@ -772,6 +808,9 @@ class Bot:
         p = self.store.project_for_thread(chat_id, thread)
         if p:
             return self.agent.general_session(project=p.name)
+        fb = getattr(self.agent, "feedback", None)
+        if fb and hasattr(self.notifier, "feedback_thread") and self.notifier.feedback_thread(chat_id) == thread:
+            return fb.reviewer()  # the 🛠 feedback topic: talk to the reviewer
         is_jobs, project = (self.notifier.jobs_topic_owner(chat_id, thread)
                             if hasattr(self.notifier, "jobs_topic_owner") else (False, None))
         if is_jobs:  # a jobs topic: its project's conversation
@@ -1284,6 +1323,47 @@ class Bot:
         await self.reply(update, f"<b>Findings in {esc(where)}</b>\n" + "\n".join(esc(x) for x in R.finding_lines(fs))
                          if fs else f"No findings yet in {esc(where)}. Agents record them with `ov finding`.")
 
+    async def cmd_feedback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/feedback [all] - what agents reported about Overseer; /feedback review [focus] - an agent groups it and
+        designs fixes (in the 🛠 feedback topic, where you can talk to it)."""
+        fb = getattr(self.agent, "feedback", None)
+        if not fb:
+            await self.reply(update, "Feedback isn't available in this Overseer.")
+            return
+        args = list(ctx.args or [])
+        if args[:1] == ["review"]:
+            s = fb.reviewer()
+            n = len(fb.listing())
+            await self.notifier.send(Outgoing(f"🛠 Reviewing {n} open feedback item(s)…", session_id=s.id, silent=True))
+            chat_id = update.effective_chat.id if update else self.cfg.telegram.allowed_chat_ids[0]
+            self._spawn(self._run_agent(chat_id, s, fb.review_prompt(" ".join(args[1:]))))
+            return
+        items = fb.listing(None if args[:1] == ["all"] else ("open", "noted"))
+        if not items:
+            await self.reply(update, "No open feedback. Agents report what limits them with `ov feedback`.")
+            return
+        await self.reply(update, "<b>🛠 Feedback</b> (most +1s first)\n" + "\n".join(fb.lines(items[:30], html=True))
+                         + "\n\n/feedback review [focus]: an agent groups these and designs fixes.")
+
+    async def cmd_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/skills: the skills agents proposed and you installed, with a 🗑 button each."""
+        addons = getattr(self.agent, "addons", None)
+        if not addons:
+            await self.reply(update, "Skills aren't available in this Overseer.")
+            return
+        installed = self.store.skills()
+        pending = self.store.skills(("proposed",))
+        if not installed and not pending:
+            await self.reply(update, "No skills yet. Agents propose them (`ov skill propose`) when they write down "
+                                     "know-how worth keeping; you approve them where they're proposed.")
+            return
+        lines = ["<b>🧩 Skills</b>"]
+        lines += [f"• <b>{esc(k.name)}</b> ({'every agent' if not k.project else 'project ' + esc(k.project)}): "
+                  f"{esc(k.description)}" for k in installed]
+        lines += [f"• waiting for your answer: {esc(k.name)}" for k in pending]
+        buttons = [[(f"🗑 {k.name}" + (f" ({k.project})" if k.project else ""), f"skrm:{k.id}")] for k in installed]
+        await self.notifier.send(Outgoing("\n".join(lines), buttons=buttons[:20], project=self._scope(update)))
+
     async def cmd_subagents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/subagents [on|off|planner <model>|workers [backend] <m1,m2>|clean]: planner mode here (a project, or the
         main chat), its models, and its subagents."""
@@ -1589,6 +1669,22 @@ class Bot:
                 result = await (subs.approve(arg) if action == "plan" else subs.decline(arg))
                 if result.startswith("This "):  # already answered: the card says so
                     await self._edit(q, result)
+            elif action == "fb" and getattr(self.agent, "feedback", None):  # 👀 Noted / ✅ Fixed / ✖ Won't fix
+                fid, _, status = arg.partition(":")
+                if not (fid.isdigit() and await self.agent.feedback.set_status(int(fid), status)):
+                    await self._edit(q, "This feedback no longer exists.")
+            elif action in ("sk", "skx", "skrm") and getattr(self.agent, "addons", None):  # skill proposals
+                addons = self.agent.addons
+                if not arg.isdigit():
+                    pass
+                elif action == "skrm":
+                    k = addons.remove(int(arg))
+                    await self._edit(q, f"🗑 Removed skill {esc(k.name)}: agents don't get it from their next run."
+                                     if k else "This skill isn't installed any more.")
+                else:
+                    result = await (addons.approve(int(arg)) if action == "sk" else addons.decline(int(arg)))
+                    if result.startswith("This "):
+                        await self._edit(q, result)
             elif action in ("subdel", "subkeep"):  # a finished subagent's thread: 🗑 Delete / Keep
                 rec = self.store.get_session(arg)
                 if not rec or not rec.is_worker:
