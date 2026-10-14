@@ -153,7 +153,12 @@ Both logins work on a headless server.
 
 **Ubuntu 24.04+.** bubblewrap may need user namespaces allowed by AppArmor; see Claude Code's sandboxing docs. `overseer check` and the first agent run will tell you if the sandbox can't start, and Overseer never falls back to running unsandboxed.
 
-To keep it running, use `deploy/overseer.service` (a systemd user unit; instructions are inside the file).
+To keep it running, use `deploy/overseer.service` (a systemd user unit; instructions are inside the file). It restarts Overseer if it crashes, and starts it at boot.
+
+**Restarts don't lose the agent's work.** Stopping Overseer (Ctrl-C, `systemctl --user restart overseer`, a crash, a reboot) also stops the agent runs in progress. Their CLIs die with Overseer, even if it's killed, so nothing carries on unseen. At the next start each conversation that was cut off gets a notice:
+- **The notice:** "⚠️ Overseer restarted while the agent was working on your message: …" (or a wake-up it had set up, or a message still waiting its turn), with **▶️ Continue** and **✖ Dismiss**.
+- **Continue:** the agent goes on in the same conversation. It's told its run was cut off and to check what was already done (files, submitted jobs) before redoing anything. A message that hadn't started yet simply runs.
+- **Wake-ups:** a wake-up that was cut off doesn't pause the others. Timers that came due while Overseer was down fire at once, and jobs that ended meanwhile are reported at the first poll.
 
 ## Using it
 

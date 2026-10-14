@@ -470,3 +470,7 @@ class Store:
     def unset(self, key: str) -> None:
         self.db.execute("DELETE FROM kv WHERE key=?", (key,))
         self.db.commit()
+
+    def keys(self, prefix: str) -> list[str]:
+        rows = self.db.execute("SELECT key FROM kv WHERE substr(key, 1, ?)=? ORDER BY key", (len(prefix), prefix))
+        return [r["key"] for r in rows.fetchall()]

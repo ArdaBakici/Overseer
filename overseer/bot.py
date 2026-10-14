@@ -85,6 +85,12 @@ Send pictures and files too (up to 20 MB): with a caption, or followed by a mess
 The agent has full access to your HPC account; you'll see every command it runs and every job it submits."""
 
 
+def _preview(rec: dict, limit: int = 120) -> str:
+    """The start of a cut-off run's request, on one line (a wake-up: its header, not the reports under it)."""
+    text = " ".join((rec.get("text") or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def _thread_error(e: Exception) -> bool:
     text = str(e).lower()
     return "thread" in text or "topic" in text
@@ -668,6 +674,9 @@ class Bot:
         t = asyncio.create_task(typing())
         try:
             await self.agent.handle(session, text, files=files)
+        except Exception:
+            if not self.agent.shutting_down:  # (cut off by Overseer stopping: offered again at the next start)
+                raise
         finally:
             t.cancel()
 
@@ -943,6 +952,24 @@ class Bot:
                                      "brings it back.")
             return
         self._spawn(self._run_agent(update.effective_chat.id, session, text, files))
+
+    # ------------------------------------------------------------------ runs cut off by a restart
+    async def offer_cut_off_runs(self) -> None:
+        """At startup: tell each conversation about the run the last Overseer didn't finish (the agent's turn, a
+        wake-up, or a message still waiting its turn), with ▶️ Continue / ✖ Dismiss."""
+        for rec in self.agent.take_cut_off_runs():
+            session = self.agent.get(rec.get("session"))
+            if not session:
+                self.agent.pop_cut_off_run(rec["id"])
+                continue
+            what = {"wakeup": "a wake-up it had set up", "checkin": "a check-in it had set up"}.get(
+                rec.get("origin"), "your message")
+            state = "was working on" if rec.get("started") else "had yet to start"
+            await self.notifier.send(Outgoing(
+                f"⚠️ Overseer restarted while the agent {state} {what}:"
+                f"<blockquote expandable>{esc(_preview(rec, 600))}</blockquote>",
+                session_id=session.id, buttons=[[("▶️ Continue", f"rerun:{rec['id']}"),
+                                                 ("✖ Dismiss", f"rerunx:{rec['id']}")]]))
 
     # ------------------------------------------------------------------ files sent to the agent
     async def on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1254,6 +1281,19 @@ class Bot:
                     await self.monitor.refresh_card_by_id(arg)
                 else:
                     await self._send_status(arg)
+            elif action in ("rerun", "rerunx"):  # a run cut off by a restart: ▶️ Continue / ✖ Dismiss
+                rec = self.agent.pop_cut_off_run(arg)
+                session = self.agent.get(rec.get("session")) if rec else None
+                if not session:
+                    await self._edit(q, "This was already continued or dismissed.")
+                elif action == "rerunx":
+                    for _, path in rec.get("files") or []:
+                        Path(path).unlink(missing_ok=True)
+                    await self._edit(q, f"✖ Dismissed: {esc(_preview(rec))}")
+                else:
+                    await self._edit(q, f"▶️ Continuing: {esc(_preview(rec))}")
+                    text, files = self.agent.continue_prompt(rec)
+                    self._spawn(self._run_agent(chat.id, session, text, files))
             elif action == "thread":
                 thread = getattr(q.message, "message_thread_id", None) if q.message else None
                 text = self._pending.pop((chat.id, thread), "")

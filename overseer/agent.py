@@ -174,6 +174,15 @@ MAX_ATTACHMENTS = 10
 
 INBOX = "inbox"  # where the researcher's files go, in the agent's working dir
 
+# Runs in progress or queued (kv), and those a restart cut off, waiting for the researcher's ▶️ Continue / ✖.
+RUN_KEY = "run:"
+CUT_OFF_KEY = "cutoff:"
+RUN_TEXT_MAX = 30_000
+CONTINUE_PROMPT = (
+    "[Overseer was restarted while you were working on the request below, and your run was cut off partway. "
+    "Some of it may already be done: check before redoing anything (files you changed, jobs you submitted - "
+    "`ov job list`, `squeue`), then finish it.]\n\n")
+
 
 def _size(n: int) -> str:
     return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{max(1, round(n / 1e3))} KB"
@@ -324,6 +333,7 @@ class Agent:
         self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
         self.ctl = None  # set by ControlServer(...): the agent's `ov` command
         self.updating = False  # the CLIs are being updated (update_clis)
+        self.shutting_down = False  # Overseer is stopping: runs cut off now are offered again at the next start
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
 
@@ -766,9 +776,12 @@ class Agent:
             await self.notifier.send(Outgoing("The agent is disabled in the config."))
             return False
         ok = False
+        run = self._run_begins(s, user_text, origin, files)
         while self.updating:  # the CLIs are being updated: runs wait until that's done
             await asyncio.sleep(1)
         async with s.lock:
+            if self.shutting_down:  # it was waiting its turn: left for the next start
+                return False
             s.task = asyncio.current_task()
             s.origin = origin
             if origin == "user" and self.autopilot:
@@ -777,24 +790,84 @@ class Agent:
                 if files:  # (moved while no run of this conversation can touch its inbox)
                     items = deliver_uploads(self.runner(project=s.project).workdir(s.id), files)
                     user_text = f"{user_text}\n\n{uploads_note(items, self.backend_of(s.project))}".strip()
+                self._run_update(run, text=user_text, files=[], started=time.time())
                 await self._turn(s, user_text, quiet)
                 ok = True
             except asyncio.CancelledError:
+                if self.shutting_down:  # not stopped by the researcher: offered again at the next start
+                    raise
                 await self.notifier.send(Outgoing("⏹ Stopped.", session_id=s.id, job_id=s.job_id))
-            except AgentRunError as e:
-                hint = ("\nOverseer can update it: /update (it also updates the CLIs once a day on its own)."
-                        if OUTDATED_RE.search(str(e)) else "")
-                await self.notifier.send(Outgoing(f"⚠️ {esc(e)}{hint}", session_id=s.id, job_id=s.job_id))
             except Exception as e:
-                log.exception("agent run failed")
-                await self.notifier.send(Outgoing(f"⚠️ Agent error: {esc(type(e).__name__)}: {esc(str(e)[:800])}",
-                                                  session_id=s.id, job_id=s.job_id))
+                if self.shutting_down:  # its CLI was stopped with Overseer: offered again at the next start
+                    raise
+                if isinstance(e, AgentRunError):
+                    await self._run_failed(s, e)
+                else:
+                    log.exception("agent run failed")
+                    await self.notifier.send(Outgoing(f"⚠️ Agent error: {esc(type(e).__name__)}: {esc(str(e)[:800])}",
+                                                      session_id=s.id, job_id=s.job_id))
             finally:
                 s.task = None
                 s.origin = "user"
+        self.store.unset(RUN_KEY + run)  # (not reached when the run is cut off by Overseer stopping)
         if self.autopilot:
             self.autopilot.turn_ended(s)
         return ok
+
+    async def _run_failed(self, s: Session, e: AgentRunError) -> None:
+        hint = ("\nOverseer can update it: /update (it also updates the CLIs once a day on its own)."
+                if OUTDATED_RE.search(str(e)) else "")
+        await self.notifier.send(Outgoing(f"⚠️ {esc(e)}{hint}", session_id=s.id, job_id=s.job_id))
+
+    # ------------------------------------------------------------------ runs cut off by a restart
+    def _run_begins(self, s: Session, text: str, origin: str, files: list[tuple[str, Path]] | None) -> str:
+        """Note a run (queued or running) until it ends: a note left at the next start means Overseer stopped
+        or crashed meanwhile, and the researcher is offered to continue it."""
+        rid = uuid.uuid4().hex[:10]
+        self.store.set(RUN_KEY + rid, json.dumps({
+            "session": s.id, "text": text[:RUN_TEXT_MAX], "origin": origin, "started": 0, "at": time.time(),
+            "files": [[name, str(path)] for name, path in files or []]}))
+        return rid
+
+    def _run_update(self, rid: str, **changes) -> None:
+        raw = self.store.get(RUN_KEY + rid)
+        if raw:
+            rec = json.loads(raw)
+            if "text" in changes:
+                changes["text"] = changes["text"][:RUN_TEXT_MAX]
+            self.store.set(RUN_KEY + rid, json.dumps({**rec, **changes}))
+
+    def take_cut_off_runs(self) -> list[dict]:
+        """At startup: the runs the last Overseer didn't finish (oldest first), kept until the researcher
+        continues or dismisses them."""
+        out = []
+        for key in self.store.keys(RUN_KEY):
+            raw = self.store.get(key)
+            self.store.unset(key)
+            try:
+                rec = json.loads(raw or "")
+            except ValueError:
+                continue
+            rid = key[len(RUN_KEY):]
+            self.store.set(CUT_OFF_KEY + rid, json.dumps(rec))
+            out.append({**rec, "id": rid})
+        return sorted(out, key=lambda r: r.get("at", 0))
+
+    def pop_cut_off_run(self, rid: str) -> dict | None:
+        raw = self.store.get(CUT_OFF_KEY + rid)
+        self.store.unset(CUT_OFF_KEY + rid)
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def continue_prompt(rec: dict) -> tuple[str, list[tuple[str, Path]]]:
+        """What to send to continue a cut-off run: (text, files still waiting to be delivered)."""
+        files = [(name, Path(p)) for name, p in rec.get("files") or [] if Path(p).is_file()]
+        if not rec.get("started"):  # it was waiting its turn: simply run it now
+            return rec.get("text", ""), files
+        return (CONTINUE_PROMPT + rec.get("text", "")), files
 
     async def _turn(self, s: Session, user_text: str, quiet: bool = False) -> None:
         backend = self.backend_of(s.project)

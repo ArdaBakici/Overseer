@@ -23,7 +23,7 @@ from overseer.config import Config, ConfigError
 from overseer.diagnose import Reporter
 from overseer.hpc import HPC
 from overseer.monitor import Monitor
-from overseer.runners import Activity, ClaudeCodeRunner, CodexRunner, display_command
+from overseer.runners import Activity, AgentRunError, ClaudeCodeRunner, CodexRunner, display_command
 from overseer.ssh import SSHRunner
 from overseer.sshlink import agent_ssh_config, overseer_ssh_config, write_configs
 from overseer.notify import Outgoing
@@ -2530,3 +2530,112 @@ async def test_messages_outside_the_topics_are_refused(env, monkeypatch):
     await bot.on_text(topic_update("a new idea", thread=903), None)
     await drain()
     assert any("Which project" in t for t, _ in PICKERS[-1:]) and 903 not in deleted
+
+
+# ----------------------------------------------------------------------------- runs cut off by a restart
+
+async def test_runs_cut_off_by_a_restart_are_offered_again(env, monkeypatch):
+    """Overseer stops while the agent works (and a message waits its turn): the CLI is stopped with it, and at the
+    next start each conversation is offered ▶️ Continue / ✖ Dismiss. Runs that ended, or that you /stop-ped, aren't."""
+    from overseer.agent import Agent, CONTINUE_PROMPT
+    from overseer.bot import Bot
+    from overseer.runners import _RUNNING, kill_running
+    s = env.agent.general_session()
+    running = asyncio.create_task(env.agent.handle(s, "FORCE_SLEEP train the big model"))
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if _RUNNING:
+            break
+    assert _RUNNING, "the fake CLI never started"
+    queued = asyncio.create_task(env.agent.handle(s, "then plot the curves"))
+    await asyncio.sleep(0.1)
+    # Overseer stops (post_stop): the CLI is killed, nothing is reported, the queued message doesn't start.
+    n_sent, n_calls = len(env.notifier.sent), len(env.cli_log())
+    env.agent.shutting_down = True
+    assert kill_running() == 1
+    with pytest.raises(AgentRunError, match="was killed"):
+        await running
+    assert await queued is False
+    assert len(env.notifier.sent) == n_sent and len(env.cli_log()) == n_calls
+
+    # The next start: one notice per cut-off run, in the conversation, with buttons.
+    agent = Agent(env.cfg, env.store, env.notifier, env.hpc)
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=agent,
+              notifier=env.notifier)
+    started = []
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        started.append((session.id, text))
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+    await bot.offer_cut_off_runs()
+    notices = env.notifier.sent[n_sent:]
+    assert len(notices) == 2 and all(m.session_id == s.id for m in notices)
+    assert "was working on your message" in notices[0].text and "train the big model" in notices[0].text
+    assert "had yet to start your message" in notices[1].text and "then plot the curves" in notices[1].text
+    (cont, cont_data), (_, dismiss_data) = notices[0].buttons[0]
+    assert cont == "▶️ Continue"
+    edits = []
+
+    async def press(data):
+        async def edit_message_text(text, **kw):
+            edits.append(text)
+        q = NS(data=data, message=NS(message_thread_id=None), answer=_noop, edit_message_text=edit_message_text)
+        await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
+        for t in list(bot._tasks):
+            await t
+
+    # ▶️ Continue: the agent is told it was cut off, with the request; a run that never started simply runs.
+    await press(cont_data)
+    assert started[-1] == (s.id, CONTINUE_PROMPT + "FORCE_SLEEP train the big model")
+    assert edits[-1].startswith("▶️ Continuing")
+    await press(notices[1].buttons[0][0][1])
+    assert started[-1] == (s.id, "then plot the curves")
+    await press(cont_data)  # pressed twice: nothing more
+    assert len(started) == 2 and "already" in edits[-1]
+    await press(dismiss_data)
+    assert "already" in edits[-1]
+
+    # A restart now offers nothing: those were handled. Nor do finished or stopped runs leave anything.
+    s = agent.get(s.id)
+    await agent.handle(s, "hello")
+    stop = asyncio.create_task(agent.handle(s, "FORCE_SLEEP long one"))
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if agent.is_running(s) and _RUNNING:
+            break
+    assert await agent.stop(s.id)
+    await stop
+    assert "⏹ Stopped." in env.notifier.sent[-1].text
+    n_sent = len(env.notifier.sent)
+    await bot.offer_cut_off_runs()
+    assert len(env.notifier.sent) == n_sent, [m.text for m in env.notifier.sent[n_sent:]]
+
+
+async def test_a_wake_up_cut_off_by_a_restart(env):
+    """A wake-up running when Overseer stops doesn't pause the conversation's wake-ups: it's offered again."""
+    from overseer.bot import Bot
+    from overseer.runners import _RUNNING, kill_running
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    w, _ = ap.add_timer(s, 60, note="FORCE_SLEEP compare the seeds")
+    w.due = time.time() - 1
+    env.store.update_watch(w)
+    await ap.tick({})
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if _RUNNING:
+            break
+    n_sent = len(env.notifier.sent)
+    env.agent.shutting_down = True
+    assert kill_running() == 1  # the wake-up's CLI was running
+    await ap.drain()
+    assert len(env.notifier.sent) == n_sent, [m.text for m in env.notifier.sent[n_sent:]]
+    assert not env.store.get(f"wakeups_paused:{s.id}")
+    env.agent.shutting_down = False
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    await bot.offer_cut_off_runs()
+    notice = env.notifier.sent[-1]
+    assert "was working on a wake-up it had set up" in notice.text and "[Wake-up you set up]" in notice.text
+    assert notice.buttons[0][0][0] == "▶️ Continue"
+    await env.ctl.stop()

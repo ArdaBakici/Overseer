@@ -51,6 +51,41 @@ SBATCH_PARSABLE_RE = re.compile(_SBATCH + r"[^;&|\n]*\s--parsable(?![\w-])")  # 
 SCANCEL_RE = re.compile(r"(?:^|[\s;&|(`'\"/])scancel(?![\w.-])([^;&|\n]*)")
 SLURM_QUERY_RE = re.compile(r"(?:^|[\s;&|(`'\"/])(?:sacct|squeue|scontrol|seff|sinfo)(?![\w.-])")
 
+# The agent CLIs running now (process group ids): ended with Overseer, so a run that a restart cut off can't go on
+# by itself while the researcher is offered to continue it.
+_RUNNING: set[int] = set()
+
+
+def _load_prctl():
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except Exception:  # not Linux
+        return None
+
+
+_PRCTL = _load_prctl()  # looked up here: the child, between fork and exec, must not import or load anything
+
+
+def _die_with_overseer() -> None:
+    """In the CLI's process, before it starts: killed if Overseer dies, even by SIGKILL (Linux)."""
+    if _PRCTL is not None:
+        _PRCTL(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
+def kill_running() -> int:
+    """Stop every agent CLI that is running (Overseer is shutting down). How many there were."""
+    n = 0
+    for pgid in list(_RUNNING):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            n += 1
+        except ProcessLookupError:
+            pass
+        _RUNNING.discard(pgid)
+    return n
+
+
 # Claude Code tools that can't work in a run that ends with the turn: wake-ups and schedules (Overseer's `ov wake` /
 # `ov watch` do that), background workflows, messages to other sessions, and tools for its own UIs. (Cron tools
 # and background subagents/commands are turned off with environment variables, see ClaudeCodeRunner.env.)
@@ -307,7 +342,9 @@ class Runner:
             *argv, cwd=str(cwd), env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=32 * 1024 * 1024,
             start_new_session=True,  # own process group, so /stop and timeouts kill everything it started
+            preexec_fn=_die_with_overseer,
         )
+        _RUNNING.add(proc.pid)
         err_task = asyncio.create_task(proc.stderr.read())
 
         async def pump():
@@ -346,7 +383,12 @@ class Runner:
             await proc.wait()
             raise
         finally:
+            _RUNNING.discard(proc.pid)
             stderr = (await err_task).decode(errors="replace")
+        if proc.returncode is not None and proc.returncode < 0:  # killed (out of memory, Overseer stopping, ...)
+            tail = "\n".join(stderr.strip().splitlines()[-5:])
+            raise AgentRunError(f"{self.name} was killed (signal {-proc.returncode}) before it finished"
+                                + (f": {tail}" if tail else ""))
         if proc.returncode != 0:
             return stderr
         return ""

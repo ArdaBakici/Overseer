@@ -69,6 +69,7 @@ def build(cfg: Config):
             log.warning("projects are defined but the bot has no topics in private chats: their messages are "
                         "labelled in the main chat (enable threaded mode for the bot in @BotFather)")
         await ctl.start()  # the agent's `ov` command
+        await bot.offer_cut_off_runs()  # runs the last Overseer didn't finish: ▶️ Continue / ✖ Dismiss
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
         await app.bot.set_my_commands([
@@ -81,6 +82,12 @@ def build(cfg: Config):
             ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
         ])
 
+    async def post_stop(app: Application) -> None:
+        agent.shutting_down = True  # runs cut off from here on are offered again at the next start
+        from .runners import kill_running
+        if kill_running():  # (their CLIs are in process groups of their own: Ctrl-C doesn't reach them)
+            log.info("stopped the agent runs in progress; they're offered again at the next start")
+
     async def post_shutdown(app: Application) -> None:
         for t in tasks:
             t.cancel()
@@ -91,6 +98,7 @@ def build(cfg: Config):
         .token(cfg.telegram.token)
         .concurrent_updates(True)
         .post_init(post_init)
+        .post_stop(post_stop)
         .post_shutdown(post_shutdown)
         .build()
     )
@@ -109,7 +117,8 @@ def build(cfg: Config):
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)
     ctl = ControlServer(cfg, agent, projects, notifier, hpc)
-    Bot(cfg, app, store, hpc, monitor, agent, notifier, projects).register()
+    bot = Bot(cfg, app, store, hpc, monitor, agent, notifier, projects)
+    bot.register()
     return app
 
 

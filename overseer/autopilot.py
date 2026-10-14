@@ -384,8 +384,13 @@ class Autopilot:
                    undo: list[tuple] | None = None, quiet: bool = False) -> None:
         if notice:
             await self.notifier.send(Outgoing(notice, session_id=s.id, silent=quiet))
-        ok = await self.agent.handle(s, prompt, quiet=quiet, origin=kind)
-        if ok:
+        try:
+            ok = await self.agent.handle(s, prompt, quiet=quiet, origin=kind)
+        except Exception:
+            if self.agent.shutting_down:  # cut off by Overseer stopping: offered again at the next start
+                return
+            raise
+        if ok or self.agent.shutting_down:
             return
         # A failed or stopped wake-up pauses this conversation's wake-ups: nothing keeps going unattended after a
         # problem. The watches that fired are put back, so they fire again once the researcher writes here.

@@ -17,6 +17,11 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=%h/Overseer/.venv/bin/python -m overseer run -c %h/Overseer/config.yaml
 Restart=on-failure
 RestartSec=30
+# Stop signals go to Overseer only: it stops the agent runs in progress itself and offers them again (▶️ Continue)
+# at the next start. With the default (control-group), the agent CLIs would be killed first and their runs reported
+# as failed. Anything left is killed after TimeoutStopSec.
+KillMode=mixed
+TimeoutStopSec=30
 
 [Install]
 WantedBy=default.target
