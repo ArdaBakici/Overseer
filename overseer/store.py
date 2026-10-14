@@ -129,6 +129,7 @@ ADDED_COLUMNS = [
     ("sessions", "started", "REAL DEFAULT 0"),
     ("sessions", "finished", "REAL DEFAULT 0"),
     ("sessions", "delivered", "INTEGER DEFAULT 0"),
+    ("metric_specs", "plot", "TEXT DEFAULT ''"),
 ]
 
 
@@ -246,6 +247,7 @@ class MetricSpec:
     alerts: str = "[]"  # JSON list of {"when": "score < 1 after 2h", "wake": bool}
     session_id: str | None = None  # the conversation that set it (woken by `wake` alerts)
     updated: float = 0.0
+    plot: str = ""  # a command on the HPC that writes PNGs into {out} (plots.py)
 
 
 @dataclass

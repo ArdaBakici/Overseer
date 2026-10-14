@@ -112,7 +112,7 @@ def build(cfg: Config):
     async def report_text(system: str, prompt: str) -> str:
         return await agent.runner().text(system=system, prompt=prompt)
 
-    reporter = Reporter(report_text, cfg.agent.enabled and cfg.agent.job_reports, cfg.agent.llm_status_updates)
+    reporter = Reporter(report_text, cfg.agent.enabled, cfg.agent.llm_status_updates)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     agent.monitor = monitor
     monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)

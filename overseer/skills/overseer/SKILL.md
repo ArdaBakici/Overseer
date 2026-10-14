@@ -18,7 +18,7 @@ Overseer started (`$OVERSEER_CTL` holds this run's token).
 ```bash
 ov job add 18746955 18746956     # after EVERY submission: Overseer checks the ids with SLURM, then reports on them
 ov job list                      # jobs of this conversation (--all: every job Overseer tracks)
-ov job show 18746955             # what Overseer knows: state, folders, logs, final report
+ov job show 18746955             # what Overseer knows: state, folders, logs, findings
 ov job move 18746955 dreamer     # the job belongs to project "dreamer" (or "main")
 ov job delete 18746955           # stop tracking it. The job keeps running: `scancel` cancels it
 ```
@@ -37,7 +37,7 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
 ## What matters in a job: its card, and alerts
 
 Every job has a live card in the project's "📊 jobs" topic. Overseer keeps editing that card until the
-job ends, and then posts a short report under it. Tell Overseer what the card should show and what's
+job ends; the card's final version is the job's result. Tell Overseer what the card should show and what's
 worth an alert:
 
 ```bash
@@ -70,6 +70,31 @@ ov metrics list | clear ...
   - who hears: `--alert` pings the researcher, and `--wake-on` also wakes you with the job's details.
 - **Which setting applies:** a job's own setting, else the newest matching `--pattern`, else the project
   default. Set it once per kind of experiment.
+
+## Graphs: your plotting script, run by Overseer
+
+The researcher sees graphs under each job's card. They come from a plotting command you write once and register for a
+job, a sweep (name pattern) or the whole project. No model is involved when they're made.
+
+```bash
+# 1. A small script in the project folder that reads the job's metrics (log, metrics.jsonl, CSV, TensorBoard events)
+#    and saves PNGs into the folder it's given.
+# 2. Register the command that runs it:
+ov plots set --pattern "ne-crl-*" --command "python {project}/plots/crl.py --log {stdout} --workdir {workdir} --out {out}"
+ov plots test 18801933     # run it now: the graphs go under the card, and copies land in ./inbox for you to check
+ov plots show 18801933 | clear ...
+```
+
+- **When Overseer runs it:** on the HPC, when the job ends, every hour while it runs, and when the researcher presses
+  📈 Plot.
+- **What the command must do:**
+  - write PNGs into `{out}` (an empty folder): up to 4, each under 10 MB;
+  - finish within 90 s, because it runs on the login node at low priority.
+  - **Placeholders:** `{job_id}`, `{name}`, `{workdir}`, `{stdout}` and `{project}` (the project's folder).
+- **Good graphs:** the main metrics against step or time, the job id in the title, a few panels if useful, readable
+  on a phone (e.g. dpi 150). Look at the `ov plots test` copies before you're done.
+- **If the researcher presses 📈 Plot and there's no command yet,** you're asked to write one. Register it for the kind
+  of job (`--pattern` or `--project`), not just the one job, so later runs get graphs too.
 
 ## Projects
 

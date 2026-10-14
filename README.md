@@ -4,7 +4,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 
 - **Monitoring.** No LLM is involved, and checks run every minute.
   - **A live card per job:** each job gets one message in its project's "📊 jobs" topic, edited in place and silently as it goes from queued to running. It shows the node, time used and left, progress, and the metrics that matter.
-  - **Final report:** when a job ends, the card shows the end and a short report is posted under it: ✅/❌, runtime, the key result and a one-line verdict, with exit code, memory and the log tail folded away. Only failures make a sound.
+  - **When a job ends:** its card is the result, with no separate report. It shows ✅/❌, runtime and the key metrics, plus the decisive error line and a 🔧 Fix button for a failure. Graphs from the agent's plotting script appear under it.
   - **Why it failed:** heuristics flag CUDA OOM, host OOM, time limits, NCCL errors, missing modules, NaNs and similar. An LLM root-cause summary is added on top.
 - **Job arrays.** An array is one job, under the id `sbatch` printed. It's running while any task is, and its report gives the task states ("📦 job array: 9 COMPLETED, 2 FAILED"). It ends with the worst task's state once all its tasks have ended.
 - **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
@@ -164,12 +164,13 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 
 | | |
 |---|---|
-| *(automatic)* | a live card per job in its jobs topic (queued → running → ended, edited in place) · ✅/❌ short final report under it |
+| *(automatic)* | a live card per job in its jobs topic (queued → running → ended, edited in place; running cards stay at the bottom) · its graphs under it |
 | **🔧 Ask agent to fix** button | the agent investigates the failed job, fixes it and resubmits |
 | *reply to any job message* | talk to the agent about that job ("lower the lr to 1e-4 and resubmit", "why is it slow?") |
 | *plain message* | general conversation ("how much quota do I have left?", "start the sweep in ~/exp/sweep.sh") |
 | `/jobs`, `/job <id>`, `/log <id> [n]` | status and log tails (long tails come as a file) |
 | **📈 Plot** button | the agent finds the job's metrics, plots them on the HPC and sends the picture with a short description of the trend |
+| **📈 Plot** button | the job's graphs now, from the agent's plotting command (no model involved); without one, the agent writes one and registers it |
 | **📊 Status** / **📜 Log** buttons | Status (on a job's card): refreshes the card now; `/job <id>` shows the card's content plus the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and check-ins too |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
 | `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
@@ -255,13 +256,17 @@ Topics in private chats need the bot's topic mode ("threaded mode"), which you s
   📈 value-loss 0.82 · dyn-loss 3.67
   ⏰ agent watching (check-ins every 2h)
   ```
-- **When it ends:** the card shows the final state, and a short report is posted as a reply to it:
+- **When it ends:** the card's final version is the result, edited in place with no separate report. For a failure it adds what went wrong and a 🔧 Ask agent to fix button:
   ```
-  ❌ 18771337 pka-ft OUT_OF_MEMORY after 2h03m (peak RAM 31.8G of 32G)
-  🧠 Host OOM while loading the full split; ask for --mem 64G.
+  ❌ 18771337 pka-ft · OUT_OF_MEMORY after 2h03m
+  🎯 score 3.2
+  ⚠️ Host out of memory (peak RAM 31.8G of 32G)
   <the decisive log line>
-  ▸ details (exit, memory, metrics, log tail - folded)
   ```
+- **Graphs:** the agent writes a small plotting script in the project folder and registers it for a job, a sweep or the whole project (`ov plots set … --command "python {project}/plots/x.py --log {stdout} --out {out}"`).
+  - **When it runs:** Overseer runs it on the HPC when the job ends, every hour while it runs (`slurm.plot_interval_minutes`), and when you press 📈 Plot.
+  - **What you see:** up to 4 PNGs under the card, replaced in place when they're refreshed. No model is involved, so this costs nothing.
+- **Running jobs stay at the bottom:** when a job ends, any running job's card (and its graphs) above it is posted again at the bottom, and the old one is deleted. If Telegram won't delete it, it is edited to say it moved.
 - **In the conversation:** when a job the agent submitted ends and the agent isn't watching it, you get a one-line pointer: "✅ Job 123 … finished". Watched jobs need no pointer, because the agent's reply follows.
 
 **What matters in a job: the agent decides, and sets alerts.** The agent tells Overseer which numbers matter and how to get them, per job, per job-name pattern (a sweep) or as a project default:
@@ -384,7 +389,6 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `slurm.status_interval_minutes`: how often a running job's card is refreshed and the agent's alerts on it checked (10).
 - `agent.autopilot`: the shortest interval for check-ins and repeating timers (`min_checkin_minutes`, 15), and how long a repeating timer lasts when the agent doesn't say (`repeat_hours`, 24). Settings from the old approval-based autopilot are ignored.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
-- `agent.job_reports: false` skips the LLM root-cause summary, leaving only the heuristics.
 - Anything the agent reads is sent to the model provider of the backend you use.
 - Overseer itself writes only to `./state` and `/tmp/overseer` (`local.allowed_roots`).
 - Secrets live in `.env` next to `config.yaml` (`local.env_file`). It is loaded at startup, and variables already set in the environment take precedence. Overseer warns if the file is readable by other users, and the agent's sandbox blocks reading it.

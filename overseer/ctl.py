@@ -101,6 +101,16 @@ def _parser() -> _Parser:
             a.add_argument("--clear-alerts", action="store_true")
     met.add_parser("show", add_help=False).add_argument("job")
     met.add_parser("list", add_help=False)
+    pl = sub.add_parser("plots", add_help=False).add_subparsers(dest="action")
+    for name in ("set", "clear"):
+        a = pl.add_parser(name, add_help=False)
+        a.add_argument("job", nargs="?")
+        a.add_argument("--pattern")
+        a.add_argument("--project", nargs="?", const="")
+        if name == "set":
+            a.add_argument("--command", required=True)
+    pl.add_parser("test", add_help=False).add_argument("job")
+    pl.add_parser("show", add_help=False).add_argument("job")
     a = sub.add_parser("watch", add_help=False)
     a.add_argument("ids", nargs="+")
     a.add_argument("--every")
@@ -189,6 +199,13 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+
+Graphs under a job's card (no model involved: your plotting script, run by Overseer on the HPC):
+  ov plots set <job | --pattern '<name glob>' | --project> --command "python {project}/plots/x.py --log {stdout} --out {out}"
+                                   writes PNGs (up to 4) into {out}; also {job_id} {name} {workdir}. Run when the job
+                                   ends, hourly while it runs, and on the researcher's 📈 button.
+  ov plots test <job>              run it now (graphs go under the card; copies into ./inbox for you to look at)
+  ov plots show <job> | clear ...
 
 Results and findings (each experiment's outcome; the project's lasting lessons):
   ov result <job> [--verdict V] [--hypothesis ...] [--conclusion ...] [--tags a,b] [--metric name=value] [--dead-end]
@@ -304,6 +321,8 @@ class ControlServer:
                 return True, await self.conversation_move(session, args)
             if area == "metrics" and args.action:
                 return True, await getattr(self, f"metrics_{args.action}")(session, args)
+            if area == "plots" and args.action:
+                return True, await getattr(self, f"plots_{args.action}")(session, args)
             if area in ("watch", "unwatch", "watches", "wake"):
                 return True, await getattr(self, area)(session, args)
             if area == "auto":
@@ -729,10 +748,87 @@ class ControlServer:
 
     async def metrics_clear(self, session, args) -> str:
         scope, key = self._spec_scope(session, args)
-        if not self.store.delete_metric_spec(scope, key):
+        spec = self.store.get_metric_spec(scope, key)
+        if not spec:
             raise CtlError(f"no metrics set for {scope} {key}")
+        if spec.plot:  # its plotting command stays (ov plots clear removes it)
+            spec.critical = spec.important = spec.progress = spec.command = ""
+            spec.alerts = "[]"
+            self.store.set_metric_spec(spec)
+        else:
+            self.store.delete_metric_spec(scope, key)
         self._refresh_cards(self._affected(scope, key))
         return f"✓ metrics for {scope} {key} removed"
+
+    # ---- graphs (plots.py)
+    def _monitor(self):
+        monitor = getattr(self.agent, "monitor", None)
+        if not monitor:
+            raise CtlError("the monitor isn't running")
+        return monitor
+
+    def _tracked(self, job: str):
+        jid = array_parent(job)
+        rec = self.store.get_job(jid)
+        if not rec:
+            raise CtlError(f"Overseer doesn't track job {jid} (ov job add {jid})")
+        return rec
+
+    async def plots_set(self, session, args) -> str:
+        scope, key = self._spec_scope(session, args)
+        if "{out}" not in args.command:
+            raise CtlError("the command must write its PNGs into {out} (Overseer fills in an empty folder), e.g. "
+                           "--command 'python {project}/plots/curves.py --log {stdout} --out {out}'")
+        spec = self.store.get_metric_spec(scope, key) or MetricSpec(scope=scope, key=key)
+        spec.plot, spec.session_id = args.command.strip(), session.id
+        self.store.set_metric_spec(spec)
+        what = {"job": f"job {key}", "pattern": f"jobs named {key}", "project": f"project {key}'s jobs"}[scope]
+        affected = self._affected(scope, key)
+        return (f"✓ graphs for {what}: run when a job ends, every {self.cfg.slurm.plot_interval_minutes} min while it "
+                "runs, and on the researcher's 📈 button. Check it now: ov plots test "
+                + (key if scope == "job" else affected[0] if affected else "<job id>"))
+
+    async def plots_clear(self, session, args) -> str:
+        scope, key = self._spec_scope(session, args)
+        spec = self.store.get_metric_spec(scope, key)
+        if not spec or not spec.plot:
+            raise CtlError(f"no plotting command set for {scope} {key}")
+        spec.plot = ""
+        if spec.critical or spec.important or spec.progress or spec.command or spec.alerts not in ("", "[]"):
+            self.store.set_metric_spec(spec)
+        else:
+            self.store.delete_metric_spec(scope, key)
+        return f"✓ no more graphs for {scope} {key}"
+
+    async def plots_test(self, session, args) -> str:
+        """Run the job's plotting command now: the graphs go under its card, and copies into ./inbox to look at."""
+        rec = self._tracked(args.job)
+        monitor = self._monitor()
+        n, err = await monitor.plots(rec)
+        if not n:
+            raise CtlError(err or "no graphs")
+        images = monitor.cached_plots(rec.job_id)
+        from .agent import deliver_uploads
+        staging = self.cfg.local.tmp("uploads")
+        staging.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staged = []
+        for name, data in images:
+            path = staging / secrets.token_hex(8)
+            path.write_bytes(data)
+            staged.append((f"plot-{rec.job_id}-{name}", path))
+        items = deliver_uploads(self.agent.session_runner(session).workdir(session.id), staged)
+        return (f"✓ {n} graph(s) shown under job {rec.job_id}'s card. Copies to look at: "
+                + ", ".join(p for p, _ in items) + (f"\n⚠️ {err}" if err else ""))
+
+    async def plots_show(self, session, args) -> str:
+        from .plots import resolve_plot
+        rec = self._tracked(args.job)
+        spec = resolve_plot(self.store, rec)
+        if not spec:
+            return f"job {rec.job_id}: no plotting command (ov plots set)"
+        err = self.store.get(f"plot_err:{rec.job_id}") or ""
+        return (f"job {rec.job_id}: graphs from {spec.scope} {spec.key}\ncommand: {spec.plot}"
+                + (f"\nlast run: {err}" if err else ""))
 
     # ---- other
     async def notify(self, session, text: str) -> str:

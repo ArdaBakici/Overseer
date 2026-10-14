@@ -1,7 +1,7 @@
 """Turning raw job data (state, sacct, logs) into human reports.
 
-Heuristics work without any LLM and are always included; the LLM adds a narrative
-summary / root-cause analysis on top when enabled.
+Heuristics work without any LLM (the decisive error line on a failed job's card, the categories in the
+agent's report); an LLM can add a one-line progress status to status messages (llm_status_updates).
 """
 
 from __future__ import annotations
@@ -138,35 +138,18 @@ def tqdm_cleanup(text: str) -> str:
     return "\n".join(line.rstrip("\r").rsplit("\r", 1)[-1] for line in text.split("\n"))
 
 
-REPORT_SYSTEM = """You write short job reports for an ML researcher, delivered as Telegram messages.
-You are given SLURM accounting data and the tail of the job's logs for a job on a university HPC cluster.
-
-Write plain text, at most 2 short sentences (it sits under a compact job card; the details are shown elsewhere):
-- If it succeeded: the verdict and the key final result (e.g. "Converged; score plateaued at 5.2 after step 3.1M.").
-- If it failed: the root cause and the fix (exact flag or change when you can tell), e.g. "Host OOM while loading the
-  full split; ask for --mem 64G."
-Only state facts supported by the data; say when the logs are inconclusive."""
-
 STATUS_SYSTEM = """Summarise the progress of a running ML training job in ONE short line for a Telegram status update
 (e.g. "epoch 3/10, loss 0.41 ↓, ~2h left at current pace"). Use only what the log shows; if nothing useful, say "no progress info in log"."""
 
 
 class Reporter:
-    """LLM summaries for job reports, using the agent's current backend in one-shot mode (no tools)."""
+    """One-line LLM progress summaries for status messages (llm_status_updates), using the agent's current
+    backend in one-shot mode (no tools)."""
 
     def __init__(self, text_fn: Callable[[str, str], Awaitable[str]] | None, enabled: bool, llm_status: bool):
         self.text_fn = text_fn  # async (system, prompt) -> str
         self.enabled = enabled and text_fn is not None
         self.llm_status = llm_status
-
-    async def final_analysis(self, context: str) -> str:
-        if not self.enabled:
-            return ""
-        try:
-            return (await self.text_fn(REPORT_SYSTEM, context)).strip()
-        except Exception as e:  # never let the LLM break monitoring
-            log.exception("LLM report failed")
-            return f"(LLM analysis unavailable: {type(e).__name__})"
 
     async def status_line(self, log_tail: str) -> str:
         if not (self.enabled and self.llm_status and log_tail.strip()):

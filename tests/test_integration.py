@@ -27,7 +27,7 @@ from overseer.runners import Activity, AgentRunError, ClaudeCodeRunner, CodexRun
 from overseer.ssh import SSHRunner
 from overseer.sshlink import agent_ssh_config, overseer_ssh_config, write_configs
 from overseer.notify import Outgoing
-from overseer.store import JobRecord, Store, WatchRecord
+from overseer.store import JobRecord, MetricSpec, Store, WatchRecord
 
 FAKE_SLURM = Path(__file__).parent / "fake_slurm"
 FAKE_CLI = Path(__file__).parent / "fake_cli"
@@ -774,18 +774,21 @@ async def test_monitor_lifecycle(env):
     log.write_text("epoch 1/3 loss 1.0\nTraceback (most recent call last):\n  File \"train.py\", line 1\n"
                    "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4 GiB\n")
     env.set_jobs(**{"77": {**env.slurm()["jobs"]["77"], "state": "FAILED", "exit": "1:0"}})
+    n = len(env.notifier.sent)
     await env.monitor.poll()
-    final = env.notifier.sent[-1]
-    assert "FAILED after" in final.text and "OK report" in final.text  # LLM analysis via the agent backend
-    assert "CUDA out of memory" in final.text and "▸ details" in final.text  # the decisive line, then folded details
-    assert final.jobs and not final.silent and ("🔧 Ask agent to fix", "fix:77") in final.buttons[0]
-    assert "FAILED after" in env.notifier.card_text("77")  # the card shows the end too
+    # No separate report: the card's final version is the result, with what went wrong and a Fix button.
+    card, buttons = env.notifier.cards["77"][-1]
+    assert "FAILED after" in card and "⚠️ <b>GPU out of memory</b>" in card and "CUDA out of memory" in card, card
+    assert ("🔧 Ask agent to fix", "fix:77") in buttons[0] and ("📊 Status", "status:77") not in buttons[0]
+    assert len(env.notifier.sent) == n and not [c for c in env.cli_log() if "--output-format" in c["argv"]
+                                                and "json" in c["argv"]]  # no LLM summary either
     rec = env.store.get_job("77")
-    assert rec.ended_at and rec.batch_script.startswith("#!/bin/bash")
+    assert rec.ended_at and rec.batch_script.startswith("#!/bin/bash") and "GPU out of memory" in rec.report
 
     env.set_jobs(**{"78": {"name": "quick", "state": "COMPLETED", "workdir": proj, "stdout": str(log)}})
     await env.monitor.poll()
-    assert "<b>78</b> quick finished" in env.notifier.sent[-1].text and env.notifier.sent[-1].silent
+    card, buttons = env.notifier.cards["78"][-1]
+    assert "<b>78</b> quick · finished" in card and "⚠️" not in card and ("🔧 Ask agent to fix", "fix:78") not in buttons[0]
 
 
 async def test_monitor_fills_in_agent_submitted_jobs(env):
@@ -937,8 +940,8 @@ async def test_working_alone_over_many_runs(env):
 
     # Job 1 finishes: the conversation is woken with its report; no one-shot LLM summary.
     await run_job(env, j1)
-    final = next(m.text for m in env.notifier.sent if f"<b>{j1}</b>" in m.text and "finished" in m.text)
-    assert "OK report" not in final
+    assert "finished" in env.notifier.card_text(j1)  # the card is the result: no report message
+    assert not any(f"<b>{j1}</b>" in m.text and "finished" in m.text for m in env.notifier.sent)
     assert not any("Waking the agent" in m.text for m in env.notifier.sent)  # the agent's reply is the notice
     call = claude_calls(env)[-1]
     assert "[Wake-up you set up]" in call["stdin"] and f"<job id='{j1}'" in call["stdin"]
@@ -1264,8 +1267,8 @@ async def test_status_follows_the_training_log(env):
         fh.write("Traceback (most recent call last):\n  File \"dreamer.py\", line 9\nValueError: bad replay ratio\n")
     env.set_jobs(**{"18743802": {**job, "state": "FAILED", "exit": "1:0"}})
     await env.monitor.poll()
-    final = next(m for m in env.notifier.sent if "<b>18743802</b>" in m.text and "FAILED" in m.text)
-    assert "ValueError: bad replay ratio" in final.text
+    card = env.notifier.card_text("18743802")
+    assert "FAILED" in card and "ValueError: bad replay ratio" in card, card  # the decisive line, on the card
 
 
 # ----------------------------------------------------------------------------- projects
@@ -1626,10 +1629,22 @@ async def test_plot_button(env, monkeypatch):
     await bot._start_plot(1, "901")
     for t in list(bot._tasks):
         await t
-    sid, text = started[-1]
+    sid, text = started[-1]  # no plotting command yet: the agent writes one (and registers it)
     assert sid == env.agent.session_for_job("901").id
-    assert "/s/train_901.log" in text and "./outbox/" in text and "PNG" in text
+    assert "/s/train_901.log" in text and "ov plots set" in text and "PNG" in text
     assert "is plotting job" in env.notifier.sent[-1].text
+    # With a plotting command: run at once, no model involved; the graphs go under the card.
+    shown = []
+
+    async def show_plots(job_id, images, repost=False):
+        shown.append((job_id, [n for n, _ in images]))
+    env.notifier.show_plots = show_plots
+    env.store.set_metric_spec(MetricSpec(scope="job", key="901", plot=(
+        "printf '\\x89PNG fake' > {out}/loss.png && printf '\\x89PNG fake' > {out}/score.png")))
+    n = len(started)
+    await bot._start_plot(1, "901")
+    assert shown == [("901", ["loss.png", "score.png"])] and len(started) == n
+    assert env.monitor.cached_plots("901")[0] == ("loss.png", b"\x89PNG fake")
 
 
 async def test_telegram_pictures_and_fallbacks(env):
@@ -2223,9 +2238,8 @@ async def test_job_arrays_are_one_job(env):
     await env.monitor.poll()
     await env.monitor.poll()
     await ap.drain()
-    finals = [m.text for m in env.notifier.sent if "<b>6100</b>" in m.text and "FAILED after" in m.text]
-    assert len(finals) == 1 and "array: 3 COMPLETED, 1 FAILED" in finals[0], finals
-    assert "📦 array: 3 COMPLETED, 1 FAILED" in env.notifier.card_text("6100")
+    card = env.notifier.card_text("6100")
+    assert "FAILED after" in card and "📦 array: 3 COMPLETED, 1 FAILED" in card, card
     stdin = [c for c in env.cli_log() if c["prog"] == "claude"][n]["stdin"]
     assert "[Wake-up you set up]" in stdin and "job array of 4 tasks: 3 COMPLETED, 1 FAILED" in stdin
 
@@ -2302,11 +2316,10 @@ async def test_job_cards_in_jobs_topics(env):
     assert len(tg.sent) == n + 1 and env.store.card_refs("501") == {"1": n + 1}
 
     env.set_jobs(**{"501": {**job, "state": "COMPLETED", "exit": "0:0"}})
+    m = len(tg.sent)
     await env.monitor.poll()
-    assert "finished" in tg.edits[-1][2]  # the card shows the end
-    report = len(tg.sent)
-    assert tg.sent[-1][1] == dreamer_jobs and "<b>501</b> train finished" in tg.sent[-1][2]
-    assert tg.replies[report] == n + 1  # under the card
+    assert "finished" in tg.edits[-1][2] and tg.edits[-1][1] == n + 1  # the card shows the end, in place
+    assert len(tg.sent) == m  # and nothing else is posted: no report under it
 
 
 async def test_agent_defined_metrics_and_alerts(env, tmp_path):
@@ -2953,3 +2966,123 @@ async def test_results_and_findings_commands(env, monkeypatch):
     env.store.add_finding(FindingRecord(project=None, kind="insight", text="bigger batch helps"))
     await bot.cmd_findings(None, NS(args=[]))
     assert "💡 F1 insight: bigger batch helps" in replies[-1]
+
+
+# ----------------------------------------------------------------------------- graphs and the order of job cards
+
+class MediaTelegram(FakeTelegram):
+    """FakeTelegram plus pictures in albums, editing a picture, and deleting messages."""
+    deleted: set = None
+    media_edits: list = None
+
+    async def send_photo(self, chat_id, photo, filename, message_thread_id=None, **kw):
+        m = await super().send_photo(chat_id, photo, filename, message_thread_id)
+        if kw.get("reply_parameters"):
+            self.replies = (self.replies or {}) | {m.message_id: kw["reply_parameters"].message_id}
+        return m
+
+    async def send_media_group(self, chat_id, media, message_thread_id=None, **kw):
+        out = []
+        for item in media:
+            self.sent.append((chat_id, message_thread_id, f"<photo {item.media.filename}>"))
+            out.append(NS(message_id=len(self.sent)))
+        if kw.get("reply_parameters"):
+            self.replies = (self.replies or {}) | {out[0].message_id: kw["reply_parameters"].message_id}
+        return out
+
+    async def edit_message_media(self, chat_id, message_id, media, **kw):
+        self.media_edits = (self.media_edits or []) + [(message_id, media.media.filename)]
+        return True
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted = (self.deleted or set()) | {message_id}
+        return True
+
+
+async def test_graphs_under_cards_and_running_cards_at_the_bottom(env):
+    """The agent's plotting command makes the graphs under a job's card: posted when the job ends, refreshed in place
+    hourly while it runs. When a job ends, running cards above it move to the bottom of the jobs topic."""
+    from overseer.bot import TelegramNotifier
+    tg = MediaTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    await notifier.ensure_jobs_topics([])
+    env.monitor.notifier = notifier
+    proj = env.home / "proj"
+    plot = ("printf '\\x89PNG {job_id}' > {out}/loss.png && printf '\\x89PNG' > {out}/score.png")
+    env.store.set_metric_spec(MetricSpec(scope="pattern", key="sweep-*", plot=plot))
+    jobs = {jid: {"name": f"sweep-{jid}", "state": "RUNNING", "workdir": str(proj), "stdout": str(proj / "o.out")}
+            for jid in ("A1", "B2")}
+    for jid in jobs:
+        (proj / "o.out").write_text("step 1 loss=1\n")
+    env.set_jobs(**{"901": jobs["A1"], "902": jobs["B2"]})
+    await env.monitor.poll()
+    await env.monitor.drain()
+    a_card, b_card = env.store.card_refs("901")["1"], env.store.card_refs("902")["1"]
+    assert a_card < b_card  # 901 started first: its card is higher up
+
+    # Hourly while it runs: the graphs appear under the card, then are replaced in place.
+    rec = env.store.get_job("901")
+    rec.last_status_at = 0
+    env.store.upsert_job(rec)
+    await env.monitor.poll()
+    await env.monitor.drain()
+    graphs = json.loads(env.store.get("plotrefs:901"))["1"]
+    assert len(graphs) == 2 and tg.replies[graphs[0]] == a_card, tg.replies
+    assert [t for _, _, t in tg.sent[-2:]] == ["<photo loss.png>", "<photo score.png>"]
+    n = len(tg.sent)
+    rec = env.store.get_job("901")
+    rec.last_status_at = 0
+    env.store.upsert_job(rec)
+    env.store.set("plot_at:901", "0")
+    await env.monitor.poll()
+    await env.monitor.drain()
+    assert len(tg.sent) == n and tg.media_edits[-2:] == [(graphs[0], "loss.png"), (graphs[1], "score.png")]
+
+    # 902 (lower down) ends: its card is edited in place, its graphs posted under it. 901 is still running and its
+    # card and graphs sit above 902's: they move to the bottom.
+    env.set_jobs(**{"901": jobs["A1"], "902": {**jobs["B2"], "state": "COMPLETED", "exit": "0:0"}})
+    await env.monitor.poll()
+    await env.monitor.drain()
+    assert "finished" in tg.edits[-1][2] or any("finished" in e[2] for e in tg.edits[-4:])
+    new_a = env.store.card_refs("901")["1"]
+    assert new_a > max(json.loads(env.store.get("plotrefs:902"))["1"]) and {a_card, *graphs} <= tg.deleted
+    new_graphs = json.loads(env.store.get("plotrefs:901"))["1"]
+    assert min(new_graphs) > new_a and tg.replies[new_graphs[0]] == new_a
+    assert "🏃 <b>901</b> sweep-A1" in [t for _, _, t in tg.sent if t.startswith("🏃")][-1]
+    # Nothing to move when the job that ends is already the lowest.
+    n = len(tg.sent)
+    env.set_jobs(**{"901": {**jobs["A1"], "state": "COMPLETED", "exit": "0:0"}})
+    await env.monitor.poll()
+    await env.monitor.drain()
+    assert env.store.card_refs("901")["1"] == new_a
+
+
+async def test_ov_plots(env):
+    await make_autopilot(env)
+    s = env.agent.general_session()
+    env.store.upsert_job(JobRecord(job_id="950", name="eval-1", state="RUNNING", by_agent=1, session_id=s.id,
+                                   workdir=str(env.home / "proj"), first_seen=time.time()))
+    token = env.ctl.open(s.id)
+
+    async def ov(*argv):
+        return await env.ctl.handle(token, list(argv))
+    ok, text = await ov("plots", "set", "--pattern", "eval-*", "--command", "python plot.py")
+    assert not ok and "{out}" in text
+    ok, text = await ov("plots", "set", "--pattern", "eval-*", "--command", "printf '\\x89PNG' > {out}/curve.png")
+    assert ok and "ov plots test 950" in text, text
+    ok, text = await ov("plots", "test", "950")
+    assert ok and "1 graph(s)" in text and "./inbox/plot-950-curve.png" in text, text
+    workdir = env.agent.session_runner(s).workdir(s.id)
+    assert (workdir / "inbox" / "plot-950-curve.png").read_bytes() == b"\x89PNG"
+    ok, text = await ov("plots", "show", "950")
+    assert "graphs from pattern eval-*" in text
+    await ov("metrics", "set", "--pattern", "eval-*", "--critical", "acc")
+    await ov("metrics", "clear", "--pattern", "eval-*")  # the plotting command stays
+    assert env.store.get_metric_spec("pattern", "eval-*").plot
+    ok, text = await ov("plots", "set", "950", "--command", "exit 3; echo {out}")
+    ok, text = await ov("plots", "test", "950")
+    assert not ok and "failed (exit 3)" in text, text
+    assert (await ov("plots", "clear", "950"))[0] and (await ov("plots", "clear", "--pattern", "eval-*"))[0]
+    assert env.store.get_metric_spec("pattern", "eval-*") is None
+    await env.ctl.stop()

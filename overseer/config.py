@@ -144,6 +144,8 @@ class SlurmConfig:
     # How often a running job's live card is refreshed (edited in place, silently) and the agent's alerts on it
     # are checked; 0 = only when it starts and ends.
     status_interval_minutes: int = 10
+    # Graphs from the agent's plotting command (ov plots set): refreshed in place this often while a job runs.
+    plot_interval_minutes: int = 60
     # "all": every job of your user. "agent": only jobs the agent submitted.
     track: str = "all"
     notify_queued: bool = True
@@ -260,8 +262,6 @@ class AgentConfig:
     # Extra local paths the agent's commands may never read (the SSH key folder, ~/.ssh,
     # Overseer's state and well-known daemon sockets are always blocked).
     deny_read: list[str] = field(default_factory=list)
-    # LLM summary of finished jobs (root cause for failures) using the same backend.
-    job_reports: bool = True
     llm_status_updates: bool = False  # one-line LLM progress summary in periodic status messages
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
@@ -363,7 +363,8 @@ class Config:
 
 RENAMED: dict[str, dict[str, str]] = {}
 # Settings that no longer exist: ignored (with a warning) rather than refused, so old config files keep working.
-DROPPED = {"AutopilotConfig": {"default_rounds", "max_rounds", "default_wakeups", "max_wakeups", "default_hours",
+DROPPED = {"AgentConfig": {"job_reports"},  # finished jobs: the card is the result, no LLM report
+           "AutopilotConfig": {"default_rounds", "max_rounds", "default_wakeups", "max_wakeups", "default_hours",
                                "max_hours", "checkin_minutes", "max_checkins_per_job", "oneoff_max_pending",
                                "oneoff_max_hours", "oneoff_chain"}}
 

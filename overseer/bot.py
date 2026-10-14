@@ -8,6 +8,7 @@ Telegram account (2FA).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -40,6 +41,7 @@ from .ssh import SSHError
 from .sshlink import master_alive
 from .store import ProjectRecord, Store
 from . import results as R
+from .plots import resolve_plot
 from .subagents import ENDED
 from .usage import usage_report
 
@@ -306,6 +308,7 @@ class TelegramNotifier:
         gone. Always silent. Never raises."""
         if not self.store.get_job(job_id):
             return
+        self.store.set(f"cardview:{job_id}", json.dumps([text, buttons]))  # to post it again further down (move_card)
         refs = self.store.card_refs(job_id)
         msg = Outgoing(text, job_id=job_id, buttons=buttons, silent=True, jobs=True)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
@@ -335,6 +338,99 @@ class TelegramNotifier:
                 changed = True
         if changed:
             self.store.set_card_refs(job_id, refs)
+
+    # ------------------------------------------------------------------ a job's graphs, and the order of the cards
+    def _plot_refs(self, job_id: str) -> dict[str, list[int]]:
+        try:
+            return {str(k): [int(x) for x in v] for k, v in json.loads(self.store.get(f"plotrefs:{job_id}") or "{}").items()}
+        except (ValueError, TypeError):
+            return {}
+
+    async def show_plots(self, job_id: str, images: list[tuple[str, bytes]], repost: bool = False) -> None:
+        """A job's graphs, under its card: the previous ones are replaced in place (or, with `repost`, or when their
+        number changed, deleted and sent again). Silent. Never raises."""
+        refs, card = self._plot_refs(job_id), self.store.card_refs(job_id)
+        msg = Outgoing("", job_id=job_id, jobs=True, silent=True)
+        bot, new_refs = self.app.bot, {}
+        for chat_id in self.chat_ids:
+            old = refs.get(str(chat_id), [])
+            if old and not repost and len(old) == len(images):
+                try:
+                    for mid, (name, data) in zip(old, images):
+                        try:
+                            await bot.edit_message_media(chat_id=chat_id, message_id=mid,
+                                                         media=InputMediaPhoto(media=data, filename=name, caption=name))
+                        except BadRequest as e:
+                            if "not modified" not in str(e).lower():
+                                raise
+                    new_refs[str(chat_id)] = old
+                    continue
+                except Exception as e:
+                    log.info("job %s: its graphs can't be edited (%s); sending them again", job_id, e)
+            for mid in old:
+                try:
+                    await bot.delete_message(chat_id, mid)
+                except Exception:
+                    log.debug("could not delete graph %s", mid, exc_info=True)
+            await self._jobs_topic_for(msg, chat_id)
+            thread, _, _ = self._target(msg, chat_id)
+            reply = (ReplyParameters(message_id=card[str(chat_id)], allow_sending_without_reply=True)
+                     if card.get(str(chat_id)) else None)
+            try:
+                if len(images) == 1:
+                    name, data = images[0]
+                    sent = [await bot.send_photo(chat_id, photo=data, filename=name, caption=name,
+                                                 disable_notification=True, message_thread_id=thread,
+                                                 reply_parameters=reply)]
+                else:
+                    sent = list(await bot.send_media_group(
+                        chat_id, media=[InputMediaPhoto(media=d, filename=n, caption=n) for n, d in images],
+                        disable_notification=True, message_thread_id=thread, reply_parameters=reply))
+            except Exception:
+                log.warning("job %s: could not send its graphs", job_id, exc_info=True)
+                continue
+            new_refs[str(chat_id)] = [m.message_id for m in sent]
+            for m in sent:
+                self.store.link_message(chat_id, m.message_id, job_id, None)
+        self.store.set(f"plotrefs:{job_id}", json.dumps(new_refs))
+
+    def last_message_ids(self, job_id: str) -> dict[str, int]:
+        """Per chat, the lowest-down message of a job in its jobs topic: its card, or its graphs below it."""
+        out = dict(self.store.card_refs(job_id))
+        for chat, mids in self._plot_refs(job_id).items():
+            out[chat] = max([out.get(chat, 0), *mids])
+        return out
+
+    async def move_card(self, job_id: str) -> None:
+        """Post a (running) job's card again at the bottom of its jobs topic and remove the old one (where Telegram
+        won't delete it, it says the card moved). Never raises."""
+        try:
+            text, buttons = json.loads(self.store.get(f"cardview:{job_id}") or "null")
+        except (ValueError, TypeError):
+            return
+        refs = self.store.card_refs(job_id)
+        msg = Outgoing(text, job_id=job_id, buttons=buttons, silent=True, jobs=True)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                       for row in buttons]) if buttons else None
+        for chat_id in self.chat_ids:
+            old = refs.get(str(chat_id))
+            if old:
+                try:
+                    await self.app.bot.delete_message(chat_id, old)
+                except Exception:
+                    try:
+                        await self.app.bot.edit_message_text(f"↓ <b>{esc(job_id)}</b>: its card moved to the bottom",
+                                                             chat_id=chat_id, message_id=old, parse_mode=ParseMode.HTML)
+                    except Exception:
+                        log.debug("could not retire the old card of %s", job_id, exc_info=True)
+            try:
+                new = await self._post_card(chat_id, msg, markup)
+            except Exception:
+                log.warning("job %s: could not post its card again", job_id, exc_info=True)
+                continue
+            if new:
+                refs[str(chat_id)] = new
+        self.store.set_card_refs(job_id, refs)
 
     async def _post_card(self, chat_id: int, msg: Outgoing, markup) -> int | None:
         await self._jobs_topic_for(msg, chat_id)
@@ -822,17 +918,25 @@ class Bot:
         self._spawn(self._run_agent(chat_id, session, text))
 
     async def _start_plot(self, chat_id: int, job_id: str) -> None:
-        """📈: the agent plots the job's metrics on the HPC and sends the picture."""
+        """📈: the job's graphs now, from the agent's plotting command; without one, the agent writes one."""
         rec = self.store.get_job(job_id)
         if not rec:
             await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
             return
+        if resolve_plot(self.store, rec):  # no model involved: the graphs appear (or are updated) under the card
+            n, err = await self.monitor.plots(rec)
+            if not n:
+                await self.notifier.send(Outgoing(f"📈 No graphs for {code(job_id)}: {esc(err)}", job_id=job_id,
+                                                  jobs=True, reply_to=self.store.card_refs(job_id), silent=True))
+            return
         log_path = (rec.info_dict.get("progress_log") or rec.stdout) if rec else ""
-        text = (f"Plot how job {job_id} ({rec.name}, {rec.state}) is doing. Find its metrics - its log {log_path}, or "
-                "metric files (metrics.jsonl, CSV, TensorBoard events) in its output folder - and make one clear PNG "
-                "with a plotting script run on a compute node (hpc-run): the main metric(s) against step or time, a "
-                "few panels if useful, the job id in the title. Copy it to ./outbox/ and describe the trend in two "
-                "or three sentences.")
+        text = (f"The researcher pressed 📈 Plot on job {job_id} ({rec.name}, {rec.state}), and there's no plotting "
+                "command for it yet. Write a small plotting script in the project folder on the HPC that reads its "
+                f"metrics - its log {log_path}, or metric files (metrics.jsonl, CSV, TensorBoard events) in its output "
+                "folder - and saves clear PNGs (the main metrics against step or time, a few panels if useful, the job "
+                "id in the title) into the folder it's given. Register it with `ov plots set` for this kind of job "
+                "(--pattern or --project, so later runs get graphs too), then `ov plots test` it and look at the "
+                "result. Describe the trend in two or three sentences.")
         session = self.agent.session_for_job(job_id)
         await self.notifier.send(Outgoing(f"📈 {esc(self.agent.session_backend(session))} is plotting job "
                                           f"{code(job_id)}…", job_id=job_id, session_id=session.id, silent=True))

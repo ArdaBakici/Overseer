@@ -7,6 +7,7 @@ import dataclasses
 import fnmatch
 import json
 import logging
+import shutil
 import time
 
 from .compute import WORKER_NAME
@@ -17,6 +18,7 @@ from .metrics import check_alerts, fired_alerts, resolve, run_command
 from .metrics import lines as metric_lines
 from .notify import Notifier, Outgoing, code, esc
 from .quota import parse_quota
+from .plots import resolve_plot, run_plots
 from .results import record_job, snapshot
 from .richtext import fold_text
 from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
@@ -59,6 +61,18 @@ class Monitor:
         self.autopilot = None  # set by Autopilot's owner: told about the agent's jobs finishing / running
         self.worker: Job | None = None  # hpc-run's compute worker, if one is queued or running
         self._quota_checked = 0.0
+        self._bg: set[asyncio.Task] = set()  # graphs and card moves: never in the way of the poll
+        self._plotting: set[str] = set()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def drain(self) -> None:
+        """Wait for graphs and card moves in progress (tests)."""
+        while self._bg:
+            await asyncio.gather(*list(self._bg), return_exceptions=True)
 
     def poke(self) -> None:
         """Poll right away (e.g. after a submission)."""
@@ -257,7 +271,8 @@ class Monitor:
         return {"text": text, "log_path": log_path, "auto": auto, "spec": spec, "values": {**auto, **values},
                 "err": err}
 
-    def _card_text(self, rec: JobRecord, job: Job | None, view: dict, final: Job | None = None) -> str:
+    def _card_text(self, rec: JobRecord, job: Job | None, view: dict, final: Job | None = None,
+                   problem: str = "") -> str:
         state = final.state if final else (job.state if job else rec.state)
         head = f"{STATE_EMOJI.get(state, '•')} <b>{esc(rec.job_id)}</b> {esc(rec.name)}"
         if final:
@@ -289,12 +304,16 @@ class Monitor:
                 lines.append("⏰ agent watching" + (f" (check-ins every {human_seconds(int(every))})" if every else ""))
             if view["err"]:
                 lines.append(f"⚠️ metrics command: {esc(view['err'][:160])}")
+        if problem:
+            lines.append(problem)
         for a in fired_alerts(self.store, rec)[:3]:
             lines.append(f"🚨 {esc(a)}")
         return "\n".join(lines)
 
-    def _card_buttons(self, rec: JobRecord, ended: bool = False) -> list[list[tuple[str, str]]]:
+    def _card_buttons(self, rec: JobRecord, ended: bool = False, failed: bool = False) -> list[list[tuple[str, str]]]:
         row = [("📜 Log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]
+        if failed:
+            row.insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
         if not ended:
             row.insert(0, ("📊 Status", f"status:{rec.job_id}"))
             watches = self.store.job_watches(rec.job_id)
@@ -354,6 +373,67 @@ class Monitor:
             return
         rec.last_status_at = time.time()
         await self.refresh_card(rec, job)
+        every = self.cfg.slurm.plot_interval_minutes * 60  # its graphs, refreshed in place
+        if every > 0 and time.time() - float(self.store.get(f"plot_at:{rec.job_id}") or 0) >= every \
+                and resolve_plot(self.store, rec):
+            self._spawn(self.plots(rec))
+
+    # ------------------------------------------------------------------ graphs (plots.py) and card order
+    async def _after_end(self, rec: JobRecord) -> None:
+        """A job ended: its graphs under its final card, then running cards above it move to the bottom."""
+        try:
+            await self.plots(rec)
+        finally:
+            await self._restack(rec)
+
+    async def plots(self, rec: JobRecord) -> tuple[int, str]:
+        """Run the job's plotting command (if the agent set one) and show the graphs under its card, replacing the
+        previous ones: (how many images, what went wrong)."""
+        spec = resolve_plot(self.store, rec)
+        if not spec:
+            return 0, "no plotting command set for this job (ov plots set)"
+        if rec.job_id in self._plotting:
+            return 0, "its graphs are being made right now: try again in a minute"
+        self._plotting.add(rec.job_id)
+        self.store.set(f"plot_at:{rec.job_id}", str(time.time()))
+        try:
+            images, err = await run_plots(self.hpc, self.store, rec, spec.plot)
+        except (SSHError, OSError) as e:
+            return 0, f"couldn't run the plotting command: {e}"
+        finally:
+            self._plotting.discard(rec.job_id)
+        self.store.set(f"plot_err:{rec.job_id}", err)
+        if images:
+            cache = self.cfg.local.state("plots", rec.job_id)
+            shutil.rmtree(cache, ignore_errors=True)
+            cache.mkdir(parents=True, exist_ok=True)
+            for i, (name, data) in enumerate(images):
+                (cache / f"{i:02d}-{name}").write_bytes(data)
+            if hasattr(self.notifier, "show_plots"):
+                await self.notifier.show_plots(rec.job_id, images)
+        return len(images), err
+
+    def cached_plots(self, job_id: str) -> list[tuple[str, bytes]]:
+        cache = self.cfg.local.state("plots", job_id)
+        if not cache.is_dir():
+            return []
+        return [(p.name.split("-", 1)[-1], p.read_bytes()) for p in sorted(cache.glob("*.png"))]
+
+    async def _restack(self, finished: JobRecord) -> None:
+        """Running jobs' cards stay below finished ones in the jobs topic: a running card (and its graphs) above the
+        one that just ended moves to the bottom."""
+        if not hasattr(self.notifier, "move_card"):
+            return
+        last = self.notifier.last_message_ids(finished.job_id)  # {chat: id of its card or graphs, the lowest down}
+        running = sorted((r for r in self.store.active_jobs() if r.project == finished.project
+                          and r.job_id != finished.job_id and r.name != WORKER_NAME), key=lambda r: r.first_seen)
+        for r in running:
+            refs = self.store.card_refs(r.job_id)
+            if any(chat in last and mid < last[chat] for chat, mid in refs.items()):
+                await self.notifier.move_card(r.job_id)
+                images = self.cached_plots(r.job_id)
+                if images:
+                    await self.notifier.show_plots(r.job_id, images, repost=True)
 
     async def status_message(self, rec: JobRecord, job: Job | None = None, gpu: bool | None = None) -> Outgoing:
         """On request (/job): the card's content plus the last lines of the (training) log. `gpu`: query
@@ -412,23 +492,21 @@ class Monitor:
         rec.state = final.state
         rec.ended_at = time.time()
         self.store.upsert_job(rec)  # mark ended first so a crash below can't cause duplicate reports
-        # A watched job is analysed by the agent itself right after: skip the one-shot LLM summary.
-        analyze = not (self.autopilot and self.autopilot.handles(rec))
         watched_here = bool(rec.session_id) and any(w.session_id == rec.session_id
                                                     for w in self.store.job_watches(rec.job_id))
         try:
-            msg, context, card = await self.final_report(rec, final, analyze=analyze)
+            context, card, failed = await self.final_report(rec, final)
         except (SSHError, OSError) as e:
             if rec.name != WORKER_NAME:
                 record_job(self.store, rec, final, {})
-            msg = Outgoing(f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} "
-                           f"{esc(final.state)} (could not build the full report: {esc(e)})", job_id=rec.job_id)
-            card = f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} · {esc(final.state)}"
+            failed = not (final.state in SUCCESS_STATES and final.exit_code.startswith("0"))
+            card = (f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} · {esc(final.state)}"
+                    f"\n(couldn't read its logs: {esc(e)})")
             context = (f"Job {rec.job_id} final state {final.state}, exit code {final.exit_code}, elapsed "
                        f"{final.elapsed} of {final.time_limit}. (Overseer couldn't read its logs: {e})")
-        await self._show_card(rec, card, self._card_buttons(rec, ended=True))
-        msg.jobs, msg.reply_to = True, self.store.card_refs(rec.job_id)  # the report goes under the card
-        await self.notifier.send(msg)
+        # The card's final version is the result (no separate report); then its graphs, and running cards below it.
+        await self._show_card(rec, card, self._card_buttons(rec, ended=True, failed=failed))
+        self._spawn(self._after_end(rec))
         if rec.by_agent and rec.session_id and not watched_here:  # results the agent isn't following
             success = final.state in SUCCESS_STATES and final.exit_code.startswith("0")
             await self.notifier.send(Outgoing(
@@ -444,8 +522,8 @@ class Monitor:
             except Exception:
                 log.exception("autopilot wake-up failed")
 
-    async def final_report(self, rec: JobRecord, final: Job, analyze: bool = True) -> tuple[Outgoing, str, str]:
-        """(the short Telegram report, the same facts as plain text for the agent, the card's final text)."""
+    async def final_report(self, rec: JobRecord, final: Job) -> tuple[str, str, bool]:
+        """(the facts as plain text for the agent, the card's final text, did it fail)."""
         steps = summarize_steps(await self.hpc.sacct_steps(rec.job_id))
         seff = await self.hpc.seff(rec.job_id)
         out_tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 200))
@@ -477,7 +555,6 @@ class Monitor:
             f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-15000:]}",
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-10000:]}" if err_tail else "",
         ] if x)
-        analysis = await self.reporter.final_analysis(context) if analyze else ""
         # For the agent: the facts first, then the end of the logs; it can read the rest itself.
         for_agent = "\n".join(x for x in [
             context.split("\nBatch script:")[0].split("\n--- stdout")[0],
@@ -486,39 +563,16 @@ class Monitor:
             f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-7000:]}",
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-3000:]}" if err_tail.strip() else "",
         ] if x)
-        rec.report = analysis or "; ".join(f.category for f in findings)
+        rec.report = "; ".join(f.category for f in findings)
         self.store.upsert_job(rec)
-
-        emoji = STATE_EMOJI.get(final.state, "🏁")
-        mem = (f"peak RAM {steps['max_rss']}" + (f" of {steps['req_mem']}" if steps.get("req_mem") else "")
-               if steps.get("max_rss") else "")
-        head = (f"{emoji} <b>{esc(rec.job_id)}</b> {esc(rec.name)} "
-                + (f"finished · {esc(final.elapsed)}" if success else f"{esc(final.state)} after {esc(final.elapsed)}")
-                + (f" · {esc(critical)}" if critical else "")
-                + (f" ({esc(mem)})" if mem and not success and "OUT_OF_MEMORY" in final.state else ""))
-        parts = [head]
-        if analysis:
-            parts.append(f"🧠 {esc(analysis)}")
-        elif findings:
-            parts.append(f"⚠️ <b>{esc(findings[0].category)}</b>: {esc(findings[0].hint)}")
-        if not success:  # the decisive line, always visible
-            decisive = findings[0].evidence if findings else (tb.strip().splitlines()[-1] if tb.strip() else "")
-            if decisive:
-                parts.append(code(decisive[:300]))
-        gpus = gpus_from_tres(final.alloc_tres)
-        facts = [f"exit {final.exit_code} · elapsed {final.elapsed} / {final.time_limit}"
-                 + (f" · {gpus} GPU" if gpus else "") + (f" · {mem}" if mem else ""),
-                 f"array: {tasks}" if tasks else "",
-                 f"{critical} · {important}".strip(" ·") if view["spec"] and (critical or important) else "",
-                 ("metrics: " + ", ".join(f"{k}={v}" for k, v in list(metrics.items())[:12])) if metrics else "",
-                 "\n".join(f"⚠️ {f.category}: {f.hint}" for f in findings[1:4]),
-                 "--- " + ("traceback" if tb else "end of the log") + " ---\n" + (tb or combined.strip())[-1500:]
-                 if (tb or combined.strip()) else ""]
-        parts.append("▸ details" + fold_text("\n".join(x for x in facts if x), 3000))
-        buttons = [[("📜 Log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]]
+        # No separate report: the card's final version is the result - with, for a failure, what went wrong.
+        problem = ""
         if not success:
-            buttons[0].insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
-        buttons += self._assign_buttons(rec)
-        card = self._card_text(rec, None, view, final=final)
-        return Outgoing("\n".join(parts), job_id=rec.job_id, buttons=buttons, silent=success), for_agent, card
+            decisive = findings[0].evidence if findings else (tb.strip().splitlines()[-1] if tb.strip() else "")
+            mem = (f" (peak RAM {steps['max_rss']}" + (f" of {steps['req_mem']}" if steps.get("req_mem") else "") + ")"
+                   if steps.get("max_rss") and "OUT_OF_MEMORY" in final.state else "")
+            problem = (f"⚠️ <b>{esc(findings[0].category)}</b>{esc(mem)}" if findings else "") + (
+                ("\n" if findings else "⚠️ ") + code(decisive[:300]) if decisive else "")
+        card = self._card_text(rec, None, view, final=final, problem=problem)
+        return for_agent, card, not success
 

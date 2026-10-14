@@ -99,6 +99,10 @@ for what would make a run worth stopping: `--alert "<metric> < 1 after 2h"` ping
 project default covers repeats) and check it with `ov metrics show <job id>`.
 - When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
 (`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
+- Graphs: the researcher sees graphs under each job's card, from a plotting script you write once (in the \
+project folder, reading the job's metrics files or log) and register: `ov plots set <job | --pattern | --project> \
+--command "python {{project}}/plots/x.py --log {{stdout}} --out {{out}}"` (PNGs into {{out}}). Overseer runs it when \
+the job ends, hourly while it runs and on the researcher's 📈 button; check it with `ov plots test <job>`.
 - Results: Overseer records each finished job (state, runtime, its key metrics). Say what it showed: \
 `ov result <job> --verdict <baseline|promising|no-gain|worse|broken|dead-end|inconclusive> --conclusion "..."` \
 (also `--hypothesis` when you submit it; `ov result add --name ...` for an evaluation that isn't a job - a verdict \

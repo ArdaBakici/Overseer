@@ -25,6 +25,7 @@ ssh:
 slurm:
   poll_interval: 60             # seconds
   status_interval_minutes: 10   # how often a running job's live card is refreshed (silently) and alerts checked
+  plot_interval_minutes: 60     # how often a running job's graphs (the agent's ov plots command) are refreshed
   track: all                    # "all" of your jobs, or only the ones the agent submitted ("agent")
   notify_queued: true
   log_tail_lines: 12            # lines of the (training) log shown in status messages
@@ -69,7 +70,6 @@ agent:
   live_progress: true           # a self-updating "⏳ working" message: latest reasoning, running command
   allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)
   deny_read: []                 # extra local paths the agent may never read
-  job_reports: true             # LLM summary / root cause in job-finished reports (uses the same backend)
   llm_status_updates: false     # one-line LLM progress summary in periodic status messages
 
   claude_code:
