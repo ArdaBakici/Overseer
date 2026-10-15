@@ -58,6 +58,11 @@ ov metrics list | clear ...
   its last part ("score" finds "crl/train_episode/score").
 - **`--progress metric/total`**: shows progress as steps done out of the total, which is more meaningful
   than time used.
+- **What Overseer reads from the log by itself:**
+  - `name value`, `name=value` and `name: value` for common metric names (step, epoch, loss, reward, score, ...);
+  - every number in JSON records (or printed Python dicts), whatever their names, with nested keys joined with
+    `/`. Printing `{"achievement_pct": 7.9, "return_mean": 2.3}` is enough to use those names.
+  - It skips parameter counts (`reward: 656,129`, `... params`).
 - **`--command`** is for when the values aren't in the log. It must be quick, because it runs on the
   login node at every card refresh (about every 10 minutes) with a 20 s limit.
   - It prints `name=value` lines or one JSON object; nested keys are joined with `/`.

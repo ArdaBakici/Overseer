@@ -3236,3 +3236,20 @@ def test_card_captions_fit_telegram():
     assert out.startswith("🏃 <b>901</b> sweep\n🎯 <b>score 4.1</b>") and "🎮" not in out and "🚨" not in out
     assert "📈" in out and len(out) <= 1000
     assert TelegramNotifier._caption("short\ncard") == "short\ncard"
+
+
+async def test_cards_read_json_records_and_skip_parameter_counts(env):
+    """FB1: a diagnostic job prints its modules' parameter counts and JSON records with the metrics the agent
+    configured. The card shows those (not 'reward 656'), and so does its result."""
+    from test_parsing import DIAG_LOG
+    proj = env.home / "proj"
+    (proj / "slurm-960.out").write_text(DIAG_LOG)
+    env.store.set_metric_spec(MetricSpec(scope="job", key="960", critical="achievement_pct,return_mean"))
+    job = {"name": "ne-diag", "workdir": str(proj), "stdout": str(proj / "slurm-960.out")}
+    env.set_jobs(**{"960": {**job, "state": "RUNNING"}})
+    await env.monitor.poll()
+    env.set_jobs(**{"960": {**job, "state": "COMPLETED", "exit": "0:0"}})
+    await env.monitor.poll()
+    card = env.notifier.card_text("960")
+    assert "🎯 <b>achievement_pct 7.9 · return_mean 2.31</b>" in card and "656" not in card, card
+    assert json.loads(env.store.get_result("960").metrics)["achievement_pct"] == "7.9"

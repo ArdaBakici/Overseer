@@ -171,3 +171,27 @@ def test_job_arrays_fold_into_one_job():
     assert b.job_id == "2" and not b.extra
     (c,) = fold_arrays([Job("3_1", state="COMPLETED"), Job("3_2", state="TIMEOUT"), Job("3_3", state="OUT_OF_MEMORY")])
     assert c.state == "OUT_OF_MEMORY" and c.extra["tasks"] == "1 COMPLETED, 1 TIMEOUT, 1 OUT_OF_MEMORY"
+
+
+# FB1: parameter counts read as metrics; JSON records ignored.
+DIAG_LOG = """Model summary:
+  encoder: 1,234,567
+  reward: 656,129
+  critic 98,305 params
+  value_head: 4096 parameters
+{"phase": "before", "achievement_pct": 3.2, "return_mean": 1.45, "episodes": 20}
+step 1000 loss=0.5
+eval: {'phase': 'mid', 'achievement_pct': 5.0}
+{"phase": "after", "achievement_pct": 7.9, "return_mean": 2.31, "episodes": 20, "nested": {"score": 0.7}}
+"""
+
+
+def test_parameter_counts_are_not_metrics_and_json_records_are():
+    from overseer.diagnose import all_metrics
+    m = all_metrics(DIAG_LOG)
+    assert "reward" not in m and "critic" not in m and "value_head" not in m, m
+    assert m["achievement_pct"] == "7.9" and m["return_mean"] == "2.31", m  # the latest record wins
+    assert m["nested/score"] == "0.7" and m["step"] == "1000" and m["loss"] == "0.5"
+    assert "phase" not in m  # not a number
+    shown = extract_metrics(DIAG_LOG)
+    assert "reward" not in shown and shown.get("return_mean") == "2.31", shown

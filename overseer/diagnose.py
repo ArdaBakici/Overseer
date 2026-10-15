@@ -6,6 +6,8 @@ agent's report); an LLM can add a one-line progress status to status messages (l
 
 from __future__ import annotations
 
+import ast
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -97,26 +99,73 @@ _METRIC_WORDS = (r"epoch|step|iter(?:ation)?|loss|acc(?:uracy)?|lr|ppl|perplexit
 # A metric name, optionally namespaced like episode/score, train/loss/dyn, val_loss or eval.acc.
 METRIC_RE = re.compile(
     r"(?<![\w/.-])((?:[a-z][\w.-]*[/.])*(?:[a-z]+_)?(?:" + _METRIC_WORDS + r")(?:[/.][\w.-]+)*)\b"
-    r"\s*[:=]?\s*\[?\s*(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?![\w.])(?:\s*/\s*(\d+)(?![\w.]))?",
+    r"\s*[:=]?\s*\[?\s*(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?![\w.])(?!,\d{3})(?:\s*/\s*(\d+)(?![\w.]))?",
     re.I,
-)
+)  # (a number with thousands separators, like 656,129, is a count - not a metric's value)
+# Model summaries list parameter counts per module ("reward: 656129 params"): not metrics.
+_PARAM_LINE = re.compile(r"\bparam(?:eter)?s?\b|#\s*params|num_params|trainable", re.I)
 # Shown first: progress, then results, then losses.
 _METRIC_RANK = [r"^(epoch|step|iter)", r"score|return|reward|success", r"(^|[/._])(eval|val|test)", r"acc|f1|bleu|auc",
                 r"loss|ppl|perplexity|mse|mae"]
 
 
-def extract_metrics(log_text: str, limit: int = 10) -> dict[str, str]:
-    """Last seen value of common training metrics, e.g. {'epoch': '3/10', 'loss': '0.412',
-    'episode/score': '3.1'}, at most `limit` of them, most informative first."""
-    metrics: dict[str, str] = {}
-    for m in METRIC_RE.finditer(log_text[-50_000:]):
-        key = m.group(1).lower()
-        metrics[key] = m.group(2) + (f"/{m.group(3)}" if m.group(3) else "")
+def _record(line: str) -> dict | None:
+    """A JSON object (or a printed Python dict) on a log line, e.g. {"achievement_pct": 7.9, "return_mean": 2.3}."""
+    start, end = line.find("{"), line.rfind("}")
+    if start < 0 or end <= start or end - start > 20_000:
+        return None
+    chunk = line[start:end + 1]
+    try:
+        obj = json.loads(chunk)
+    except ValueError:
+        try:
+            obj = ast.literal_eval(chunk)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+    return obj if isinstance(obj, dict) else None
 
+
+def _numbers(obj: dict, prefix: str = "") -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in obj.items():
+        key = f"{prefix}/{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(_numbers(v, key))
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[key] = f"{v:.4g}" if isinstance(v, float) else str(v)
+    return out
+
+
+def all_metrics(log_text: str) -> dict[str, str]:
+    """Every metric a log shows, by its last value: `name value` / `name=value` / `name: value` for common metric
+    names (epoch, step, loss, reward, score, ...), and every number in JSON records printed on their own line (any
+    name, nested keys joined with /). Parameter counts in model summaries are not metrics."""
+    metrics: dict[str, str] = {}
+    for line in log_text[-50_000:].splitlines():
+        record = _record(line) if "{" in line else None
+        if record is not None:
+            metrics.update(_numbers(record))
+            continue
+        if _PARAM_LINE.search(line):
+            continue
+        for m in METRIC_RE.finditer(line):
+            key = m.group(1).lower()
+            metrics[key] = m.group(2) + (f"/{m.group(3)}" if m.group(3) else "")
+    return metrics
+
+
+def rank_metrics(metrics: dict[str, str], limit: int = 10) -> dict[str, str]:
+    """The most informative first (progress, then results, then losses), at most `limit`."""
     def rank(key: str) -> int:
-        return next((i for i, rx in enumerate(_METRIC_RANK) if re.search(rx, key)), len(_METRIC_RANK))
+        return next((i for i, rx in enumerate(_METRIC_RANK) if re.search(rx, key, re.I)), len(_METRIC_RANK))
 
     return dict(sorted(metrics.items(), key=lambda kv: rank(kv[0]))[:limit])
+
+
+def extract_metrics(log_text: str, limit: int = 10) -> dict[str, str]:
+    """Last seen value of a log's metrics, e.g. {'epoch': '3/10', 'loss': '0.412', 'episode/score': '3.1'}, at
+    most `limit` of them, most informative first."""
+    return rank_metrics(all_metrics(log_text), limit)
 
 
 _PATH_RE = re.compile(r"(?<![\w.-])(/[\w./%+=@-]+\.(?:log|out|txt|err|jsonl|csv))\b")

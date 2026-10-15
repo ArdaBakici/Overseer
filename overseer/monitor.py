@@ -12,7 +12,8 @@ import time
 
 from .compute import WORKER_NAME
 from .config import Config
-from .diagnose import Reporter, extract_metrics, extract_traceback, find_issues, find_log_paths, tqdm_cleanup
+from .diagnose import (Reporter, all_metrics, extract_traceback, find_issues, find_log_paths, rank_metrics,
+                       tqdm_cleanup)
 from .hpc import HPC
 from .metrics import check_alerts, fired_alerts, resolve, run_command
 from .metrics import lines as metric_lines
@@ -265,10 +266,11 @@ class Monitor:
         self.store.upsert_job(rec)
         source = log_path or rec.stdout
         text = tqdm_cleanup(await self.hpc.try_tail(source, 200)) if source else ""
-        auto = extract_metrics(text)
+        found = all_metrics(text)  # everything the log shows: configured metrics are looked up here
+        auto = rank_metrics(found)  # (the most informative, for a card without configured metrics)
         spec = resolve(self.store, rec)
         values, err = (await run_command(self.hpc, rec, spec.command)) if spec and spec.command else ({}, "")
-        return {"text": text, "log_path": log_path, "auto": auto, "spec": spec, "values": {**auto, **values},
+        return {"text": text, "log_path": log_path, "auto": auto, "spec": spec, "values": {**found, **values},
                 "err": err}
 
     def _card_text(self, rec: JobRecord, job: Job | None, view: dict, final: Job | None = None,
