@@ -195,3 +195,15 @@ def test_parameter_counts_are_not_metrics_and_json_records_are():
     assert "phase" not in m  # not a number
     shown = extract_metrics(DIAG_LOG)
     assert "reward" not in shown and shown.get("return_mean") == "2.31", shown
+
+
+def test_array_task_logs():
+    from overseer.slurm import Job, fold_arrays, log_template, task_states
+    assert log_template("/r/pair_42_4294967294.out", "42") == "/r/pair_42_%a.out"
+    assert log_template("/r/slurm-42_7.out", "42", "7") == "/r/slurm-42_%a.out"
+    assert log_template("/r/run/t3.log", "42", "3") == "/r/run/t%a.log"
+    assert log_template("/r/run3/t3.log", "42", "3") == ""  # can't tell which 3 is the task's
+    assert log_template("/r/out.log", "42", "3") == ""
+    (a,) = fold_arrays([Job("5_0", state="COMPLETED"), Job("5_1", state="RUNNING"), Job("5_[2-3]", state="PENDING")])
+    assert a.extra["task"] == "1" and task_states(a) == [("0", "COMPLETED"), ("1", "RUNNING")]
+    assert a.extra["task_count"] == "4"

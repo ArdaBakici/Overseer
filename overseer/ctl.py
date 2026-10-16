@@ -641,6 +641,8 @@ class ControlServer:
             f"project: {rec.project or 'main'}" + (f"; conversation: {rec.session_id}" if rec.session_id else ""),
             f"workdir: {rec.workdir}" if rec.workdir else "",
             f"stdout: {rec.stdout}" if rec.stdout else "",
+            (f"job array: each task writes {rec.info_dict['stdout_tpl']} (%a = the task id; sacct -j {rec.job_id} "
+             "lists them)") if rec.info_dict.get("stdout_tpl") else "",
             f"report: {rec.report[:1500]}" if rec.report else "",
         ] if x)
 

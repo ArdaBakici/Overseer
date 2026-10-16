@@ -101,6 +101,32 @@ def _task_count(job_id: str) -> int:
     return max(n, 1)
 
 
+NO_VAL = "4294967294"  # SLURM's "no value": what %a becomes in the log path of an array's not-yet-started tasks
+_TASK_ID = re.compile(r"^\d+_(\d+)$")
+
+
+def task_states(job: Job | None) -> list[tuple[str, str]]:
+    """An array's tasks that have an id of their own (not the pending 123_[4-9]), as (task id, state)."""
+    raw = (job.extra.get("task_states", "") if job else "").split()
+    return [tuple(x.split(":", 1)) for x in raw if ":" in x]  # type: ignore[misc]
+
+
+def log_template(path: str, array_id: str, task: str = "") -> str:
+    """An array task's log path as a template, %a standing for the task id: from the path SLURM shows for one task
+    (`task` in it) or for the array's pending tasks (NO_VAL in place of the id). "" when it can't tell."""
+    if not path:
+        return ""
+    if NO_VAL in path:
+        return path.replace(NO_VAL, "%a")
+    if task.isdigit():
+        if f"{array_id}_{task}" in path:
+            return path.replace(f"{array_id}_{task}", f"{array_id}_%a")
+        hits = list(re.finditer(rf"(?<!\d){task}(?!\d)", path))
+        if len(hits) == 1:
+            return path[:hits[0].start()] + "%a" + path[hits[0].end():]
+    return ""
+
+
 # Which final state an array reports when its tasks ended differently (the worst one wins).
 _SEVERITY = ["OUT_OF_MEMORY", "FAILED", "NODE_FAIL", "BOOT_FAIL", "TIMEOUT", "DEADLINE", "PREEMPTED", "CANCELLED",
              "REVOKED", "COMPLETED"]
@@ -108,7 +134,9 @@ _SEVERITY = ["OUT_OF_MEMORY", "FAILED", "NODE_FAIL", "BOOT_FAIL", "TIMEOUT", "DE
 
 def fold_arrays(jobs: list[Job]) -> list[Job]:
     """A job array's tasks as one job under the array's id (the one sbatch printed): active while any task is,
-    then the worst final state of its tasks. extra["tasks"] summarises them, e.g. "1 RUNNING, 10 PENDING"."""
+    then the worst final state of its tasks. extra["tasks"] summarises them, e.g. "1 RUNNING, 10 PENDING";
+    extra["task_states"] lists the tasks that have an id of their own ("0:COMPLETED 1:RUNNING") and extra["task"] is
+    the one whose state, times and logs the job shows."""
     groups: dict[str, list[Job]] = {}
     for j in jobs:
         groups.setdefault(array_parent(j.job_id), []).append(j)
@@ -127,8 +155,11 @@ def fold_arrays(jobs: list[Job]) -> list[Job]:
             rank = {s: i for i, s in enumerate(_SEVERITY)}
             rep = min(tasks, key=lambda t: rank.get(t.state, len(_SEVERITY) - 1))
         summary = ", ".join(f"{n} {s}" for s, n in sorted(counts.items(), key=lambda kv: -kv[1]))
-        out.append(replace(rep, job_id=parent, extra={**rep.extra, "tasks": summary,
-                                                      "task_count": str(sum(counts.values()))}))
+        own = sorted(((m.group(1), t.state) for t in tasks if (m := _TASK_ID.match(t.job_id))), key=lambda x: int(x[0]))
+        rep_task = _TASK_ID.match(rep.job_id)
+        out.append(replace(rep, job_id=parent, extra={
+            **rep.extra, "tasks": summary, "task_count": str(sum(counts.values())),
+            "task_states": " ".join(f"{i}:{st}" for i, st in own), "task": rep_task.group(1) if rep_task else ""}))
     return out
 
 

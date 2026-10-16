@@ -30,7 +30,9 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
 - Ids are checked: jobs that SLURM doesn't know as the researcher's are refused.
 - Job arrays are one job to Overseer, under the id sbatch printed (`123`, not `123_4`). It's running while any
   task is, and it ends when all tasks have ended. Its report gives the task states (e.g. "9 COMPLETED,
-  2 FAILED"); each task has its own log. Watching an array wakes you when all its tasks have ended.
+  2 FAILED"); each task has its own log. Watching an array wakes you when all its tasks have ended, with
+  each task's state and log path and the end of each log (failed tasks first). Its card and check-ins show the
+  running task's log; `ov job show <id>` gives the tasks' log pattern (%a = the task id).
 - `hpc-run`'s shared worker job (`overseer-worker`) is not one of your jobs. Don't register or watch
   it: `hpc-run` starts, reuses and ends it (`hpc-run --stop` ends it early).
 

@@ -22,8 +22,8 @@ from .quota import parse_quota
 from .plots import resolve_plot, run_plots
 from .results import record_job, snapshot
 from .richtext import fold_text
-from .slurm import (STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
-                    human_seconds, slurm_seconds, summarize_steps)
+from .slurm import (NO_VAL, STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
+                    human_seconds, log_template, slurm_seconds, summarize_steps, task_states)
 from .ssh import SSHError
 from .store import JobRecord, Store
 
@@ -148,6 +148,7 @@ class Monitor:
                 continue
             if not rec.stdout:  # submitted by the agent: fill in details on first sight
                 await self._fill(rec, job)
+            self._follow_task(rec, job)
             prev = rec.state
             rec.state = job.state
             rec.missing_polls = 0
@@ -172,10 +173,13 @@ class Monitor:
                 rec.ended_at, rec.ignored = time.time(), 1
                 self.store.upsert_job(rec)
                 continue
-            final = recent_by_id.get(rec.job_id) or await self.hpc.sacct_job(rec.job_id)
+            final = recent_by_id.get(rec.job_id)
+            if final is None or "tasks" in final.extra:  # (the recent window misses an array's earlier tasks)
+                final = await self.hpc.sacct_job(rec.job_id) or final
             if final and final.is_terminal:
                 if not rec.stdout:
                     await self._fill(rec, final)
+                self._follow_task(rec, final)
                 await self._on_finished(rec, final)
             else:
                 rec.missing_polls += 1
@@ -244,14 +248,72 @@ class Monitor:
 
     async def _fill(self, rec: JobRecord, job: Job) -> None:
         """Look up a job's name, paths and batch script (scontrol only knows recent jobs)."""
-        info = await self.hpc.scontrol_job(job.job_id)
+        records = await self.hpc.scontrol_jobs(job.job_id)
+        # An array's id shows each task, and its pending tasks as one record whose %a is NO_VAL: one task's is real.
+        info = next((r for r in records if r.get("ArrayTaskId", "").isdigit()), records[0] if records else {})
         rec.name = rec.name or info.get("JobName") or job.name
         rec.partition = rec.partition or job.partition or info.get("Partition", "")
         rec.workdir = info.get("WorkDir") or job.workdir or rec.workdir
         rec.stdout = info.get("StdOut") or (f"{rec.workdir}/slurm-{job.job_id}.out" if rec.workdir else "")
         rec.stderr = info.get("StdErr") or rec.stdout
         rec.batch_script = rec.batch_script or await self.hpc.batch_script(job.job_id)
-        rec.info = json.dumps({k: info[k] for k in ("TimeLimit", "TRES", "NumNodes", "Command", "SubmitTime") if k in info})
+        keep = {k: info[k] for k in ("TimeLimit", "TRES", "NumNodes", "Command", "SubmitTime") if k in info}
+        if "tasks" in job.extra or info.get("ArrayJobId"):  # each task writes its own logs: remember their pattern
+            array_id = array_parent(job.job_id)
+            for key, field in (("stdout_tpl", "StdOut"), ("stderr_tpl", "StdErr")):
+                tpl = next((t for r in records if (t := log_template(r.get(field, ""), array_id,
+                                                                     r.get("ArrayTaskId", "")))), "")
+                if not tpl and not records and rec.workdir:  # scontrol forgot it: SLURM's default name
+                    tpl = f"{rec.workdir}/slurm-{array_id}_%a.out"
+                if tpl:
+                    keep[key] = tpl
+        rec.info = json.dumps(keep)
+        self._follow_task(rec, job)
+
+    def _follow_task(self, rec: JobRecord, job: Job | None) -> None:
+        """An array's logs are those of the task its card shows: the running one, at the end the worst one."""
+        info = rec.info_dict
+        if not info.get("stdout_tpl") and NO_VAL in (rec.stdout or ""):  # recorded before task logs were followed
+            info["stdout_tpl"] = rec.stdout.replace(NO_VAL, "%a")
+            info["stderr_tpl"] = (rec.stderr or rec.stdout).replace(NO_VAL, "%a")
+        tpl = info.get("stdout_tpl")
+        own = task_states(job)
+        task = (job.extra.get("task") if job else "") or (own[0][0] if own else "")
+        if tpl and task:
+            out, err = tpl.replace("%a", task), (info.get("stderr_tpl") or tpl).replace("%a", task)
+            if out != rec.stdout:
+                rec.stdout, rec.stderr = out, err
+                info.pop("progress_log", None)  # (found in the task's stdout)
+        if info != rec.info_dict:
+            rec.info = json.dumps(info)
+
+    def task_logs(self, rec: JobRecord, job: Job | None) -> list[tuple[str, str, str, str]]:
+        """An array's tasks that have run or run now: (task id, state, stdout, stderr)."""
+        info = rec.info_dict
+        tpl = info.get("stdout_tpl")
+        if not tpl:
+            return []
+        err = info.get("stderr_tpl") or tpl
+        return [(t, st, tpl.replace("%a", t), err.replace("%a", t)) for t, st in task_states(job) if st != "PENDING"]
+
+    async def _task_report(self, rec: JobRecord, final: Job) -> str:
+        """For the agent, about an array: each task's state and logs, and the end of the other tasks' logs (failed
+        ones first; the task the card shows is in the stdout tail already)."""
+        tasks = self.task_logs(rec, final)
+        if len(tasks) < 2:
+            return ""
+        lines = ["Its tasks (state, stdout" + (", stderr" if any(o != e for _, _, o, e in tasks) else "") + "):"]
+        lines += [f"  task {t}: {st} {o}" + (f" {e}" if e != o else "") for t, st, o, e in tasks[:40]]
+        if len(tasks) > 40:
+            lines.append(f"  … {len(tasks) - 40} more: {rec.info_dict['stdout_tpl']} with %a = the task id")
+        bad = [x for x in tasks if x[1] not in SUCCESS_STATES]
+        others = [x for x in bad + [x for x in tasks if x not in bad] if x[2] != rec.stdout][:6]
+        for t, st, o, e in others:
+            tail = tqdm_cleanup(await self.hpc.try_tail(o, 60 if st not in SUCCESS_STATES else 25))
+            if e != o and st not in SUCCESS_STATES:
+                tail += "\n" + tqdm_cleanup(await self.hpc.try_tail(e, 30))
+            lines.append(f"--- task {t} ({st}) tail of {o} ---\n{tail.strip()[-2500:] or '(empty or unreadable)'}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ events
     def _header(self, rec: JobRecord, emoji: str, verb: str) -> str:
@@ -541,15 +603,19 @@ class Monitor:
             record_job(self.store, rec, final, snapshot(view["spec"], metrics))
 
         tasks = final.extra.get("tasks")
+        shown = final.extra.get("task")
+        task_report = await self._task_report(rec, final) if tasks else ""
         context = "\n".join(x for x in [
             f"Job {rec.job_id} '{rec.name}' final state {final.state}, exit code {final.exit_code}",
             (f"It is a job array of {final.extra.get('task_count')} tasks: {tasks}. The state, exit code and times are "
-             "those of its worst task; each task has its own log (the logs below may be one task's)") if tasks else "",
+             f"those of its worst task{f' (task {shown})' if shown else ''}; the stdout tail below is "
+             f"{f'task {shown}' if shown else 'one task'}'s") if tasks else "",
             f"Elapsed {final.elapsed} of limit {final.time_limit}; partition {final.partition}; nodes {final.nodelist}",
             f"Allocated TRES: {final.alloc_tres}",
             f"Step summary: {json.dumps(steps)}",
             f"seff:\n{seff}" if seff else "",
             f"Heuristic findings: {[f.category + ': ' + f.evidence for f in findings]}",
+            task_report,
             f"Batch script:\n{rec.batch_script[:6000]}" if rec.batch_script else "",
             f"--- stdout tail ({rec.stdout}) ---\n{out_tail[-15000:]}",
             f"--- stderr tail ({rec.stderr}) ---\n{err_tail[-10000:]}" if err_tail else "",

@@ -139,8 +139,15 @@ class HPC:
         return parse_sacct_steps(res.stdout)
 
     async def scontrol_job(self, job_id: str) -> dict[str, str]:
+        jobs = await self.scontrol_jobs(job_id)
+        return jobs[0] if jobs else {}
+
+    async def scontrol_jobs(self, job_id: str) -> list[dict[str, str]]:
+        """`scontrol show job`: one record, or for an array's id one per task (and one for its pending tasks)."""
         res = await self.run(self._slurm(["scontrol", "show", "job", "-o", job_id]))
-        return parse_scontrol(res.stdout) if res.ok else {}
+        if not res.ok:
+            return []
+        return [d for d in (parse_scontrol(line) for line in res.stdout.splitlines() if line.strip()) if d]
 
     async def batch_script(self, job_id: str) -> str:
         res = await self.run(self._slurm(["scontrol", "write", "batch_script", job_id, "-"]), max_output=500_000)

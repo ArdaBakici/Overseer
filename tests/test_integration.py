@@ -2244,6 +2244,79 @@ async def test_job_arrays_are_one_job(env):
     assert "[Wake-up you set up]" in stdin and "job array of 4 tasks: 3 COMPLETED, 1 FAILED" in stdin
 
 
+def replace_jobs(env, **jobs):
+    st = env.slurm()
+    st["jobs"] = jobs
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+
+
+async def test_array_tasks_logs_are_their_own(env):
+    """FB2: for an array's pending tasks SLURM puts NO_VAL (4294967294) where %a goes in the log path. The array's
+    logs are its tasks' own (the running one on the card); at the end the agent gets every task's state and log, and
+    all the tasks - also the ones that ended before sacct's recent window."""
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    logs = env.home / "proj" / "runs" / "slurm"
+    logs.mkdir(parents=True)
+    (logs / "ne-ratio-pair_8100_0.out").write_text("ratio 32: achievement_pct=41.5\n")
+    (logs / "ne-ratio-pair_8100_1.out").write_text("ratio 128: achievement_pct=47.25\n")
+    task = {"name": "ne-ratio-pair", "workdir": str(env.home / "proj"),
+            "stdout": str(logs / "ne-ratio-pair_8100_%a.out")}
+    env.set_jobs(**{"8100_[0-1]": {**task, "state": "PENDING"}})
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, ["watch", "8100"])
+    assert ok, text
+    await env.monitor.poll()
+    rec = env.store.get_job("8100")
+    assert rec.info_dict["stdout_tpl"] == str(logs / "ne-ratio-pair_8100_%a.out"), rec.info
+
+    replace_jobs(env, **{"8100_0": {**task, "state": "RUNNING"}, "8100_[1]": {**task, "state": "PENDING"}})
+    await env.monitor.poll()
+    rec = env.store.get_job("8100")
+    assert rec.stdout == str(logs / "ne-ratio-pair_8100_0.out") and "4294967294" not in rec.stderr, rec
+
+    # Task 0 ended long ago (outside sacct's recent window, and scontrol forgot it); task 1 just now.
+    n = len([c for c in env.cli_log() if c["prog"] == "claude"])
+    replace_jobs(env, **{"8100_0": {**task, "state": "COMPLETED", "ended_long_ago": True, "scontrol_gone": True},
+                    "8100_1": {**task, "state": "COMPLETED"}})
+    await env.monitor.poll()
+    await env.monitor.poll()
+    await ap.drain()
+    card = env.notifier.card_text("8100")
+    assert "📦 array: 2 COMPLETED" in card, card
+    stdin = [c for c in env.cli_log() if c["prog"] == "claude"][n]["stdin"]
+    assert "job array of 2 tasks: 2 COMPLETED" in stdin, stdin
+    assert "4294967294" not in stdin, stdin
+    for i, value in ((0, "41.5"), (1, "47.25")):
+        assert f"task {i}: COMPLETED {logs}/ne-ratio-pair_8100_{i}.out" in stdin, stdin
+        assert value in stdin, stdin
+
+
+async def test_array_records_with_no_val_logs_are_repaired(env):
+    """Records stored with the NO_VAL path (before FB2 was fixed) get their tasks' logs at the end."""
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    (proj / "pair_8200_1.out").write_text("Traceback (most recent call last):\nValueError: ratio must be > 0\n")
+    (proj / "pair_8200_0.out").write_text("done: return_mean=3.5\n")
+    env.store.upsert_job(JobRecord(job_id="8200", name="pair", state="RUNNING", first_seen=time.time(), by_agent=1,
+                                   session_id=s.id, workdir=str(proj), stdout=str(proj / "pair_8200_4294967294.out"),
+                                   stderr=str(proj / "pair_8200_4294967294.out")))
+    token = env.ctl.open(s.id)
+    assert (await env.ctl.handle(token, ["watch", "8200"]))[0]
+    env.set_jobs(**{"8200_0": {"name": "pair", "state": "COMPLETED", "scontrol_gone": True},
+                    "8200_1": {"name": "pair", "state": "FAILED", "exit": "1:0", "scontrol_gone": True}})
+    n = len([c for c in env.cli_log() if c["prog"] == "claude"])
+    await env.monitor.poll()
+    await ap.drain()
+    rec = env.store.get_job("8200")
+    assert rec.stdout == str(proj / "pair_8200_1.out"), rec  # the failed task's
+    card = env.notifier.card_text("8200")
+    assert "FAILED after" in card and "ratio must be" in card, card
+    stdin = [c for c in env.cli_log() if c["prog"] == "claude"][n]["stdin"]
+    assert "ValueError: ratio must be > 0" in stdin and "return_mean=3.5" in stdin, stdin
+
+
 async def test_old_records_of_array_tasks_become_the_array(env):
     """Records of single tasks (6300_2), stored before arrays were tracked as one job, never show up in squeue
     again: they become the array's record, silently, instead of "left the queue" for each task."""

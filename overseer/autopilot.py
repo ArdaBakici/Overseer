@@ -357,7 +357,10 @@ class Autopilot:
             parts.append("\n".join(x for x in [
                 f"<job id='{rec.job_id}' name='{rec.name}' state='RUNNING' elapsed='{job.elapsed}' "
                 f"time_limit='{job.time_limit}' node='{job.reason}' stdout='{rec.stdout}' stderr='{rec.stderr}'>",
-                f"job array tasks: {tasks}" if tasks else "",
+                (f"job array tasks: {tasks}" + (f"; the logs above are task {job.extra['task']}'s, each task "
+                                                f"writes {rec.info_dict['stdout_tpl']} (%a = its id)"
+                                                if job.extra.get("task") and rec.info_dict.get("stdout_tpl") else ""))
+                if tasks else "",
                 f"latest metrics: {metrics}" if metrics else "",
                 f"<stdout_tail>\n{tail[-6000:]}\n</stdout_tail>" if tail.strip() else "(no output yet)",
                 f"<stderr_tail>\n{err[-3000:]}\n</stderr_tail>" if err.strip() else "",

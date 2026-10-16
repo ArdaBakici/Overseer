@@ -60,6 +60,8 @@ elif prog == "sacct":
     for jid, j in jobs.items():
         if sel and jid != sel and jid.split("_")[0] != sel:  # like sacct: an array's id lists its tasks
             continue
+        if not sel and j.get("ended_long_ago"):  # outside `sacct -S now-N`'s window
+            continue
         if "-X" in args:
             print("|".join([jid, j["name"], j["state"], j.get("exit", "0:0"), j.get("elapsed", "00:10:00"),
                             j.get("time_limit", "01:00:00"), "s", "e", j.get("partition", "gpu"), "n1",
@@ -70,13 +72,20 @@ elif prog == "sacct":
 elif prog == "scontrol":
     if args[:2] == ["show", "job"]:
         jid = args[-1]
-        j = jobs.get(jid) or next((v for k, v in jobs.items() if k.split("_")[0] == jid), None)  # an array's tasks
-        if not j:
+        # like scontrol: an array's id shows each of its tasks; for its pending tasks (123_[2-4]) %a is NO_VAL
+        found = [(jid, jobs[jid])] if jid in jobs else [(k, v) for k, v in jobs.items() if k.split("_")[0] == jid]
+        found = [(k, v) for k, v in found if not v.get("scontrol_gone")]
+        if not found:
             sys.exit(1)
         import getpass
-        print(f"JobId={jid} JobName={j['name']} UserId={j.get('user') or getpass.getuser()}(1000) "
-              f"JobState={j['state']} WorkDir={j.get('workdir', '')} "
-              f"StdErr={j.get('stderr', '')} StdOut={j.get('stdout', '')} TimeLimit=01:00:00")
+        for k, j in found:
+            task = k.split("_", 1)[1] if "_" in k else ""
+            a = task if task.isdigit() else "4294967294"
+            arr = f"ArrayJobId={k.split('_')[0]} ArrayTaskId={task.strip('[]')} " if task else ""
+            print(f"JobId={k} {arr}JobName={j['name']} UserId={j.get('user') or getpass.getuser()}(1000) "
+                  f"JobState={j['state']} WorkDir={j.get('workdir', '')} "
+                  f"StdErr={j.get('stderr', '').replace('%a', a)} StdOut={j.get('stdout', '').replace('%a', a)} "
+                  "TimeLimit=01:00:00")
     elif args[:2] == ["write", "batch_script"]:
         j = jobs.get(args[2])
         if not j:
