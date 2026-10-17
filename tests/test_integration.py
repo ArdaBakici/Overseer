@@ -2719,6 +2719,98 @@ async def test_search_past_work(env):
     assert "Usage: /search" in replies[-1]
 
 
+async def test_dashboard(env):
+    """The Mini App's server: the page for anyone (it holds no data), the data only with Telegram's signed launch
+    data of an allowed user; read-only; graphs, logs, results, findings and the timeline."""
+    from tests.test_parsing import sign_init_data
+    from overseer.dashboard import Dashboard
+    from overseer.store import FindingRecord, ResultRecord
+    token = "123:abc"
+    env.cfg.dashboard.port = 0
+    proj = env.home / "proj"
+    (proj / "slurm-951.out").write_text("epoch 9 return=3.5\n")
+    env.set_jobs(**{"951": {"name": "ne-run", "state": "RUNNING", "workdir": str(proj),
+                            "stdout": str(proj / "slurm-951.out"), "start": "2026-10-17T08:00:00"},
+                    "952": {"name": "ne-old", "state": "FAILED", "start": "2026-10-16T08:00:00",
+                            "end": "2026-10-16T09:00:00"}})
+    await env.monitor.poll()
+    env.store.set("cardview:951", json.dumps(["🏃 <b>951</b> ne-run · n1\n🎯 <b>return 3.5</b>", []]))  # (Telegram's)
+    env.store.save_result(ResultRecord(id="951", name="ne-run", verdict="promising", metrics=json.dumps({"return": 3.5})))
+    env.store.save_result(ResultRecord(id="r1", name="by eye", conclusion="looks <b>fine</b>"))
+    env.store.add_finding(FindingRecord(project=None, kind="insight", text="warmup helps"))
+    cache = env.cfg.local.state("plots", "951")
+    cache.mkdir(parents=True)
+    (cache / "00-curve.png").write_bytes(b"\x89PNG fake")
+    d = Dashboard(env.cfg, env.store, env.monitor, env.hpc, token)
+    await d.start()
+    allowed = env.cfg.telegram.allowed_chat_ids[0]
+
+    async def get(path, init=None, method="GET"):
+        r, w = await asyncio.open_connection("127.0.0.1", d.port)
+        hdr = f"X-Telegram-Init-Data: {init}\r\n" if init else ""
+        w.write(f"{method} {path} HTTP/1.1\r\nHost: x\r\n{hdr}\r\n".encode())
+        await w.drain()
+        raw = await r.read()
+        w.close()
+        head, _, body = raw.partition(b"\r\n\r\n")
+        return int(head.split()[1]), head.decode(), body
+
+    try:
+        good = sign_init_data(token, allowed)
+        status, head, body = await get("/")
+        assert status == 200 and b"<nav" in body and "Content-Security-Policy" in head and "no-store" in head
+        assert "'unsafe-inline' https://telegram.org" not in head  # scripts: only its own file and Telegram's
+        status, head, body = await get("/app.js")
+        assert status == 200 and b"X-Telegram-Init-Data" in body
+        assert (await get("/api/overview"))[0] == 401
+        assert (await get("/api/overview", sign_init_data(token, allowed + 1)))[0] == 401
+        assert (await get("/api/overview", sign_init_data("9:other", allowed)))[0] == 401
+        assert (await get("/api/overview", good, method="POST"))[0] == 405
+
+        status, _, body = await get("/api/overview", good)
+        data = json.loads(body)
+        assert status == 200 and {j["id"] for j in data["jobs"]} >= {"951"}, data
+        j = next(j for j in data["jobs"] if j["id"] == "951")
+        assert j["state"] == "RUNNING" and j["plots"] == 1 and j["card"] == "🏃 951 ne-run · n1\n🎯 return 3.5", j
+        res = json.loads((await get("/api/results", good))[2])
+        assert res["metric_keys"] == ["return"] and {r["id"] for r in res["rows"]} == {"951", "952", "r1"}
+        assert json.loads((await get("/api/findings", good))[2])["rows"][0]["text"] == "warmup helps"
+        tl = json.loads((await get("/api/timeline?days=30", good))[2])
+        assert {x["id"]: x["end"] for x in tl["jobs"]} == {"951": "", "952": "2026-10-16T09:00:00"}, tl
+        status, head, body = await get("/api/plot/951/0", good)
+        assert status == 200 and "image/png" in head and body == b"\x89PNG fake"
+        assert (await get("/api/plot/951/1", good))[0] == 404
+        assert (await get("/api/plot/..%2F..%2Fetc/0", good))[0] == 404
+        assert (await get("/api/plot/../0", good))[0] == 404
+        log_ = json.loads((await get("/api/log/951?lines=20", good))[2])
+        assert "epoch 9 return=3.5" in log_["text"] and log_["path"].endswith("slurm-951.out"), log_
+        assert "doesn't track" in json.loads((await get("/api/log/999", good))[2])["error"]
+        assert (await get("/nothing", good))[0] == 404
+    finally:
+        await d.stop()
+
+    # /dashboard: the button when the address is set, how to set it up otherwise.
+    from overseer.bot import Bot
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    bot.reply = reply
+    await bot.cmd_dashboard(None, NS(args=[]))
+    assert "tailscale serve --bg 8765" in replies[-1] and "funnel" in replies[-1]
+    bot.dashboard = d
+    env.cfg.dashboard.url = "https://homelab.tail1234.ts.net"
+    sent = []
+
+    async def reply_text(text, reply_markup=None, **kw):
+        sent.append((text, reply_markup))
+    await bot.cmd_dashboard(NS(effective_message=NS(reply_text=reply_text)), NS(args=[]))
+    button = sent[-1][1].inline_keyboard[0][0]
+    assert button.web_app.url == "https://homelab.tail1234.ts.net" and "Open the dashboard" in button.text
+
+
 def test_stalled_alert(env):
     from overseer.metrics import check_alerts, parse_alert
     from overseer.store import MetricSpec

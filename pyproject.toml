@@ -24,7 +24,7 @@ overseer = "overseer.__main__:main"
 include = ["overseer*"]
 
 [tool.setuptools.package-data]
-overseer = ["skills/*/SKILL.md"]
+overseer = ["skills/*/SKILL.md", "dashboard.html", "dashboard.js"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

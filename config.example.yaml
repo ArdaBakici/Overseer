@@ -112,6 +112,13 @@ digest:
   enabled: true
   time: "08:00"                 # this machine's local time
 
+# The dashboard Mini App (/dashboard): served on this machine, reachable only on your tailnet.
+# Run `tailscale serve --bg 8765` once and put the https://….ts.net address it prints in url.
+dashboard:
+  enabled: false
+  port: 8765
+  url: ""                       # e.g. https://homelab.tail1234.ts.net
+
 # Projects: each gets its own Telegram topic, conversations, jobs, notes (OVERSEER.md in its folder) and agent
 # settings. You can also create them from Telegram: /project new <name> <dir> [what it's about].
 # Topics in the chat with the bot need its topic mode ("threaded mode"), switched on in @BotFather.

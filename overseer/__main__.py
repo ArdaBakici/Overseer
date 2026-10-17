@@ -75,6 +75,12 @@ def build(cfg: Config):
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
         tasks.append(asyncio.create_task(digest.loop(), name="digest"))
+        if dashboard:
+            try:
+                await dashboard.start()
+            except OSError as e:
+                log.error("dashboard: can't listen on %s:%s (%s)", cfg.dashboard.host, cfg.dashboard.port, e)
+            await bot.set_dashboard_button()
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
             ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
@@ -82,7 +88,8 @@ def build(cfg: Config):
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
             ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
-            ("digest", "what happened since the last digest"), ("search", "search past work"), ("cluster", "free GPUs, when queued jobs start"),
+            ("digest", "what happened since the last digest"), ("search", "search past work"),
+            ("dashboard", "jobs, results, findings, timeline"), ("cluster", "free GPUs, when queued jobs start"),
             ("subagents", "planner mode: on/off, models, threads"),
             ("results", "experiments and what each showed"), ("findings", "insights and dead ends"),
             ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"), ("project", "projects: list, new, context, notes"),
@@ -99,6 +106,8 @@ def build(cfg: Config):
         for t in tasks:
             t.cancel()
         await ctl.stop()
+        if dashboard:
+            await dashboard.stop()
 
     app = (
         Application.builder()
@@ -134,6 +143,11 @@ def build(cfg: Config):
     digest = Digest(cfg, store, hpc, notifier, agent, monitor)  # the morning digest, in the general topic
     bot = Bot(cfg, app, store, hpc, monitor, agent, notifier, projects)
     bot.digest = digest
+    dashboard = None
+    if cfg.dashboard.enabled:  # the Mini App: on this machine, reachable on your tailnet via `tailscale serve`
+        from .dashboard import Dashboard
+        dashboard = Dashboard(cfg, store, monitor, hpc, cfg.telegram.token)
+    bot.dashboard = dashboard
     bot.register()
     return app
 

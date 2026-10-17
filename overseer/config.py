@@ -301,6 +301,16 @@ class DigestConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """The dashboard Mini App (dashboard.py): served on this machine; make it reachable on your tailnet with
+    `tailscale serve --bg <port>` and put the https://<machine>.<tailnet>.ts.net address it prints in `url`."""
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8765
+    url: str = ""  # what Telegram opens (https, e.g. https://homelab.tail1234.ts.net); "" = not reachable yet
+
+
+@dataclass
 class Config:
     local: LocalConfig = field(default_factory=LocalConfig)
     ssh: SSHConfig = field(default_factory=SSHConfig)
@@ -308,6 +318,7 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
     # ---- derived SSH paths (all inside the allowed local folders)
@@ -369,6 +380,9 @@ class Config:
         self.agent.codex.web_search = {True: "live", False: "disabled"}.get(ws, ws) if isinstance(ws, bool) else ws
         if self.agent.codex.web_search not in ("live", "cached", "disabled"):
             raise ConfigError("agent.codex.web_search must be live, cached or disabled")
+        if self.dashboard.url and not self.dashboard.url.startswith("https://"):
+            raise ConfigError("dashboard.url must be https:// (Telegram only opens Mini Apps over HTTPS): the address "
+                              "`tailscale serve` prints")
         if self.digest.time and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", self.digest.time.strip()):
             raise ConfigError("digest.time must be HH:MM, e.g. 08:00")
         if self.slurm.track not in ("all", "agent"):

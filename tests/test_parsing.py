@@ -1,3 +1,4 @@
+import json
 from overseer.diagnose import extract_metrics, extract_traceback, find_issues, tqdm_cleanup
 from overseer.notify import split_message
 from overseer.slurm import (
@@ -247,3 +248,30 @@ def test_search_query():
     assert parse_since("") == 0 and parse_since("7d") > 0
     with pytest.raises(SearchError):
         parse_since("yesterday")
+
+
+def sign_init_data(token: str, user_id: int, auth_date: int | None = None, extra: str = "") -> str:
+    """Telegram's Mini App launch data, signed the way Telegram signs it."""
+    import hashlib
+    import hmac
+    import time
+    from urllib.parse import urlencode
+    fields = {"auth_date": str(auth_date or int(time.time())), "query_id": "AAH",
+              "user": json.dumps({"id": user_id, "first_name": "A"})}
+    check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields) + extra
+
+
+def test_init_data_verification():
+    import time
+    from overseer.dashboard import verify_init_data
+    tok = "123:abc"
+    assert verify_init_data(sign_init_data(tok, 42), tok, [42]) == 42
+    assert verify_init_data(sign_init_data(tok, 42), tok, [7]) is None  # not an allowed user
+    assert verify_init_data(sign_init_data("999:other", 42), tok, [42]) is None  # another bot's
+    assert verify_init_data(sign_init_data(tok, 42, int(time.time()) - 2 * 86400), tok, [42]) is None  # too old
+    assert verify_init_data(sign_init_data(tok, 42, extra="&user=x"), tok, [42]) is None  # a field twice
+    assert verify_init_data(sign_init_data(tok, 42).replace("A%22", "B%22"), tok, [42]) is None  # changed
+    assert verify_init_data("", tok, [42]) is None and verify_init_data("garbage", tok, [42]) is None

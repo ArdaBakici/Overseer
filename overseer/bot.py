@@ -85,6 +85,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /cluster [partition] — free GPUs and CPUs per partition, when your queued jobs should start, your fairshare
 /digest — what happened since the last digest (one comes every morning)
 /search &lt;text&gt; — past conversations, results, findings and jobs
+/dashboard — jobs, results, findings and a timeline in a Mini App (on your tailnet)
 /health — connection status
 
 <b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
@@ -833,6 +834,7 @@ class Bot:
         self._uploads: dict[tuple[int, int | None], dict] = {}  # files received, not yet given to the agent
         self.digest = None  # digest.Digest (the morning digest), set by the app
         self._searcher = None  # search.Search (/search), made on first use
+        self.dashboard = None  # dashboard.Dashboard (the Mini App), when dashboard.enabled
 
     def register(self) -> None:
         allowed = filters.Chat(chat_id=self.cfg.telegram.allowed_chat_ids)
@@ -853,6 +855,7 @@ class Bot:
         add(CommandHandler("cluster", self.cmd_cluster, filters=allowed))
         add(CommandHandler("digest", self.cmd_digest, filters=allowed))
         add(CommandHandler("search", self.cmd_search, filters=allowed))
+        add(CommandHandler("dashboard", self.cmd_dashboard, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
@@ -1182,6 +1185,36 @@ class Bot:
             return
         names = {r.job_id: r.name for r in self.store.active_jobs()}
         await self.reply(update, "🖥 " + self.monitor.cluster.text(snap, names, partition=partition, html=True))
+
+    DASHBOARD_SETUP = (
+        "The dashboard needs two settings in config.yaml, then a restart:\n"
+        "1. <code>dashboard: {enabled: true}</code> - Overseer serves it on this machine (127.0.0.1:8765).\n"
+        "2. On the homelab: <code>tailscale serve --bg 8765</code>. It prints an https://….ts.net address, reachable "
+        "only on your tailnet (not the internet: that would be <i>funnel</i>). Put it in <code>dashboard.url</code>.\n"
+        "Then /dashboard opens it, from any of your devices with Tailscale on.")
+
+    async def cmd_dashboard(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        url = self.dashboard.url if self.dashboard else ""
+        if not url:
+            await self.reply(update, self.DASHBOARD_SETUP)
+            return
+        from telegram import WebAppInfo
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Open the dashboard", web_app=WebAppInfo(url))]])
+        await update.effective_message.reply_text(
+            "Jobs, results, findings and a timeline (read-only; only on your tailnet).", reply_markup=markup)
+
+    async def set_dashboard_button(self) -> None:
+        """The chat's menu button opens the dashboard (when it's reachable)."""
+        url = self.dashboard.url if self.dashboard else ""
+        if not url:
+            return
+        from telegram import MenuButtonWebApp, WebAppInfo
+        for chat_id in self.cfg.telegram.allowed_chat_ids:
+            try:
+                await self.app.bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonWebApp(
+                    "Dashboard", WebAppInfo(url)))
+            except Exception as e:  # (not fatal: /dashboard still works)
+                log.warning("dashboard menu button for chat %s: %s", chat_id, e)
 
     async def cmd_search(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Past work: conversations, results, findings, jobs (in a project's topic: that project's)."""
