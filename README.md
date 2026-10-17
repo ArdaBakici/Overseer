@@ -6,6 +6,9 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **A live card per job:** each job gets one message in its project's "📊 jobs" topic, edited in place and silently as it goes from queued to running. It shows the node, time used and left, progress, and the metrics that matter.
   - **When a job ends:** its card is the result, with no separate report. It shows ✅/❌, runtime and the key metrics, plus the decisive error line and a 🔧 Fix button for a failure. Graphs from the agent's plotting script appear under it.
   - **Why it failed:** heuristics flag CUDA OOM, host OOM, time limits, NCCL errors, missing modules, NaNs and similar. An LLM root-cause summary is added on top.
+- **Idle GPUs.** Overseer samples the GPUs of running jobs every 10 minutes (`srun --overlap nvidia-smi`, five readings a second apart). When all of a job's GPUs stay at most 5% busy for 30 minutes, its card gets a 💤 line, you're told under the card, and the agent watching the job is woken to find out why (a hang, data loading, a CPU-only bug) and stop or fix it. Once per idle spell.
+- **Morning digest.** Every morning at 08:00, one message in the general topic: the jobs that ended (failed first) and the ones running or queued, the GPU-hours your jobs used, new results and findings, what each agent did and is waiting for, tokens and cost, and what waits for you. No model involved. `/digest` shows it any time.
+- **Cluster awareness.** `ov cluster` (and `/cluster` for you) shows, per partition, the nodes up, free GPUs and their type, the most GPUs free on one node, free CPUs and RAM, and the time limit, plus SLURM's estimated start of your queued jobs and your fairshare. Agents check it before choosing where to submit; a queued job's card shows its estimated start.
 - **Job arrays.** An array is one job, under the id `sbatch` printed. It's running while any task is, and its report gives the task states ("📦 job array: 9 COMPLETED, 2 FAILED"). It ends with the worst task's state once all its tasks have ended, and the agent's wake-up lists each task with its own log (never the `4294967294` path SLURM gives the array's pending tasks).
 - **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
   - **Visibility:** while it works, one message updates itself with its latest reasoning and the command it is running. Afterwards you see every command it ran, and you get a message the moment it submits a job.
@@ -183,6 +186,8 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/feedback [all\|review [focus]]`, `/skills` | what agents reported about Overseer (in the 🛠 feedback topic); review: an agent groups it and designs fixes. Skills agents proposed and you installed (below) |
 | `/subagents [on\|off]` | planner mode in this project: the agent plans and delegates to subagents on cheaper models (below). The agent can also propose it for one conversation, and you approve or decline |
 | `/auto <goal>` | ask the agent to work on a goal on its own (below). As a reply to a message, it applies to that conversation. `/auto` lists pending wake-ups, `/auto off` cancels them (in this thread, topic, or replied-to conversation) |
+| `/digest` | what happened since the last digest (one comes every morning, `digest.time`) |
+| `/cluster [partition]` | free GPUs, CPUs and RAM per partition, time limits, when your queued jobs should start (SLURM's estimate), your fairshare |
 | `/usage [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
@@ -403,6 +408,8 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 - `slurm.quota_command`, `quota_check_hours`, `quota_warn_percent`: the disk quota check (above). The command's output must be a table like `myquota`'s: size, quota (%), files, quota (%). Set it to `""` to turn the check off.
 - `slurm.compute`: the partition, cores, memory and hours of the shared worker, how long it may stay idle, how long `hpc-run` waits for a node, the GPU partition and gres for `--gpu`, extra `sbatch` flags (e.g. an account), the login-node CPU limit (`login_cpu_seconds`, 0 = off) and the warning threshold.
 - `slurm.status_interval_minutes`: how often a running job's card is refreshed and the agent's alerts on it checked (10).
+- `slurm.idle_gpu_minutes` (30, 0 = off), `idle_gpu_percent` (5), `idle_gpu_sample_minutes` (10): the idle-GPU alarm. Each sample is one short `srun --overlap` step inside the job.
+- `digest.time` (`"08:00"`, this machine's local time) and `digest.enabled`: the morning digest.
 - `agent.autopilot`: the shortest interval for check-ins and repeating timers (`min_checkin_minutes`, 15), and how long a repeating timer lasts when the agent doesn't say (`repeat_hours`, 24). Settings from the old approval-based autopilot are ignored.
 - `agent.allowed_domains`: give the agent's local shell internet access to specific hosts (e.g. `pypi.org`). Its web search and fetch tools work regardless, because they run on the model provider's side.
 - Anything the agent reads is sent to the model provider of the backend you use.
@@ -431,6 +438,8 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `autopilot.py` | watches and timers that wake conversations, check-ins, pausing after a failed wake-up |
 | `metrics.py` | what matters in a job (`ov metrics`): critical/important metrics, progress, the extraction command, alerts |
 | `usage.py` | `/usage`: tokens and cost per day, by origin, backend and conversation |
+| `cluster.py` | `ov cluster`, `/cluster`, queued cards' estimated start: free GPUs/CPUs per partition, SLURM's start estimates, fairshare |
+| `digest.py` | the morning digest (and `/digest`): jobs, GPU time, results, agents, tokens |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
 | `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches and timers, notifications); installs the `overseer` skill |
 | `compute.py` | `hpc-run` and the shared compute worker, the agent's ssh wrapper with the login-node CPU limit |

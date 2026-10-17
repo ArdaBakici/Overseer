@@ -85,6 +85,7 @@ class Subagents:
         """Wait for subagent runs and planner wake-ups in flight (tests)."""
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            await asyncio.sleep(0)  # (finished tasks leave the set in a callback: let it run)
 
     # ------------------------------------------------------------------ checks
     def _check(self, planner, name: str, task: str, backend: str | None, model: str | None,

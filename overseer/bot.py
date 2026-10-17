@@ -82,6 +82,8 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /feedback [all|review] — what agents reported about Overseer; review: an agent designs fixes · /skills — installed skills
 /subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents, each in a thread
 /usage [today|yesterday|week] — tokens and cost of the agent's runs
+/cluster [partition] — free GPUs and CPUs per partition, when your queued jobs should start, your fairshare
+/digest — what happened since the last digest (one comes every morning)
 /health — connection status
 
 <b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
@@ -828,6 +830,7 @@ class Bot:
         self._pending: dict[tuple[int, int | None], str] = {}  # new thread -> its first message, until a project is picked
         self._pending_files: dict[tuple[int, int | None], list[tuple[str, Path]]] = {}  # ...and the files sent with it
         self._uploads: dict[tuple[int, int | None], dict] = {}  # files received, not yet given to the agent
+        self.digest = None  # digest.Digest (the morning digest), set by the app
 
     def register(self) -> None:
         allowed = filters.Chat(chat_id=self.cfg.telegram.allowed_chat_ids)
@@ -845,6 +848,8 @@ class Bot:
         add(CommandHandler("compact", self.cmd_compact, filters=allowed))
         add(CommandHandler("update", self.cmd_update, filters=allowed))
         add(CommandHandler("usage", self.cmd_usage, filters=allowed))
+        add(CommandHandler("cluster", self.cmd_cluster, filters=allowed))
+        add(CommandHandler("digest", self.cmd_digest, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
@@ -1164,6 +1169,27 @@ class Bot:
                                      "thread).")
             return
         self._spawn(self.agent.compact(session, " ".join(ctx.args or []).strip()))
+
+    async def cmd_cluster(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        partition = (ctx.args or [None])[0]
+        try:
+            snap = await self.monitor.cluster.snapshot(fresh=True)
+        except (SSHError, OSError) as e:
+            await self.reply(update, f"Couldn't read the cluster: {code(str(e)[:300])}")
+            return
+        names = {r.job_id: r.name for r in self.store.active_jobs()}
+        await self.reply(update, "🖥 " + self.monitor.cluster.text(snap, names, partition=partition, html=True))
+
+    async def cmd_digest(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """The digest now: since the last one (or the last 24 hours); the morning one still comes."""
+        if not self.digest:
+            await self.reply(update, "The digest isn't available.")
+            return
+        now = time.time()
+        since = max(float(self.store.get("digest_at") or 0) or now - 86400, now - 7 * 86400)
+        if now - since < 3600:  # just sent: the last day instead
+            since = now - 86400
+        await self.reply(update, await self.digest.build(since, now))
 
     async def cmd_usage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         period = (ctx.args or ["today"])[0].lower()

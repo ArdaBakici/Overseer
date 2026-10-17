@@ -74,6 +74,7 @@ def build(cfg: Config):
         subagents.resume()  # queued subagents get their turn
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
+        tasks.append(asyncio.create_task(digest.loop(), name="digest"))
         await app.bot.set_my_commands([
             ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
             ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
@@ -81,6 +82,7 @@ def build(cfg: Config):
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
             ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
+            ("digest", "what happened since the last digest"), ("cluster", "free GPUs, when queued jobs start"),
             ("subagents", "planner mode: on/off, models, threads"),
             ("results", "experiments and what each showed"), ("findings", "insights and dead ends"),
             ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"), ("project", "projects: list, new, context, notes"),
@@ -128,7 +130,10 @@ def build(cfg: Config):
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)
     ctl = ControlServer(cfg, agent, projects, notifier, hpc)
+    from .digest import Digest
+    digest = Digest(cfg, store, hpc, notifier, agent, monitor)  # the morning digest, in the general topic
     bot = Bot(cfg, app, store, hpc, monitor, agent, notifier, projects)
+    bot.digest = digest
     bot.register()
     return app
 

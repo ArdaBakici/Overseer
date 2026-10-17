@@ -152,6 +152,12 @@ class SlurmConfig:
     log_tail_lines: int = 12  # lines of the (training) log shown in status messages
     # Run `srun --overlap nvidia-smi` inside running jobs for GPU utilisation in status updates.
     gpu_stats: bool = False
+    # Idle GPUs: a running job whose GPUs all stay at most idle_gpu_percent busy for idle_gpu_minutes gets a 💤 line
+    # on its card, you're told, and the conversations watching it (ov watch) are woken. 0 minutes = off.
+    # Its GPUs are sampled every idle_gpu_sample_minutes (srun --overlap nvidia-smi inside the job).
+    idle_gpu_minutes: float = 30
+    idle_gpu_percent: int = 5
+    idle_gpu_sample_minutes: float = 10
     # Jobs whose names match any of these globs are ignored (e.g. interactive sessions).
     ignore_name_globs: list[str] = field(default_factory=lambda: ["interactive", "sys/dashboard*", "ood-*"])
     # SSH commands run in a non-login shell, where SLURM is often not on PATH. Overseer picks up
@@ -288,12 +294,20 @@ class ProjectConfig:
 
 
 @dataclass
+class DigestConfig:
+    """The morning digest (digest.py): once a day in the general topic, what happened since the last one."""
+    enabled: bool = True
+    time: str = "08:00"  # local time of this machine (HH:MM)
+
+
+@dataclass
 class Config:
     local: LocalConfig = field(default_factory=LocalConfig)
     ssh: SSHConfig = field(default_factory=SSHConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    digest: DigestConfig = field(default_factory=DigestConfig)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
     # ---- derived SSH paths (all inside the allowed local folders)
@@ -355,6 +369,8 @@ class Config:
         self.agent.codex.web_search = {True: "live", False: "disabled"}.get(ws, ws) if isinstance(ws, bool) else ws
         if self.agent.codex.web_search not in ("live", "cached", "disabled"):
             raise ConfigError("agent.codex.web_search must be live, cached or disabled")
+        if self.digest.time and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", self.digest.time.strip()):
+            raise ConfigError("digest.time must be HH:MM, e.g. 08:00")
         if self.slurm.track not in ("all", "agent"):
             raise ConfigError("slurm.track must be 'all' or 'agent'")
         if not self.telegram.allowed_chat_ids:

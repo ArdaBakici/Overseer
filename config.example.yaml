@@ -30,6 +30,11 @@ slurm:
   notify_queued: true
   log_tail_lines: 12            # lines of the (training) log shown in status messages
   gpu_stats: false              # GPU use in the hourly status (srun --overlap nvidia-smi); the 📊 Status button always shows it
+  # Idle GPUs: a running job whose GPUs all stay at most idle_gpu_percent busy this long gets a 💤 on its card,
+  # you're told, and the agent watching it is woken. 0 = off.
+  idle_gpu_minutes: 30
+  idle_gpu_percent: 5
+  idle_gpu_sample_minutes: 10   # how often running GPU jobs are sampled (a short srun --overlap step)
   ignore_name_globs: ["interactive", "sys/dashboard*", "ood-*"]
   # Where the agent runs anything heavier than a quick command (scripts, plots, data processing):
   # `hpc-run -- <command>` runs it on a compute node. A shared worker job keeps a node for a while
@@ -101,6 +106,11 @@ agent:
     workers:                    # models subagents may use; the first is the default
       claude_code: [claude-sonnet-5-5]
       codex: [gpt-6.1-sol, gpt-6-luna]
+
+# The morning digest, in the general topic: jobs, GPU time, results, what the agents did, tokens. /digest: now.
+digest:
+  enabled: true
+  time: "08:00"                 # this machine's local time
 
 # Projects: each gets its own Telegram topic, conversations, jobs, notes (OVERSEER.md in its folder) and agent
 # settings. You can also create them from Telegram: /project new <name> <dir> [what it's about].

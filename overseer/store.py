@@ -405,6 +405,11 @@ class Store:
         rows = self.db.execute("SELECT * FROM jobs WHERE NOT ignored ORDER BY first_seen DESC LIMIT ?", (limit,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
 
+    def jobs_ended_since(self, since: float) -> list[JobRecord]:
+        rows = self.db.execute("SELECT * FROM jobs WHERE ended_at >= ? AND NOT ignored ORDER BY ended_at DESC",
+                               (since,)).fetchall()
+        return [_row(JobRecord, r) for r in rows]
+
     def session_jobs(self, session_id: str) -> list[JobRecord]:
         """Jobs the agent submitted in a conversation."""
         rows = self.db.execute("SELECT * FROM jobs WHERE session_id=? AND by_agent=1 AND NOT ignored ORDER BY first_seen",

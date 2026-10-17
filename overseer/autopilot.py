@@ -103,6 +103,7 @@ class Autopilot:
         """Wait for wake-ups in flight (tests)."""
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            await asyncio.sleep(0)  # (finished tasks leave the set in a callback: let it run)
 
     # ------------------------------------------------------------------ state
     def paused(self, session_id: str) -> bool:
@@ -381,6 +382,25 @@ class Autopilot:
         prompt = (f"[Alert you set up] Job {rec.job_id} ({rec.name}): `{alert}` matched (now {value}).\n\n"
                   f"stdout: {rec.stdout}\n\nLook at the job now (its logs or metrics) and decide: let it run, or "
                   "scancel it, fix and resubmit. Note it in the research log.")
+        self._spawn(self._run(s, prompt, None, "wakeup"))
+
+    async def idle_wake(self, session_id: str, rec: JobRecord, idle_for: str, state: dict) -> None:
+        """A job this conversation watches has left its GPUs idle (monitor.py): wake it to find out why."""
+        s = self.agent.get(session_id)
+        if not s or self.paused(session_id):
+            return
+        mem, total = state.get("mem", 0) / 1024, state.get("total", 0) / 1024
+        hint = ("Nothing is on the GPU: the program may be running on the CPU (a device bug), or still in a long "
+                "CPU phase (data preparation)." if mem < 0.5 else
+                "The GPU holds data, but nothing runs on it: a hang or deadlock (e.g. a distributed collective), "
+                "waiting on data loading or I/O, or a long CPU phase (evaluation, checkpointing).")
+        prompt = (f"[Idle GPU] Job {rec.job_id} ({rec.name}), which you watch, has been running with its "
+                  f"{state.get('n', 1)} GPU(s) idle for {idle_for}: at most {self.cfg.slurm.idle_gpu_percent}% busy "
+                  f"(now {state.get('util', 0):.0f}%), {mem:.1f} of {total:.0f} GB GPU memory in use. {hint}\n\n"
+                  f"stdout: {rec.stdout}\n\nFind out why from its logs (is it still making progress?). If it's stuck "
+                  "or wasting the GPU, scancel it, fix the cause, resubmit and `ov watch` the new job; if the idle "
+                  "phase is expected, say so briefly (you won't be woken again unless it's busy and then idle again). "
+                  "Note what you found in the research log.")
         self._spawn(self._run(s, prompt, None, "wakeup"))
 
     # ------------------------------------------------------------------ running a wake-up

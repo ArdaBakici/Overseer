@@ -193,6 +193,9 @@ def _parser() -> _Parser:
     a.add_argument("text", nargs="+")
     sub.add_parser("planner", add_help=False).add_argument("mode", choices=["off"])
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
+    a = sub.add_parser("cluster", add_help=False)
+    a.add_argument("--partition", "-p")
+    a.add_argument("--fresh", action="store_true")
     sub.add_parser("status", add_help=False)
     sub.add_parser("help", add_help=False)
     return p
@@ -212,6 +215,9 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+  ov cluster [-p <partition>] [--fresh]   what's free now per partition (GPUs, CPUs, RAM, time limits), SLURM's
+                                   estimated start of your queued jobs, and your fairshare. Check it before
+                                   choosing a partition and a job size.
 
 Graphs under a job's card (no model involved: your plotting script, run by Overseer on the HPC):
   ov plots set <job | --pattern '<name glob>' | --project> --command "python {project}/plots/x.py --log {stdout} --out {out}"
@@ -278,6 +284,7 @@ class ControlServer:
         self.tokens: dict[str, str] = {}  # token -> conversation
         self._bg: set[asyncio.Task] = set()  # card refreshes in flight
         self.server: asyncio.AbstractServer | None = None
+        self._cluster = None  # cluster.Cluster, made on first use
         agent.ctl = self
 
     # ------------------------------------------------------------------ tokens
@@ -366,10 +373,21 @@ class ControlServer:
                 return True, await self.notify(session, " ".join(args.text))
             if area == "status":
                 return True, self.status(session)
+            if area == "cluster":
+                return True, await self.cluster(session, args)
             return False, HELP
         except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ResultError, FeedbackError, SkillError,
                 ValueError) as e:
             return False, str(e)
+
+    # ---- the cluster (cluster.py)
+    async def cluster(self, session, args) -> str:
+        if self._cluster is None:
+            from .cluster import Cluster
+            self._cluster = Cluster(self.hpc)
+        snap = await self._cluster.snapshot(fresh=args.fresh)
+        names = {r.job_id: r.name for r in self.store.active_jobs()}
+        return self._cluster.text(snap, names, partition=args.partition)
 
     # ---- feedback about Overseer (feedback.py) and skills as addons (addons.py)
     async def feedback_cmd(self, session, args) -> str:

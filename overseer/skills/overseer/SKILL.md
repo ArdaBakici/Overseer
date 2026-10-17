@@ -36,6 +36,20 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
 - `hpc-run`'s shared worker job (`overseer-worker`) is not one of your jobs. Don't register or watch
   it: `hpc-run` starts, reuses and ends it (`hpc-run --stop` ends it early).
 
+## Where to submit: `ov cluster`
+
+```bash
+ov cluster                       # every partition: nodes up, free GPUs (and their type), CPUs, RAM, time limit
+ov cluster -p nvidia             # one partition
+ov cluster --fresh               # not the copy from the last 2 minutes
+```
+
+It also lists SLURM's estimated start of your queued jobs and your fairshare (1 = full priority; lower means
+recent usage pushes you back in the queue). Check it before choosing a partition, a GPU count and a time limit:
+- Prefer what can start now. "at most 2 on one node" means a 4-GPU single-node job waits.
+- A job that has waited long may start sooner smaller, shorter or on another partition: check its estimate.
+- A queued job's card shows its estimated start, so the researcher sees it too.
+
 ## What matters in a job: its card, and alerts
 
 Every job has a live card in the project's "📊 jobs" topic. Overseer keeps editing that card until the
@@ -246,6 +260,11 @@ When you are woken, the message contains:
 - your timer's or watch's note;
 - which jobs are still running;
 - in a project, the research log's beginning and latest entries.
+
+**Idle GPUs:** Overseer samples the GPUs of running jobs. When a job you watch leaves all its GPUs idle (at most
+5% busy) for 30 minutes, you're woken with `[Idle GPU]`, its GPU use and memory. Find out why from its log: a hang
+or deadlock, data loading, a CPU-only bug, or an expected CPU phase (evaluation, checkpointing). If it's stuck,
+`scancel` it, fix, resubmit and watch the new job; if it's expected, say so. You're woken once per idle spell.
 
 A check-in shows a running job's progress: metrics and the end of its log.
 - **Healthy:** change nothing and reply in a sentence or two.

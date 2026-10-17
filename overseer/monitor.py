@@ -22,14 +22,31 @@ from .quota import parse_quota
 from .plots import resolve_plot, run_plots
 from .results import record_job, snapshot
 from .richtext import fold_text
+from .cluster import Cluster, until
 from .slurm import (NO_VAL, STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
-                    human_seconds, log_template, slurm_seconds, summarize_steps, task_states)
+                    has_gpus, human_seconds, log_template, parse_gpu_stats, slurm_seconds, summarize_steps,
+                    task_states)
 from .ssh import SSHError
 from .store import JobRecord, Store
 
 log = logging.getLogger(__name__)
 
 MISSING_POLLS_BEFORE_GIVING_UP = 10
+ESTIMATE_SECONDS = 300  # how often queued jobs' estimated starts are read
+
+
+def when(start: str, clock: str, relative: bool = False) -> str:
+    """'today 14:20' ('today 14:20 (in ~1h05m)' with `relative`), 'tomorrow 03:00', 'Mon 20 Oct 09:00': an
+    estimated start, in the cluster's time. (The card shows no "in ...": it would change at every look.)"""
+    from datetime import datetime
+    try:
+        t, now = datetime.fromisoformat(start), datetime.fromisoformat(clock)
+    except ValueError:
+        return start
+    days = (t.date() - now.date()).days
+    day = "today" if days <= 0 else "tomorrow" if days == 1 else t.strftime("%a %d %b")
+    rel = until(start, clock) if days <= 0 and relative else ""
+    return f"{day} {t.strftime('%H:%M')}" + (f" ({rel})" if rel else "")
 
 
 async def progress_log(hpc: HPC, rec: JobRecord) -> str:
@@ -64,6 +81,9 @@ class Monitor:
         self._quota_checked = 0.0
         self._bg: set[asyncio.Task] = set()  # graphs and card moves: never in the way of the poll
         self._plotting: set[str] = set()
+        self._sampling: set[str] = set()  # jobs whose GPUs are being sampled
+        self.cluster = Cluster(hpc)  # what's free, when queued jobs start (ov cluster, /cluster, queued cards)
+        self._estimated = 0.0
 
     def _spawn(self, coro) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -74,6 +94,7 @@ class Monitor:
         """Wait for graphs and card moves in progress (tests)."""
         while self._bg:
             await asyncio.gather(*list(self._bg), return_exceptions=True)
+            await asyncio.sleep(0)  # (finished tasks leave _bg in a callback: let it run)
 
     def poke(self) -> None:
         """Poll right away (e.g. after a submission)."""
@@ -153,13 +174,17 @@ class Monitor:
             rec.state = job.state
             rec.missing_polls = 0
             if prev != "RUNNING" and job.state == "RUNNING":  # started: its card says so
+                self.store.unset(f"eststart:{rec.job_id}")
                 rec.last_status_at = time.time()
                 self.store.upsert_job(rec)
                 await self.refresh_card(rec, job)
             elif job.state == "RUNNING":
                 await self._maybe_status(rec, job)
+            if job.state == "RUNNING":
+                self._maybe_sample_gpus(rec, job)
             self.store.upsert_job(rec)
 
+        await self._estimate_starts(live)
         if adopted:
             await self.notifier.send(Outgoing(
                 f"👀 <b>Overseer online</b>: tracking {len(adopted)} job(s) - {', '.join(r.job_id for r in adopted[:8])}"
@@ -347,6 +372,8 @@ class Monitor:
         elif job:
             head += f" · ⏳ {esc(state.lower())}: {esc(job.reason)}"
         lines = [head]
+        if job and not final and state == "PENDING" and self.store.get(f"eststart:{rec.job_id}"):
+            lines.append(f"🕐 {esc(self.store.get(f'eststart:{rec.job_id}'))} (SLURM's estimate)")
         critical, important, progress = metric_lines(view["spec"], view["values"], view["auto"])
         if job and not final and state == "RUNNING":
             elapsed, limit = slurm_seconds(job.elapsed), slurm_seconds(job.time_limit)
@@ -368,6 +395,10 @@ class Monitor:
                 lines.append("⏰ agent watching" + (f" (check-ins every {human_seconds(int(every))})" if every else ""))
             if view["err"]:
                 lines.append(f"⚠️ metrics command: {esc(view['err'][:160])}")
+            idle = self.idle_state(rec.job_id)
+            if idle.get("alerted") and state == "RUNNING":
+                lines.append(f"💤 <b>GPU idle</b> for {human_seconds(int(time.time() - idle['since']))} "
+                             f"(≤{self.cfg.slurm.idle_gpu_percent}% busy)")
         if problem:
             lines.append(problem)
         for a in fired_alerts(self.store, rec)[:3]:
@@ -441,6 +472,97 @@ class Monitor:
         if every > 0 and time.time() - float(self.store.get(f"plot_at:{rec.job_id}") or 0) >= every \
                 and resolve_plot(self.store, rec):
             self._spawn(self.plots(rec))
+
+    # ------------------------------------------------------------------ queued jobs: when they should start
+    async def _estimate_starts(self, live: list[Job]) -> None:
+        """Every few minutes, SLURM's estimated start of the tracked jobs that wait in the queue: on their cards."""
+        pending = {j.job_id: j for j in live if j.state == "PENDING"}
+        tracked = {r.job_id: r for r in self.store.active_jobs() if r.job_id in pending}
+        if not tracked or time.time() - self._estimated < ESTIMATE_SECONDS:
+            return
+        self._estimated = time.time()
+        try:
+            estimates, clock = await self.cluster.estimates()
+        except (SSHError, OSError):
+            return
+        for jid, rec in tracked.items():
+            start = estimates.get(jid, ("", ""))[0]
+            line = f"starts {when(start, clock)}" if start[:1].isdigit() and clock else ""
+            if line != (self.store.get(f"eststart:{jid}") or ""):
+                if line:
+                    self.store.set(f"eststart:{jid}", line)
+                else:
+                    self.store.unset(f"eststart:{jid}")
+                await self.refresh_card(rec, pending[jid])
+
+    # ------------------------------------------------------------------ idle GPUs
+    def idle_state(self, job_id: str) -> dict:
+        """{since: first idle sample, util, mem, total, alerted: when it was reported} while a job's GPUs are idle."""
+        try:
+            return json.loads(self.store.get(f"gpuidle:{job_id}") or "{}")
+        except ValueError:
+            return {}
+
+    def _maybe_sample_gpus(self, rec: JobRecord, job: Job) -> None:
+        c = self.cfg.slurm
+        if c.idle_gpu_minutes <= 0 or rec.name == WORKER_NAME or rec.job_id in self._sampling:
+            return
+        if not has_gpus(job, rec.info_dict.get("TRES", "")):
+            return
+        key = f"gpusample_at:{rec.job_id}"
+        if time.time() - float(self.store.get(key) or 0) < c.idle_gpu_sample_minutes * 60:
+            return
+        self.store.set(key, str(time.time()))
+        self._sampling.add(rec.job_id)
+        self._spawn(self._sample_gpus(rec.job_id, job))
+
+    async def _sample_gpus(self, job_id: str, job: Job) -> None:
+        """One look at a running job's GPUs (nvidia-smi inside it). All of them at most idle_gpu_percent busy for
+        idle_gpu_minutes: reported once (card, message, the watching conversations woken) until they're busy again."""
+        try:
+            task = job.extra.get("task")  # an array: the task the card shows
+            gpus = parse_gpu_stats(await self.hpc.gpu_stats(f"{job_id}_{task}" if task else job_id, readings=5))
+        except (SSHError, OSError) as e:
+            log.info("job %s: no GPU sample (%s)", job_id, e)
+            return
+        finally:
+            self._sampling.discard(job_id)
+        rec = self.store.get_job(job_id)
+        if not gpus or not rec or rec.ended_at:
+            return  # (no conclusion from a failed sample)
+        c = self.cfg.slurm
+        state = self.idle_state(job_id)
+        util = max(u for u, _, _ in gpus)
+        if util > c.idle_gpu_percent:
+            if state:
+                self.store.unset(f"gpuidle:{job_id}")
+                if state.get("alerted"):  # busy again: the card says so no more
+                    log.info("job %s: GPUs busy again (%s%%)", job_id, util)
+                    await self.refresh_card(rec, job)
+            return
+        now = time.time()
+        state.setdefault("since", now)
+        state.update(util=util, mem=sum(m for _, m, _ in gpus), total=sum(t for _, _, t in gpus), n=len(gpus))
+        due = not state.get("alerted") and now - state["since"] >= c.idle_gpu_minutes * 60
+        if due:
+            state["alerted"] = now
+        self.store.set(f"gpuidle:{job_id}", json.dumps(state))
+        if due:
+            await self._report_idle(rec, job, state)
+
+    async def _report_idle(self, rec: JobRecord, job: Job, state: dict) -> None:
+        sessions = list(dict.fromkeys(w.session_id for w in self.store.job_watches(rec.job_id)))
+        idle_for = human_seconds(int(time.time() - state["since"]))
+        mem = f"{state['mem'] / 1024:.1f} of {state['total'] / 1024:.0f} GB GPU memory in use"
+        await self.notifier.send(Outgoing(
+            f"💤 <b>{esc(rec.job_id)}</b> {esc(rec.name)}: its {state['n']} GPU(s) have been idle for {idle_for} "
+            f"(now {state['util']:.0f}% busy, {esc(mem)})"
+            + (" - waking the agent watching it" if sessions and self.autopilot else " - no agent is watching it"),
+            job_id=rec.job_id, jobs=True, reply_to=self.store.card_refs(rec.job_id)))
+        await self.refresh_card(rec, job)
+        if self.autopilot:
+            for sid in sessions:
+                await self.autopilot.idle_wake(sid, rec, idle_for, state)
 
     # ------------------------------------------------------------------ graphs (plots.py) and card order
     async def _after_end(self, rec: JobRecord) -> None:
@@ -553,6 +675,8 @@ class Monitor:
         rec.state = final.state
         rec.ended_at = time.time()
         self.store.upsert_job(rec)  # mark ended first so a crash below can't cause duplicate reports
+        for key in (f"gpuidle:{rec.job_id}", f"gpusample_at:{rec.job_id}", f"eststart:{rec.job_id}"):
+            self.store.unset(key)
         watched_here = bool(rec.session_id) and any(w.session_id == rec.session_id
                                                     for w in self.store.job_watches(rec.job_id))
         try:

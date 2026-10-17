@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 
 PATH_MARK = "__OVERSEER_PATH__="
+GPU_STEP = "overseer-gpu"  # the name of Overseer's nvidia-smi steps inside jobs: left out of the jobs' step summaries
 
 
 class HPC:
@@ -91,13 +92,14 @@ class HPC:
         res = await self.run(self._slurm(["squeue", "-h", "-u", self.user, "-o", SQUEUE_FORMAT]), check=True)
         return fold_arrays(parse_squeue(res.stdout))  # an array's tasks are one job
 
-    async def sacct_recent(self, minutes: int) -> list[Job]:
+    async def sacct_recent(self, minutes: int, fold: bool = True) -> list[Job]:
         res = await self.run(
             self._slurm(["sacct", "-X", "-n", "-P", "-u", self.user, "-S", f"now-{int(minutes)}minutes",
                          "-o", SACCT_LIST_FORMAT]),
             check=True,
         )
-        return fold_arrays(parse_sacct_list(res.stdout))
+        jobs = parse_sacct_list(res.stdout)
+        return fold_arrays(jobs) if fold else jobs
 
     async def quota(self, command: str) -> str:
         """The output of the cluster's quota command (e.g. myquota), or "" if it fails."""
@@ -136,7 +138,7 @@ class HPC:
 
     async def sacct_steps(self, job_id: str) -> list[dict[str, str]]:
         res = await self.run(self._slurm(["sacct", "-n", "-P", "-j", job_id, "-o", SACCT_STEP_FORMAT]))
-        return parse_sacct_steps(res.stdout)
+        return [r for r in parse_sacct_steps(res.stdout) if r.get("name") != GPU_STEP]  # (Overseer's own looks)
 
     async def scontrol_job(self, job_id: str) -> dict[str, str]:
         jobs = await self.scontrol_jobs(job_id)
@@ -153,6 +155,27 @@ class HPC:
         res = await self.run(self._slurm(["scontrol", "write", "batch_script", job_id, "-"]), max_output=500_000)
         return res.stdout if res.ok else ""
 
+    # ---- the cluster (cluster.py): what's free, when your queued jobs start, your fairshare
+    async def _lines(self, argv: list[str], timeout: float = 60) -> str:
+        try:
+            res = await self.run(self._slurm(argv), timeout=timeout, max_output=5_000_000)
+        except SSHError:
+            return ""
+        return res.stdout if res.ok else ""
+
+    async def nodes(self) -> list[dict[str, str]]:
+        out = await self._lines(["scontrol", "show", "node", "-o"])
+        return [d for d in (parse_scontrol(line) for line in out.splitlines() if line.strip()) if d.get("NodeName")]
+
+    async def sinfo_partitions(self) -> str:
+        return await self._lines(["sinfo", "-h", "-o", "%P|%a|%l"])
+
+    async def pending_starts(self) -> str:
+        return await self._lines(["squeue", "-h", "-u", self.user, "-t", "PENDING", "--start", "-o", "%i|%S|%r"])
+
+    async def sshare(self) -> str:
+        return await self._lines(["sshare", "-h", "-P", "-U", "-u", self.user, "-o", "Account,FairShare"], timeout=30)
+
     async def seff(self, job_id: str) -> str:
         try:
             res = await self.run(self._slurm(["seff", job_id]), timeout=30)
@@ -160,13 +183,18 @@ class HPC:
             return ""
         return res.stdout.strip() if res.ok else ""
 
-    async def gpu_stats(self, job_id: str) -> str:
+    async def gpu_stats(self, job_id: str, readings: int = 1) -> str:
+        """nvidia-smi inside a running job: index, name, busy %, memory used and total per GPU (CSV). With
+        `readings` > 1, that many readings a second apart (one line per GPU each)."""
+        query = ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader"]
+        if readings > 1:
+            query = ["sh", "-c", f"for i in $(seq {int(readings)}); do {' '.join(query)}; sleep 1; done"]
         try:
             res = await self.run(
-                self._slurm(["srun", f"--jobid={job_id}", "--overlap", "--ntasks=1", "nvidia-smi",
-                             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
-                             "--format=csv,noheader"]),
-                timeout=45,
+                self._slurm(["srun", f"--jobid={job_id}", "--overlap", "--ntasks=1", f"--job-name={GPU_STEP}",
+                             *query]),
+                timeout=45 + readings,
             )
         except SSHError:
             return ""

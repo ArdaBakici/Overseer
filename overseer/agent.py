@@ -97,6 +97,9 @@ command printing name=value lines or a JSON object, e.g. reading the last line o
 for what would make a run worth stopping: `--alert "<metric> < 1 after 2h"` pings the researcher, `--wake-on \
 "loss is nan"` / `"step stalled 30m"` also wakes you. Set it once per kind of experiment (a pattern or the \
 project default covers repeats) and check it with `ov metrics show <job id>`.
+- Before choosing where to submit (partition, GPUs, time limit), run `ov cluster`: free GPUs/CPUs per partition, \
+the most GPUs free on one node, time limits, SLURM's estimated start of your queued jobs and your fairshare. Prefer \
+what starts soon; a job stuck in the queue may start sooner resized or elsewhere.
 - When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
 (`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
 - Graphs: the researcher sees graphs under each job's card, from a plotting script you write once (in the \

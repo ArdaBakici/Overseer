@@ -207,3 +207,29 @@ def test_array_task_logs():
     (a,) = fold_arrays([Job("5_0", state="COMPLETED"), Job("5_1", state="RUNNING"), Job("5_[2-3]", state="PENDING")])
     assert a.extra["task"] == "1" and task_states(a) == [("0", "COMPLETED"), ("1", "RUNNING")]
     assert a.extra["task_count"] == "4"
+
+
+def test_cluster_parsing():
+    from overseer.cluster import fairshare, gpu_count, gpus_allocated, partitions, start_estimates, until
+    from overseer.slurm import parse_scontrol
+    assert gpu_count("gpu:a100:4(S:0-1)") == (4, ["a100"]) and gpu_count("(null)") == (0, [])
+    assert gpu_count("gpu:a100:2,gpu:v100:2(S:0)") == (4, ["a100", "v100"]) and gpu_count("gpu:2") == (2, [])
+    assert gpus_allocated("cpu=8,mem=64G,gres/gpu=3,gres/gpu:a100=3") == 3
+    assert gpus_allocated("cpu=8,gres/gpu:a100=1,gres/gpu:v100=2") == 3 and gpus_allocated("") == 0
+    nodes = [parse_scontrol(x) for x in [
+        "NodeName=g1 CPUAlloc=16 CPUTot=64 Gres=gpu:a100:4(S:0-1) RealMemory=512000 AllocMem=128000 "
+        "State=MIXED Partitions=nvidia,preempt AllocTRES=cpu=16,gres/gpu=2",
+        "NodeName=g2 CPUAlloc=0 CPUTot=64 Gres=gpu:a100:4 RealMemory=512000 AllocMem=0 State=IDLE+DRAIN "
+        "Partitions=nvidia AllocTRES=",
+        "NodeName=c1 CPUAlloc=0 CPUTot=128 Gres=(null) RealMemory=256000 AllocMem=0 State=IDLE Partitions=compute "
+        "AllocTRES="]]
+    parts = {p.name: p for p in partitions(nodes, "compute*|up|2-00:00:00\nnvidia|up|4-00:00:00\n")}
+    nv = parts["nvidia"]
+    assert (nv.nodes, nv.usable, nv.gpus, nv.gpus_free, nv.max_free_gpus, nv.cpus_free) == (2, 1, 8, 2, 2, 48)
+    assert nv.time_limit == "4-00:00:00" and nv.gpu_types == ["a100"] and round(nv.max_free_mem_gb) == 375
+    assert parts["compute"].default and parts["compute"].idle == 1 and parts["preempt"].gpus_free == 2
+    est = start_estimates("5_[2-3]|2026-10-17T15:00:00|Priority\n5_1|2026-10-17T14:00:00|Resources\n6|N/A|Priority\n")
+    assert est == {"5": ("2026-10-17T14:00:00", "Resources"), "6": ("N/A", "Priority")}
+    assert fairshare("ab11578_acct|0.421053\n") == [("ab11578_acct", "0.421053")]
+    assert until("2026-10-17T14:05:00", "2026-10-17T13:00:00") == "in ~1h05m"
+    assert until("N/A", "2026-10-17T13:00:00") == ""

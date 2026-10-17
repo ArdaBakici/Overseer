@@ -2453,6 +2453,203 @@ async def test_agent_defined_metrics_and_alerts(env, tmp_path):
     assert "⚠️ metrics command: exit 1" in env.notifier.card_text("601")
 
 
+async def test_idle_gpus_wake_the_watching_agent(env):
+    """A running GPU job whose GPUs stay idle for idle_gpu_minutes: a 💤 line on its card, a message, and the
+    conversation watching it woken - once, until the GPUs are busy and then idle again."""
+    ap = await make_autopilot(env)
+    env.cfg.slurm.idle_gpu_sample_minutes = 0  # sample at every poll
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    (proj / "slurm-701.out").write_text("epoch 3 loss=0.4\nwaiting for rank 1...\n")
+    job = {"name": "ddp-train", "state": "RUNNING", "workdir": str(proj), "stdout": str(proj / "slurm-701.out")}
+    env.set_jobs(**{"701": job, "702": {**job, "name": "other"}})
+    token = env.ctl.open(s.id)
+    assert (await env.ctl.handle(token, ["watch", "701"]))[0]
+
+    def gpu(jid, util, mem="40960 MiB"):
+        st = env.slurm()
+        st.setdefault("gpu_util", {})[jid] = [util, mem]
+        (env.tmp / "slurm.json").write_text(json.dumps(st))
+
+    async def poll():
+        await env.monitor.poll()
+        await env.monitor.drain()
+        await ap.drain()
+
+    def backdate(jid, minutes):  # as if the GPUs had been idle that long
+        state = env.monitor.idle_state(jid)
+        state["since"] -= minutes * 60
+        env.store.set(f"gpuidle:{jid}", json.dumps(state))
+
+    await poll()
+    assert "701" in env.slurm()["gpu_samples"] and not env.monitor.idle_state("701")  # busy (87%)
+    n = len(claude_calls(env))
+    gpu("701", "0 %")
+    gpu("702", "2 %")
+    await poll()
+    assert env.monitor.idle_state("701")["util"] == 0 and len(claude_calls(env)) == n  # not idle long enough yet
+    backdate("701", 31)
+    backdate("702", 31)
+    await poll()
+    idle = {m.text.split("</b>")[0][-3:]: m for m in env.notifier.sent if m.text.startswith("💤")}
+    assert set(idle) == {"701", "702"}, [m.text for m in env.notifier.sent]
+    assert "waking the agent watching it" in idle["701"].text and idle["701"].jobs
+    assert "no agent is watching it" in idle["702"].text
+    assert "💤 <b>GPU idle</b> for 31m" in env.notifier.card_text("701"), env.notifier.card_text("701")
+    calls = claude_calls(env)[n:]
+    assert len(calls) == 1 and "[Idle GPU] Job 701 (ddp-train)" in calls[0]["stdin"], calls
+    assert "40.0 of 80 GB GPU memory in use" in calls[0]["stdin"] and "hang or deadlock" in calls[0]["stdin"]
+
+    await poll()  # still idle: not again
+    assert len([m for m in env.notifier.sent if m.text.startswith("💤")]) == 2 and len(claude_calls(env)) == n + 1
+    gpu("701", "fail")  # a sample that fails says nothing
+    await poll()
+    assert env.monitor.idle_state("701").get("alerted")
+    gpu("701", "95 %")  # busy again: the card loses its line, and a new idle spell is reported again
+    await poll()
+    assert not env.monitor.idle_state("701") and "💤" not in env.notifier.card_text("701")
+    gpu("701", "1 %", "0 MiB")
+    await poll()
+    backdate("701", 45)
+    await poll()
+    calls = claude_calls(env)[n:]
+    assert len(calls) == 2 and "running on the CPU" in calls[1]["stdin"], calls
+
+    # One sample at most per job at a time, never of hpc-run's worker; none when it's off.
+    env.cfg.slurm.idle_gpu_minutes = 0
+    before = len(env.slurm()["gpu_samples"])
+    await poll()
+    assert len(env.slurm()["gpu_samples"]) == before
+    # The job ends: its idle state goes.
+    st = env.slurm()
+    st["jobs"]["701"]["state"] = "COMPLETED"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await poll()
+    assert env.store.get("gpuidle:701") is None
+
+
+async def test_cluster_for_agents_and_queued_cards(env):
+    """ov cluster: free GPUs per partition, time limits, the queued jobs' estimated starts and the fairshare; the
+    estimated start is also on a queued job's card, until it starts."""
+    from overseer import monitor as M
+    await make_autopilot(env)
+    s = env.agent.general_session()
+    st = env.slurm()
+    st["nodes"] = {
+        "gpu1": {"gres": "gpu:a100:4(S:0-1)", "alloc_tres": "cpu=16,gres/gpu=3", "cpu_alloc": 16, "state": "MIXED",
+                 "partitions": "nvidia"},
+        "gpu2": {"gres": "gpu:a100:4", "state": "DOWN*", "partitions": "nvidia"},
+        "cpu1": {"partitions": "compute", "cpus": 128}}
+    st["partitions"] = {"compute*": {}, "nvidia": {"time": "4-00:00:00"}}
+    st["fairshare"] = {"ab11578_acct": "0.42"}
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    clock = (await env.hpc.clock())
+    from datetime import datetime, timedelta
+    soon = (datetime.fromisoformat(clock) + timedelta(hours=2, minutes=1)).isoformat(timespec="seconds")
+    env.set_jobs(**{"801": {"name": "big-sweep", "state": "PENDING", "reason": "Resources", "est_start": soon}})
+    await env.monitor.poll()
+    card = env.notifier.card_text("801")
+    assert f"🕐 starts {M.when(soon, clock)} (SLURM's estimate)" in card, card
+
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, ["cluster"])
+    assert ok, text
+    assert "nvidia: 1/2 nodes up · GPUs 1/8 free (a100), at most 1 on one node · CPUs 48/128 free" in text, text
+    assert "max time 4-00:00:00" in text and "compute (default): 1/1 nodes up, 1 idle" in text, text
+    assert "801 big-sweep: " in text and "(in ~2h0" in text and "waiting for Resources" in text, text
+    assert "Fairshare: ab11578_acct 0.42" in text, text
+    ok, text = await env.ctl.handle(token, ["cluster", "-p", "nvidia"])
+    assert ok and "compute" not in text.split("Your queued")[0], text
+    ok, text = await env.ctl.handle(token, ["cluster", "-p", "nope"])
+    assert ok and "no partition 'nope'" in text
+
+    # It starts: the estimate leaves the card.
+    st = env.slurm()
+    st["jobs"]["801"]["state"] = "RUNNING"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await env.monitor.poll()
+    assert "🕐" not in env.notifier.card_text("801") and env.store.get("eststart:801") is None
+
+
+async def test_morning_digest(env):
+    """Once a day (digest.time, local time) in the general topic: jobs, GPU time, results and findings, what each
+    agent did and waits for, tokens, what waits for the researcher. /digest any time."""
+    from datetime import datetime, timedelta
+    from overseer.digest import Digest
+    from overseer.live import Transcript
+    from overseer.store import FeedbackRecord, FindingRecord, ResultRecord
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    clock = datetime.fromisoformat(await env.hpc.clock())
+    iso = lambda dt: dt.isoformat(timespec="seconds")  # noqa: E731
+    env.set_jobs(**{
+        "901": {"name": "sweep-a", "state": "COMPLETED", "start": iso(clock - timedelta(hours=3)),
+                "end": iso(clock - timedelta(hours=1)), "tres": "cpu=8,gres/gpu=2"},
+        "902": {"name": "sweep-b", "state": "OUT_OF_MEMORY", "start": iso(clock - timedelta(hours=30)),
+                "end": iso(clock - timedelta(hours=20)), "tres": "cpu=8,gres/gpu=4"},  # 4 GPUs x 4h in the window
+        "903": {"name": "long-run", "state": "RUNNING", "start": iso(clock - timedelta(hours=2))}})
+    now = time.time()
+    for jid, name, state in (("901", "sweep-a", "COMPLETED"), ("902", "sweep-b", "OUT_OF_MEMORY")):
+        env.store.upsert_job(JobRecord(job_id=jid, name=name, state=state, first_seen=now - 9000, ended_at=now - 3600,
+                                       report="out of memory" if state != "COMPLETED" else "", session_id=s.id))
+    env.store.upsert_job(JobRecord(job_id="903", name="long-run", state="RUNNING", first_seen=now - 7200))
+    env.store.set("gpuidle:903", json.dumps({"since": now - 4000, "alerted": now - 100}))
+    env.store.upsert_job(JobRecord(job_id="800", name="old", state="COMPLETED", first_seen=now - 9e5,
+                                   ended_at=now - 8e5))
+    env.store.save_result(ResultRecord(id="901", name="sweep-a", verdict="promising", conclusion="lr 3e-4 helps"))
+    env.store.save_result(ResultRecord(id="902", name="sweep-b"))
+    env.store.add_finding(FindingRecord(project=None, kind="dead-end", text="batch 4096 OOMs on a100-40g"))
+    env.store.add_usage(session_id=s.id, project=None, backend="claude_code", model="m", origin="wakeup",
+                        input=150_000, cached=0, output=5_000, cost=1.25)
+    Transcript(env.cfg, s.id).write({"kind": "end", "status": "done", "text": "Sweep A beat the baseline by 4%."})
+    token = env.ctl.open(s.id)
+    assert (await env.ctl.handle(token, ["watch", "903", "--every", "1h"]))[0]
+    env.store.add_feedback(FeedbackRecord(kind="bug", text="something is off with ov", session_id=s.id))
+
+    d = Digest(env.cfg, env.store, env.hpc, env.notifier, env.agent, env.monitor)
+    text = await d.build(now - 86400, now)
+    assert text.startswith("☀️ <b>Digest</b>") and "since " in text, text
+    assert "✅ 1 finished · ❌ 1 failed · 🏃 1 running" in text, text
+    assert "<code>902</code> sweep-b · OUT_OF_MEMORY · out of memory" in text, text
+    assert "<code>903</code> long-run · running · 💤 GPU idle" in text and "old" not in text, text
+    assert "🎮 <b>GPU time</b>: 22.0 GPU-hours in 3 job(s)" in text, text  # 2x2h + 4x4h + 1x2h (default 1 GPU)
+    assert "<b>Results</b>: 2 new (1 promising, 1 not judged yet)" in text and "lr 3e-4 helps" in text, text
+    assert "🚫 batch 4096 OOMs" in text, text
+    assert f"💬 main <code>{s.id}</code> · 1 run(s) (1 wake-ups) · ⏰ job 903" in text, text
+    assert "<i>Sweep A beat the baseline by 4%.</i>" in text, text
+    assert "🪙 <b>Tokens</b>: 155.0k · $1.25" in text and "🛠 1 open feedback item(s)" in text, text
+
+    # When: once a day, after digest.time; then the next covers what happened since.
+    env.cfg.digest.time = "00:00"
+    assert d.due()
+    await d.send()
+    assert not d.due() and env.notifier.sent[-1].text.startswith("☀️") and env.notifier.sent[-1].session_id is None
+    env.cfg.digest.time = "23:59"
+    env.store.unset("digest_day")
+    assert d.due() == (time.localtime().tm_hour == 23 and time.localtime().tm_min == 59)
+    env.cfg.digest.enabled = False
+    assert not d.due()
+
+    # /digest and /cluster in Telegram.
+    from overseer.bot import Bot
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    bot.digest = d
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    bot.reply = reply
+    await bot.cmd_digest(None, NS(args=[]))
+    assert replies[-1].startswith("☀️ <b>Digest</b>") and "sweep-b" in replies[-1], replies[-1]
+    st = env.slurm()
+    st["nodes"] = {"g1": {"gres": "gpu:h100:8", "alloc_tres": "gres/gpu=5", "partitions": "nvidia"}}
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await bot.cmd_cluster(None, NS(args=[]))
+    assert "🖥 <b>Cluster now</b>" in replies[-1] and "<b>nvidia</b>: 1/1 nodes up" in replies[-1], replies[-1]
+    assert "GPUs 3/8 free (h100)" in replies[-1], replies[-1]
+
+
 def test_stalled_alert(env):
     from overseer.metrics import check_alerts, parse_alert
     from overseer.store import MetricSpec

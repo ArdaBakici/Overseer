@@ -302,3 +302,25 @@ def format_gpu_stats(csv: str) -> list[str]:
             mem = f"{used}/{total}"
         out.append(f"GPU {idx} {name.replace('NVIDIA ', '')}: {util.replace(' ', '')} busy · {mem}")
     return out
+
+
+def parse_gpu_stats(csv: str) -> list[tuple[float, float, float]]:
+    """nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total CSV -> (busy %, used MiB,
+    total MiB) per GPU. Several readings of the same GPU: its highest. Lines it can't read are left out."""
+    gpus: dict[str, tuple[float, float, float]] = {}
+    for line in csv.strip().splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) != 5:
+            continue
+        try:
+            row = (float(cols[2].split()[0]), float(cols[3].split()[0]), float(cols[4].split()[0]))
+        except (ValueError, IndexError):
+            continue
+        old = gpus.get(cols[0])
+        gpus[cols[0]] = tuple(max(a, b) for a, b in zip(old, row)) if old else row  # type: ignore[assignment]
+    return list(gpus.values())
+
+
+def has_gpus(job: Job, tres: str = "") -> bool:
+    """Did the job ask for GPUs (squeue's gres, or the TRES scontrol shows)?"""
+    return "gpu" in (job.gres or "").lower() or "gres/gpu" in (tres or "")
