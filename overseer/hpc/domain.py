@@ -49,7 +49,36 @@ class HpcDomain(Domain):
     def __init__(self, cfg, store, notifier, hpc: HPC):
         super().__init__(cfg, store, notifier)
         self.hpc = hpc
-        self.monitor = None  # set by the app; poked when the agent submits a job
+        self._monitor = None
+        self.jobs = None  # watches.JobWatches, once the wake-up engine exists
+
+    @property
+    def monitor(self):
+        """The SLURM monitor (set by the app): poked when the agent submits a job, tells the job watches."""
+        return self._monitor
+
+    @monitor.setter
+    def monitor(self, monitor) -> None:
+        self._monitor = monitor
+        if monitor is not None and self.jobs is not None:
+            monitor.autopilot = self.jobs
+
+    # ------------------------------------------------------------------ wake-ups
+    def attach_autopilot(self, autopilot) -> None:
+        from .watches import JobWatches
+        self.jobs = JobWatches(self, autopilot)
+        autopilot.register(self.jobs)
+        if self._monitor is not None:
+            self._monitor.autopilot = self.jobs
+
+    def wake_instructions(self, s: Session) -> str:
+        return ("Read the results (open the logs or metrics files for more), record what each showed (`ov result "
+                "<job> --verdict ... --conclusion ...`; a lasting lesson: `ov finding`) and update the research log. "
+                "If the work goes on, submit the next run and `ov watch` it; if the goal is reached or nothing "
+                "sensible is left, say so and set no more wake-ups; if you need the researcher's decision, ask.")
+
+    def ledger_context(self, project: str | None, session_id: str | None = None) -> str:
+        return results_context(self.store, project, session_id)
 
     # ------------------------------------------------------------------ the sandbox
     def sandbox(self) -> Sandbox:

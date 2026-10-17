@@ -727,8 +727,8 @@ class ControlServer:
                 continue
             rec.ignored = 1
             self.store.upsert_job(rec)
-            if self.agent.autopilot:
-                self.agent.autopilot.forget_job(jid)
+            if getattr(self.agent.domain, "jobs", None):
+                self.agent.domain.jobs.forget_job(jid)
             await self._announce(session, f"🗑 Overseer no longer tracks job {code(jid)} {esc(rec.name)} "
                                           "(the job itself wasn't touched).")
             out.append(f"✓ job {jid} is no longer tracked (it keeps running; scancel {jid} would cancel it)")
@@ -1017,7 +1017,7 @@ class ControlServer:
                 if state and state.split()[0] in TERMINAL_STATES:
                     raise CtlError(f"job {jid} has already ended ({state}): look at it now")
                 await self.job_add(session, argparse.Namespace(ids=[jid]))
-        w, remark = ap.add_watch(session, ids, every, args.note)
+        w, remark = ap.add_watch(session, "jobs", ids, every, args.note)
         what = f"job{'s' if len(ids) > 1 else ''} {', '.join(ids)}"
         self._refresh_cards(ids)  # the cards show "⏰ agent watching", with a ✖ to cancel it
         return (f"✓ w{w.id}: you'll be woken when {what} {'have' if len(ids) > 1 else 'has'} ended"

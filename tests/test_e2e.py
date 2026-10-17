@@ -223,7 +223,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         s = agent.general_session()
         # The wake-up instructions must reach the model through each CLI's own mechanism.
         from overseer.core.autopilot import Autopilot
-        autopilot = Autopilot(cfg, store, agent, notes, agent.domain.hpc)
+        autopilot = Autopilot(cfg, store, agent, notes)
         try:
             await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
         finally:
@@ -419,7 +419,7 @@ async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, plann
         from overseer.core.subagents import Subagents
         ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.domain.hpc)
         await ctl.start()
-        Autopilot(cfg, store, agent, notes, agent.domain.hpc)
+        Autopilot(cfg, store, agent, notes)
         subs = Subagents(cfg, store, agent, notes)
         s = agent.general_session()
         try:

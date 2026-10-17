@@ -63,3 +63,16 @@ class Domain:
 
     async def after_run(self, s: Session, activity: Activity, state: Any, reply: str) -> None:
         """After the CLI answered, before the reply is sent."""
+
+    # ------------------------------------------------------------------ wake-ups (autopilot.py)
+    def attach_autopilot(self, autopilot) -> None:
+        """The wake-up engine exists: register the domain's watch kinds (autopilot.WatchKind)."""
+
+    def wake_instructions(self, s: Session) -> str:
+        """The last part of a wake-up's prompt: what to do now."""
+        return ("Look at what woke you and decide the next step. If you need the researcher's decision, ask; if "
+                "nothing is left to do, say so and set no more wake-ups.")
+
+    def ledger_context(self, project: str | None, session_id: str | None = None) -> str:
+        """What the domain keeps about a project's progress (e.g. the HPC's results and findings), for prompts."""
+        return ""

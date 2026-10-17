@@ -1,19 +1,16 @@
 """Wake-ups: the agent decides what wakes it, without asking.
 
-With `ov` (ctl.py) the agent sets up what wakes it:
+With its control command (ctl.py) the agent sets up what wakes it:
 
-* `ov watch <job ids>` - woken when those jobs have ended (all of them, or as soon as one fails), with
-  their final reports; `--every 30m` adds check-ins while they run;
-* `ov wake in 90m` - woken once, later; `ov wake every 2h [--for 12h]` - repeatedly, until a set end.
+* timers - `ov wake in 90m`: woken once, later; `ov wake every 2h [--for 12h]`: repeatedly, until a set end;
+* watches of a kind its domain registers (a WatchKind) - e.g. the HPC's `ov watch <job ids>`: woken when those
+  jobs have ended (hpc/watches.py).
 
-That is how it works on its own over many runs ("auto research"): submit, watch, read the results when
-woken, submit the next run. Each watch is announced in the conversation's topic with a cancel button.
-Guardrails: check-ins and repeating timers at least `agent.autopilot.min_checkin_minutes` apart,
-repeating timers end (by default after `repeat_hours`), `/auto off` and `/stop`, and a wake-up that
-fails pauses the conversation's wake-ups until the researcher writes there.
-
-In projects the agent keeps a research log (RESEARCH_LOG.md in the project folder); its beginning and
-latest entries are shown to the agent whenever it is woken.
+That is how it works on its own over many runs: start something, watch it, read the results when woken, decide the
+next step. Each watch is announced in the conversation's topic with a cancel button. Guardrails: repeating timers
+(and check-ins) at least `agent.autopilot.min_checkin_minutes` apart, repeating timers end (by default after
+`repeat_hours`), `/auto off` and `/stop`, and a wake-up that fails pauses the conversation's wake-ups until the
+researcher writes there.
 """
 
 from __future__ import annotations
@@ -22,23 +19,16 @@ import asyncio
 import logging
 import re
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .config import Config
-from ..hpc.diagnose import extract_metrics, tqdm_cleanup
-from ..hpc.remote import HPC
-from ..hpc.monitor import progress_log
 from .notify import Notifier, Outgoing, code, esc
-from ..hpc.slurm import SUCCESS_STATES, Job
-from .store import JobRecord, Store, WatchRecord
+from .store import Store, WatchRecord
 
 if TYPE_CHECKING:
     from .agent import Agent, Session
 
 log = logging.getLogger(__name__)
-
-MAX_REPORT = 12_000  # chars of a finished job's report given to the agent
-
 
 class WatchError(ValueError):
     """A watch or timer the agent may not set (the message tells it why)."""
@@ -68,21 +58,50 @@ def human_interval(seconds: float) -> str:
     return f"{max(1, round(seconds / 60))}m"
 
 
-def _ids(jobs: list[JobRecord]) -> str:
-    return ", ".join(j.job_id for j in jobs)
+class WatchKind:
+    """Something besides timers that wakes a conversation, registered by its domain (e.g. the HPC's jobs). A watch
+    of the kind names its subjects (WatchRecord.jobs: ids, space-separated)."""
+
+    name = ""
+
+    def describe(self, w: WatchRecord) -> str:
+        return f"{self.name} {w.jobs}"
+
+    def remove(self, w: WatchRecord, ref: str) -> bool:
+        """`ov unwatch <ref>` where ref isn't a watch id: take it out of this watch (True if it was in it)."""
+        if ref not in w.job_ids:
+            return False
+        rest = [j for j in w.job_ids if j != ref]
+        w.jobs, w.state = " ".join(rest), ("active" if rest else "cancelled")
+        return True
+
+    def evaluate(self, w: WatchRecord) -> tuple[Any, list[str]] | None:
+        """None while the watch isn't due; else (what the wake-up prompt needs, the subjects still to watch)."""
+        return None
+
+    async def wake_parts(self, s: Session, fired: list[tuple[WatchRecord, Any]]) -> list[str]:
+        """The wake-up prompt's parts about the watches of this kind that fired."""
+        return []
+
+    def after_turn(self, s: Session, activity) -> None:
+        """After a successful turn (e.g. the jobs the agent cancelled itself wake nobody)."""
 
 
 class Autopilot:
     """The conversations' watches and timers, and the wake-ups they cause."""
 
-    def __init__(self, cfg: Config, store: Store, agent: Agent, notifier: Notifier, hpc: HPC):
+    def __init__(self, cfg: Config, store: Store, agent: Agent, notifier: Notifier):
         self.cfg = cfg
         self.store = store
         self.agent = agent
         self.notifier = notifier
-        self.hpc = hpc
+        self.kinds: dict[str, WatchKind] = {}
         self._tasks: set[asyncio.Task] = set()
         agent.autopilot = self
+        agent.domain.attach_autopilot(self)  # its watch kinds
+
+    def register(self, kind: WatchKind) -> None:
+        self.kinds[kind.name] = kind
 
     @property
     def c(self):
@@ -108,10 +127,6 @@ class Autopilot:
     def paused(self, session_id: str) -> bool:
         return bool(self.store.get(f"wakeups_paused:{session_id}"))
 
-    def handles(self, rec: JobRecord) -> bool:
-        """A job whose end wakes the agent (so the agent analyses it, not a one-shot summary)."""
-        return bool(self.store.job_watches(rec.job_id))
-
     def describe_watches(self, watches: list[WatchRecord]) -> str:
         parts = []
         now = time.time()
@@ -122,10 +137,10 @@ class Autopilot:
                     p += f", then every {human_interval(w.every)}"
                     if w.until:
                         p += f" for {human_interval(max(60.0, w.until - now))}"
+            elif w.kind in self.kinds:
+                p = self.kinds[w.kind].describe(w)
             else:
-                p = f"job{'s' if len(w.job_ids) > 1 else ''} {', '.join(w.job_ids)}"
-                if w.every:
-                    p += f" (check-ins every {human_interval(w.every)})"
+                p = f"{w.kind} {w.jobs}"
             parts.append(p)
         return "; ".join(parts)
 
@@ -159,18 +174,20 @@ class Autopilot:
         return "⏰ <b>Pending wake-ups</b>\n" + "\n".join(lines) + "\n\n/auto off cancels them"
 
     # ------------------------------------------------------------------ watches and timers
-    def add_watch(self, s: Session, job_ids: list[str], every: float = 0.0, note: str = "") -> tuple[WatchRecord, str]:
-        """Wake the conversation when these jobs have ended. Returns the watch and a remark for the agent."""
+    def add_watch(self, s: Session, kind: str, subjects: list[str], every: float = 0.0,
+                  note: str = "") -> tuple[WatchRecord, str]:
+        """Wake the conversation when these subjects (of a registered kind, e.g. jobs) call for it. Returns the
+        watch and a remark for the agent."""
         remark = ""
         if every and every < self.min_interval:
             remark = f" (check-ins are at least {human_interval(self.min_interval)} apart)"
             every = self.min_interval
-        for w in self.store.watches(s.id):  # the latest grouping wins: a job is in one watch of this conversation
-            if w.kind == "jobs" and set(w.job_ids) & set(job_ids):
-                rest = [j for j in w.job_ids if j not in job_ids]
+        for w in self.store.watches(s.id):  # the latest grouping wins: a subject is in one watch of this conversation
+            if w.kind == kind and set(w.job_ids) & set(subjects):
+                rest = [j for j in w.job_ids if j not in subjects]
                 w.jobs, w.state = " ".join(rest), ("active" if rest else "cancelled")
                 self.store.update_watch(w)
-        w = self.store.add_watch(WatchRecord(session_id=s.id, kind="jobs", jobs=" ".join(job_ids), every=every,
+        w = self.store.add_watch(WatchRecord(session_id=s.id, kind=kind, jobs=" ".join(subjects), every=every,
                                              note=note.strip()))
         return w, remark
 
@@ -188,15 +205,12 @@ class Autopilot:
         return w, remark
 
     def unwatch(self, session_id: str, ref: str) -> list[WatchRecord]:
-        """Remove a watch (w12), a job from the watches (its id), or everything (all)."""
+        """Remove a watch (w12), a subject from the watches (e.g. a job id), or everything (all)."""
         changed = []
         for w in self.store.watches(session_id):
             if ref == "all" or ref.lower() == f"w{w.id}":
                 w.state = "cancelled"
-            elif w.kind == "jobs" and ref in w.job_ids:
-                rest = [j for j in w.job_ids if j != ref]
-                w.jobs, w.state = " ".join(rest), ("active" if rest else "cancelled")
-            else:
+            elif not (w.kind in self.kinds and self.kinds[w.kind].remove(w, ref)):
                 continue
             self.store.update_watch(w)
             changed.append(w)
@@ -225,28 +239,11 @@ class Autopilot:
                                      "ones unless they ask you to continue.")
         return cancelled
 
-    def forget_job(self, job_id: str) -> None:
-        """The job isn't tracked any more (ov job delete): it wakes nobody."""
-        for w in self.store.job_watches(job_id):
-            rest = [j for j in w.job_ids if j != job_id]
-            w.jobs, w.state = " ".join(rest), ("active" if rest else "cancelled")
-            self.store.update_watch(w)
-
     # ------------------------------------------------------------------ events from the monitor and agent
     def user_turn(self, s: Session) -> None:
         """The researcher wrote in this conversation: wake-ups paused after a failure resume (after this turn)."""
         if self.paused(s.id):
             self.store.set(f"wakeups_paused:{s.id}", "")
-
-    async def job_finished(self, rec: JobRecord, report: str) -> None:
-        watches = self.store.job_watches(rec.job_id)
-        if not watches:
-            return
-        rec = self.store.get_job(rec.job_id) or rec
-        rec.report = report[-MAX_REPORT:]
-        self.store.upsert_job(rec)
-        for sid in dict.fromkeys(w.session_id for w in watches):
-            await self.check(sid)
 
     async def check(self, session_id: str) -> None:
         """Wake the conversation if watches or timers call for it (all that are due, in one turn)."""
@@ -254,33 +251,34 @@ class Autopilot:
         if not s or self.agent.is_running(s) or self.paused(session_id):
             return  # a running turn re-checks when it ends (turn_ended); a paused one when the researcher writes
         now = time.time()
-        fired: list[tuple[WatchRecord, list[JobRecord], list[JobRecord]]] = []  # (watch, ended, still running)
+        fired: list[tuple[WatchRecord, Any, list[str]]] = []  # (watch, what its kind found, subjects still to watch)
         for w in self.store.watches(session_id):
             if w.kind == "timer":
                 if w.due <= now:
-                    fired.append((w, [], []))
+                    fired.append((w, None, []))
                 continue
-            recs = [r for j in w.job_ids if (r := self.store.get_job(j)) and not r.ignored]
-            ended = [r for r in recs if r.ended_at]
-            running = [r for r in recs if not r.ended_at]
-            if not recs:
-                w.state = "cancelled"
+            kind = self.kinds.get(w.kind)
+            if kind is None:
+                continue  # (a kind of another domain: not this bot's)
+            state = w.state
+            due = kind.evaluate(w)
+            if w.state != state:  # (e.g. nothing left to watch)
                 self.store.update_watch(w)
-            elif not running or any(r.state not in SUCCESS_STATES for r in ended):
-                fired.append((w, ended, running))
+            if due is not None:
+                fired.append((w, *due))
         if not fired:
             return
         undo: list[tuple] = [(w.id, w.state, w.due, w.fired) for w, _, _ in fired]
-        for w, ended, running in fired:
+        for w, _, rest_ids in fired:
             w.fired = now
             if w.kind == "timer" and w.every and (not w.until or now + w.every <= w.until):
                 w.due = now + w.every  # repeating: stays active until its end
             else:
                 w.state = "fired"
             self.store.update_watch(w)
-            if running:  # woken early because one failed: the rest stay watched
-                rest = self.store.add_watch(WatchRecord(session_id=session_id, kind="jobs", every=w.every, note=w.note,
-                                                        jobs=" ".join(r.job_id for r in running)))
+            if rest_ids:  # woken early (e.g. one job failed): the rest stay watched
+                rest = self.store.add_watch(WatchRecord(session_id=session_id, kind=w.kind, every=w.every, note=w.note,
+                                                        jobs=" ".join(rest_ids)))
                 undo.append((rest.id, "cancelled", rest.due, rest.fired))  # undone if this wake-up fails
         prompt = await self._wake_prompt(s, fired)
         self._spawn(self._run(s, prompt, None, "wakeup", undo=undo))  # (the agent's reply is the notice)
@@ -296,111 +294,33 @@ class Autopilot:
 
     def after_turn(self, s: Session, activity) -> str:
         """After a successful turn: a line for the reply (HTML) saying what will wake the agent, if anything."""
-        for jid in getattr(activity, "cancelled", []):  # the agent knows why it cancelled these: their end wakes nobody
-            for w in self.store.job_watches(jid):
-                if w.session_id == s.id:
-                    rest = [j for j in w.job_ids if j != jid]
-                    w.jobs, w.state = " ".join(rest), ("active" if rest else "cancelled")
-                    self.store.update_watch(w)
+        for kind in self.kinds.values():
+            kind.after_turn(s, activity)
         watches = self.store.watches(s.id)
         return f"⏰ Waiting for: {esc(self.describe_watches(watches))}" if watches else ""
 
-    # ------------------------------------------------------------------ the minute tick: timers, check-ins
-    async def tick(self, live: dict[str, Job]) -> None:
-        """Called by the monitor after each poll."""
+    # ------------------------------------------------------------------ the tick: timers
+    async def tick(self) -> None:
+        """Timers that came due (every poll of a domain's monitor, and the platform's own loop)."""
         now = time.time()
         for sid in dict.fromkeys(w.session_id for w in self.store.watches() if w.kind == "timer" and w.due <= now):
             await self.check(sid)
-        await self._checkins(live, now)
 
-    async def _checkins(self, live: dict[str, Job], now: float) -> None:
-        by_session: dict[str, list[tuple[JobRecord, Job, float]]] = {}
-        for w in self.store.watches():
-            if w.kind != "jobs" or not w.every or self.paused(w.session_id):
-                continue
-            every = max(w.every, self.min_interval)
-            for jid in w.job_ids:
-                j = self.store.get_job(jid)
-                if not j or j.ended_at or jid not in live or live[jid].state != "RUNNING":
-                    continue
-                if not j.last_checkin:  # the clock starts when the job starts running
-                    j.last_checkin = now
-                    self.store.upsert_job(j)
-                by_session.setdefault(w.session_id, []).append((j, live[jid], every))
-        for sid, items in by_session.items():
-            s = self.agent.get(sid)
-            if not s or self.agent.is_running(s):
-                continue
-            if not any(now - j.last_checkin >= every for j, _, every in items):
-                continue
-            # One check-in covers every running job that is at least halfway to its next one.
-            due = [(j, job) for j, job, every in items if now - j.last_checkin >= every / 2]
-            for j, _ in due:
-                j.checkins += 1
-                j.last_checkin = now
-                self.store.upsert_job(j)
-            self._spawn(self._checkin(s, due))
+    async def loop(self, every: float = 30) -> None:
+        while True:
+            await asyncio.sleep(every)
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("timer tick failed")
 
-    async def _checkin(self, s: Session, due: list[tuple[JobRecord, Job]]) -> None:
-        parts = []
-        for rec, job in due:
-            tail = tqdm_cleanup(await self.hpc.try_tail(rec.stdout, 40)) if rec.stdout else ""
-            log_path = await progress_log(self.hpc, rec)
-            if log_path:  # the program's own log, where the training progress is
-                self.store.upsert_job(rec)
-                tail += f"\n--- {log_path} ---\n" + tqdm_cleanup(await self.hpc.try_tail(log_path, 80))
-            err = ""
-            if rec.stderr and rec.stderr != rec.stdout:
-                err = tqdm_cleanup(await self.hpc.try_tail(rec.stderr, 30))
-            metrics = extract_metrics(tail)
-            tasks = job.extra.get("tasks")
-            parts.append("\n".join(x for x in [
-                f"<job id='{rec.job_id}' name='{rec.name}' state='RUNNING' elapsed='{job.elapsed}' "
-                f"time_limit='{job.time_limit}' node='{job.reason}' stdout='{rec.stdout}' stderr='{rec.stderr}'>",
-                (f"job array tasks: {tasks}" + (f"; the logs above are task {job.extra['task']}'s, each task "
-                                                f"writes {rec.info_dict['stdout_tpl']} (%a = its id)"
-                                                if job.extra.get("task") and rec.info_dict.get("stdout_tpl") else ""))
-                if tasks else "",
-                f"latest metrics: {metrics}" if metrics else "",
-                f"<stdout_tail>\n{tail[-6000:]}\n</stdout_tail>" if tail.strip() else "(no output yet)",
-                f"<stderr_tail>\n{err[-3000:]}\n</stderr_tail>" if err.strip() else "",
-                "</job>",
-            ] if x))
-        prompt = (
-            "[Check-in you asked for - these jobs are still running]\n\n" + "\n\n".join(parts) + "\n\n"
-            "Check whether they are healthy (read more of the logs or metrics files if you need to). If they are, "
-            "change nothing: reply in one or two sentences. If a run is clearly broken, diverging or wasting GPU "
-            "time, scancel it, note why in the research log, fix and resubmit, and `ov watch` the new job.")
-        await self._run(s, prompt, notice=None, kind="checkin", quiet=True)
-
-    async def alert_wake(self, session_id: str, rec: JobRecord, alert: str, value: str) -> None:
-        """An alert the agent set (`ov metrics set --wake-on`) matched: wake its conversation about the job."""
-        s = self.agent.get(session_id)
-        if not s or self.paused(session_id):
+    def wake(self, s: Session, prompt: str, kind: str = "wakeup", quiet: bool = False) -> None:
+        """Wake the conversation now with this prompt (a domain's alert), unless its wake-ups are paused."""
+        if self.paused(s.id):
             return
-        prompt = (f"[Alert you set up] Job {rec.job_id} ({rec.name}): `{alert}` matched (now {value}).\n\n"
-                  f"stdout: {rec.stdout}\n\nLook at the job now (its logs or metrics) and decide: let it run, or "
-                  "scancel it, fix and resubmit. Note it in the research log.")
-        self._spawn(self._run(s, prompt, None, "wakeup"))
-
-    async def idle_wake(self, session_id: str, rec: JobRecord, idle_for: str, state: dict) -> None:
-        """A job this conversation watches has left its GPUs idle (monitor.py): wake it to find out why."""
-        s = self.agent.get(session_id)
-        if not s or self.paused(session_id):
-            return
-        mem, total = state.get("mem", 0) / 1024, state.get("total", 0) / 1024
-        hint = ("Nothing is on the GPU: the program may be running on the CPU (a device bug), or still in a long "
-                "CPU phase (data preparation)." if mem < 0.5 else
-                "The GPU holds data, but nothing runs on it: a hang or deadlock (e.g. a distributed collective), "
-                "waiting on data loading or I/O, or a long CPU phase (evaluation, checkpointing).")
-        prompt = (f"[Idle GPU] Job {rec.job_id} ({rec.name}), which you watch, has been running with its "
-                  f"{state.get('n', 1)} GPU(s) idle for {idle_for}: at most {self.cfg.slurm.idle_gpu_percent}% busy "
-                  f"(now {state.get('util', 0):.0f}%), {mem:.1f} of {total:.0f} GB GPU memory in use. {hint}\n\n"
-                  f"stdout: {rec.stdout}\n\nFind out why from its logs (is it still making progress?). If it's stuck "
-                  "or wasting the GPU, scancel it, fix the cause, resubmit and `ov watch` the new job; if the idle "
-                  "phase is expected, say so briefly (you won't be woken again unless it's busy and then idle again). "
-                  "Note what you found in the research log.")
-        self._spawn(self._run(s, prompt, None, "wakeup"))
+        self._spawn(self._run(s, prompt, None, kind, quiet=quiet))
 
     # ------------------------------------------------------------------ running a wake-up
     async def _run(self, s: Session, prompt: str, notice: str | None, kind: str,
@@ -428,29 +348,18 @@ class Autopilot:
             "you write to the agent here; /auto off cancels them.", session_id=s.id))
 
     # ------------------------------------------------------------------ prompts
-    async def _wake_prompt(self, s: Session,
-                           fired: list[tuple[WatchRecord, list[JobRecord], list[JobRecord]]]) -> str:
-        ended = list({r.job_id: r for _, e, _ in fired for r in e}.values())
-        running = list({r.job_id: r for _, _, rn in fired for r in rn}.values())
-        timers = [w for w, _, _ in fired if w.kind == "timer"]
-        notes = [f"w{w.id}: {w.note}" for w, _, _ in fired if w.note and w.kind == "jobs"]
+    async def _wake_prompt(self, s: Session, fired: list[tuple[WatchRecord, Any, list[str]]]) -> str:
         parts = ["[Wake-up you set up]"]
-        if ended:
-            parts.append("Job(s) you watched have finished:")
-            parts.append("\n\n".join(
-                f"<job id='{j.job_id}' name='{j.name}' state='{j.state}' stdout='{j.stdout}' stderr='{j.stderr}'>\n"
-                f"{(j.report or '(no final report: read its logs)').strip()}\n</job>" for j in ended))
-        for w in timers:
-            ago = human_interval(max(60.0, time.time() - w.created))
-            parts.append(f"Your timer w{w.id} (set {ago} ago): {w.note or '(no note)'}")
-        if notes:
-            parts.append("Your notes for these: " + "; ".join(notes))
-        if running:
-            parts.append(f"Still running: {_ids(running)} (still watched; one of the jobs failed, which is why "
-                         "you're woken now).")
+        by_kind: dict[str, list[tuple[WatchRecord, Any]]] = {}
+        for w, info, _ in fired:
+            if w.kind != "timer":
+                by_kind.setdefault(w.kind, []).append((w, info))
+        for name, items in by_kind.items():
+            parts += await self.kinds[name].wake_parts(s, items)
+        for w, _, _ in fired:
+            if w.kind == "timer":
+                ago = human_interval(max(60.0, time.time() - w.created))
+                parts.append(f"Your timer w{w.id} (set {ago} ago): {w.note or '(no note)'}")
         parts += await self.agent.domain.wake_context(s)  # e.g. the research log, the latest results
-        parts.append("Read the results (open the logs or metrics files for more), record what each showed (`ov result "
-                     "<job> --verdict ... --conclusion ...`; a lasting lesson: `ov finding`) and update the research log. "
-                     "If the work goes on, submit the next run and `ov watch` it; if the goal is reached or nothing "
-                     "sensible is left, say so and set no more wake-ups; if you need the researcher's decision, ask.")
+        parts.append(self.agent.domain.wake_instructions(s))
         return "\n\n".join(p for p in parts if p)

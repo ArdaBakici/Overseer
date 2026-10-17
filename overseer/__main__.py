@@ -75,6 +75,7 @@ def build(cfg: Config):
         tasks.append(asyncio.create_task(monitor.run_forever(), name="monitor"))
         tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
         tasks.append(asyncio.create_task(digest.loop(), name="digest"))
+        tasks.append(asyncio.create_task(autopilot.loop(), name="timers"))
         if dashboard:
             try:
                 await dashboard.start()
@@ -130,7 +131,7 @@ def build(cfg: Config):
     reporter = Reporter(report_text, cfg.agent.enabled, cfg.agent.llm_status_updates)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     domain.monitor = monitor
-    monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
+    autopilot = Autopilot(cfg, store, agent, notifier)  # wake-ups (the domain adds its watch kinds)
     from .core.subagents import Subagents
     subagents = Subagents(cfg, store, agent, notifier)  # planner mode (off unless turned on or approved)
     from .core.addons import Addons

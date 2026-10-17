@@ -228,7 +228,7 @@ class Digest:
                                                                       origins.items() if o != "user") + ")"
                                                      if set(origins) - {"user"} else ""))
             watches = self.store.watches(sid)
-            ap = getattr(self.monitor, "autopilot", None) if self.monitor else None
+            ap = getattr(self.agent, "autopilot", None) if self.agent else None
             if watches and ap:
                 what.append(f"⏰ {esc(_clip(ap.describe_watches(watches), 120))}")
             lines.append(f"{label} {code(sid)}" + (" · " + " · ".join(what) if what else ""))

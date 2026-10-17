@@ -25,7 +25,6 @@ import uuid
 from .autopilot import human_interval
 from .config import BACKENDS, Config
 from .notify import Notifier, Outgoing, code, esc
-from ..hpc.results import context as results_context
 from .store import SessionRecord, Store
 
 log = logging.getLogger(__name__)
@@ -234,7 +233,7 @@ class Subagents:
             parts.append("Still working: " + ", ".join(f"{r.name} ({r.state})" for r in active)
                          + ". You'll be woken when they're done.")
         if ended:
-            ctx = results_context(self.store, ended[0].project)
+            ctx = self.agent.domain.ledger_context(ended[0].project)  # e.g. the HPC's results
             if ctx:
                 parts.append(ctx)
         parts.append("Record the results in the research log (their rows: `ov results`, and give each a verdict if its "

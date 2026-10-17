@@ -1747,7 +1747,7 @@ class Bot:
             rec = self.store.get_job(job_id)
             wake = bool(ap and rec and not rec.ended_at)
             if wake:  # part of the conversation's work: its end wakes the agent
-                ap.add_watch(conv, [job_id])
+                ap.add_watch(conv, "jobs", [job_id])
             await self.reply(update, f"🔗 Job {code(job_id)} is now part of this conversation: its reports come here"
                                      + (" and the agent is woken when it ends (/auto off cancels that)." if wake else "."))
             return

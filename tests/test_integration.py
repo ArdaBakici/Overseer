@@ -887,8 +887,7 @@ async def make_autopilot(env):
     from overseer.core.autopilot import Autopilot
     from overseer.core.ctl import ControlServer
     from overseer.core.projects import Projects
-    ap = Autopilot(env.cfg, env.store, env.agent, env.notifier, env.hpc)
-    env.monitor.autopilot = ap
+    ap = Autopilot(env.cfg, env.store, env.agent, env.notifier)  # (the domain links its job watches to the monitor)
     env.ctl = ControlServer(env.cfg, env.agent, Projects(env.cfg, env.store, env.agent), env.notifier, env.hpc)
     await env.ctl.start()
     return ap
@@ -3082,7 +3081,7 @@ async def test_a_wake_up_cut_off_by_a_restart(env):
     w, _ = ap.add_timer(s, 60, note="FORCE_SLEEP compare the seeds")
     w.due = time.time() - 1
     env.store.update_watch(w)
-    await ap.tick({})
+    await ap.tick()
     for _ in range(50):
         await asyncio.sleep(0.05)
         if _RUNNING:
@@ -3366,7 +3365,7 @@ async def test_agents_see_findings_and_stalls(env):
     w, _ = ap.add_timer(s, 60, note="look again")
     w.due = time.time() - 1
     env.store.update_watch(w)
-    await ap.tick({})
+    await ap.tick()
     await ap.drain()
     stdin = claude_runs(env)[-1]["stdin"]
     assert "[Wake-up you set up]" in stdin and "brought no gain" in stdin and "ov result <job>" in stdin
