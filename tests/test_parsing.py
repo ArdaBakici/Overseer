@@ -275,3 +275,26 @@ def test_init_data_verification():
     assert verify_init_data(sign_init_data(tok, 42, extra="&user=x"), tok, [42]) is None  # a field twice
     assert verify_init_data(sign_init_data(tok, 42).replace("A%22", "B%22"), tok, [42]) is None  # changed
     assert verify_init_data("", tok, [42]) is None and verify_init_data("garbage", tok, [42]) is None
+
+
+def test_core_never_imports_a_domain():
+    """The platform (overseer/core) knows domains only through core/domain.py's hooks: no core module imports a
+    domain's code (overseer/hpc, ...). Domains import core, never the other way round."""
+    import ast
+    from pathlib import Path
+    core = Path(__file__).resolve().parent.parent / "overseer" / "core"
+    domains = {p.name for p in core.parent.iterdir() if p.is_dir() and p.name not in ("core", "__pycache__")}
+    bad = []
+    for f in core.glob("*.py"):
+        for node in ast.walk(ast.parse(f.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                top = mod.split(".")[0] if node.level >= 2 else (mod.split(".")[1] if mod.startswith("overseer.") else "")
+                if node.level >= 2 and not mod:  # from .. import hpc
+                    top = next((a.name for a in node.names if a.name in domains), "")
+                if top in domains:
+                    bad.append(f"{f.name}:{node.lineno} from {'.' * node.level}{mod}")
+            elif isinstance(node, ast.Import):
+                bad += [f"{f.name}:{node.lineno} import {a.name}" for a in node.names
+                        if a.name.split(".")[:2] in (["overseer", d] for d in domains)]
+    assert domains and not bad, bad

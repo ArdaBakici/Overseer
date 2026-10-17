@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..core.notify import code, esc
-from .slurm import array_parent, human_seconds
+from ..core.notify import human_seconds
+from .slurm import array_parent
 
 # Node states in which nothing new starts on a node.
 UNUSABLE = ("DOWN", "DRAIN", "FAIL", "MAINT", "NOT_RESPONDING", "POWERED_DOWN", "POWERING", "REBOOT", "RESERVED",

@@ -24,7 +24,7 @@ import uuid
 
 from .autopilot import human_interval
 from .config import BACKENDS, Config
-from .notify import Notifier, Outgoing, code, esc
+from .notify import Notifier, Outgoing, esc
 from .store import SessionRecord, Store
 
 log = logging.getLogger(__name__)

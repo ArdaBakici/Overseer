@@ -100,3 +100,33 @@ class Domain:
         """A project's notes file for /project notes: (where it is, its beginning); None if the domain keeps none."""
         return None
 
+    # ------------------------------------------------------------------ the morning digest (digest.py)
+    async def digest_sections(self, since: float, now: float) -> list[str]:
+        """The domain's sections (HTML), first in the digest."""
+        return []
+
+    async def digest_closing(self) -> list[str]:
+        """The domain's last lines in the digest."""
+        return []
+
+    # ------------------------------------------------------------------ the dashboard (dashboard.py)
+    def dashboard_js(self) -> bytes:
+        """The dashboard page's script: it builds the domain's tabs (nav) and renders them from dashboard_api."""
+        return (b'document.getElementById("main").innerHTML = '
+                b'"<div class=\\"empty\\">This bot has no dashboard yet.</div>";\n')
+
+    async def dashboard_api(self, parts: list[str], query: dict[str, str]):
+        """/api/<parts...>: (status, content type, body, extra headers), or None (404). Only called for the
+        researcher (the platform checked Telegram's signed launch data)."""
+        return None
+
+    # ------------------------------------------------------------------ search (search.py)
+    def search_rows(self) -> list[tuple]:
+        """The domain's records to search besides conversations: (body, title, kind, ref, session, project, ts,
+        what). Read in the event loop, so they may come from the store."""
+        return []
+
+    def search_line(self, hit, where: str, snippet: str, html: bool) -> str | None:
+        """How a hit of the domain's kinds reads in the results (None: a plain line)."""
+        return None
+

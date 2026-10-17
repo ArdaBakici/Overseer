@@ -1087,14 +1087,14 @@ class Bot:
                                      "word*). In a project's topic: that project only.")
             return
         if self._searcher is None:
-            self._searcher = Search(self.cfg, self.store)
+            self._searcher = Search(self.cfg, self.store, self.agent.domain)
         project = self._scope(update)
         try:
             hits, total = await self._searcher.asearch(text, project=project if project else False, limit=10)
         except SearchError as e:
             await self.reply(update, esc(str(e)))
             return
-        await self.reply(update, render_hits(hits, total, text, html=True)
+        await self.reply(update, render_hits(hits, total, text, html=True, domain=self.agent.domain)
                          + (f"\n<i>in project {esc(project)}</i>" if project else ""))
 
     async def cmd_digest(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

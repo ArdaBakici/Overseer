@@ -1,4 +1,4 @@
-// Overseer's dashboard (dashboard.py): read-only views of jobs, results, findings and a timeline.
+// The HPC's dashboard tabs (hpc/dashboard.py): read-only views of jobs, results, findings and a timeline.
 "use strict";
 const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) {
@@ -253,11 +253,15 @@ function drawTimeline(jobs, lo, hi) {
 document.addEventListener("scroll", () => tip.style.display = "none", {passive: true});
 
 // ------------------------------------------------------------------ tabs
-const TABS = {jobs: renderJobs, results: renderResults, findings: renderFindings, timeline: renderTimeline};
-document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
-  document.querySelectorAll("nav button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+const TABS = [["jobs", "Jobs", renderJobs], ["results", "Results", renderResults], ["findings", "Findings", renderFindings],
+              ["timeline", "Timeline", renderTimeline]];
+const nav = document.querySelector("nav");
+nav.innerHTML = TABS.map(([key, label], i) =>
+  `<button role="tab" data-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join("");
+nav.querySelectorAll("button").forEach((b) => b.onclick = () => {
+  nav.querySelectorAll("button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
   state.tab = b.dataset.tab;
   tip.style.display = "none";
-  TABS[state.tab]().catch(fail);
+  TABS.find(([key]) => key === state.tab)[2]().catch(fail);
 });
 renderJobs().catch(fail);

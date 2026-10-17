@@ -21,10 +21,11 @@ from ..core.notify import Notifier, Outgoing, code, esc
 from .quota import parse_quota
 from .plots import resolve_plot, run_plots
 from .results import record_job, snapshot
+from ..core.notify import human_seconds
 from ..core.richtext import fold_text
 from .cluster import Cluster, until
-from .slurm import (NO_VAL, STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
-                    has_gpus, human_seconds, log_template, parse_gpu_stats, slurm_seconds, summarize_steps,
+from .slurm import (NO_VAL, STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats,
+                    has_gpus, log_template, parse_gpu_stats, slurm_seconds, summarize_steps,
                     task_states)
 from .ssh import SSHError
 from ..core.store import JobRecord, Store

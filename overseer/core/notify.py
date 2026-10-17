@@ -57,3 +57,13 @@ def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
     """Split Telegram HTML into messages, keeping every tag balanced in each one."""
     from .richtext import split_html
     return split_html(text, limit)
+
+
+def human_seconds(sec: int) -> str:
+    """'45m', '3h05m', '2d4h'."""
+    if sec < 3600:
+        return f"{sec // 60}m"
+    if sec < 86400:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{sec // 86400}d{sec % 86400 // 3600}h"
+

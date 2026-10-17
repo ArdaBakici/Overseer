@@ -59,6 +59,7 @@ class HpcDomain(Domain):
         self.hpc = hpc
         self._monitor = None
         self.jobs = None  # watches.JobWatches, once the wake-up engine exists
+        self._dashboard = None  # dashboard.HpcDashboard, made on first use
 
     @property
     def monitor(self):
@@ -75,6 +76,35 @@ class HpcDomain(Domain):
     def ctl_commands(self, ctl):
         from .commands import HpcCommands
         return HpcCommands(ctl, self)
+
+    # ------------------------------------------------------------------ search
+    def search_rows(self) -> list[tuple]:
+        from .search import search_rows
+        return search_rows(self.store)
+
+    def search_line(self, hit, where: str, snippet: str, html: bool) -> str | None:
+        from .search import search_line
+        return search_line(hit, where, snippet, html)
+
+    # ------------------------------------------------------------------ the dashboard
+    def dashboard_js(self) -> bytes:
+        from .dashboard import page_js
+        return page_js()
+
+    async def dashboard_api(self, parts: list[str], query: dict[str, str]):
+        if self._dashboard is None:
+            from .dashboard import HpcDashboard
+            self._dashboard = HpcDashboard(self)
+        return await self._dashboard.route(parts, query)
+
+    # ------------------------------------------------------------------ the morning digest
+    async def digest_sections(self, since: float, now: float) -> list[str]:
+        from .digest import HpcDigest
+        return await HpcDigest(self).sections(since, now)
+
+    async def digest_closing(self) -> list[str]:
+        from .digest import HpcDigest
+        return await HpcDigest(self).closing()
 
     # ------------------------------------------------------------------ Telegram
     def bot_commands(self, bot):

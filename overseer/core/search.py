@@ -1,12 +1,12 @@
-"""Search across past work: conversations, results, findings and jobs.
+"""Search across past work: conversations, and what the domain keeps (for the HPC: results, findings and jobs).
 
 "What did we try with ratio 64 last month?" - for agents (`ov history search`, then `ov history show` to read a
 past conversation) and for you (/search). A full-text index (SQLite FTS5, in state/search.db, rebuilt from the
 sources whenever it's missing):
 - conversations: from their transcripts (state/transcripts/<id>.jsonl), read incrementally - each request, reply,
   in-between note and command the agent ran (not command output or reasoning);
-- results (name, verdict, hypothesis, conclusion, tags, metrics), findings, and jobs (name, state, report): re-read
-  at each search, since they change.
+- the domain's records (Domain.search_rows; for the HPC: results, findings and jobs): re-read at each search, since
+  they change.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from .config import Config
 from .store import Store
 
-KINDS = ("conversation", "result", "finding", "job")
 MAX_BODY = 6000  # characters of one event indexed (a wake-up's prompt carries whole job reports)
 SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
@@ -85,9 +84,10 @@ class Search:
     """The index. Reading and searching it happens in a worker thread (a first indexing of long transcripts takes
     a while); Overseer's records are read in the event loop first (the store isn't shared across threads)."""
 
-    def __init__(self, cfg: Config, store: Store):
+    def __init__(self, cfg: Config, store: Store, domain=None):
         self.cfg = cfg
         self.store = store
+        self.domain = domain  # its records (search_rows) and how a hit of theirs reads (search_line)
         self.path = cfg.local.state("search.db")
         self._lock = threading.Lock()
         self.db = self._open()
@@ -118,7 +118,7 @@ class Search:
     def update(self, rows: list[tuple] | None = None, projects: dict[str, str] | None = None) -> None:
         with self._lock:
             self._transcripts(self._projects() if projects is None else projects)
-            self.db.execute("DELETE FROM docs WHERE kind IN ('result', 'finding', 'job')")
+            self.db.execute("DELETE FROM docs WHERE kind != 'conversation'")
             self.db.executemany("INSERT INTO docs VALUES (?,?,?,?,?,?,?,?)",
                                 self._record_rows() if rows is None else rows)
             self.db.commit()
@@ -172,21 +172,9 @@ class Search:
         return None
 
     def _record_rows(self) -> list[tuple]:
-        """Results, findings and jobs change: indexed again at each search (they're small)."""
-        rows = []
-        for r in self.store.results(hidden=True):
-            metrics = ", ".join(f"{k}={v}" for k, v in (json.loads(r.metrics or "{}") or {}).items())
-            body = " · ".join(x for x in [r.name, r.verdict, r.hypothesis, r.conclusion, r.tags, metrics, r.state] if x)
-            rows.append((body, f"result {r.id} {r.name}", "result", r.id, r.session_id or "", r.project or "",
-                         r.ended or r.created, r.verdict or ""))
-        for f in self.store.findings():
-            rows.append((f.text, f"{f.kind} F{f.id}", "finding", f"F{f.id}", f.session_id or "", f.project or "",
-                         f.created, f.kind))
-        for j in self.store.jobs_for_search():
-            body = " · ".join(x for x in [j.name, j.state, j.report, j.workdir] if x)
-            rows.append((body, f"job {j.job_id} {j.name}", "job", j.job_id, j.session_id or "", j.project or "",
-                         j.ended_at or j.first_seen, j.state))
-        return rows
+        """The domain's records (they change, so they're indexed again at each search; they're small): rows of
+        (body, title, kind, ref, session, project, ts, what)."""
+        return self.domain.search_rows() if self.domain else []
 
     # ------------------------------------------------------------------ searching
     def search(self, text: str, *, project: str | None | bool = False, kinds: tuple[str, ...] = (),
@@ -265,7 +253,7 @@ def _when(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
 
 
-def render_hits(hits: list[Hit], total: int, text: str, html: bool = False) -> str:
+def render_hits(hits: list[Hit], total: int, text: str, html: bool = False, domain=None) -> str:
     from .notify import code, esc
     e = esc if html else (lambda x: x)
     c = code if html else (lambda x: x)
@@ -281,12 +269,9 @@ def render_hits(hits: list[Hit], total: int, text: str, html: bool = False) -> s
             lines.append(f"💬 {c(h.ref)}{where} · {e(_when(h.ts))} · {e(h.what)}: {snippet}")
             if not html:
                 lines.append(f"   → ov history show {h.ref} --grep '{text[:40]}'")
-        elif h.kind == "result":
-            lines.append(f"📊 result {c(h.ref)}{where} · {e(_when(h.ts)[:10])}: {snippet}")
-        elif h.kind == "finding":
-            lines.append(f"{'🚫' if h.what == 'dead-end' else '💡'} {c(h.ref)}{where}: {snippet}")
-        else:
-            lines.append(f"🧾 job {c(h.ref)}{where} · {e(h.what)} · {e(_when(h.ts)[:10])}: {snippet}")
+        else:  # the domain's records
+            line = domain.search_line(h, where, snippet, html) if domain else None
+            lines.append(line or f"• {e(h.kind)} {c(h.ref)}{where} · {e(_when(h.ts)[:10])}: {snippet}")
     return "\n".join(lines)
 
 

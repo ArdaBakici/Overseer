@@ -2608,7 +2608,7 @@ async def test_morning_digest(env):
     assert (await env.ctl.handle(token, ["watch", "903", "--every", "1h"]))[0]
     env.store.add_feedback(FeedbackRecord(kind="bug", text="something is off with ov", session_id=s.id))
 
-    d = Digest(env.cfg, env.store, env.hpc, env.notifier, env.agent, env.monitor)
+    d = Digest(env.cfg, env.store, env.notifier, env.agent)
     text = await d.build(now - 86400, now)
     assert text.startswith("☀️ <b>Digest</b>") and "since " in text, text
     assert "✅ 1 finished · ❌ 1 failed · 🏃 1 running" in text, text
@@ -2743,7 +2743,7 @@ async def test_dashboard(env):
     cache = env.cfg.local.state("plots", "951")
     cache.mkdir(parents=True)
     (cache / "00-curve.png").write_bytes(b"\x89PNG fake")
-    d = Dashboard(env.cfg, env.store, env.monitor, env.hpc, token)
+    d = Dashboard(env.cfg, env.store, token, env.agent.domain)
     await d.start()
     allowed = env.cfg.telegram.allowed_chat_ids[0]
 

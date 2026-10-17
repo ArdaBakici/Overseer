@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+
 from dataclasses import dataclass, field, replace
 
 ACTIVE_STATES = {
@@ -277,14 +278,6 @@ def slurm_seconds(t: str) -> int | None:
         parts.insert(0, 0)
     h, m, sec = parts[-3:]
     return days * 86400 + h * 3600 + m * 60 + sec
-
-
-def human_seconds(sec: int) -> str:
-    if sec < 3600:
-        return f"{sec // 60}m"
-    if sec < 86400:
-        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
-    return f"{sec // 86400}d{sec % 86400 // 3600}h"
 
 
 def format_gpu_stats(csv: str) -> list[str]:

@@ -257,7 +257,7 @@ class ControlServer:
     def _search(self):
         if self._searcher is None:
             from .search import Search
-            self._searcher = Search(self.cfg, self.store)
+            self._searcher = Search(self.cfg, self.store, self.agent.domain)
         return self._searcher
 
     async def history_search(self, session, args) -> str:
@@ -268,7 +268,7 @@ class ControlServer:
             project = None if args.project.lower() in ("main", "none") else args.project.lower()
         hits, total = await self._search().asearch(text, project=project, kinds=tuple(args.kind or ()),
                                                    since=parse_since(args.since), limit=max(1, min(args.limit, 50)))
-        return render_hits(hits, total, text)
+        return render_hits(hits, total, text, domain=self.agent.domain)
 
     async def history_show(self, session, args) -> str:
         from .search import render_turns

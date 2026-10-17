@@ -143,13 +143,13 @@ def build(cfg: Config):
         log.info("project %s created from config.yaml", name)
     ctl = ControlServer(cfg, agent, projects, notifier)
     from .core.digest import Digest
-    digest = Digest(cfg, store, hpc, notifier, agent, monitor)  # the morning digest, in the general topic
+    digest = Digest(cfg, store, notifier, agent)  # the morning digest, in the general topic
     bot = Bot(cfg, app, store, agent, notifier, projects)
     bot.digest = digest
     dashboard = None
     if cfg.dashboard.enabled:  # the Mini App: on this machine, reachable on your tailnet via `tailscale serve`
         from .core.dashboard import Dashboard
-        dashboard = Dashboard(cfg, store, monitor, hpc, cfg.telegram.token)
+        dashboard = Dashboard(cfg, store, cfg.telegram.token, domain)
     bot.dashboard = dashboard
     bot.register()
     return app
