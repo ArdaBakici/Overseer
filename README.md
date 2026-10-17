@@ -423,6 +423,25 @@ tailscale serve --bg 8765
 - **Read-only:** nothing in it changes anything; actions stay in the chat, where each one is announced.
 - **Menu button:** with `url` set, the chat's menu button opens it too.
 
+**Behind Caddy instead of `tailscale serve`.** Any HTTPS reverse proxy to `127.0.0.1:8765` works; put its address in `dashboard.url`. The certificate must be one your devices already trust, because Telegram opens the page in its own web view:
+
+```
+# Tailscale's certificate (Caddy fetches it from tailscaled; set TS_PERMIT_CERT_UID=caddy for tailscaled)
+homelab.tail1234.ts.net {
+    bind 100.x.y.z                 # the homelab's Tailscale IP: not on the LAN or the internet
+    reverse_proxy 127.0.0.1:8765
+}
+
+# or your own domain, pointed at the Tailscale IP, with a DNS-challenge plugin (no open ports)
+overseer.example.com {
+    bind 100.x.y.z
+    tls { dns cloudflare {env.CF_API_TOKEN} }
+    reverse_proxy 127.0.0.1:8765
+}
+```
+
+`tls internal` (Caddy's own CA) only works where you install Caddy's root certificate: iOS (and enable full trust) and desktops yes, Android most likely not, since apps there ignore user-installed CAs.
+
 ## Configuration notes
 
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
