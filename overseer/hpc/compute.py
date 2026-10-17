@@ -18,7 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from .config import Config
+from ..core.config import Config
 
 WORKER_NAME = "overseer-worker"
 # Remote commands that hand their work to SLURM (or are file transfers): no CPU limit for them.

@@ -27,13 +27,13 @@ from pathlib import Path
 import pytest
 
 from fake_model_server import FakeModel
-from overseer.agent import Agent
-from overseer.config import Config
-from overseer.hpc import HPC
-from overseer.runners import _toml
-from overseer.ssh import SSHRunner
-from overseer.sshlink import setup_key, write_configs
-from overseer.store import Store
+from overseer.core.agent import Agent
+from overseer.core.config import Config
+from overseer.hpc.remote import HPC
+from overseer.core.runners import _toml
+from overseer.hpc.ssh import SSHRunner
+from overseer.hpc.sshlink import setup_key, write_configs
+from overseer.core.store import Store
 
 FAKE_SLURM = Path(__file__).parent / "fake_slurm"
 SSHD = shutil.which("sshd") or ("/usr/sbin/sshd" if os.path.exists("/usr/sbin/sshd") else None)
@@ -207,7 +207,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
     write_configs(cfg)
     (app / ".env").write_text("TELEGRAM_BOT_TOKEN=999:super-secret-token\n")
     (app / ".env").chmod(0o600)
-    from overseer import live
+    from overseer.core import live
     monkeypatch.setattr(live, "PROGRESS_SECONDS", 0.2)
     with FakeModel(script, think=True) as fm:
         configure_backend(cfg, backend, cli, fm)
@@ -215,13 +215,13 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         notes = Notes()
         agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
         agent.set_backend(backend)
-        from overseer.ctl import ControlServer
-        from overseer.projects import Projects
+        from overseer.core.ctl import ControlServer
+        from overseer.core.projects import Projects
         ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
         await ctl.start()
         s = agent.general_session()
         # The wake-up instructions must reach the model through each CLI's own mechanism.
-        from overseer.autopilot import Autopilot
+        from overseer.core.autopilot import Autopilot
         autopilot = Autopilot(cfg, store, agent, notes, agent.hpc)
         try:
             await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
@@ -412,10 +412,10 @@ async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, plann
         notes = Notes()
         agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
         agent.set_backend(planner)
-        from overseer.autopilot import Autopilot
-        from overseer.ctl import ControlServer
-        from overseer.projects import Projects
-        from overseer.subagents import Subagents
+        from overseer.core.autopilot import Autopilot
+        from overseer.core.ctl import ControlServer
+        from overseer.core.projects import Projects
+        from overseer.core.subagents import Subagents
         ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
         await ctl.start()
         Autopilot(cfg, store, agent, notes, agent.hpc)
@@ -461,8 +461,8 @@ async def test_installed_skills_reach_the_cli(hpc, backend, cli_name):
     if not cli:
         pytest.skip(f"{cli_name} not installed")
     cfg, remote, state, app = hpc
-    from overseer.addons import Addons
-    from overseer.store import SkillRecord
+    from overseer.core.addons import Addons
+    from overseer.core.store import SkillRecord
     with FakeModel(["echo hi"]) as fm:
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)

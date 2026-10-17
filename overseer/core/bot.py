@@ -33,15 +33,15 @@ from .agent import Agent, Session
 from .projects import ProjectError, Projects
 from .richtext import RICH_LIMIT, strip_html
 from .config import BACKENDS, Config
-from .hpc import HPC
-from .monitor import Monitor, progress_log
+from ..hpc.remote import HPC
+from ..hpc.monitor import Monitor, progress_log
 from .notify import TG_LIMIT, Outgoing, code, esc, pre, split_message
-from .slurm import STATE_EMOJI
-from .ssh import SSHError
-from .sshlink import master_alive
+from ..hpc.slurm import STATE_EMOJI
+from ..hpc.ssh import SSHError
+from ..hpc.sshlink import master_alive
 from .store import ProjectRecord, Store
-from . import results as R
-from .plots import resolve_plot
+from ..hpc import results as R
+from ..hpc.plots import resolve_plot
 from .subagents import ENDED
 from .usage import usage_report
 

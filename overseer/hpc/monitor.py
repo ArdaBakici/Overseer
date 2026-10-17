@@ -11,23 +11,23 @@ import shutil
 import time
 
 from .compute import WORKER_NAME
-from .config import Config
+from ..core.config import Config
 from .diagnose import (Reporter, all_metrics, extract_traceback, find_issues, find_log_paths, rank_metrics,
                        tqdm_cleanup)
-from .hpc import HPC
+from .remote import HPC
 from .metrics import check_alerts, fired_alerts, resolve, run_command
 from .metrics import lines as metric_lines
-from .notify import Notifier, Outgoing, code, esc
+from ..core.notify import Notifier, Outgoing, code, esc
 from .quota import parse_quota
 from .plots import resolve_plot, run_plots
 from .results import record_job, snapshot
-from .richtext import fold_text
+from ..core.richtext import fold_text
 from .cluster import Cluster, until
 from .slurm import (NO_VAL, STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats, gpus_from_tres,
                     has_gpus, human_seconds, log_template, parse_gpu_stats, slurm_seconds, summarize_steps,
                     task_states)
 from .ssh import SSHError
-from .store import JobRecord, Store
+from ..core.store import JobRecord, Store
 
 log = logging.getLogger(__name__)
 

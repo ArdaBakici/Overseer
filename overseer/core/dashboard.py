@@ -25,7 +25,7 @@ from importlib import resources
 from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from .config import Config
-from .slurm import gpus_from_tres
+from ..hpc.slurm import gpus_from_tres
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -144,10 +144,10 @@ class Dashboard:
         url = urlsplit(target)
         path, query = url.path, {k: v[-1] for k, v in parse_qs(url.query).items()}
         if path in ("/", "/index.html"):
-            page = resources.files("overseer").joinpath("dashboard.html").read_bytes()
+            page = resources.files("overseer.core").joinpath("dashboard.html").read_bytes()
             return 200, "text/html; charset=utf-8", page, {"Content-Security-Policy": CSP}
         if path == "/app.js":
-            js = resources.files("overseer").joinpath("dashboard.js").read_bytes()
+            js = resources.files("overseer.core").joinpath("dashboard.js").read_bytes()
             return 200, "text/javascript; charset=utf-8", js, {}
         if not path.startswith("/api/"):
             return 404, "text/plain", b"not found", {}

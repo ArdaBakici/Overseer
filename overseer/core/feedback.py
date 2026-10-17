@@ -25,7 +25,7 @@ from .store import FeedbackRecord, SessionRecord, Store
 KINDS = {"limitation": "🧱", "bug": "🐞", "idea": "💡"}
 STATUS = {"open": "", "noted": "👀 noted", "fixed": "✅ fixed", "wontfix": "✖ won't fix"}
 PER_DAY = 3  # new items per conversation per day (+1s are unlimited)
-SOURCE = Path(__file__).resolve().parent.parent  # Overseer's source (README, overseer/, tests/)
+SOURCE = Path(__file__).resolve().parent.parent.parent  # Overseer's source (README, overseer/, tests/)
 REVIEWER_KEY = "feedback_reviewer"
 
 REVIEW_PROMPT = """[Feedback review]{focus}

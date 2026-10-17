@@ -20,7 +20,7 @@ import time
 
 from .metrics import number, parse_names, pick
 from .slurm import Job, slurm_seconds
-from .store import FindingRecord, JobRecord, MetricSpec, ResultRecord, Store
+from ..core.store import FindingRecord, JobRecord, MetricSpec, ResultRecord, Store
 
 VERDICTS = {"baseline": "📏", "promising": "✅", "no-gain": "➖", "worse": "🔻", "broken": "💥", "dead-end": "⛔",
             "inconclusive": "❔"}

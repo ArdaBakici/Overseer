@@ -31,17 +31,17 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .compute import WORKER_NAME
+from ..hpc.compute import WORKER_NAME
 from .config import Config
 from .notify import Outgoing, code, esc
 from .autopilot import WatchError, human_interval, parse_duration
-from .metrics import SpecError, check_progress, parse_alert
+from ..hpc.metrics import SpecError, check_progress, parse_alert
 from .projects import ProjectError, Projects
-from .slurm import TERMINAL_STATES, array_parent
+from ..hpc.slurm import TERMINAL_STATES, array_parent
 from .store import MetricSpec
 from .subagents import ENDED, STATE_LABEL, SubagentError, model_label
-from . import results as R
-from .results import ResultError
+from ..hpc import results as R
+from ..hpc.results import ResultError
 from .feedback import FeedbackError
 from .addons import SkillError
 
@@ -423,7 +423,7 @@ class ControlServer:
     # ---- the cluster (cluster.py)
     async def cluster(self, session, args) -> str:
         if self._cluster is None:
-            from .cluster import Cluster
+            from ..hpc.cluster import Cluster
             self._cluster = Cluster(self.hpc)
         snap = await self._cluster.snapshot(fresh=args.fresh)
         names = {r.job_id: r.name for r in self.store.active_jobs()}
@@ -846,7 +846,7 @@ class ControlServer:
         monitor = getattr(self.agent, "monitor", None)
         if not monitor:
             raise CtlError("the monitor isn't running")
-        from .metrics import lines as metric_lines
+        from ..hpc.metrics import lines as metric_lines
         view = await monitor._view(rec)
         spec = view["spec"]
         critical, important, progress = metric_lines(spec, view["values"], view["auto"])
@@ -859,7 +859,7 @@ class ControlServer:
             out.append(f"  error: {view['err']}" if view["err"] else "  ok")
         out.append("values: " + (", ".join(f"{k}={v}" for k, v in list(view["values"].items())[:30]) or "(none found)"))
         if spec and json.loads(spec.alerts or "[]"):
-            from .metrics import fired_alerts
+            from ..hpc.metrics import fired_alerts
             fired = fired_alerts(self.store, rec)
             for a in json.loads(spec.alerts):
                 out.append(f"alert: {a['when']}" + (" (wakes you)" if a.get("wake") else "")
@@ -950,7 +950,7 @@ class ControlServer:
                 + ", ".join(p for p, _ in items) + (f"\n⚠️ {err}" if err else ""))
 
     async def plots_show(self, session, args) -> str:
-        from .plots import resolve_plot
+        from ..hpc.plots import resolve_plot
         rec = self._tracked(args.job)
         spec = resolve_plot(self.store, rec)
         if not spec:
@@ -1116,7 +1116,7 @@ def write_ov_tool(cfg: Config, bin_dir: Path, write) -> None:
           0o700)
 
 
-SKILL = Path(__file__).parent / "skills" / "overseer" / "SKILL.md"
+SKILL = Path(__file__).parent.parent / "hpc" / "skills" / "overseer" / "SKILL.md"
 
 
 def install_skill(skills_dir: Path) -> None:

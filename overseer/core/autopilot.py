@@ -25,12 +25,12 @@ import time
 from typing import TYPE_CHECKING
 
 from .config import Config
-from .diagnose import extract_metrics, tqdm_cleanup
-from .hpc import HPC
-from .results import context as results_context
-from .monitor import progress_log
+from ..hpc.diagnose import extract_metrics, tqdm_cleanup
+from ..hpc.remote import HPC
+from ..hpc.results import context as results_context
+from ..hpc.monitor import progress_log
 from .notify import Notifier, Outgoing, code, esc
-from .slurm import SUCCESS_STATES, Job
+from ..hpc.slurm import SUCCESS_STATES, Job
 from .store import JobRecord, Store, WatchRecord
 
 if TYPE_CHECKING:

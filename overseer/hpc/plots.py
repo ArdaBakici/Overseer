@@ -15,7 +15,7 @@ import fnmatch
 import shlex
 import time
 
-from .store import JobRecord, MetricSpec, Store
+from ..core.store import JobRecord, MetricSpec, Store
 
 PLOT_TIMEOUT = 90  # seconds: plotting from logs is quick; heavy work belongs in the script's own job
 MAX_IMAGES = 4

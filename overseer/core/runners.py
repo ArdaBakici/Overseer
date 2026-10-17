@@ -32,9 +32,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .compute import DISPATCHED, LOGIN_NODE_CMD
+from ..hpc.compute import DISPATCHED, LOGIN_NODE_CMD
 from .config import Config
-from .sshlink import agent_bin_dir
+from ..hpc.sshlink import agent_bin_dir
 
 log = logging.getLogger(__name__)
 

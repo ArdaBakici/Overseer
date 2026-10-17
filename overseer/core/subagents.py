@@ -25,7 +25,7 @@ import uuid
 from .autopilot import human_interval
 from .config import BACKENDS, Config
 from .notify import Notifier, Outgoing, code, esc
-from .results import context as results_context
+from ..hpc.results import context as results_context
 from .store import SessionRecord, Store
 
 log = logging.getLogger(__name__)

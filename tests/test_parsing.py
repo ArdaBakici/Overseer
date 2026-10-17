@@ -1,7 +1,7 @@
 import json
-from overseer.diagnose import extract_metrics, extract_traceback, find_issues, tqdm_cleanup
-from overseer.notify import split_message
-from overseer.slurm import (
+from overseer.hpc.diagnose import extract_metrics, extract_traceback, find_issues, tqdm_cleanup
+from overseer.core.notify import split_message
+from overseer.hpc.slurm import (
     gpus_from_tres,
     normalize_state,
     parse_sacct_list,
@@ -96,7 +96,7 @@ def test_split_message_keeps_pre_balanced():
 
 
 def test_markdown_to_telegram_html():
-    from overseer.richtext import md_to_html
+    from overseer.core.richtext import md_to_html
     out = md_to_html("## Result\nSeed 1 scored **0**: the `reward` wrapper. See [log](https://x.org/a?b=1&c=2).\n\n"
                      "1. fixed `a.py`\n2. job **42**\n   - lr `3e-4`\n\n```python\nr = 1 < 2\n```\n\n"
                      "| seed | score |\n|---|---|\n| 0 | 3.1 |\n\n> quote with `code` and [a](https://x.org)\n\n"
@@ -113,7 +113,7 @@ def test_markdown_to_telegram_html():
 
 def test_split_html_keeps_tags_balanced():
     import re
-    from overseer.richtext import split_html, strip_html
+    from overseer.core.richtext import split_html, strip_html
     text = ("<b>head</b>\n<blockquote expandable>" + "\n".join(f"$ cmd {i} &amp; more" for i in range(300))
             + "</blockquote>\n<i>tail " + "y" * 3000 + "</i>")
     chunks = split_html(text, 1000)
@@ -127,7 +127,7 @@ def test_split_html_keeps_tags_balanced():
 
 
 def test_fold_long_answers():
-    from overseer.richtext import fold_long, md_to_html
+    from overseer.core.richtext import fold_long, md_to_html
     long = md_to_html("\n\n".join(f"Paragraph {i}: " + "word " * 60 for i in range(10)))
     folded = fold_long(long)
     assert folded.startswith("Paragraph 0") and "<blockquote expandable>Paragraph 1" in folded
@@ -148,7 +148,7 @@ Disk quotas for ab11578 (uid 4167280):
 
 
 def test_quota_table():
-    from overseer.quota import limits_line, over, parse_quota
+    from overseer.hpc.quota import limits_line, over, parse_quota
     rows = parse_quota(QUOTA)
     assert [(q.fs, q.used, q.limit, q.pct, q.files, q.files_limit, q.files_pct) for q in rows] == [
         ("/home", "31GB", "50GB", 63, 260_000, 500_000, 52),
@@ -163,7 +163,7 @@ def test_quota_table():
 
 
 def test_job_arrays_fold_into_one_job():
-    from overseer.slurm import Job, _task_count, array_parent, fold_arrays
+    from overseer.hpc.slurm import Job, _task_count, array_parent, fold_arrays
     assert array_parent("18771337_[2-11%4]") == "18771337" and array_parent("99") == "99"
     assert _task_count("1_[2-11,15,20-21%4]") == 13 and _task_count("1_4") == 1
     (a, b) = fold_arrays([Job("1_1", state="RUNNING", elapsed="5:00"), Job("1_[2-11]", state="PENDING"),
@@ -188,7 +188,7 @@ eval: {'phase': 'mid', 'achievement_pct': 5.0}
 
 
 def test_parameter_counts_are_not_metrics_and_json_records_are():
-    from overseer.diagnose import all_metrics
+    from overseer.hpc.diagnose import all_metrics
     m = all_metrics(DIAG_LOG)
     assert "reward" not in m and "critic" not in m and "value_head" not in m, m
     assert m["achievement_pct"] == "7.9" and m["return_mean"] == "2.31", m  # the latest record wins
@@ -199,7 +199,7 @@ def test_parameter_counts_are_not_metrics_and_json_records_are():
 
 
 def test_array_task_logs():
-    from overseer.slurm import Job, fold_arrays, log_template, task_states
+    from overseer.hpc.slurm import Job, fold_arrays, log_template, task_states
     assert log_template("/r/pair_42_4294967294.out", "42") == "/r/pair_42_%a.out"
     assert log_template("/r/slurm-42_7.out", "42", "7") == "/r/slurm-42_%a.out"
     assert log_template("/r/run/t3.log", "42", "3") == "/r/run/t%a.log"
@@ -211,8 +211,8 @@ def test_array_task_logs():
 
 
 def test_cluster_parsing():
-    from overseer.cluster import fairshare, gpu_count, gpus_allocated, partitions, start_estimates, until
-    from overseer.slurm import parse_scontrol
+    from overseer.hpc.cluster import fairshare, gpu_count, gpus_allocated, partitions, start_estimates, until
+    from overseer.hpc.slurm import parse_scontrol
     assert gpu_count("gpu:a100:4(S:0-1)") == (4, ["a100"]) and gpu_count("(null)") == (0, [])
     assert gpu_count("gpu:a100:2,gpu:v100:2(S:0)") == (4, ["a100", "v100"]) and gpu_count("gpu:2") == (2, [])
     assert gpus_allocated("cpu=8,mem=64G,gres/gpu=3,gres/gpu:a100=3") == 3
@@ -238,7 +238,7 @@ def test_cluster_parsing():
 
 def test_search_query():
     import pytest
-    from overseer.search import SearchError, fts_query, parse_since
+    from overseer.core.search import SearchError, fts_query, parse_since
     assert fts_query("ratio 64") == '"ratio" "64"*'
     assert fts_query('"batch size" OR lr') == '"batch size" OR "lr"*'
     assert fts_query('lr=3e-4 NEAR(') == '"lr 3e 4" "NEAR"*'
@@ -266,7 +266,7 @@ def sign_init_data(token: str, user_id: int, auth_date: int | None = None, extra
 
 def test_init_data_verification():
     import time
-    from overseer.dashboard import verify_init_data
+    from overseer.core.dashboard import verify_init_data
     tok = "123:abc"
     assert verify_init_data(sign_init_data(tok, 42), tok, [42]) == 42
     assert verify_init_data(sign_init_data(tok, 42), tok, [7]) is None  # not an allowed user

@@ -20,19 +20,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import BACKENDS, Config
-from .hpc import HPC
-from .compute import WORKER_NAME
+from ..hpc.remote import HPC
+from ..hpc.compute import WORKER_NAME
 from .autopilot import human_interval
 from .ctl import TOKEN_ENV
-from .quota import Quota, limits_line, over
+from ..hpc.quota import Quota, limits_line, over
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, fold_text, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
-from .results import context as results_context
-from .slurm import array_parent
-from .ssh import SSHError
-from .sshlink import ensure_master
+from ..hpc.results import context as results_context
+from ..hpc.slurm import array_parent
+from ..hpc.ssh import SSHError
+from ..hpc.sshlink import ensure_master
 from .store import JobRecord, SessionRecord, Store
 
 log = logging.getLogger(__name__)

@@ -22,7 +22,7 @@ import shlex
 import time
 from dataclasses import dataclass
 
-from .store import JobRecord, MetricSpec, Store
+from ..core.store import JobRecord, MetricSpec, Store
 
 COMMAND_TIMEOUT = 20  # seconds; the command runs on the login node at every card refresh
 COMMAND_OUTPUT = 16_000
@@ -38,7 +38,7 @@ class SpecError(ValueError):
 
 
 def _seconds(text: str) -> float | None:
-    from .autopilot import parse_duration
+    from ..core.autopilot import parse_duration
     d = parse_duration(text)
     return d if d and d > 0 else None
 

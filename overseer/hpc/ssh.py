@@ -16,7 +16,7 @@ import shlex
 import time
 from dataclasses import dataclass
 
-from .config import Config
+from ..core.config import Config
 from .sshlink import base_argv
 
 log = logging.getLogger(__name__)

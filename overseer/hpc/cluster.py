@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .notify import code, esc
+from ..core.notify import code, esc
 from .slurm import array_parent, human_seconds, parse_scontrol
 
 # Node states in which nothing new starts on a node.

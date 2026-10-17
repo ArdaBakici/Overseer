@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from .config import Config
 from .notify import Notifier, Outgoing, code, esc
-from .slurm import STATE_EMOJI, SUCCESS_STATES, gpus_from_tres, human_seconds
+from ..hpc.slurm import STATE_EMOJI, SUCCESS_STATES, gpus_from_tres, human_seconds
 from .store import Store
 from .usage import ORIGINS, _n
 

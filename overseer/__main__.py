@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import sys
 
-from .config import BACKENDS, Config, ConfigError, load_config
+from .core.config import BACKENDS, Config, ConfigError, load_config
 
 log = logging.getLogger("overseer")
 
@@ -41,17 +41,17 @@ def prepare_local_dirs(cfg: Config) -> None:
 def build(cfg: Config):
     from telegram.ext import Application
 
-    from .agent import Agent
-    from .autopilot import Autopilot
-    from .bot import Bot, TelegramNotifier
-    from .ctl import ControlServer
-    from .diagnose import Reporter
-    from .hpc import HPC
-    from .monitor import Monitor
-    from .projects import Projects
-    from .ssh import SSHRunner
-    from .sshlink import write_configs
-    from .store import Store
+    from .core.agent import Agent
+    from .core.autopilot import Autopilot
+    from .core.bot import Bot, TelegramNotifier
+    from .core.ctl import ControlServer
+    from .hpc.diagnose import Reporter
+    from .hpc.remote import HPC
+    from .hpc.monitor import Monitor
+    from .core.projects import Projects
+    from .hpc.ssh import SSHRunner
+    from .hpc.sshlink import write_configs
+    from .core.store import Store
 
     prepare_local_dirs(cfg)
     write_configs(cfg)
@@ -98,7 +98,7 @@ def build(cfg: Config):
 
     async def post_stop(app: Application) -> None:
         agent.shutting_down = True  # runs cut off from here on are offered again at the next start
-        from .runners import kill_running
+        from .core.runners import kill_running
         if kill_running():  # (their CLIs are in process groups of their own: Ctrl-C doesn't reach them)
             log.info("stopped the agent runs in progress; they're offered again at the next start")
 
@@ -129,23 +129,23 @@ def build(cfg: Config):
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
     agent.monitor = monitor
     monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
-    from .subagents import Subagents
+    from .core.subagents import Subagents
     subagents = Subagents(cfg, store, agent, notifier)  # planner mode (off unless turned on or approved)
-    from .addons import Addons
-    from .feedback import Feedback
+    from .core.addons import Addons
+    from .core.feedback import Feedback
     Feedback(cfg, store, agent, notifier)  # agents' feedback about Overseer, in the 🛠 feedback topic
     Addons(store, agent, notifier)  # skills agents proposed and the researcher approved
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)
     ctl = ControlServer(cfg, agent, projects, notifier, hpc)
-    from .digest import Digest
+    from .core.digest import Digest
     digest = Digest(cfg, store, hpc, notifier, agent, monitor)  # the morning digest, in the general topic
     bot = Bot(cfg, app, store, hpc, monitor, agent, notifier, projects)
     bot.digest = digest
     dashboard = None
     if cfg.dashboard.enabled:  # the Mini App: on this machine, reachable on your tailnet via `tailscale serve`
-        from .dashboard import Dashboard
+        from .core.dashboard import Dashboard
         dashboard = Dashboard(cfg, store, monitor, hpc, cfg.telegram.token)
     bot.dashboard = dashboard
     bot.register()
@@ -154,11 +154,11 @@ def build(cfg: Config):
 
 async def check(cfg: Config) -> int:
     """Verify SSH, SLURM, the agent CLI and credentials without starting the bot."""
-    from .agent import Agent
-    from .hpc import HPC
-    from .ssh import SSHRunner
-    from .sshlink import ensure_master, key_permissions_ok, write_configs
-    from .store import Store
+    from .core.agent import Agent
+    from .hpc.remote import HPC
+    from .hpc.ssh import SSHRunner
+    from .hpc.sshlink import ensure_master, key_permissions_ok, write_configs
+    from .core.store import Store
 
     ok = True
 
@@ -221,7 +221,7 @@ async def check(cfg: Config) -> int:
 
 
 def ssh_command(cfg: Config, action: str, import_from: str | None) -> int:
-    from .sshlink import connect_interactive, ensure_master, setup_key
+    from .hpc.sshlink import connect_interactive, ensure_master, setup_key
 
     prepare_local_dirs(cfg)
     if action == "setup":
@@ -252,7 +252,7 @@ def ssh_command(cfg: Config, action: str, import_from: str | None) -> int:
 
 
 def login(cfg: Config, backend: str, extra: list[str]) -> int:
-    from .runners import make_runner
+    from .core.runners import make_runner
 
     if backend not in BACKENDS:
         print(f"usage: overseer login {'|'.join(BACKENDS)}", file=sys.stderr)
@@ -278,7 +278,7 @@ def _ago(ts: float) -> str:
 
 
 def sessions_command(cfg: Config, limit: int = 20) -> int:
-    from .store import Store
+    from .core.store import Store
 
     rows = Store(cfg.local.db_path).list_sessions(limit)
     if not rows:
@@ -297,9 +297,9 @@ INTERACTIVE_TERM_ENV = ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "CO
 
 
 def open_command(cfg: Config, target: str | None) -> int:
-    from .runners import make_runner
-    from .sshlink import ensure_master, write_configs
-    from .store import Store
+    from .core.runners import make_runner
+    from .hpc.sshlink import ensure_master, write_configs
+    from .core.store import Store
 
     prepare_local_dirs(cfg)
     rows = [r for r in Store(cfg.local.db_path).list_sessions(500) if r.cli_session_id]
@@ -335,7 +335,7 @@ def open_command(cfg: Config, target: str | None) -> int:
 
 async def update_command(cfg: Config) -> int:
     """Update Claude Code and Codex with their own updaters (the bot does it once a day by itself)."""
-    from .runners import make_runner
+    from .core.runners import make_runner
     rc = 0
     for backend in BACKENDS:
         r = make_runner(cfg, backend)
@@ -387,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "open":
             return open_command(cfg, args.target)
         if args.command == "watch":
-            from .live import watch
+            from .core.live import watch
             return watch(cfg, args.target, full=args.full)
         if args.command == "update":
             return asyncio.run(update_command(cfg))
