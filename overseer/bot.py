@@ -84,6 +84,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /usage [today|yesterday|week] — tokens and cost of the agent's runs
 /cluster [partition] — free GPUs and CPUs per partition, when your queued jobs should start, your fairshare
 /digest — what happened since the last digest (one comes every morning)
+/search &lt;text&gt; — past conversations, results, findings and jobs
 /health — connection status
 
 <b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
@@ -831,6 +832,7 @@ class Bot:
         self._pending_files: dict[tuple[int, int | None], list[tuple[str, Path]]] = {}  # ...and the files sent with it
         self._uploads: dict[tuple[int, int | None], dict] = {}  # files received, not yet given to the agent
         self.digest = None  # digest.Digest (the morning digest), set by the app
+        self._searcher = None  # search.Search (/search), made on first use
 
     def register(self) -> None:
         allowed = filters.Chat(chat_id=self.cfg.telegram.allowed_chat_ids)
@@ -850,6 +852,7 @@ class Bot:
         add(CommandHandler("usage", self.cmd_usage, filters=allowed))
         add(CommandHandler("cluster", self.cmd_cluster, filters=allowed))
         add(CommandHandler("digest", self.cmd_digest, filters=allowed))
+        add(CommandHandler("search", self.cmd_search, filters=allowed))
         add(CommandHandler("stop", self.cmd_stop, filters=allowed))
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
@@ -1179,6 +1182,25 @@ class Bot:
             return
         names = {r.job_id: r.name for r in self.store.active_jobs()}
         await self.reply(update, "🖥 " + self.monitor.cluster.text(snap, names, partition=partition, html=True))
+
+    async def cmd_search(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Past work: conversations, results, findings, jobs (in a project's topic: that project's)."""
+        from .search import Search, SearchError, render_hits
+        text = " ".join(ctx.args or []).strip()
+        if not text:
+            await self.reply(update, "Usage: /search &lt;text&gt; — e.g. /search ratio 64 (\"a phrase\", OR, "
+                                     "word*). In a project's topic: that project only.")
+            return
+        if self._searcher is None:
+            self._searcher = Search(self.cfg, self.store)
+        project = self._scope(update)
+        try:
+            hits, total = await self._searcher.asearch(text, project=project if project else False, limit=10)
+        except SearchError as e:
+            await self.reply(update, esc(str(e)))
+            return
+        await self.reply(update, render_hits(hits, total, text, html=True)
+                         + (f"\n<i>in project {esc(project)}</i>" if project else ""))
 
     async def cmd_digest(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """The digest now: since the last one (or the last 24 hours); the morning one still comes."""

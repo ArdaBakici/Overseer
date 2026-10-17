@@ -97,6 +97,9 @@ command printing name=value lines or a JSON object, e.g. reading the last line o
 for what would make a run worth stopping: `--alert "<metric> < 1 after 2h"` pings the researcher, `--wake-on \
 "loss is nan"` / `"step stalled 30m"` also wakes you. Set it once per kind of experiment (a pattern or the \
 project default covers repeats) and check it with `ov metrics show <job id>`.
+- Past work: `ov history search <text>` searches every conversation (requests, replies, commands), the results, \
+findings and jobs; `ov history show <conversation> --grep <text>` reads one. Use it when the researcher refers to \
+earlier work ("what did we try with ...", "like last time") or before repeating an experiment.
 - Before choosing where to submit (partition, GPUs, time limit), run `ov cluster`: free GPUs/CPUs per partition, \
 the most GPUs free on one node, time limits, SLURM's estimated start of your queued jobs and your fairshare. Prefer \
 what starts soon; a job stuck in the queue may start sooner resized or elsewhere.

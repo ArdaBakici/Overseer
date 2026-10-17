@@ -36,6 +36,20 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
 - `hpc-run`'s shared worker job (`overseer-worker`) is not one of your jobs. Don't register or watch
   it: `hpc-run` starts, reuses and ends it (`hpc-run --stop` ends it early).
 
+## Past work: `ov history`
+
+```bash
+ov history search ratio 64                      # every conversation (requests, replies, commands), results,
+                                                # findings and jobs; best matches first
+ov history search "batch size" OR lr --project dreamer --since 30d --kind conversation
+ov history show conv-ne-12 --grep "ratio 64"    # read a past conversation: its turns that mention it
+ov history show conv-ne-12 --last 3             # ...or its last turns
+```
+
+Use it when the researcher refers to earlier work ("what did we try with ...", "like last time"), and before
+re-running something that may have been tried already. Command output and reasoning aren't searched: the
+replies, results and findings are where conclusions are.
+
 ## Where to submit: `ov cluster`
 
 ```bash

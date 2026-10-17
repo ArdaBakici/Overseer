@@ -82,7 +82,7 @@ def build(cfg: Config):
             ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
             ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
             ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
-            ("digest", "what happened since the last digest"), ("cluster", "free GPUs, when queued jobs start"),
+            ("digest", "what happened since the last digest"), ("search", "search past work"), ("cluster", "free GPUs, when queued jobs start"),
             ("subagents", "planner mode: on/off, models, threads"),
             ("results", "experiments and what each showed"), ("findings", "insights and dead ends"),
             ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"), ("project", "projects: list, new, context, notes"),

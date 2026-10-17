@@ -193,6 +193,17 @@ def _parser() -> _Parser:
     a.add_argument("text", nargs="+")
     sub.add_parser("planner", add_help=False).add_argument("mode", choices=["off"])
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
+    hist = sub.add_parser("history", add_help=False).add_subparsers(dest="action")
+    a = hist.add_parser("search", add_help=False)
+    a.add_argument("text", nargs="+")
+    a.add_argument("--project")
+    a.add_argument("--kind", action="append", choices=["conversation", "result", "finding", "job"])
+    a.add_argument("--since")
+    a.add_argument("--limit", type=int, default=12)
+    a = hist.add_parser("show", add_help=False)
+    a.add_argument("conversation")
+    a.add_argument("--last", type=int, default=5)
+    a.add_argument("--grep", default="")
     a = sub.add_parser("cluster", add_help=False)
     a.add_argument("--partition", "-p")
     a.add_argument("--fresh", action="store_true")
@@ -215,6 +226,10 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+  ov history search <text> [--project p|main] [--kind conversation|result|finding|job] [--since 30d] [--limit N]
+                                   search past work: every conversation's requests, replies and commands, the
+                                   results, findings and jobs. "quoted phrase", OR, the last word as a prefix
+  ov history show <conversation> [--last 5] [--grep text]   read a past conversation's turns
   ov cluster [-p <partition>] [--fresh]   what's free now per partition (GPUs, CPUs, RAM, time limits), SLURM's
                                    estimated start of your queued jobs, and your fairshare. Check it before
                                    choosing a partition and a job size.
@@ -285,6 +300,7 @@ class ControlServer:
         self._bg: set[asyncio.Task] = set()  # card refreshes in flight
         self.server: asyncio.AbstractServer | None = None
         self._cluster = None  # cluster.Cluster, made on first use
+        self._searcher = None  # search.Search, made on first use
         agent.ctl = self
 
     # ------------------------------------------------------------------ tokens
@@ -375,10 +391,34 @@ class ControlServer:
                 return True, self.status(session)
             if area == "cluster":
                 return True, await self.cluster(session, args)
+            if area == "history" and args.action:
+                return True, await getattr(self, f"history_{args.action}")(session, args)
             return False, HELP
         except (CtlError, ProjectError, WatchError, SpecError, SubagentError, ResultError, FeedbackError, SkillError,
-                ValueError) as e:
+                ValueError) as e:  # (SearchError is a ValueError)
             return False, str(e)
+
+    # ---- past work (search.py)
+    def _search(self):
+        if self._searcher is None:
+            from .search import Search
+            self._searcher = Search(self.cfg, self.store)
+        return self._searcher
+
+    async def history_search(self, session, args) -> str:
+        from .search import parse_since, render_hits
+        text = " ".join(args.text)
+        project = False
+        if args.project:
+            project = None if args.project.lower() in ("main", "none") else args.project.lower()
+        hits, total = await self._search().asearch(text, project=project, kinds=tuple(args.kind or ()),
+                                                   since=parse_since(args.since), limit=max(1, min(args.limit, 50)))
+        return render_hits(hits, total, text)
+
+    async def history_show(self, session, args) -> str:
+        from .search import render_turns
+        turns = await self._search().aconversation(args.conversation, args.last, args.grep)
+        return render_turns(args.conversation, turns)
 
     # ---- the cluster (cluster.py)
     async def cluster(self, session, args) -> str:

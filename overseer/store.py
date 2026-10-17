@@ -405,6 +405,10 @@ class Store:
         rows = self.db.execute("SELECT * FROM jobs WHERE NOT ignored ORDER BY first_seen DESC LIMIT ?", (limit,)).fetchall()
         return [_row(JobRecord, r) for r in rows]
 
+    def jobs_for_search(self, limit: int = 5000) -> list[JobRecord]:
+        rows = self.db.execute("SELECT * FROM jobs WHERE NOT ignored ORDER BY first_seen DESC LIMIT ?", (limit,))
+        return [_row(JobRecord, r) for r in rows.fetchall()]
+
     def jobs_ended_since(self, since: float) -> list[JobRecord]:
         rows = self.db.execute("SELECT * FROM jobs WHERE ended_at >= ? AND NOT ignored ORDER BY ended_at DESC",
                                (since,)).fetchall()

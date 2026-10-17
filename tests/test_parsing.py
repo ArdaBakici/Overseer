@@ -233,3 +233,17 @@ def test_cluster_parsing():
     assert fairshare("ab11578_acct|0.421053\n") == [("ab11578_acct", "0.421053")]
     assert until("2026-10-17T14:05:00", "2026-10-17T13:00:00") == "in ~1h05m"
     assert until("N/A", "2026-10-17T13:00:00") == ""
+
+
+def test_search_query():
+    import pytest
+    from overseer.search import SearchError, fts_query, parse_since
+    assert fts_query("ratio 64") == '"ratio" "64"*'
+    assert fts_query('"batch size" OR lr') == '"batch size" OR "lr"*'
+    assert fts_query('lr=3e-4 NEAR(') == '"lr 3e 4" "NEAR"*'
+    assert fts_query('"exact phrase"') == '"exact phrase"'
+    with pytest.raises(SearchError):
+        fts_query("  -- ")
+    assert parse_since("") == 0 and parse_since("7d") > 0
+    with pytest.raises(SearchError):
+        parse_since("yesterday")

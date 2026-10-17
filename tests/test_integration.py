@@ -2650,6 +2650,75 @@ async def test_morning_digest(env):
     assert "GPUs 3/8 free (h100)" in replies[-1], replies[-1]
 
 
+async def test_search_past_work(env):
+    """ov history search / show and /search: conversations (requests, replies, commands), results, findings, jobs;
+    the transcripts are indexed as they grow."""
+    from overseer.live import Transcript
+    from overseer.store import FindingRecord, ResultRecord, SessionRecord
+    await make_autopilot(env)
+    s = env.agent.general_session()
+    make_projects(env)
+    env.store.upsert_session(SessionRecord(id="conv-ne", created=time.time(), project="dreamer"))
+    old = time.time() - 40 * 86400
+    t = Transcript(env.cfg, "conv-ne")
+    t.write({"kind": "turn", "text": "try the NE ratio 64 with a smaller batch", "ts": old})
+    t.write({"kind": "command", "command": "ssh hpc 'cd ne && sbatch --export=RATIO=64 run.sh'", "ts": old})
+    t.write({"kind": "output", "output": "secret-output-not-indexed 64", "ts": old})
+    t.write({"kind": "end", "status": "done", "text": "Ratio 64 diverged after 2k steps; 32 is stable.", "ts": old})
+    env.store.save_result(ResultRecord(id="9100", project="dreamer", name="ne-ratio-64", verdict="broken",
+                                       conclusion="diverges at ratio 64", metrics=json.dumps({"return": 1.5})))
+    env.store.add_finding(FindingRecord(project="dreamer", kind="dead-end", text="NE ratio above 32 diverges"))
+    env.store.upsert_job(JobRecord(job_id="9100", name="ne-ratio-64", state="FAILED", first_seen=old,
+                                   report="NaN loss", project="dreamer"))
+    token = env.ctl.open(s.id)
+
+    ok, text = await env.ctl.handle(token, ["history", "search", "ratio", "64"])
+    assert ok and "match(es)" in text, text
+    assert "💬 conv-ne · 📁 dreamer" in text and "«Ratio» «64» diverged" in text, text
+    assert "→ ov history show conv-ne --grep 'ratio 64'" in text
+    assert "📊 result 9100 · 📁 dreamer" in text and "🧾 job 9100" in text, text
+    assert "secret-output-not-indexed" not in text  # command output isn't indexed
+    ok, text = await env.ctl.handle(token, ["history", "search", "diverges", "--kind", "finding"])
+    assert ok and text.count("\n") == 1 and "🚫 F1 · 📁 dreamer: NE ratio above 32 «diverges»" in text, text
+    ok, text = await env.ctl.handle(token, ["history", "search", "ratio", "--since", "7d"])
+    assert ok and "conv-ne" not in text, text  # 40 days old
+    ok, text = await env.ctl.handle(token, ["history", "search", "ratio", "--project", "main"])
+    assert ok and text.startswith("nothing found"), text
+    ok, text = await env.ctl.handle(token, ["history", "search", "--since", "7d"])
+    assert not ok
+
+    # The transcript grows: the new turn is found at the next search.
+    Transcript(env.cfg, "conv-ne").write({"kind": "turn", "text": "now try ratio 48 with warmup"})
+    Transcript(env.cfg, "conv-ne").write({"kind": "end", "status": "done", "text": "Ratio 48 with warmup is stable."})
+    ok, text = await env.ctl.handle(token, ["history", "search", "warmup"])
+    assert ok and "«warmup»" in text, text
+
+    ok, text = await env.ctl.handle(token, ["history", "show", "conv-ne", "--grep", "ratio 64"])
+    assert ok and "👤 try the NE ratio 64 with a smaller batch" in text and "  $ ssh hpc 'cd ne && sbatch" in text, text
+    assert "🤖 Ratio 64 diverged" in text, text
+    ok, text = await env.ctl.handle(token, ["history", "show", "conv-ne", "--last", "1"])
+    assert ok and "turn(s)" in text and "ratio 48" in text and "smaller batch" not in text, text
+    ok, text = await env.ctl.handle(token, ["history", "show", "../etc"])
+    assert not ok and "no conversation" in text
+
+    # /search in Telegram (in a project's topic: that project's work).
+    from overseer.bot import Bot
+    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+              notifier=env.notifier)
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    bot.reply = reply
+    await bot.cmd_search(None, NS(args=["ratio", "64"]))
+    assert replies[-1].startswith("🔎 <b>ratio 64</b>") and "<b>Ratio</b> <b>64</b> diverged" in replies[-1], replies[-1]
+    bot._scope = lambda update: "chemistry"
+    await bot.cmd_search(None, NS(args=["ratio"]))
+    assert "Nothing found" in replies[-1] and "in project chemistry" in replies[-1], replies[-1]
+    await bot.cmd_search(None, NS(args=[]))
+    assert "Usage: /search" in replies[-1]
+
+
 def test_stalled_alert(env):
     from overseer.metrics import check_alerts, parse_alert
     from overseer.store import MetricSpec

@@ -8,6 +8,7 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
   - **Why it failed:** heuristics flag CUDA OOM, host OOM, time limits, NCCL errors, missing modules, NaNs and similar. An LLM root-cause summary is added on top.
 - **Idle GPUs.** Overseer samples the GPUs of running jobs every 10 minutes (`srun --overlap nvidia-smi`, five readings a second apart). When all of a job's GPUs stay at most 5% busy for 30 minutes, its card gets a 💤 line, you're told under the card, and the agent watching the job is woken to find out why (a hang, data loading, a CPU-only bug) and stop or fix it. Once per idle spell.
 - **Morning digest.** Every morning at 08:00, one message in the general topic: the jobs that ended (failed first) and the ones running or queued, the GPU-hours your jobs used, new results and findings, what each agent did and is waiting for, tokens and cost, and what waits for you. No model involved. `/digest` shows it any time.
+- **Search past work.** `ov history search` (agents) and `/search` (you) search every conversation's requests, replies and commands, the results, findings and jobs: "what did we try with ratio 64?". `ov history show` lets an agent read another conversation's turns.
 - **Cluster awareness.** `ov cluster` (and `/cluster` for you) shows, per partition, the nodes up, free GPUs and their type, the most GPUs free on one node, free CPUs and RAM, and the time limit, plus SLURM's estimated start of your queued jobs and your fairshare. Agents check it before choosing where to submit; a queued job's card shows its estimated start.
 - **Job arrays.** An array is one job, under the id `sbatch` printed. It's running while any task is, and its report gives the task states ("📦 job array: 9 COMPLETED, 2 FAILED"). It ends with the worst task's state once all its tasks have ended, and the agent's wake-up lists each task with its own log (never the `4294967294` path SLURM gives the array's pending tasks).
 - **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
@@ -187,6 +188,7 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | `/subagents [on\|off]` | planner mode in this project: the agent plans and delegates to subagents on cheaper models (below). The agent can also propose it for one conversation, and you approve or decline |
 | `/auto <goal>` | ask the agent to work on a goal on its own (below). As a reply to a message, it applies to that conversation. `/auto` lists pending wake-ups, `/auto off` cancels them (in this thread, topic, or replied-to conversation) |
 | `/digest` | what happened since the last digest (one comes every morning, `digest.time`) |
+| `/search <text>` | past conversations, results, findings and jobs (in a project's topic: that project's). `"a phrase"`, `OR`, the last word as a prefix |
 | `/cluster [partition]` | free GPUs, CPUs and RAM per partition, time limits, when your queued jobs should start (SLURM's estimate), your fairshare |
 | `/usage [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
 | `/health` | SSH connection, last poll, agents with their model and effort |
@@ -439,6 +441,7 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 | `metrics.py` | what matters in a job (`ov metrics`): critical/important metrics, progress, the extraction command, alerts |
 | `usage.py` | `/usage`: tokens and cost per day, by origin, backend and conversation |
 | `cluster.py` | `ov cluster`, `/cluster`, queued cards' estimated start: free GPUs/CPUs per partition, SLURM's start estimates, fairshare |
+| `search.py` | `ov history`, `/search`: a full-text index (SQLite FTS5, `state/search.db`) of transcripts, results, findings and jobs |
 | `digest.py` | the morning digest (and `/digest`): jobs, GPU time, results, agents, tokens |
 | `projects.py` | projects from config and Telegram, folder matching for jobs |
 | `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches and timers, notifications); installs the `overseer` skill |
