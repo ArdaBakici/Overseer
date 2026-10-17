@@ -82,3 +82,21 @@ class Domain:
     def ledger_context(self, project: str | None, session_id: str | None = None) -> str:
         """What the domain keeps about a project's progress (e.g. the HPC's results and findings), for prompts."""
         return ""
+
+    # ------------------------------------------------------------------ Telegram (bot.py)
+    def bot_commands(self, bot):
+        """The domain's Telegram commands and buttons: an object with help, menu [(command, description)],
+        commands() -> [(names, handler)], on_button(update, q, chat_id, action, arg) -> handled,
+        watch_cancelled(watch) -> handled, health_lines() -> [str], errors. None: only the platform's."""
+        return None
+
+    def auto_prompt(self, goal: str) -> str:
+        """What /auto <goal> asks the agent."""
+        return (f"Work on this on your own, over as many runs as it takes: {goal}\nSet wake-ups (`{self.command} wake`) "
+                "for what you're waiting for and end your reply; carry on when woken until the goal is reached or "
+                "nothing sensible is left, then tell me. Ask me when you need a decision.")
+
+    async def project_notes_file(self, project) -> tuple[str, str] | None:
+        """A project's notes file for /project notes: (where it is, its beginning); None if the domain keeps none."""
+        return None
+

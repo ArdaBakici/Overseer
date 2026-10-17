@@ -1,7 +1,8 @@
 """Telegram front-end. Only chats listed in telegram.allowed_chat_ids can talk to the bot.
 
-Note: the agent has full access to your HPC account, so whoever controls an allowed chat
-effectively has a shell there. Keep allowed_chat_ids to your own chat and protect your
+The platform's commands and buttons live here; a domain adds its own (e.g. hpc/telegram.py: /jobs, the job cards'
+buttons). Note: the agent can do whatever its domain lets it (for the HPC: everything your account can), so
+whoever controls an allowed chat effectively can too. Keep allowed_chat_ids to your own chat and protect your
 Telegram account (2FA).
 """
 
@@ -33,15 +34,8 @@ from .agent import Agent, Session
 from .projects import ProjectError, Projects
 from .richtext import RICH_LIMIT, strip_html
 from .config import BACKENDS, Config
-from ..hpc.remote import HPC
-from ..hpc.monitor import Monitor, progress_log
 from .notify import TG_LIMIT, Outgoing, code, esc, pre, split_message
-from ..hpc.slurm import STATE_EMOJI
-from ..hpc.ssh import SSHError
-from ..hpc.sshlink import master_alive
 from .store import ProjectRecord, Store
-from ..hpc import results as R
-from ..hpc.plots import resolve_plot
 from .subagents import ENDED
 from .usage import usage_report
 
@@ -55,47 +49,19 @@ UPLOAD_WAIT = 30
 ALBUM_WAIT = 2
 MAX_DOWNLOAD = 20 * 1024 * 1024  # the largest file the Bot API lets bots download
 
-# /auto <goal>: what the agent is asked
-AUTO_PROMPT = """Work on this on your own, over as many runs as it takes: {goal}
+HELP = """<b>Overseer</b>
 
-Keep the research log up to date (in a project). Submit the runs, `ov watch` them and end your reply: you're woken \
-when they finish (or set `ov wake` timers). Carry on until the goal is reached or nothing sensible is left, then \
-tell me. Ask me when you need a decision."""
+/ask &lt;text&gt; — talk to the agent (or just send a message) · /new — a fresh conversation
+/backend [claude_code|codex] · /model [name|default] · /effort [level|default] — the agent
+/stop — stop the agent's current run · /compact [focus] — compact the conversation
+/update — update Claude Code and Codex now
+/auto &lt;goal&gt; — ask the agent to work on it on its own · /auto — pending wake-ups · /auto off — cancel them
+/feedback [all|review] — what agents reported about Overseer · /skills — installed skills
+/subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents
+/usage · /digest · /search &lt;text&gt; · /dashboard · /health
+/project — projects (each gets its own topic)
 
-HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
-
-/jobs — active and recent jobs
-/job &lt;id&gt; — status + log tail of a job
-/log &lt;id&gt; [lines] — tail of a job's log
-/fix &lt;id&gt; [instructions] — ask the agent to diagnose/fix a job
-/ask &lt;text&gt; — talk to the agent (or just send a message)
-/new — start a fresh agent conversation
-/backend [claude_code|codex] — show or switch the agent
-/model [name|default] — show or set the active agent's model
-/effort [level|default] — show or set the active agent's effort
-/stop — stop the agent's current run
-/update — update Claude Code and Codex now (Overseer also does it once a day, while nothing runs)
-/compact [focus] — compact the conversation now: older turns become a summary, which frees context (as a reply: that conversation). Claude Code takes a focus, e.g. /compact keep the lr sweep results
-/auto &lt;goal&gt; — ask the agent to work on it on its own: it watches its jobs and wakes itself (as a reply: in that conversation)
-/auto — pending wake-ups · /auto off — cancel them (here, or as a reply: in that conversation)
-/results [project] [sort] [N] [csv] — experiments and what each showed · /findings — insights and dead ends
-/feedback [all|review] — what agents reported about Overseer; review: an agent designs fixes · /skills — installed skills
-/subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents, each in a thread
-/usage [today|yesterday|week] — tokens and cost of the agent's runs
-/cluster [partition] — free GPUs and CPUs per partition, when your queued jobs should start, your fairshare
-/digest — what happened since the last digest (one comes every morning)
-/search &lt;text&gt; — past conversations, results, findings and jobs
-/dashboard — jobs, results, findings and a timeline in a Mini App (on your tailnet)
-/health — connection status
-
-<b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
-/project — list · /project new &lt;name&gt; &lt;dir on HPC&gt; [what it's about]
-/project context|dir|notes|archive|restore …
-/assign &lt;job&gt; &lt;project|main&gt; — move a job (or reply to its message: /assign &lt;project&gt;)
-
-Reply to any job message to talk to the agent about that job.
-Send pictures and files too (up to 20 MB): with a caption, or followed by a message about them.
-The agent has full access to your HPC account; you'll see every command it runs and every job it submits."""
+Send pictures and files too (up to 20 MB): with a caption, or followed by a message about them."""
 
 
 def _preview(rec: dict, limit: int = 120) -> str:
@@ -818,14 +784,12 @@ class TelegramNotifier:
 
 
 class Bot:
-    def __init__(self, cfg: Config, app: Application, store: Store, hpc: HPC, monitor: Monitor,
-                 agent: Agent, notifier: TelegramNotifier, projects: Projects | None = None):
+    def __init__(self, cfg: Config, app: Application, store: Store, agent: Agent, notifier: TelegramNotifier,
+                 projects: Projects | None = None):
         self.projects = projects or Projects(cfg, store, agent)
         self.cfg = cfg
         self.app = app
         self.store = store
-        self.hpc = hpc
-        self.monitor = monitor
         self.agent = agent
         self.notifier = notifier
         self._tasks: set[asyncio.Task] = set()
@@ -835,15 +799,15 @@ class Bot:
         self.digest = None  # digest.Digest (the morning digest), set by the app
         self._searcher = None  # search.Search (/search), made on first use
         self.dashboard = None  # dashboard.Dashboard (the Mini App), when dashboard.enabled
+        # The domain's commands and buttons (help, menu, commands(), on_button, watch_cancelled, health_lines, errors)
+        self.ext = agent.domain.bot_commands(self)
+        self.help = getattr(self.ext, "help", None) or HELP
+        self.errors = tuple(getattr(self.ext, "errors", ()))
 
     def register(self) -> None:
         allowed = filters.Chat(chat_id=self.cfg.telegram.allowed_chat_ids)
         add = self.app.add_handler
         add(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
-        add(CommandHandler("jobs", self.cmd_jobs, filters=allowed))
-        add(CommandHandler("job", self.cmd_job, filters=allowed))
-        add(CommandHandler("log", self.cmd_log, filters=allowed))
-        add(CommandHandler("fix", self.cmd_fix, filters=allowed))
         add(CommandHandler("ask", self.cmd_ask, filters=allowed))
         add(CommandHandler("new", self.cmd_new, filters=allowed))
         add(CommandHandler("backend", self.cmd_backend, filters=allowed))
@@ -852,7 +816,6 @@ class Bot:
         add(CommandHandler("compact", self.cmd_compact, filters=allowed))
         add(CommandHandler("update", self.cmd_update, filters=allowed))
         add(CommandHandler("usage", self.cmd_usage, filters=allowed))
-        add(CommandHandler("cluster", self.cmd_cluster, filters=allowed))
         add(CommandHandler("digest", self.cmd_digest, filters=allowed))
         add(CommandHandler("search", self.cmd_search, filters=allowed))
         add(CommandHandler("dashboard", self.cmd_dashboard, filters=allowed))
@@ -860,12 +823,11 @@ class Bot:
         add(CommandHandler("health", self.cmd_health, filters=allowed))
         add(CommandHandler("auto", self.cmd_auto, filters=allowed))
         add(CommandHandler("subagents", self.cmd_subagents, filters=allowed))
-        add(CommandHandler("results", self.cmd_results, filters=allowed))
         add(CommandHandler("feedback", self.cmd_feedback, filters=allowed))
         add(CommandHandler("skills", self.cmd_skills, filters=allowed))
-        add(CommandHandler("findings", self.cmd_findings, filters=allowed))
         add(CommandHandler(["project", "projects"], self.cmd_project, filters=allowed))
-        add(CommandHandler("assign", self.cmd_assign, filters=allowed))
+        for names, handler in (self.ext.commands() if self.ext else []):  # the domain's (e.g. /jobs)
+            add(CommandHandler(names, handler, filters=allowed))
         # Updates python-telegram-bot doesn't know yet (e.g. the Stop button of a streaming draft).
         add(TypeHandler(Update, self.on_raw_update), group=-1)
         add(CallbackQueryHandler(self.on_button))
@@ -982,107 +944,15 @@ class Bot:
     # ------------------------------------------------------------------ commands
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         scope = self._scope(update)
-        await self.reply(update, HELP + f"\n\nHere: {self._where(scope)} · agent {code(self.agent.backend_of(scope))}")
+        await self.reply(update, self.help + f"\n\nHere: {self._where(scope)} · agent {code(self.agent.backend_of(scope))}")
 
-    async def cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        scope = self._scope(update)
-        rows = self.store.project_jobs(scope, 15) if scope else self.store.recent_jobs(20)
-        if not rows:
-            await self.reply(update, "No jobs seen yet.")
-            return
-        lines = []
-        for r in rows:
-            tag = " 🤖" if r.by_agent else ""
-            proj = f" · 📁{esc(r.project)}" if r.project and not scope else ""
-            lines.append(f"{STATE_EMOJI.get(r.state, '•')} {code(r.job_id)} {esc(r.name)} — {esc(r.state)}{tag}{proj}")
-        title = f"Jobs of {esc(scope)}" if scope else "Recent jobs"
-        await self.reply(update, f"<b>{title}</b> (🤖 = submitted by the agent)\n" + "\n".join(lines))
 
-    async def cmd_job(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not ctx.args:
-            await self.reply(update, "Usage: /job &lt;id&gt;")
-            return
-        await self._send_status(ctx.args[0])
 
-    async def _send_status(self, job_id: str) -> None:
-        rec = self.store.get_job(job_id)
-        if not rec:
-            await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
-            return
-        live = {j.job_id: j for j in await self.hpc.squeue()}
-        msg = await self.monitor.status_message(rec, live.get(job_id), gpu=True)
-        msg.silent = False
-        if rec.report:
-            msg.text += f"\n\n🧠 {esc(rec.report[:1500])}"
-        await self.notifier.send(msg)
 
-    async def cmd_log(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not ctx.args:
-            await self.reply(update, "Usage: /log &lt;id&gt; [lines]")
-            return
-        lines = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 100
-        await self._send_log(ctx.args[0], lines)
 
-    async def _send_log(self, job_id: str, lines: int = 100) -> None:
-        rec = self.store.get_job(job_id)
-        if not rec:
-            await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
-            return
-        lines = max(1, min(lines, 5000))
-        log_path = await progress_log(self.hpc, rec)
-        self.store.upsert_job(rec)
-        out = await self.hpc.try_tail(rec.stdout, lines)
-        files = [(f"job-{job_id}-stdout.log", out.encode())]
-        if rec.stderr and rec.stderr != rec.stdout:
-            files.append((f"job-{job_id}-stderr.log", (await self.hpc.try_tail(rec.stderr, lines)).encode()))
-        if log_path:  # the program writes its real output here; SLURM's stdout only has the preamble
-            main = await self.hpc.try_tail(log_path, lines)
-            files.insert(0, (log_path.rsplit("/", 1)[-1], main.encode()))
-            text = f"📜 Job {code(job_id)} {code(log_path)}" + pre(main, 3000) + f"\nSLURM stdout: {code(rec.stdout)}"
-            files = files if lines > 60 else []
-            await self.notifier.send(Outgoing(text, job_id=job_id, files=files))
-            return
-        await self.notifier.send(Outgoing(f"📜 Job {code(job_id)} {code(rec.stdout)}" + pre(out, 3000),
-                                          job_id=job_id, files=files if lines > 60 else []))
 
-    async def cmd_fix(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not ctx.args:
-            await self.reply(update, "Usage: /fix &lt;job id&gt; [instructions]")
-            return
-        await self._start_fix(update.effective_chat.id, ctx.args[0], " ".join(ctx.args[1:]))
 
-    async def _start_fix(self, chat_id: int, job_id: str, instr: str = "") -> None:
-        session = self.agent.session_for_job(job_id)
-        text = instr or (f"Job {job_id} failed. Find out why, fix it, and resubmit it if the fix is clear. "
-                         "If it needs a decision from me, explain the options instead.")
-        await self.notifier.send(Outgoing(f"🔧 {esc(self.agent.session_backend(session))} is working on job {code(job_id)}…",
-                                          job_id=job_id, session_id=session.id, silent=True))
-        self._spawn(self._run_agent(chat_id, session, text))
 
-    async def _start_plot(self, chat_id: int, job_id: str) -> None:
-        """📈: the job's graphs now, from the agent's plotting command; without one, the agent writes one."""
-        rec = self.store.get_job(job_id)
-        if not rec:
-            await self.notifier.send(Outgoing(f"Unknown job {code(job_id)}."))
-            return
-        if resolve_plot(self.store, rec):  # no model involved: the graphs appear (or are updated) under the card
-            n, err = await self.monitor.plots(rec)
-            if not n:
-                await self.notifier.send(Outgoing(f"📈 No graphs for {code(job_id)}: {esc(err)}", job_id=job_id,
-                                                  jobs=True, reply_to=self.store.card_refs(job_id), silent=True))
-            return
-        log_path = (rec.info_dict.get("progress_log") or rec.stdout) if rec else ""
-        text = (f"The researcher pressed 📈 Plot on job {job_id} ({rec.name}, {rec.state}), and there's no plotting "
-                "command for it yet. Write a small plotting script in the project folder on the HPC that reads its "
-                f"metrics - its log {log_path}, or metric files (metrics.jsonl, CSV, TensorBoard events) in its output "
-                "folder - and saves clear PNGs (the main metrics against step or time, a few panels if useful, the job "
-                "id in the title) into the folder it's given. Register it with `ov plots set` for this kind of job "
-                "(--pattern or --project, so later runs get graphs too), then `ov plots test` it and look at the "
-                "result. Describe the trend in two or three sentences.")
-        session = self.agent.session_for_job(job_id)
-        await self.notifier.send(Outgoing(f"📈 {esc(self.agent.session_backend(session))} is plotting job "
-                                          f"{code(job_id)}…", job_id=job_id, session_id=session.id, silent=True))
-        self._spawn(self._run_agent(chat_id, session, text))
 
     async def cmd_ask(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         text = " ".join(ctx.args or [])
@@ -1176,15 +1046,6 @@ class Bot:
             return
         self._spawn(self.agent.compact(session, " ".join(ctx.args or []).strip()))
 
-    async def cmd_cluster(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        partition = (ctx.args or [None])[0]
-        try:
-            snap = await self.monitor.cluster.snapshot(fresh=True)
-        except (SSHError, OSError) as e:
-            await self.reply(update, f"Couldn't read the cluster: {code(str(e)[:300])}")
-            return
-        names = {r.job_id: r.name for r in self.store.active_jobs()}
-        await self.reply(update, "🖥 " + self.monitor.cluster.text(snap, names, partition=partition, html=True))
 
     DASHBOARD_SETUP = (
         "The dashboard needs two settings in config.yaml, then a restart:\n"
@@ -1264,19 +1125,15 @@ class Bot:
             await self.reply(update, "\n".join(lines) or "No agent CLI is installed.")
 
     async def cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        last = f"{int(time.time() - self.monitor.last_ok)}s ago" if self.monitor.last_ok else "never"
-        err = f"\nlast error: {code(self.monitor.last_error[:300])}" if self.monitor.last_error else ""
-        conn = "up" if await master_alive(self.cfg) else "down (reopens on the next poll)"
         running = len(self.agent.running_sessions())
         auto = {w.session_id for w in self.store.watches()}
-        await self.reply(update, f"HPC user {code(self.hpc.user or '?')} · SSH connection {conn}\n"
-                                 f"last successful poll: {last}{err}\n"
-                                 f"agent runs in progress: {running} · conversations with wake-ups pending: {len(auto)}\n"
-                                 f"{self._worker_line()}\n"
-                                 f"{await self._versions_line()}\n"
-                                 f"projects: {len(self.store.list_projects())} · topics "
-                                 f"{'on' if getattr(self.notifier, 'topics', False) else 'off (enable threaded mode in BotFather)'}"
-                                 f"\n\n{self._agents_summary(self._scope(update))}")
+        domain = await self.ext.health_lines() if self.ext and hasattr(self.ext, "health_lines") else []
+        await self.reply(update, "\n".join(domain + [
+            f"agent runs in progress: {running} · conversations with wake-ups pending: {len(auto)}",
+            await self._versions_line(),
+            f"projects: {len(self.store.list_projects())} · topics "
+            f"{'on' if getattr(self.notifier, 'topics', False) else 'off (enable threaded mode in BotFather)'}"])
+            + f"\n\n{self._agents_summary(self._scope(update))}")
 
     async def _versions_line(self) -> str:
         parts = []
@@ -1286,12 +1143,6 @@ class Bot:
                 parts.append(f"{name} {esc(await r.version() or '?')}")
         return "CLIs: " + (" · ".join(parts) or "none installed") + " (/update)"
 
-    def _worker_line(self) -> str:
-        w = getattr(self.monitor, "worker", None)
-        if not w:
-            return "compute worker: none (hpc-run starts one when needed)"
-        where = f"on {esc(w.reason)}" if w.state == "RUNNING" else f"{esc(w.state)} ({esc(w.reason)})"
-        return f"compute worker: job {code(w.job_id)} {where} · {esc(w.elapsed)} of {esc(w.time_limit)}"
 
     # ------------------------------------------------------------------ free text & buttons
     def _replied_session(self, update: Update | None) -> Session | None:
@@ -1442,60 +1293,8 @@ class Bot:
             return [r.id for r in self.store.list_sessions(10_000) if r.project == scope]
         return None
 
-    def _results_scope(self, update: Update, args: list[str]) -> tuple[str | None | bool, list[str]]:
-        """A project named in the args ("all": every project, "main": the main chat), else this topic's."""
-        rest, scope = [], self._scope(update)
-        for a in args:
-            if a == "all":
-                scope = False
-            elif a == "main":
-                scope = None
-            elif self.store.get_project(a):
-                scope = a
-            else:
-                rest.append(a)
-        return scope, rest
 
-    async def cmd_results(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/results [project|all] [sort key, e.g. score] [asc] [N] [csv]: the experiments and what each showed."""
-        scope, rest = self._results_scope(update, list(ctx.args or []))
-        want_csv, asc, limit, sort, verdicts = False, None, 15, "", []
-        for a in rest:
-            if a == "csv":
-                want_csv = True
-            elif a in ("asc", "desc"):
-                asc = a == "asc"
-            elif a.isdigit():
-                limit = int(a)
-            elif a in R.VERDICTS:
-                verdicts.append(a)
-            else:
-                sort = a
-        rs = R.select(self.store.results(scope), sort=sort, asc=asc, verdicts=verdicts,
-                      limit=0 if want_csv else limit)
-        where = "all projects" if scope is False else (f"project {scope}" if scope else "the main chat")
-        if not rs:
-            await self.reply(update, f"No results yet in {esc(where)}. Every finished job gets one; the agent adds "
-                                     "what it showed (`ov result`).")
-            return
-        title = f"📊 Results in {where}" + (f", by {sort}" if sort else ", newest first")
-        if want_csv:
-            await self.notifier.send(Outgoing(f"{esc(title)}: {len(rs)} rows", project=scope or None,
-                                              files=[("results.csv", R.render(rs, "csv").encode())]))
-            return
-        total = len(self.store.results(scope))
-        more = f"\n{len(rs)} of {total}: /results [project] [sort] [N] [verdict] [csv]" if total > len(rs) else ""
-        await self.notifier.send(Outgoing(
-            f"<b>{esc(title)}</b>\n<pre>{esc(R.render(rs, 'table'))}</pre>{esc(more)}",
-            markdown=f"**{title}**\n\n{R.render(rs, 'md')}{more}", project=scope or None))
 
-    async def cmd_findings(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/findings [project|all]: the insights and dead ends the agents recorded."""
-        scope, _ = self._results_scope(update, list(ctx.args or []))
-        fs = self.store.findings(scope)
-        where = "all projects" if scope is False else (f"project {scope}" if scope else "the main chat")
-        await self.reply(update, f"<b>Findings in {esc(where)}</b>\n" + "\n".join(esc(x) for x in R.finding_lines(fs))
-                         if fs else f"No findings yet in {esc(where)}. Agents record them with `ov finding`.")
 
     async def cmd_feedback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/feedback [all] - what agents reported about Overseer; /feedback review [focus] - an agent groups it and
@@ -1625,7 +1424,7 @@ class Bot:
             if self._thread(update):
                 self.store.bind_thread(update.effective_chat.id, self._thread(update), session.id)
         self._spawn(self._run_agent(update.effective_chat.id if update else self.cfg.telegram.allowed_chat_ids[0],
-                                    session, AUTO_PROMPT.format(goal=goal)))
+                                    session, self.agent.domain.auto_prompt(goal)))
 
     # ------------------------------------------------------------------ projects
     def _projects_summary(self) -> str:
@@ -1718,8 +1517,11 @@ class Bot:
             p = self.projects.update(name, dir=rest)
             await self.reply(update, f"{code(name)} now lives in {code(p.dir)}.")
         elif sub == "notes":
-            path = f"{p.dir.rstrip('/')}/OVERSEER.md"
-            notes = await self.hpc.try_head(self.agent.domain.remote_path(path), 200)
+            found = await self.agent.domain.project_notes_file(p)
+            if found is None:
+                await self.reply(update, "This bot keeps no project notes.")
+                return
+            path, notes = found
             await self.reply(update, f"📝 {code(path)}" + (pre(notes, 3500) if notes.strip() else
                                      "\n(empty - the agent creates it when it learns something worth keeping)"))
         elif sub == "archive":
@@ -1731,55 +1533,7 @@ class Bot:
                 raise ProjectError(f"{name!r} isn't archived")
             await self._new_project(update, name, p.dir, p.context)
 
-    async def cmd_assign(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        args = list(ctx.args or [])
-        job_id = None
-        msg = update.effective_message if update else None
-        if msg is not None and msg.reply_to_message:
-            job_id, _ = self.store.message_link(update.effective_chat.id, msg.reply_to_message.message_id)
-        if args and args[0].isdigit():
-            job_id, args = args[0], args[1:]
-        thread = self._thread(update)
-        conv = self.agent.get(self.store.thread_session(update.effective_chat.id, thread)) if thread else None
-        if job_id and not args and conv:  # in a conversation's thread: the job becomes part of it
-            self.agent.domain.record_job(conv, job_id)
-            ap = self.agent.autopilot
-            rec = self.store.get_job(job_id)
-            wake = bool(ap and rec and not rec.ended_at)
-            if wake:  # part of the conversation's work: its end wakes the agent
-                ap.add_watch(conv, "jobs", [job_id])
-            await self.reply(update, f"🔗 Job {code(job_id)} is now part of this conversation: its reports come here"
-                                     + (" and the agent is woken when it ends (/auto off cancels that)." if wake else "."))
-            return
-        target = args[0].lower() if args else self._scope(update)
-        if not job_id or not target:
-            await self.reply(update, "Usage: /assign &lt;job id&gt; &lt;project|main&gt; - or reply to a job's message "
-                                     "with /assign &lt;project|main&gt;. In a conversation's thread, /assign &lt;job id&gt; "
-                                     "makes the job part of that conversation (its end wakes the agent).")
-            return
-        await self._assign(job_id, target, update)
 
-    async def _assign(self, job_id: str, target: str | None, update: Update | None) -> None:
-        project = None if target in (None, "main", "none") else target
-        p = self.store.get_project(project) if project else None
-        if project and (not p or p.archived):
-            await self.reply(update, f"⛔ No active project {code(project)}. /project lists them.")
-            return
-        rec = self.store.get_job(job_id)
-        if not rec:
-            await self.reply(update, f"⛔ Unknown job {code(job_id)}.")
-            return
-        old = rec.project
-        if old == project:
-            await self.reply(update, f"Job {code(job_id)} is already in {self._where(project)}.")
-            return
-        self.agent.domain.move_job(job_id, project)
-        await self.reply(update, f"📁 Job {code(job_id)} moved to {self._where(project)}.")
-        # A card in its new place, so its updates and replies continue there.
-        await self.notifier.send(Outgoing(
-            f"📁 Job {code(job_id)} {esc(rec.name)} ({esc(rec.state)}) moved here from {self._where(old)}.",
-            job_id=job_id, silent=True,
-            buttons=[[("📜 Log", f"log:{job_id}"), ("📊 Status", f"status:{job_id}")]]))
 
     async def on_raw_update(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         stopped = (update.api_kwargs or {}).get("stopped_message_generation")
@@ -1813,16 +1567,8 @@ class Bot:
         action, _, arg = (q.data or "").partition(":")
         await q.answer()
         try:
-            if action == "fix":
-                await self._start_fix(chat.id, arg)
-            elif action == "log":
-                await self._send_log(arg, 200)
-            elif action == "status":  # on a job's card: refresh it in place
-                rec = self.store.get_job(arg)
-                if rec and not rec.ended_at:
-                    await self.monitor.refresh_card_by_id(arg)
-                else:
-                    await self._send_status(arg)
+            if self.ext and await self.ext.on_button(update, q, chat.id, action, arg):  # the domain's (job cards)
+                pass
             elif action in ("rerun", "rerunx"):  # a run cut off by a restart: ▶️ Continue / ✖ Dismiss
                 rec = self.agent.pop_cut_off_run(arg)
                 session = self.agent.get(rec.get("session")) if rec else None
@@ -1843,10 +1589,6 @@ class Bot:
                 result = await (subs.approve(arg) if action == "plan" else subs.decline(arg))
                 if result.startswith("This "):  # already answered: the card says so
                     await self._edit(q, result)
-            elif action == "pg":  # ◀ / ▶ on a job's card: another of its graphs, in place
-                job_id, _, page = arg.rpartition(":")
-                if page.isdigit() and hasattr(self.notifier, "page"):
-                    await self.notifier.page(job_id, int(page), self.monitor.cached_plots(job_id))
             elif action == "noop":
                 pass
             elif action == "fb" and getattr(self.agent, "feedback", None):  # 👀 Noted / ✅ Fixed / ✖ Won't fix
@@ -1891,21 +1633,15 @@ class Bot:
                 except Exception:
                     pass
                 await self._start_thread(chat.id, thread, project, text, files)
-            elif action == "plot":
-                await self._start_plot(chat.id, arg)
-            elif action == "assign":
-                job_id, _, name = arg.partition(":")
-                await self._assign(job_id, name or None, update)
             elif action == "ap":  # an approval card from before wake-ups needed no approval
                 await self._edit(q, "This approval card is no longer used: the agent sets up its wake-ups itself now "
                                     "(/auto lists them).")
             elif action == "uw":  # ✖ on a wake-up's notice, or on a job's card (its watch)
                 w = self.agent.autopilot.cancel_watch(int(arg)) if self.agent.autopilot and arg.isdigit() else None
-                if w and w.kind == "jobs":  # the button is on the job's card: update the card
-                    for jid in w.job_ids:
-                        await self.monitor.refresh_card_by_id(jid)
+                if w and self.ext and await self.ext.watch_cancelled(w):  # e.g. on a job's card: the card shows it
+                    pass
                 else:
                     await self._edit(q, "✖ Cancelled: the agent won't be woken for this." if w else
                                      "This wake-up has already happened or was cancelled.")
-        except SSHError as e:
+        except self.errors as e:  # the domain's (e.g. the HPC unreachable)
             await self.notifier.send(Outgoing(f"⚠️ {esc(e)}"))

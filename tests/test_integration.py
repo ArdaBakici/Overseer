@@ -817,7 +817,7 @@ async def test_monitor_track_agent_only(env):
 async def test_bot_routing_and_commands(env, monkeypatch):
     from overseer.core.bot import Bot
 
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     started = []
 
@@ -1104,7 +1104,7 @@ async def test_failed_wakeup_pauses_until_you_write(env):
 async def test_auto_command(env, monkeypatch):
     from overseer.core.bot import Bot
     await make_autopilot(env)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -1151,7 +1151,7 @@ async def test_cancel_button_and_old_cards(env):
     s = env.agent.general_session()
     env.set_jobs(**{"5001": {"name": "train", "state": "RUNNING", "workdir": str(env.home / "proj")}})
     await env.agent.handle(s, "FAKE_OV ov watch 5001 --note 'compare the loss'\nFAKE_OV ov wake in 30m look at the eval")
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     w, timer = env.store.watches(s.id)
     await asyncio.gather(*list(env.ctl._bg))
@@ -1241,9 +1241,9 @@ async def test_status_follows_the_training_log(env):
     env.set_jobs(**{"18743802": job})
     await env.monitor.poll()
 
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
-    await bot._send_status("18743802")
+    await bot.ext._send_status("18743802")
     text = env.notifier.sent[-1].text
     assert "🏃 <b>18743802</b> bench-dreamerv3-mixed-s0 · cn257\n⏱ 1:00:00 / 4:00:00 (25%, 3h00m left)" in text
     assert "📈 step 12k · score 3.1 · dyn 0.42" in text, text
@@ -1254,11 +1254,11 @@ async def test_status_follows_the_training_log(env):
 
     # A real problem on stderr is flagged.
     stderr.write_text("Traceback (most recent call last):\n  File \"train.py\"\ntorch.OutOfMemoryError: CUDA out of memory.\n")
-    await bot._send_status("18743802")
+    await bot.ext._send_status("18743802")
     assert "⚠️ stderr: <b>" in env.notifier.sent[-1].text
 
     # 📜 Log shows the training log; SLURM's own files come along as attachments.
-    await bot._send_log("18743802", 200)
+    await bot.ext._send_log("18743802", 200)
     msg = env.notifier.sent[-1]
     assert "train_18743802.log" in msg.text and "episode/score 3.1" in msg.text
     assert [name for name, _ in msg.files] == ["train_18743802.log", "job-18743802-stdout.log", "job-18743802-stderr.log"]
@@ -1508,7 +1508,7 @@ async def test_topics_routing(env):
 async def test_project_commands(env, monkeypatch):
     from overseer.core.bot import Bot
     projects = make_projects(env)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier, projects=projects)
     replies, started = [], []
 
@@ -1559,19 +1559,19 @@ async def test_project_commands(env, monkeypatch):
     # /jobs in a topic lists that project's jobs; /assign moves jobs (args, reply, in-topic, button).
     env.store.upsert_job(JobRecord(job_id="801", name="dft", state="RUNNING", project="chem"))
     env.store.upsert_job(JobRecord(job_id="802", name="misc", state="RUNNING"))
-    await bot.cmd_jobs(topic_update("/jobs", thread=77), NS(args=[]))
+    await bot.ext.cmd_jobs(topic_update("/jobs", thread=77), NS(args=[]))
     assert "801" in replies[-1] and "802" not in replies[-1]
-    await bot.cmd_jobs(topic_update("/jobs"), NS(args=[]))
+    await bot.ext.cmd_jobs(topic_update("/jobs"), NS(args=[]))
     assert "801" in replies[-1] and "📁chem" in replies[-1] and "802" in replies[-1]
-    await bot.cmd_assign(topic_update("/assign"), NS(args=["802", "dreamer"]))
+    await bot.ext.cmd_assign(topic_update("/assign"), NS(args=["802", "dreamer"]))
     assert env.store.get_job("802").project == "dreamer" and "moved to project <code>dreamer</code>" in replies[-1]
     assert "moved here from the main chat" in env.notifier.sent[-1].text and env.notifier.sent[-1].job_id == "802"
     env.store.link_message(1, 555, "802", None)
-    await bot.cmd_assign(topic_update("/assign", reply_to=555), NS(args=["main"]))
+    await bot.ext.cmd_assign(topic_update("/assign", reply_to=555), NS(args=["main"]))
     assert env.store.get_job("802").project is None
-    await bot.cmd_assign(topic_update("/assign", thread=77), NS(args=["802"]))
+    await bot.ext.cmd_assign(topic_update("/assign", thread=77), NS(args=["802"]))
     assert env.store.get_job("802").project == "chem"
-    await bot._assign("802", "nope", None)
+    await bot.ext._assign("802", "nope", None)
     assert "No active project" in replies[-1]
     s = env.agent.session_for_job("801")
     assert s.project == "chem"  # a job's conversation lives in the job's project
@@ -1618,7 +1618,7 @@ async def test_rich_reply_and_outbox(env, monkeypatch):
 
 async def test_plot_button(env, monkeypatch):
     from overseer.core.bot import Bot
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     started = []
 
@@ -1628,7 +1628,7 @@ async def test_plot_button(env, monkeypatch):
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
     env.store.upsert_job(JobRecord(job_id="901", name="dreamer", state="RUNNING", stdout="/s/slurm-901.out",
                                    info=json.dumps({"progress_log": "/s/train_901.log"})))
-    await bot._start_plot(1, "901")
+    await bot.ext._start_plot(1, "901")
     for t in list(bot._tasks):
         await t
     sid, text = started[-1]  # no plotting command yet: the agent writes one (and registers it)
@@ -1644,7 +1644,7 @@ async def test_plot_button(env, monkeypatch):
     env.store.set_metric_spec(MetricSpec(scope="job", key="901", plot=(
         "printf '\\x89PNG fake' > {out}/loss.png && printf '\\x89PNG fake' > {out}/score.png")))
     n = len(started)
-    await bot._start_plot(1, "901")
+    await bot.ext._start_plot(1, "901")
     assert shown == [("901", ["loss.png", "score.png"])] and len(started) == n
     assert env.monitor.cached_plots("901")[0] == ("loss.png", b"\x89PNG fake")
 
@@ -1700,7 +1700,7 @@ async def test_threads_are_conversations(env, monkeypatch):
     notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
     await notifier.detect_topics()
     projects = make_projects(env)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=notifier, projects=projects)
     started = []
 
@@ -1822,7 +1822,7 @@ async def test_streaming_drafts(env, monkeypatch):
     assert tg.api_calls[-1][1]["draft_id"] == handle["draft"] and tg.api_calls[-1][1]["text"] == "⏳ still working"
 
     # The draft's Stop button stops the agent's run.
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent, notifier=notifier)
     stopped = []
 
     async def stop(sid):
@@ -1896,7 +1896,7 @@ async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
     """A job the agent submitted unnoticed can be handed to its conversation: /assign <id> in the thread."""
     from overseer.core.bot import Bot
     ap = await make_autopilot(env)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -1906,7 +1906,7 @@ async def test_assign_links_a_job_to_the_conversation(env, monkeypatch):
     s = env.agent.new_conversation()
     env.store.bind_thread(1, 301, s.id)
     env.store.upsert_job(JobRecord(job_id="18746955", name="native7", state="RUNNING"))  # seen, but not linked
-    await bot.cmd_assign(topic_update("/assign", thread=301), NS(args=["18746955"]))
+    await bot.ext.cmd_assign(topic_update("/assign", thread=301), NS(args=["18746955"]))
     rec = env.store.get_job("18746955")
     assert rec.by_agent == 1 and rec.session_id == s.id
     assert "part of this conversation" in replies[-1] and "the agent is woken when it ends" in replies[-1]
@@ -1941,7 +1941,7 @@ async def test_general_topic(env, monkeypatch):
     assert tg.sent[-1][1] == gen
 
     # Messages in the general topic go to the main conversation; /new there starts a fresh one.
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=notifier)
     started, replies = [], []
 
@@ -2064,7 +2064,7 @@ async def test_automatic_compaction_is_reported(env, backend):
 async def test_compact_on_request(env, backend, monkeypatch):
     from overseer.core.bot import Bot
     env.agent.set_backend(backend)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -2191,7 +2191,7 @@ async def test_updating_the_clis(env, monkeypatch):
     env.agent.updating = False
     await run
 
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -2634,7 +2634,7 @@ async def test_morning_digest(env):
 
     # /digest and /cluster in Telegram.
     from overseer.core.bot import Bot
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     bot.digest = d
     replies = []
@@ -2647,7 +2647,7 @@ async def test_morning_digest(env):
     st = env.slurm()
     st["nodes"] = {"g1": {"gres": "gpu:h100:8", "alloc_tres": "gres/gpu=5", "partitions": "nvidia"}}
     (env.tmp / "slurm.json").write_text(json.dumps(st))
-    await bot.cmd_cluster(None, NS(args=[]))
+    await bot.ext.cmd_cluster(None, NS(args=[]))
     assert "🖥 <b>Cluster now</b>" in replies[-1] and "<b>nvidia</b>: 1/1 nodes up" in replies[-1], replies[-1]
     assert "GPUs 3/8 free (h100)" in replies[-1], replies[-1]
 
@@ -2705,7 +2705,7 @@ async def test_search_past_work(env):
 
     # /search in Telegram (in a project's topic: that project's work).
     from overseer.core.bot import Bot
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -2793,7 +2793,7 @@ async def test_dashboard(env):
 
     # /dashboard: the button when the address is set, how to set it up otherwise.
     from overseer.core.bot import Bot
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -2861,7 +2861,7 @@ async def test_files_sent_to_the_agent(env, monkeypatch):
     ./inbox and the agent is told where."""
     import overseer.core.bot as botmod
     from overseer.core.bot import Bot
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     started, replies = [], []
 
@@ -2950,7 +2950,7 @@ async def test_messages_outside_the_topics_are_refused(env, monkeypatch):
     projects.create("dreamer", "/scratch/me/rf-dreamer")
     await notifier.ensure_jobs_topics(["dreamer"])
     await notifier.ensure_topic("dreamer")
-    bot = Bot(env.cfg, app=NS(bot=tg), store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=NS(bot=tg), store=env.store, agent=env.agent,
               notifier=notifier, projects=projects)
     started = []
 
@@ -3021,7 +3021,7 @@ async def test_runs_cut_off_by_a_restart_are_offered_again(env, monkeypatch):
 
     # The next start: one notice per cut-off run, in the conversation, with buttons.
     agent = Agent(env.cfg, env.store, env.notifier, HpcDomain(env.cfg, env.store, env.notifier, env.hpc))
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=agent,
               notifier=env.notifier)
     started = []
 
@@ -3093,7 +3093,7 @@ async def test_a_wake_up_cut_off_by_a_restart(env):
     assert len(env.notifier.sent) == n_sent, [m.text for m in env.notifier.sent[n_sent:]]
     assert not env.store.get(f"wakeups_paused:{s.id}")
     env.agent.shutting_down = False
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     await bot.offer_cut_off_runs()
     notice = env.notifier.sent[-1]
@@ -3179,7 +3179,7 @@ async def test_writing_to_the_agent_declines_its_plan(env, monkeypatch):
     comment; a newer plan replaces the old one."""
     from overseer.core.bot import Bot
     subs, ap = await make_subagents(env)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     s = env.agent.general_session()
     p1 = await subs.propose(s, PLAN)
@@ -3248,7 +3248,7 @@ async def test_subagent_rules(env):
 async def test_subagent_threads_and_the_subagents_command(env, monkeypatch):
     from overseer.core.bot import Bot
     subs, ap = await make_subagents(env)
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
@@ -3375,29 +3375,29 @@ async def test_agents_see_findings_and_stalls(env):
 async def test_results_and_findings_commands(env, monkeypatch):
     from overseer.core.bot import Bot
     from overseer.core.store import FindingRecord, ResultRecord
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent,
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent,
               notifier=env.notifier)
     replies = []
 
     async def reply(update, text):
         replies.append(text)
     monkeypatch.setattr(bot, "reply", reply)
-    await bot.cmd_results(None, NS(args=[]))
+    await bot.ext.cmd_results(None, NS(args=[]))
     assert "No results yet" in replies[-1]
     for jid, score, verdict in (("801", "2", "baseline"), ("802", "9", "promising"), ("803", "5", "no-gain")):
         env.store.save_result(ResultRecord(id=jid, job_id=jid, name=f"r{jid}", state="COMPLETED", ended=time.time(),
                                            verdict=verdict, metrics=json.dumps({"score": score})))
-    await bot.cmd_results(None, NS(args=["score"]))
+    await bot.ext.cmd_results(None, NS(args=["score"]))
     msg = env.notifier.sent[-1]
     assert "by score" in msg.text and msg.markdown.index("802") < msg.markdown.index("803") < msg.markdown.index("801")
     assert "| id | name | state | verdict | score | conclusion |" in msg.markdown
-    await bot.cmd_results(None, NS(args=["promising"]))
+    await bot.ext.cmd_results(None, NS(args=["promising"]))
     assert "802" in env.notifier.sent[-1].markdown and "801" not in env.notifier.sent[-1].markdown
-    await bot.cmd_results(None, NS(args=["csv"]))
+    await bot.ext.cmd_results(None, NS(args=["csv"]))
     (name, data), = env.notifier.sent[-1].files
     assert name == "results.csv" and data.decode().count("\n") == 4
     env.store.add_finding(FindingRecord(project=None, kind="insight", text="bigger batch helps"))
-    await bot.cmd_findings(None, NS(args=[]))
+    await bot.ext.cmd_findings(None, NS(args=[]))
     assert "💡 F1 insight: bigger batch helps" in replies[-1]
 
 
@@ -3478,7 +3478,7 @@ async def test_graphs_carousel_in_cards_and_running_cards_at_the_bottom(env):
     await poll(due=["901"])
     assert len(tg.sent) == n and tg.media_edits[-1][:2] == (card, "loss.png")
     # ▶: the next graph, in place.
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent, notifier=notifier)
     q = NS(data="pg:901:1", message=NS(message_thread_id=None), answer=_noop, edit_message_text=_noop)
     await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
     assert tg.media_edits[-1][:2] == (card, "score.png") and tg.markups[card][0][1] == ("📈 2/2", "noop:")
@@ -3564,7 +3564,7 @@ async def test_feedback_cards_votes_and_answers(env, monkeypatch):
     ok, text = await env.ctl.handle(t1, ["feedback", "list"])
     assert text.splitlines()[0].startswith("🧱 FB1 limitation · +1"), text  # most +1s first
 
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent, notifier=notifier)
     q = NS(data="fb:1:fixed", message=NS(message_thread_id=thread), answer=_noop, edit_message_text=_noop)
     await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
     assert env.store.get_feedback(1).status == "fixed" and "✅ fixed" in tg.edits[-1][2]
@@ -3586,7 +3586,7 @@ async def test_feedback_review_runs_in_the_feedback_topic(env, monkeypatch):
     fb.notifier = notifier
     s = env.agent.general_session()
     await fb.report(s, "no way to see a job's GPU memory over time", "idea", "debugging an OOM")
-    bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=env.agent, notifier=notifier)
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent, notifier=notifier)
     await bot.cmd_feedback(None, NS(args=["review", "GPU", "things"]))
     for t in list(bot._tasks):
         await t

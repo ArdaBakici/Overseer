@@ -29,6 +29,19 @@ from .core.config import BACKENDS, Config, ConfigError, load_config
 log = logging.getLogger("overseer")
 
 
+
+CORE_MENU = [
+    ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
+    ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
+    ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
+    ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
+    ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
+    ("digest", "what happened since the last digest"), ("search", "search past work"),
+    ("dashboard", "the dashboard Mini App"), ("subagents", "planner mode: on/off, models, threads"),
+    ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"),
+    ("project", "projects: list, new, context, notes"), ("health", "connection status"), ("help", "help"),
+]
+
 def prepare_local_dirs(cfg: Config) -> None:
     """Create the local state and tmp dirs (inside local.allowed_roots), private to this user."""
     for d in (cfg.local.state(), cfg.local.tmp()):
@@ -82,20 +95,7 @@ def build(cfg: Config):
             except OSError as e:
                 log.error("dashboard: can't listen on %s:%s (%s)", cfg.dashboard.host, cfg.dashboard.port, e)
             await bot.set_dashboard_button()
-        await app.bot.set_my_commands([
-            ("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
-            ("fix", "ask the agent to fix a job"), ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
-            ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
-            ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
-            ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
-            ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),
-            ("digest", "what happened since the last digest"), ("search", "search past work"),
-            ("dashboard", "jobs, results, findings, timeline"), ("cluster", "free GPUs, when queued jobs start"),
-            ("subagents", "planner mode: on/off, models, threads"),
-            ("results", "experiments and what each showed"), ("findings", "insights and dead ends"),
-            ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"), ("project", "projects: list, new, context, notes"),
-            ("assign", "move a job to a project"), ("health", "connection status"), ("help", "help"),
-        ])
+        await app.bot.set_my_commands([*(bot.ext.menu if bot.ext else []), *CORE_MENU])
 
     async def post_stop(app: Application) -> None:
         agent.shutting_down = True  # runs cut off from here on are offered again at the next start
@@ -144,7 +144,7 @@ def build(cfg: Config):
     ctl = ControlServer(cfg, agent, projects, notifier)
     from .core.digest import Digest
     digest = Digest(cfg, store, hpc, notifier, agent, monitor)  # the morning digest, in the general topic
-    bot = Bot(cfg, app, store, hpc, monitor, agent, notifier, projects)
+    bot = Bot(cfg, app, store, agent, notifier, projects)
     bot.digest = digest
     dashboard = None
     if cfg.dashboard.enabled:  # the Mini App: on this machine, reachable on your tailnet via `tailscale serve`

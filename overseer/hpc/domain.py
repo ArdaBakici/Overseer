@@ -76,6 +76,19 @@ class HpcDomain(Domain):
         from .commands import HpcCommands
         return HpcCommands(ctl, self)
 
+    # ------------------------------------------------------------------ Telegram
+    def bot_commands(self, bot):
+        from .telegram import HpcBot
+        return HpcBot(bot, self)
+
+    def auto_prompt(self, goal: str) -> str:
+        from .telegram import AUTO_PROMPT
+        return AUTO_PROMPT.format(goal=goal)
+
+    async def project_notes_file(self, project) -> tuple[str, str] | None:
+        path = f"{project.dir.rstrip('/')}/{P.NOTES_FILE}"
+        return path, await self.hpc.try_head(self.remote_path(path), 200)
+
     # ------------------------------------------------------------------ wake-ups
     def attach_autopilot(self, autopilot) -> None:
         from .watches import JobWatches
