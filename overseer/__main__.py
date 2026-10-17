@@ -120,14 +120,16 @@ def build(cfg: Config):
     )
     notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store, rich=cfg.telegram.rich_messages,
                                 streaming=cfg.telegram.streaming)
-    agent = Agent(cfg, store, notifier, hpc)
+    from .hpc.domain import HpcDomain
+    domain = HpcDomain(cfg, store, notifier, hpc)  # this bot: the HPC (Overseer)
+    agent = Agent(cfg, store, notifier, domain)
 
     async def report_text(system: str, prompt: str) -> str:
         return await agent.runner().text(system=system, prompt=prompt)
 
     reporter = Reporter(report_text, cfg.agent.enabled, cfg.agent.llm_status_updates)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
-    agent.monitor = monitor
+    domain.monitor = monitor
     monitor.autopilot = Autopilot(cfg, store, agent, notifier, hpc)
     from .core.subagents import Subagents
     subagents = Subagents(cfg, store, agent, notifier)  # planner mode (off unless turned on or approved)
@@ -199,7 +201,8 @@ async def check(cfg: Config) -> int:
         report("telegram token", False, str(e))
     if cfg.agent.enabled:
         store = Store(cfg.local.db_path)
-        agent = Agent(cfg, store, None, hpc)  # type: ignore[arg-type]
+        from .hpc.domain import HpcDomain
+        agent = Agent(cfg, store, None, HpcDomain(cfg, store, None, hpc))  # type: ignore[arg-type]
         for backend in BACKENDS:
             runner = agent.runner(backend)
             cmd = runner.c.command
@@ -318,7 +321,8 @@ def open_command(cfg: Config, target: str | None) -> int:
         asyncio.run(ensure_master(cfg))
     except ConfigError as e:
         print(f"note: SSH connection to the HPC is not available, `ssh hpc` won't work in this session: {e}")
-    runner = make_runner(cfg, rec.backend)
+    from .hpc.domain import hpc_sandbox
+    runner = make_runner(cfg, rec.backend, hpc_sandbox(cfg))  # the bot's sandbox, exactly
     argv, env, cwd = runner.interactive_command(rec.cli_session_id, rec.id)
     # The bot runs the CLIs without a terminal (TERM=dumb, NO_COLOR); here they get the user's terminal.
     env.pop("NO_COLOR", None)

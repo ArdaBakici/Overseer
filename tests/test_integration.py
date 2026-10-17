@@ -24,6 +24,8 @@ from overseer.hpc.diagnose import Reporter
 from overseer.hpc.remote import HPC
 from overseer.hpc.monitor import Monitor
 from overseer.core.runners import Activity, AgentRunError, ClaudeCodeRunner, CodexRunner, display_command
+from overseer.hpc.activity import JobActivity
+from overseer.hpc.domain import HpcDomain
 from overseer.hpc.ssh import SSHRunner
 from overseer.hpc.sshlink import agent_ssh_config, overseer_ssh_config, write_configs
 from overseer.core.notify import Outgoing
@@ -130,15 +132,16 @@ def env(tmp_path, monkeypatch, short_tmp):
     runner = LocalRunner(cfg)
     hpc = HPC(runner)
     notifier = FakeNotifier()
-    agent = Agent(cfg, store, notifier, hpc)
+    domain = HpcDomain(cfg, store, notifier, hpc)
+    agent = Agent(cfg, store, notifier, domain)
     reporter = Reporter(lambda system, prompt: agent.runner().text(system=system, prompt=prompt), True, False)
     monitor = Monitor(cfg, hpc, store, notifier, reporter)
-    agent.monitor = monitor
+    domain.monitor = monitor
 
     async def no_master(_cfg):
         return None
 
-    monkeypatch.setattr("overseer.core.agent.ensure_master", no_master)
+    monkeypatch.setattr("overseer.hpc.domain.ensure_master", no_master)
 
     def set_jobs(**jobs):
         st = json.loads(state.read_text())
@@ -306,7 +309,7 @@ def test_store_migrates_old_database(tmp_path):
 # ----------------------------------------------------------------------------- activity parsing
 
 def test_job_detection_ignores_lookalikes():
-    from overseer.core.runners import submitted_jobs
+    from overseer.hpc.activity import submitted_jobs
     not_submissions = [
         ("ssh hpc 'cd ~/rf-dreamer/sbatch && sacct -u $USER -n -X -o JobID --parsable2 -S now-2days'", "12345\n12346\n"),
         ("ssh hpc 'bash -lc \"sacct -j 12345 --parsable2 -n -o JobID; cat scripts/train.sbatch\"'", "12345\n"),
@@ -330,7 +333,7 @@ def test_job_detection_ignores_lookalikes():
 
 def test_activity_and_job_detection():
     seen = []
-    a = Activity(on_job=lambda j, c: seen.append(j))
+    a = JobActivity(on_job=lambda j, c: seen.append(j))
     assert display_command("/bin/bash -lc 'ssh hpc squeue -u me'") == "ssh hpc squeue -u me"
     assert display_command("ssh hpc ls") == "ssh hpc ls"
     a.command("/bin/bash -lc 'ssh hpc sbatch run.sh'")
@@ -353,14 +356,14 @@ def test_deny_list_covers_secrets_without_nesting(env, monkeypatch):
     from overseer.core.runners import Runner
 
     env.cfg.local.env_path.write_text("TELEGRAM_BOT_TOKEN=x\n")
-    denied = Runner(env.cfg).deny_read()
+    denied = Runner(env.cfg, env.agent.domain.sandbox()).deny_read()
     assert covered(env.cfg.ssh_dir, denied) and covered(env.cfg.local.state(), denied)
     assert str(env.cfg.local.env_path) in denied
     assert not any(Path(a) in Path(b).parents for a in denied for b in denied)  # no nested entries
     # With the key folder outside the state dir it is listed on its own.
     env.cfg.ssh.dir = str(env.tmp / "app" / "keys")
     (env.tmp / "app" / "keys").mkdir()
-    assert str(env.cfg.ssh_dir) in Runner(env.cfg).deny_read()
+    assert str(env.cfg.ssh_dir) in Runner(env.cfg, env.agent.domain.sandbox()).deny_read()
 
 
 def test_deny_list_uses_real_paths(env):
@@ -376,15 +379,15 @@ def test_deny_list_uses_real_paths(env):
     sock.bind(str(run / "d.sock"))
     try:
         env.cfg.agent.deny_read = [str(env.tmp / "var-run" / "d.sock"), str(run / "d.sock")]
-        denied = Runner(env.cfg).deny_read()
+        denied = Runner(env.cfg, env.agent.domain.sandbox()).deny_read()
         assert str(run / "d.sock") in denied and not any("var-run" in d for d in denied)
     finally:
         sock.close()
 
 
 async def test_claude_runner_sandbox_and_parsing(env):
-    r = ClaudeCodeRunner(env.cfg)
-    act = Activity()
+    r = ClaudeCodeRunner(env.cfg, env.agent.domain.sandbox())
+    act = JobActivity()
     res = await r.run("fix job 1", system="SYS", session_id=None, key="s1", activity=act)
     assert res.text == "Fixed the batch size and resubmitted as job 4242." and res.session_id
     assert act.jobs == [("4242", "ssh hpc 'cd ~/proj && sbatch train.sh'")] and act.files == ["/tmp/x/notes.md"]
@@ -422,8 +425,8 @@ async def test_claude_runner_sandbox_and_parsing(env):
 
 
 async def test_codex_runner_profile_and_parsing(env):
-    r = CodexRunner(env.cfg)
-    act = Activity()
+    r = CodexRunner(env.cfg, env.agent.domain.sandbox())
+    act = JobActivity()
     res = await r.run("fix job 1", system="SYS", session_id=None, key="s2", activity=act)
     assert res.text == "Resubmitted as job 4343." and res.session_id
     assert act.commands == ["ssh hpc sbatch --parsable ~/proj/train.sh"]
@@ -1195,7 +1198,7 @@ async def test_research_log(env):
     assert "- run 2999:" in stdin and "- run 1500:" not in stdin  # the beginning and the latest entries
     assert "too long: condense" not in stdin
     (pdir / "RESEARCH_LOG.md").write_text("x" * 700_000)
-    assert "too long: condense" in await env.agent.research_log("dreamer")
+    assert "too long: condense" in await env.agent.domain.research_log("dreamer")
 
 
 async def test_usage_report(env):
@@ -1573,7 +1576,7 @@ async def test_project_commands(env, monkeypatch):
     assert "No active project" in replies[-1]
     s = env.agent.session_for_job("801")
     assert s.project == "chem"  # a job's conversation lives in the job's project
-    env.agent.move_job("801", "dreamer")
+    env.agent.domain.move_job("801", "dreamer")
     assert env.agent.get(s.id).project == "dreamer"
 
     # Context, archive, restore.
@@ -1847,7 +1850,7 @@ def test_login_node_warnings(monkeypatch):
     import overseer.core.runners as runners
     clock = [1000.0]
     monkeypatch.setattr(runners.time, "monotonic", lambda: clock[0])
-    a = Activity(login_warn_seconds=120)
+    a = JobActivity(login_warn_seconds=120)
     for cmd, took in [("ssh hpc 'python make_plots.py'", 200), ("ssh hpc 'ls -la'", 2),
                       ("hpc-run --dir ~/proj -- python make_plots.py", 900), ("ssh hpc 'cd x && sbatch run.sh'", 300),
                       ("python local_thing.py", 500), ("/bin/bash -lc \"ssh hpc 'srun -p compute python x.py'\"", 400)]:
@@ -1859,7 +1862,7 @@ def test_login_node_warnings(monkeypatch):
 
 async def test_login_node_warning_in_summary(env):
     s = env.agent.general_session()
-    a = Activity(login_warn_seconds=120)
+    a = JobActivity(login_warn_seconds=120)
     a.commands = ["ssh hpc 'python make_plots.py'"]
     a.login_node = [("ssh hpc 'python make_plots.py'", 312)]
     await env.agent._report_activity(s, a, [])
@@ -2138,7 +2141,7 @@ async def test_disk_quota(env, monkeypatch, tmp_path):
     assert len([m for m in env.notifier.sent if "💾" in m.text]) == n  # once, not on every check
     table.write_text(QUOTA)  # cleaned up: below the threshold again
     await env.monitor.check_quota(force=True)
-    assert env.agent._storage_warning() == ""
+    assert env.agent.domain.storage_warning() == ""
     table.write_text(QUOTA.replace("301       500 ( 60%)", "450       500 ( 90%)"))
     await env.monitor.check_quota(force=True)
     assert len([m for m in env.notifier.sent if "💾" in m.text]) == n + 1  # filled up again: warned again
@@ -3018,7 +3021,7 @@ async def test_runs_cut_off_by_a_restart_are_offered_again(env, monkeypatch):
     assert len(env.notifier.sent) == n_sent and len(env.cli_log()) == n_calls
 
     # The next start: one notice per cut-off run, in the conversation, with buttons.
-    agent = Agent(env.cfg, env.store, env.notifier, env.hpc)
+    agent = Agent(env.cfg, env.store, env.notifier, HpcDomain(env.cfg, env.store, env.notifier, env.hpc))
     bot = Bot(env.cfg, app=None, store=env.store, hpc=env.hpc, monitor=env.monitor, agent=agent,
               notifier=env.notifier)
     started = []

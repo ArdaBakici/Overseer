@@ -1719,7 +1719,7 @@ class Bot:
             await self.reply(update, f"{code(name)} now lives in {code(p.dir)}.")
         elif sub == "notes":
             path = f"{p.dir.rstrip('/')}/OVERSEER.md"
-            notes = await self.hpc.try_head(self.agent._remote_path(path), 200)
+            notes = await self.hpc.try_head(self.agent.domain.remote_path(path), 200)
             await self.reply(update, f"📝 {code(path)}" + (pre(notes, 3500) if notes.strip() else
                                      "\n(empty - the agent creates it when it learns something worth keeping)"))
         elif sub == "archive":
@@ -1742,7 +1742,7 @@ class Bot:
         thread = self._thread(update)
         conv = self.agent.get(self.store.thread_session(update.effective_chat.id, thread)) if thread else None
         if job_id and not args and conv:  # in a conversation's thread: the job becomes part of it
-            self.agent._record_job(conv, job_id)
+            self.agent.domain.record_job(conv, job_id)
             ap = self.agent.autopilot
             rec = self.store.get_job(job_id)
             wake = bool(ap and rec and not rec.ended_at)
@@ -1773,7 +1773,7 @@ class Bot:
         if old == project:
             await self.reply(update, f"Job {code(job_id)} is already in {self._where(project)}.")
             return
-        self.agent.move_job(job_id, project)
+        self.agent.domain.move_job(job_id, project)
         await self.reply(update, f"📁 Job {code(job_id)} moved to {self._where(project)}.")
         # A card in its new place, so its updates and replies continue there.
         await self.notifier.send(Outgoing(

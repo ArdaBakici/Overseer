@@ -32,24 +32,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..hpc.compute import DISPATCHED, LOGIN_NODE_CMD
 from .config import Config
-from ..hpc.sshlink import agent_bin_dir
 
 log = logging.getLogger(__name__)
 
 MAX_PROMPT = 200_000
 BASE_ENV = ["LANG", "LC_ALL", "TZ"]
-SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 # Claude Code's answer when a tool call needed an interactive approval that -p mode can't give.
 PERMISSION_DENIED_RE = re.compile(r"requires approval|permission to use .* (?:was|has been) denied|haven't granted", re.I)
-PARSABLE_RE = re.compile(r"^\s*(\d+)(?:;\S+)?\s*$", re.M)
-# `sbatch` run as a command - not a folder, a `train.sbatch` file or sacct's --parsable2.
-_SBATCH = r"(?:^|[\s;&|(`'\"/])sbatch(?![\w.-])"
-SBATCH_RE = re.compile(_SBATCH)
-SBATCH_PARSABLE_RE = re.compile(_SBATCH + r"[^;&|\n]*\s--parsable(?![\w-])")  # the flag of that same sbatch
-SCANCEL_RE = re.compile(r"(?:^|[\s;&|(`'\"/])scancel(?![\w.-])([^;&|\n]*)")
-SLURM_QUERY_RE = re.compile(r"(?:^|[\s;&|(`'\"/])(?:sacct|squeue|scontrol|seff|sinfo)(?![\w.-])")
 
 # The agent CLIs running now (process group ids): ended with Overseer, so a run that a restart cut off can't go on
 # by itself while the researcher is offered to continue it.
@@ -125,8 +115,22 @@ class RunResult:
 
 
 @dataclass
+class Sandbox:
+    """What a domain adds to the agent's sandbox (on top of the platform's own rules, below)."""
+    deny_read: list[Path] = field(default_factory=list)  # more local paths its commands must never read
+    unix_sockets: list[Path] = field(default_factory=list)  # local sockets its commands may connect to
+    writable: list[Path] = field(default_factory=list)  # local folders it may write besides its scratch folder
+
+
+def agent_bin_dir(cfg: Config) -> Path:
+    """The agent's own commands (its control command, and whatever its domain adds): first on its PATH."""
+    return cfg.local.tmp("agent-bin")
+
+
+@dataclass
 class Activity:
-    """What the agent did during one request (for Telegram reports, job tracking and the live view).
+    """What the agent did during one request (for Telegram reports and the live view). A domain's subclass
+    watches the commands too (shell_command, shell_output), e.g. for the jobs they submit.
 
     Every step is also passed to `on_progress` as a dict with a "kind": thought (reasoning summary),
     message (text the agent wrote between steps), command, output, tool, file, session, compacting or
@@ -134,19 +138,22 @@ class Activity:
 
     commands: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
-    jobs: list[tuple[str, str]] = field(default_factory=list)  # (job_id, command)
     blocked: list[tuple[str, str]] = field(default_factory=list)  # (command, reason) refused by the CLI itself
-    cancelled: list[str] = field(default_factory=list)  # job ids the agent ran scancel on
-    # (command, seconds) that ran on the login node for at least login_warn_seconds (0 = don't check)
-    login_node: list[tuple[str, float]] = field(default_factory=list)
-    login_warn_seconds: float = 0
     _started: dict[str, float] = field(default_factory=dict)
-    # Numbers seen in command output -> the command (to recognise job ids submitted by scripts)
-    numbers: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)  # extra environment for this run (e.g. the ov token)
-    on_job: Callable[[str, str], None] | None = None
     on_command: Callable[[str], None] | None = None
     on_progress: Callable[[dict[str, Any]], None] | None = None
+
+    # ---- what a domain's subclass watches
+    def shell_command(self, cmd: str) -> None:
+        """A command the agent started (as displayed)."""
+
+    def shell_output(self, cmd: str, output: str, took: float | None) -> None:
+        """Its output, and how long it ran (None if its start wasn't seen)."""
+
+    def report_lines(self) -> list[str]:
+        """Extra lines (HTML) for the summary of the commands it ran."""
+        return []
 
     def _emit(self, kind: str, **data: Any) -> None:
         if self.on_progress:
@@ -180,30 +187,16 @@ class Activity:
         cmd = display_command(cmd)
         self.commands.append(cmd)
         self._started[cmd] = time.monotonic()
-        for args in SCANCEL_RE.findall(cmd):
-            for jid in re.findall(r"(?<![\w-])(\d+)(?:_\d+)?(?![\w.])", args):
-                if jid not in self.cancelled:
-                    self.cancelled.append(jid)
+        self.shell_command(cmd)
         if self.on_command:
             self.on_command(cmd)
         self._emit("command", command=cmd)
 
     def output(self, cmd: str, output: str, exit_code: int | None = None) -> None:
-        self._emit("output", command=display_command(cmd), output=output or "", exit_code=exit_code)
-        for n in re.findall(r"(?<![\w.])\d{3,12}(?![\w.])", (output or "")[-20_000:]):
-            if len(self.numbers) < 5000:
-                self.numbers.setdefault(n, display_command(cmd))
-        started = self._started.pop(display_command(cmd), None)
-        if started is not None and self.login_warn_seconds:
-            took = time.monotonic() - started
-            shown = display_command(cmd)
-            if took >= self.login_warn_seconds and LOGIN_NODE_CMD.search(shown) and not DISPATCHED.search(shown):
-                self.login_node.append((shown, took))
-        for jid in submitted_jobs(cmd, output or ""):
-            if all(jid != j for j, _ in self.jobs):
-                self.jobs.append((jid, display_command(cmd)))
-                if self.on_job:
-                    self.on_job(jid, display_command(cmd))
+        shown = display_command(cmd)
+        self._emit("output", command=shown, output=output or "", exit_code=exit_code)
+        started = self._started.pop(shown, None)
+        self.shell_output(shown, output or "", time.monotonic() - started if started is not None else None)
 
     def file(self, path: str) -> None:
         if not path:
@@ -214,19 +207,6 @@ class Activity:
 
     def block(self, cmd: str, reason: str) -> None:
         self.blocked.append((display_command(cmd), reason.strip()[:300]))
-
-
-def submitted_jobs(cmd: str, output: str) -> list[str]:
-    """Job ids a command submitted: only when it actually runs sbatch (reading a log that says
-    "Submitted batch job N", or sacct output, is not a submission)."""
-    if not SBATCH_RE.search(cmd):
-        return []
-    ids = SUBMITTED_RE.findall(output)
-    if not ids and SBATCH_PARSABLE_RE.search(cmd):
-        ids = PARSABLE_RE.findall(output)
-        if SLURM_QUERY_RE.search(cmd):  # other numbers in the output may be sacct/squeue job ids
-            ids = ids[:1]
-    return ids
 
 
 def display_command(cmd: str) -> str:
@@ -272,8 +252,9 @@ class Runner:
     name = ""
     efforts: tuple[str, ...] = ()
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, sandbox: Sandbox | None = None):
         self.cfg = cfg
+        self.sandbox = sandbox or Sandbox()  # what the domain adds to the sandbox
         self.timeout = cfg.agent.timeout_minutes * 60
         # Set from Telegram (/model, /effort); None = use config.yaml (where null = the CLI's default).
         self.model_override: str | None = None
@@ -301,7 +282,7 @@ class Runner:
         home = Path.home()
         uid = os.getuid()
         candidates = [
-            self.cfg.ssh_dir, home / ".ssh", self.cfg.local.state(), self.cfg.local.env_path,
+            *self.sandbox.deny_read, home / ".ssh", self.cfg.local.state(), self.cfg.local.env_path,
             home / ".gnupg", home / ".docker", home / ".aws", home / ".config" / "gcloud",
             Path("/var/run/docker.sock"), Path("/run/docker.sock"), Path("/run/containerd"),
             Path("/run/podman"), Path("/var/run/podman"), Path(f"/run/user/{uid}"),
@@ -485,8 +466,8 @@ class ClaudeCodeRunner(Runner):
                 "allowUnsandboxedCommands": False,  # no dangerouslyDisableSandbox escape hatch
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": [],
-                "filesystem": {"allowWrite": [str(workdir)], "denyRead": deny},
-                # The HPC is reached through the unix socket of Overseer's SSH master.
+                "filesystem": {"allowWrite": [str(workdir), *map(str, self.sandbox.writable)], "denyRead": deny},
+                # Overseer's control socket, and the domain's (e.g. the SSH master that reaches the HPC).
                 "network": {"allowAllUnixSockets": True, "allowedDomains": list(self.cfg.agent.allowed_domains)},
             },
             "permissions": {
@@ -635,8 +616,8 @@ class CodexRunner(Runner):
     name = "codex"
     efforts = CODEX_EFFORTS
 
-    def __init__(self, cfg: Config):
-        super().__init__(cfg)
+    def __init__(self, cfg: Config, sandbox: Sandbox | None = None):
+        super().__init__(cfg, sandbox)
         self._catalog: dict[str, str] | None = None  # model -> its default reasoning effort
 
     def _configured_effort(self) -> str | None:
@@ -660,6 +641,8 @@ class CodexRunner(Runner):
         fs: dict[str, str] = {"/": "read"}
         if writable:
             fs[str(workdir)] = "write"
+            for p in self.sandbox.writable:
+                fs[str(p)] = "write"
         for p in self.deny_read():
             fs[p] = "deny"
         net: dict[str, Any] = {"enabled": network}
@@ -667,7 +650,8 @@ class CodexRunner(Runner):
             net.update({
                 "mode": "limited",
                 "domains": {d: "allow" for d in self.cfg.agent.allowed_domains},
-                "unix_sockets": {str(self.cfg.control_socket): "allow", str(self.cfg.ctl_socket): "allow"},
+                "unix_sockets": {**{str(p): "allow" for p in self.sandbox.unix_sockets},
+                                 str(self.cfg.ctl_socket): "allow"},
             })
         out = [
             'default_permissions="overseer"',
@@ -969,5 +953,5 @@ def _claude_usage(ev: dict[str, Any], result: RunResult) -> None:
         result.cost_usd = float(cost)
 
 
-def make_runner(cfg: Config, backend: str) -> Runner:
-    return ClaudeCodeRunner(cfg) if backend == "claude_code" else CodexRunner(cfg)
+def make_runner(cfg: Config, backend: str, sandbox: Sandbox | None = None) -> Runner:
+    return ClaudeCodeRunner(cfg, sandbox) if backend == "claude_code" else CodexRunner(cfg, sandbox)

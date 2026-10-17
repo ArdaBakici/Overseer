@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING
 from .config import Config
 from ..hpc.diagnose import extract_metrics, tqdm_cleanup
 from ..hpc.remote import HPC
-from ..hpc.results import context as results_context
 from ..hpc.monitor import progress_log
 from .notify import Notifier, Outgoing, code, esc
 from ..hpc.slurm import SUCCESS_STATES, Job
@@ -295,9 +294,9 @@ class Autopilot:
                 await self.check(s.id)
             self._spawn(recheck())
 
-    def after_turn(self, s: Session, cancelled: list[str]) -> str:
+    def after_turn(self, s: Session, activity) -> str:
         """After a successful turn: a line for the reply (HTML) saying what will wake the agent, if anything."""
-        for jid in cancelled:  # the agent knows why it cancelled these: their end wakes nobody
+        for jid in getattr(activity, "cancelled", []):  # the agent knows why it cancelled these: their end wakes nobody
             for w in self.store.job_watches(jid):
                 if w.session_id == s.id:
                     rest = [j for j in w.job_ids if j != jid]
@@ -449,9 +448,7 @@ class Autopilot:
         if running:
             parts.append(f"Still running: {_ids(running)} (still watched; one of the jobs failed, which is why "
                          "you're woken now).")
-        if s.project:
-            parts.append(await self.agent.research_log(s.project))
-        parts.append(results_context(self.store, s.project, s.id))
+        parts += await self.agent.domain.wake_context(s)  # e.g. the research log, the latest results
         parts.append("Read the results (open the logs or metrics files for more), record what each showed (`ov result "
                      "<job> --verdict ... --conclusion ...`; a lasting lesson: `ov finding`) and update the research log. "
                      "If the work goes on, submit the next run and `ov watch` it; if the goal is reached or nothing "

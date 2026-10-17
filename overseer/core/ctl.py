@@ -670,7 +670,7 @@ class ControlServer:
                     rec.ended_at, rec.state = None, state.split()[0]
                 self.store.upsert_job(rec)
             if not already:
-                self.agent._record_job(session, jid)
+                self.agent.domain.record_job(session, jid)
                 rec = self.store.get_job(jid)
                 if not rec.name:  # what SLURM said, until the monitor's next poll
                     rec.name, rec.state, rec.workdir = name, state or rec.state, workdir
@@ -712,7 +712,7 @@ class ControlServer:
         if not rec:
             raise CtlError(f"Overseer doesn't track job {args.id}")
         old = rec.project
-        self.agent.move_job(args.id, project)
+        self.agent.domain.move_job(args.id, project)
         where = f"project {code(project)}" if project else "the main chat"
         await self._announce(None, f"🔀 Job {code(args.id)} {esc(rec.name)} moved to {where} by the agent "
                                    f"(was: {esc(old or 'main')}).", job_id=args.id)
@@ -843,7 +843,7 @@ class ControlServer:
         rec = self.store.get_job(jid)
         if not rec:
             raise CtlError(f"Overseer doesn't track job {jid} (ov job add {jid})")
-        monitor = getattr(self.agent, "monitor", None)
+        monitor = getattr(self.agent.domain, "monitor", None)
         if not monitor:
             raise CtlError("the monitor isn't running")
         from ..hpc.metrics import lines as metric_lines
@@ -891,7 +891,7 @@ class ControlServer:
 
     # ---- graphs (plots.py)
     def _monitor(self):
-        monitor = getattr(self.agent, "monitor", None)
+        monitor = getattr(self.agent.domain, "monitor", None)
         if not monitor:
             raise CtlError("the monitor isn't running")
         return monitor
@@ -1025,7 +1025,7 @@ class ControlServer:
                 + (f", with check-ins every {human_interval(w.every)} while running" if w.every else "") + remark)
 
     def _refresh_cards(self, job_ids: list[str]) -> None:
-        monitor = getattr(self.agent, "monitor", None)
+        monitor = getattr(self.agent.domain, "monitor", None)
         if monitor and hasattr(monitor, "refresh_card_by_id"):
             for jid in job_ids:
                 task = asyncio.get_running_loop().create_task(monitor.refresh_card_by_id(jid))

@@ -1,9 +1,9 @@
 """Agent conversations: Telegram message -> Claude Code / Codex run -> Telegram reply.
 
-The agent has full access to the HPC (`ssh hpc ...`) and is sandboxed on this machine
-(see runners.py). Overseer's job here is bookkeeping: which conversation belongs to which
-job, resuming the CLI's session, reporting the commands it ran, and noticing the jobs it
-submits so the monitor reports on them and replies continue the same conversation.
+The agent is sandboxed on this machine (see runners.py); what it can reach beyond that is its domain's (e.g. the HPC
+over `ssh hpc`, see hpc/domain.py). The platform's job here is bookkeeping: conversations and their projects,
+resuming the CLI's session, reporting the commands it ran, the files it sends, and the domain's hooks around each run
+(its instructions, context, and what it watches in the commands).
 """
 
 from __future__ import annotations
@@ -18,22 +18,18 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import BACKENDS, Config
-from ..hpc.remote import HPC
-from ..hpc.compute import WORKER_NAME
-from .autopilot import human_interval
 from .ctl import TOKEN_ENV
-from ..hpc.quota import Quota, limits_line, over
 from .live import Progress, Transcript
-from .richtext import fold, fold_long, fold_text, md_to_html, rich_code, rich_details, rich_markdown
+from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
-from ..hpc.results import context as results_context
-from ..hpc.slurm import array_parent
-from ..hpc.ssh import SSHError
-from ..hpc.sshlink import ensure_master
-from .store import JobRecord, SessionRecord, Store
+from .store import SessionRecord, Store
+
+if TYPE_CHECKING:
+    from .domain import Domain
 
 log = logging.getLogger(__name__)
 
@@ -41,156 +37,6 @@ LIVE_FLUSH_SECONDS = 5
 NAMES = {"claude_code": "Claude Code", "codex": "Codex"}
 # The CLI is too old (e.g. for a new model): "version 2.1.280 or newer is required. Run 'claude update'"
 OUTDATED_RE = re.compile(r"or newer is required|(?:claude|codex) update\b|upgrade (?:claude|codex)", re.I)
-
-SYSTEM_PROMPT = """You are Overseer's agent. You help an ML researcher run, debug and fix SLURM jobs on their \
-university HPC cluster. They talk to you through Telegram.
-
-## Environment
-- You run on the researcher's homelab, NOT on the HPC. Your local working directory is a scratch folder; \
-you can't write anywhere else on this machine, and the local shell has no internet access{domains}.{web}
-- The HPC is reachable as `{host}`: `ssh {host} '<command>'`, and `rsync`/`scp` with `{host}:<path>`. This goes \
-through a connection Overseer keeps open. On the HPC you have the researcher's full permissions.
-- `ssh {host} '<command>'` runs a non-login shell that doesn't read the login profile, so SLURM commands \
-and modules are often not on PATH there. Run remote commands through a login shell: \
-`ssh {host} 'bash -lc "{setup}squeue -u $USER"'`. Load modules / activate environments explicitly inside it.
-
-## How to work
-- Investigate with real commands: squeue, `sacct -j <id> --format=JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem`, \
-scontrol show job, the job's log files and batch script, the code, disk quota, module/env availability.
-- The login node is only for quick commands: looking at files and logs, git, editing, squeue/sacct, submitting \
-jobs, installing packages. Anything that computes - running Python scripts, plotting, processing data, \
-compiling, tests, evaluation - runs on a compute node: `hpc-run --dir <project dir> -- <command>` runs it in a \
-compute node's login shell and returns its output (it reuses a node Overseer keeps for a while, so it usually \
-starts at once; `hpc-run --cpus N --mem 64G --time 120 -- ...` or `--gpu` gets a node of its own; \
-`hpc-run --help` for more). That worker job (overseer-worker) is Overseer's: don't register or watch it (`hpc-run --stop` ends it). Long runs and experiments are sbatch jobs as usual.{login_limit}
-- For non-trivial changes to the researcher's code, prefer a copy or a git branch, and say where it is.
-- When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \
-track the job and report on it.{ov_rule}
-- Don't cancel or modify jobs you weren't asked about.
-- Nobody can approve commands for you: there is no approval step. If a command is refused (sandbox or \
-permission error), it will not be approved later - do it another way, or tell the researcher exactly what failed \
-and quote the error. Never ask them to approve something.
-- Your final message is sent to Telegram, rendered from Markdown. Keep it short: what you found, what you changed \
-(paths), the job ids you submitted, and what happens next. **Bold**, lists, `code`, small code blocks and small \
-tables are fine; avoid headings and wide tables (it's read on a phone).
-
-## Sending plots and files
-Anything you put in `./outbox/` (in your local working directory) is sent to the researcher with your reply: \
-images (.png, .jpg) as pictures, other files as documents - up to 10 per reply, images up to 10 MB, files up to \
-50 MB. Plots are made on the HPC, where the data is: write a small plotting script there (matplotlib in the \
-project's environment), run it with `hpc-run --dir <dir> -- python plot.py` (not on the login node), save a PNG \
-(e.g. dpi=150, readable on a phone), copy it back with `scp {host}:/path/plot.png ./outbox/`, and say in your \
-reply what it shows."""
-
-
-OV_SECTION = """
-
-## Talking to Overseer: `ov`
-Overseer tracks jobs, reports on them to the researcher, and wakes you up. The local `ov` command talks to it \
-directly and answers at once. The `overseer` skill has the full reference (or run `ov help`). The essentials:
-- After every job you submit, whichever way (sbatch, a script, a CLI, an array): `ov job add <id>`. Overseer \
-checks the id with SLURM and reports on the job to the researcher.
-- Each job has a live card in Telegram. Say what matters in it: `ov metrics set <job id | --pattern '<name glob>' | \
---project> --critical "<metric=label>" --important "<metric=label,...>" [--progress step/<total>]` - the 1-2 \
-numbers that tell whether the run works go in --critical. If the log doesn't show them, add `--command` (a quick \
-command printing name=value lines or a JSON object, e.g. reading the last line of a metrics.jsonl). Add alerts \
-for what would make a run worth stopping: `--alert "<metric> < 1 after 2h"` pings the researcher, `--wake-on \
-"loss is nan"` / `"step stalled 30m"` also wakes you. Set it once per kind of experiment (a pattern or the \
-project default covers repeats) and check it with `ov metrics show <job id>`.
-- Past work: `ov history search <text>` searches every conversation (requests, replies, commands), the results, \
-findings and jobs; `ov history show <conversation> --grep <text>` reads one. Use it when the researcher refers to \
-earlier work ("what did we try with ...", "like last time") or before repeating an experiment.
-- Before choosing where to submit (partition, GPUs, time limit), run `ov cluster`: free GPUs/CPUs per partition, \
-the most GPUs free on one node, time limits, SLURM's estimated start of your queued jobs and your fairshare. Prefer \
-what starts soon; a job stuck in the queue may start sooner resized or elsewhere.
-- When the researcher asks you to create a project, reassign a job or stop tracking one, do it with `ov` \
-(`ov project new`, `ov job move`, `ov job delete`). Every change is announced to them, so don't ask first.
-- Graphs: the researcher sees graphs under each job's card, from a plotting script you write once (in the \
-project folder, reading the job's metrics files or log) and register: `ov plots set <job | --pattern | --project> \
---command "python {{project}}/plots/x.py --log {{stdout}} --out {{out}}"` (PNGs into {{out}}). Overseer runs it when \
-the job ends, hourly while it runs and on the researcher's 📈 button; check it with `ov plots test <job>`.
-- Results: Overseer records each finished job (state, runtime, its key metrics). Say what it showed: \
-`ov result <job> --verdict <baseline|promising|no-gain|worse|broken|dead-end|inconclusive> --conclusion "..."` \
-(also `--hypothesis` when you submit it; `ov result add --name ...` for an evaluation that isn't a job - a verdict \
-needs no number). `ov results` lists, filters and sorts them (`--sort <metric>`, `--verdict`, `--format md|csv`): \
-use it when the researcher asks how experiments went, and give them the table (or a CSV in ./outbox/).
-- Feedback about Overseer itself: when Overseer limits you - an `ov` command you needed doesn't exist, it didn't \
-tell you something it should have, its sandbox blocked something legitimate, it behaved wrongly - report it: \
-`ov feedback "<what limited you>" --context "<what you were doing>" [--kind bug|idea]` (check `ov feedback list` first \
-and `ov feedback +1 FB<n>` the same problem instead). Not for problems with the cluster, your code or the \
-researcher's decisions; never include secrets. Then carry on: work around it if you can.
-- Skills: when you work out know-how other agents will need (how to do something on this cluster, a tool's quirks), \
-write it as a skill (a SKILL.md: frontmatter with only name and description, then the instructions) and propose it: \
-`ov skill propose skill.md` (this project) or `--all` (every agent). The researcher approves it; then agents get it.
-- Findings: lasting lessons of the project, kept whole and shown at every start and wake-up - \
-`ov finding dead-end "..."` for what failed and mustn't be retried, `ov finding insight "..."` for what holds.
-
-
-## Working over time: watches and wake-ups
-You only run when the researcher writes to you or when a wake-up you set up fires. You don't need permission \
-to set them up:
-- `ov watch <job ids> [--note "<what to do then>"]`: woken when the jobs have ended (all of them, or as soon as \
-one fails), with their final reports. `--every 30m` adds check-ins while they run (at least {min_gap} apart).
-- `ov wake in 90m "<what to look at>"`: woken once, later. `ov wake every 2h [--for 12h] "<...>"`: woken \
-repeatedly (at least {min_gap} apart), for {repeat} unless you give `--for`.
-- `ov watches` lists them, `ov unwatch <w12|job id|all>` removes them. Each one is announced to the researcher, \
-who can cancel it.
-For work that takes several runs (tuning, sweeps, ablations, "keep going until X"), carry on by yourself: \
-submit, `ov watch`, end your reply; when woken, read the results, decide, submit the next run and watch it. \
-Don't wait, poll or sleep: Overseer wakes you. Stop when the goal is reached or nothing sensible is left to \
-try: say so and set no more wake-ups. When you need the researcher's decision, ask in your reply (`ov notify` \
-for something urgent mid-run) instead of spending more runs. Every wake-up re-reads the whole conversation and \
-costs real money: wake yourself when there is something to look at, and prefer job ends over frequent check-ins."""
-
-
-STORAGE_SECTION = """
-
-## Storage on the HPC: the number of files runs out first
-Quotas: {limits}. The file (inode) quota is the tight one: a few hundred thousand files fill it long before \
-the space runs out, and when it's full, jobs, installs and even logins fail. Check usage with {check} before \
-and after anything that creates many files; `du --inodes -s <dir>` counts a folder.
-- Prefer few large files over many small ones: datasets as tar/zip/HDF5/Parquet/Zarr/WebDataset shards (don't \
-unpack archives of many small files), metrics in one CSV/JSONL per run, one log file per job, a bounded number \
-of checkpoints (the last few and the best: rotate or overwrite).
-- Code you write or change and job scripts you submit must do the same: no file per step or per sample, no \
-unbounded checkpoint or sample dumps, temporary files cleaned up at the end. Point it out when the researcher's \
-code would create many files.
-- Caches are the usual hidden cause: pip/uv/conda caches, __pycache__, HuggingFace caches, wandb run folders \
-(offline runs: sync, then delete). Prune them, and delete what you created when it's no longer needed. Ask \
-before deleting the researcher's own files."""
-
-PYTHON_SECTION = """
-
-## Python on the HPC: uv
-Use uv for Python:
-- Environments: `uv venv --python 3.12` in the project folder, or a pyproject.toml with `uv add <package>` and \
-`uv sync`. Run with `uv run python train.py` (in job scripts and hpc-run too). No `pip install --user`, no \
-system Python, no new conda environments.
-- If uv is missing: `curl -LsSf https://astral.sh/uv/install.sh | sh` (installs into ~/.local/bin).
-- An ML environment is tens of thousands of files. Keep uv's cache on the same filesystem as the environments \
-(e.g. `export UV_CACHE_DIR=<that filesystem>/$USER/.cache/uv` in ~/.bashrc), so uv hard-links packages instead \
-of copying them, which would create new files. Share one environment between a project's runs instead of making \
-one per run, and `uv cache prune` now and then."""
-
-
-PROJECT_SECTION = """
-
-## Project: {name}
-This conversation belongs to the project in `{dir}` on the HPC. Work there unless asked otherwise.{context}
-Project notes: `{notes}` holds durable notes for this project - how to run things, environments, data \
-locations, conventions, known issues. It is shown to you at the start of each conversation. When you learn \
-something future conversations here should know, add it there (keep it short and current; create it if missing).
-{log_rule}"""
-
-LOG_RULE = """Research log: `{log}` is this project's experiment history. Whenever you run experiments here, keep it \
-up to date: at the top the current goal (rewrite it when the goal changes, with a one-line note of the old one), \
-then one entry per experiment or wake-up - what you changed and why, the job ids, the key results, the next idea. \
-Overseer shows you its beginning and latest entries when a conversation starts and when you are woken. Keep it \
-compact, well under 200k tokens (~800 KB): when it grows long, condense the old entries into a short summary \
-section at the top - the findings (`ov finding`) keep what must never be lost."""
-
-WORKER_LOG_RULE = """Research log: `{log}` is written by your planner only - don't edit it (read it if useful). Your \
-detailed notes go in your own NOTES.md (below); your planner records the results from your report."""
 
 # Normal mode: the agent may propose planner mode (subagents.py); the researcher approves or declines.
 PROPOSE_SECTION = """
@@ -238,10 +84,6 @@ own output folder; never overwrite other runs' results. Don't \
 start subagents or propose planner mode. When the task is done, your final reply is your report to the planner: \
 what you did, the key numbers, where the results are (at most ~15 lines). If you're blocked or the task turns out \
 wrong, say so in that report rather than guessing."""
-
-NOTES_FILE = "OVERSEER.md"
-LOG_FILE = "RESEARCH_LOG.md"
-LOG_CONDENSE_BYTES = 600_000  # ~150k tokens: past this the agent is asked to condense the research log
 
 
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -354,11 +196,6 @@ def _command_fold(commands: list[str]) -> str:
     return fold(esc("\n".join(f"$ {clip(c)}" for c in commands)))
 
 
-def _duration(seconds: float) -> str:
-    s = int(seconds)
-    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
-
-
 def strip_tags(html_text: str) -> str:
     return re.sub(r"<[^>]+>", "", html_text)
 
@@ -404,12 +241,12 @@ class Session:
 
 
 class Agent:
-    def __init__(self, cfg: Config, store: Store, notifier: Notifier, hpc: HPC):
+    def __init__(self, cfg: Config, store: Store, notifier: Notifier, domain: Domain):
         self.cfg = cfg
         self.store = store
         self.notifier = notifier
-        self.hpc = hpc
-        self.monitor = None  # set by the app; poked when the agent submits a job
+        self.domain = domain  # what makes this bot what it is (hpc/, ...): its instructions, context and hooks
+        domain.attach(self)
         self.autopilot = None  # set by Autopilot(...): wakes conversations when their jobs finish
         self.subagents = None  # set by Subagents(...): planner mode
         self.feedback = None  # set by Feedback(...): agents' feedback about Overseer, and its review
@@ -472,7 +309,7 @@ class Agent:
         # each other's model / effort.
         key = f"{b}@{project or ''}"
         if key not in self._runners:
-            self._runners[key] = make_runner(self.cfg, b)
+            self._runners[key] = make_runner(self.cfg, b, self.domain.sandbox())
         r = self._runners[key]
         # Overrides set from Telegram (/model, /effort) win over config.yaml.
         r.model_override = self._setting(f"model:{b}", project)
@@ -508,7 +345,7 @@ class Agent:
             return self.runner(b, s.project)
         key = f"{b}@{s.project or ''}#{model}#{effort}"  # its own runner: the model never changes under a run
         if key not in self._runners:
-            self._runners[key] = make_runner(self.cfg, b)
+            self._runners[key] = make_runner(self.cfg, b, self.domain.sandbox())
         r = self._runners[key]
         r.model_override, r.effort_override = model, effort
         return r
@@ -635,21 +472,6 @@ class Agent:
         self.store.set(f"notes:{sid}", "[]")
         return json.loads(raw)
 
-    def move_job(self, job_id: str, project: str | None) -> JobRecord | None:
-        """Reassign a job (and the conversation about it) to another project, or the main chat."""
-        rec = self.store.get_job(job_id)
-        if not rec:
-            return None
-        rec.project = project
-        self.store.upsert_job(rec)
-        for sess in [self.store.session_for_job(job_id)]:
-            if sess and sess.job_id == job_id:
-                sess.project = project
-                self.store.upsert_session(sess)
-                if sess.id in self.sessions:
-                    self.sessions[sess.id].rec.project = project
-        return rec
-
     async def compact(self, s: Session, focus: str = "") -> bool:
         """Compact the conversation now (the researcher's /compact): the CLI summarises its older turns."""
         backend = self.session_backend(s)
@@ -760,7 +582,7 @@ class Agent:
                 await self.notifier.send(Outgoing("\n".join(changed), silent=True))
 
     # ------------------------------------------------------------------ prompts
-    def _web_line(self, project: str | None) -> str:
+    def web_line(self, project: str | None) -> str:
         if self.backend_of(project) == "codex":
             if self.cfg.agent.codex.web_search == "disabled":
                 return ""
@@ -771,30 +593,8 @@ class Agent:
                 "error messages and cluster documentation.")
 
     def system_prompt(self, session_id: str | None = None) -> str:
-        domains = self.cfg.agent.allowed_domains
-        setup = self.cfg.slurm.setup.strip()
-        cpu = self.cfg.slurm.compute.login_cpu_seconds
-        prompt = SYSTEM_PROMPT.format(
-            login_limit=(f" Commands run directly on the login node are stopped after {cpu} CPU seconds." if cpu else ""),
-            host=self.cfg.ssh.host,
-            setup=f"{setup}; " if setup else "",
-            domains=f" (except {', '.join(domains)})" if domains else "",
-            web=self._web_line(sess.project if (sess := self.get(session_id)) else None),
-            ov_rule=" Then register it: `ov job add <id>`." if self.ctl else "",
-        )
-        if self.ctl:
-            prompt += OV_SECTION.format(min_gap=human_interval(self.cfg.agent.autopilot.min_checkin_minutes * 60),
-                                        repeat=human_interval(self.cfg.agent.autopilot.repeat_hours * 3600))
-        prompt += self._storage_section() + PYTHON_SECTION
         sess = self.get(session_id)
-        proj = self.store.get_project(sess.project) if sess else None
-        worker = bool(sess and sess.rec.is_worker)
-        if proj:
-            context = f"\n\nAbout this project, from the researcher:\n{proj.context.strip()}" if proj.context.strip() else ""
-            log = f"{proj.dir.rstrip('/')}/{LOG_FILE}"
-            prompt += PROJECT_SECTION.format(name=proj.name, dir=proj.dir, context=context,
-                                             notes=f"{proj.dir.rstrip('/')}/{NOTES_FILE}",
-                                             log_rule=(WORKER_LOG_RULE if worker else LOG_RULE).format(log=log))
+        prompt = self.domain.system_prompt(sess)
         if self.ctl and self.subagents and sess and sess.rec.role != "reviewer":
             prompt += self._subagent_section(sess)
         if sess and sess.rec.role == "reviewer":
@@ -811,93 +611,6 @@ class Agent:
         if self.planner_on(s):
             return PLANNER_SECTION.format(workers=workers, max_running=self.cfg.agent.subagents.max_running)
         return PROPOSE_SECTION.format(planner=self.planner_model(b, s.project) or "a stronger model", workers=workers)
-
-    def _quota_rows(self) -> list:
-        try:
-            return [Quota(**r) for r in json.loads(self.store.get("quota") or "{}").get("rows", [])]
-        except (ValueError, TypeError):
-            return []
-
-    def _storage_section(self) -> str:
-        """The quota limits (stable: they're in the system prompt) and how to check the usage."""
-        cmd = self.cfg.slurm.quota_command.strip()
-        rows = self._quota_rows()
-        limits = (f"{limits_line(rows)} (from `{cmd}`)" if rows else
-                  "not known to Overseer yet" + (f" (`{cmd}` shows them)" if cmd else " (`quota -s` may show them)"))
-        return STORAGE_SECTION.format(limits=limits, check=f"`{cmd}`" if cmd else "the cluster's quota command")
-
-    def _storage_warning(self) -> str:
-        """For the start of a request, while a filesystem is nearly full (the usage changes, so not in the system prompt)."""
-        full = over(self._quota_rows(), self.cfg.slurm.quota_warn_percent)
-        if not full:
-            return ""
-        return ("<storage_warning>The HPC disk quota is nearly full: " + "; ".join(full) + ". Don't create more files "
-                "there than needed; clean up what you can (your own files, caches) and tell the researcher.</storage_warning>")
-
-    def _remote_path(self, path: str) -> str:
-        """'~/x' -> '/home/me/x' (paths are passed quoted, so the remote shell won't expand ~)."""
-        if path.startswith("~/") and self.hpc.home:
-            return self.hpc.home.rstrip("/") + path[1:]
-        return path
-
-    async def _project_notes(self, project: str) -> str:
-        proj = self.store.get_project(project)
-        if not proj or not proj.dir:
-            return ""
-        path = f"{proj.dir.rstrip('/')}/{NOTES_FILE}"
-        notes = await self.hpc.try_head(self._remote_path(path), 400)
-        if not notes.strip():
-            notes = (f"<project_notes path='{path}'>(no notes yet - create the file when there is something "
-                     "worth keeping)</project_notes>")
-        else:
-            notes = f"<project_notes path='{path}'>\n{notes[:12000].strip()}\n</project_notes>"
-        return notes + "\n\n" + await self.research_log(project)
-
-    async def research_log(self, project: str) -> str:
-        """The project's research log for the agent: its beginning (the goal) and its latest entries."""
-        proj = self.store.get_project(project)
-        if not proj or not proj.dir:
-            return ""
-        path = f"{proj.dir.rstrip('/')}/{LOG_FILE}"
-        remote = self._remote_path(path)
-        try:
-            res = await self.hpc.run(["stat", "-c", "%s", remote])
-            size = int(res.stdout.strip()) if res.ok and res.stdout.strip().isdigit() else -1
-        except SSHError:
-            size = -1
-        if size <= 0:
-            return (f"<research_log path='{path}'>(none yet - start it when you run experiments in this "
-                    "project)</research_log>")
-        async def part(argv: list[str]) -> str:  # bytes, not lines: a line can be huge
-            try:
-                res = await self.hpc.run(argv, max_output=20_000)
-            except SSHError:
-                return ""
-            return res.stdout if res.ok else ""
-
-        if size <= 12_000:
-            body = await part(["head", "-c", "12000", "--", remote])
-        else:
-            head = await part(["head", "-c", "4000", "--", remote])
-            tail = await part(["tail", "-c", "8000", "--", remote])
-            body = f"{head.rstrip()}\n[... {size // 1000} KB in all; the latest entries: ...]\n{tail}"
-        note = (f"\n(The log is {size // 1000} KB - too long: condense the older entries into a short summary.)"
-                if size > LOG_CONDENSE_BYTES else "")
-        return f"<research_log path='{path}'>\n{body.strip()}\n</research_log>{note}"
-
-    async def _job_context(self, job_id: str) -> str:
-        rec = self.store.get_job(job_id)
-        if not rec:
-            return f"(Job {job_id} is not known to Overseer; look it up with sacct.)"
-        tail = await self.hpc.try_tail(rec.stdout, 60) if rec.stdout else ""
-        return "\n".join(x for x in [
-            f"<job id='{rec.job_id}' name='{rec.name}' state='{rec.state}' workdir='{rec.workdir}' "
-            f"stdout='{rec.stdout}' stderr='{rec.stderr}'>",
-            f"<overseer_analysis>\n{rec.report}\n</overseer_analysis>" if rec.report else "",
-            f"<batch_script>\n{rec.batch_script[:8000]}\n</batch_script>" if rec.batch_script else "",
-            f"<stdout_tail>\n{tail[-6000:]}\n</stdout_tail>" if tail else "",
-            "</job>",
-        ] if x)
 
     # ------------------------------------------------------------------ running a request
     async def handle(self, s: Session, user_text: str, quiet: bool = False, origin: str = "user",
@@ -1012,16 +725,7 @@ class Agent:
         backend = self.session_backend(s)
         runner = self.session_runner(s)
         resume = s.rec.cli_session_id if s.rec.backend == backend else None
-        parts = []
-        if resume is None and s.project:  # a new CLI session: give it the project's notes
-            parts.append(await self._project_notes(s.project))
-        if resume is None and s.job_id:
-            parts.append(await self._job_context(s.job_id))
-        if resume is None:  # a new CLI session: the project's findings and latest results
-            parts.append(results_context(self.store, s.project, s.id))
-        warning = self._storage_warning()
-        if warning:
-            parts.append(warning)
+        parts = await self.domain.context(s, fresh=resume is None)  # (a new CLI session knows nothing yet)
         notes = self.take_notes(s.id)
         if notes:  # things that happened since the agent last ran (e.g. the researcher declined a request)
             parts.append("<overseer_notes>\n" + "\n".join(f"- {n}" for n in notes) + "\n</overseer_notes>")
@@ -1057,9 +761,7 @@ class Agent:
         if progress:
             progress.start()
         try:
-            await ensure_master(self.cfg)
-            since = await self._cluster_clock()
-            started = time.monotonic()
+            state = await self.domain.before_run(s)
             res = await runner.run(prompt, system=self.system_prompt(s.id), session_id=resume, key=s.id,
                                    activity=activity)
         except asyncio.CancelledError:
@@ -1076,7 +778,7 @@ class Agent:
             if progress:
                 await progress.close()
             await self._report_activity(s, activity, buffer)
-        await self._find_submissions(activity, since, started, res.text)
+        await self.domain.after_run(s, activity, state, res.text)
         if res.session_id:
             s.rec.backend, s.rec.cli_session_id = backend, res.session_id
             self.store.upsert_session(s.rec)
@@ -1090,7 +792,7 @@ class Agent:
         self._record_usage(s, backend, res)
         text, autopilot_line = res.text, ""
         if self.autopilot:
-            autopilot_line = self.autopilot.after_turn(s, activity.cancelled)
+            autopilot_line = self.autopilot.after_turn(s, activity)
         photos, docs, notes = collect_outbox(outbox)
         if photos or docs:
             transcript.write({"kind": "tool", "name": "attachments", "detail": ", ".join(n for n, _ in photos + docs)})
@@ -1106,20 +808,8 @@ class Agent:
             photos=photos, files=docs))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
-        activity = Activity(login_warn_seconds=self.cfg.slurm.compute.login_warn_seconds)
+        activity = self.domain.new_activity(s)  # (the domain's: it watches the commands, e.g. for submitted jobs)
         buffer: list[str] = []  # live mode: commands not yet sent
-
-        def on_job(job_id: str, command: str) -> None:
-            job_id = array_parent(job_id)
-            known = self.store.get_job(job_id)
-            if known and known.by_agent and known.session_id == s.id and not known.ignored:
-                return  # already registered (ov job add) and announced
-            self._record_job(s, job_id)
-            asyncio.get_running_loop().create_task(self.notifier.send(Outgoing(
-                f"🚀 Agent submitted job {esc(job_id)}" + fold_text(command, 600),
-                job_id=job_id, session_id=s.id, silent=True)))
-
-        activity.on_job = on_job
         live = None
         if self.cfg.agent.report_commands == "live":
             activity.on_command = buffer.append
@@ -1157,8 +847,7 @@ class Agent:
         lines = [f"🛠 <b>{n} command(s)</b>" + (" (the last 40 here, all in commands.txt)" if n > 40 else "")]
         if activity.commands:
             lines.append(_command_fold(activity.commands[-40:]))
-        for cmd, took in activity.login_node[:5]:  # heavy work that should have gone to a compute node
-            lines.append(f"⚠️ ran {_duration(took)} on the login node: {code(cmd[:200])}")
+        lines += activity.report_lines()  # the domain's remarks (e.g. heavy work on the HPC's login node)
         if activity.files:
             lines.append("✏️ local files: " + ", ".join(code(f) for f in activity.files[:20]))
         files = [("commands.txt", "\n\n".join(activity.commands).encode())] if len(activity.commands) > 15 else []
@@ -1169,46 +858,3 @@ class Agent:
         rich += lines[2:] if activity.commands else lines[1:]
         await self.notifier.send(Outgoing("\n".join(lines), markdown="\n\n".join(rich), session_id=s.id,
                                           job_id=s.job_id, silent=True, files=files))
-
-    async def _cluster_clock(self) -> str:
-        try:
-            await self.hpc.ensure_connected()
-            return await self.hpc.clock()
-        except Exception:
-            log.debug("could not read the cluster's clock", exc_info=True)
-            return ""
-
-    async def _find_submissions(self, activity: Activity, since: str, started: float, reply: str) -> None:
-        """Jobs the agent submitted in ways the output parsing can't see (a script or CLI that calls sbatch):
-        your jobs that SLURM says were submitted during this turn, whose id appears in the agent's command
-        output or reply. Old jobs it merely looked at weren't submitted during the turn, so they don't count."""
-        if not since or not activity.on_job:
-            return
-        try:
-            new = await self.hpc.submitted_since(since, int((time.monotonic() - started) / 60) + 3,
-                                                 skip_names=(WORKER_NAME,))  # hpc-run's worker isn't a job of yours
-        except Exception:
-            log.debug("could not ask SLURM for new jobs", exc_info=True)
-            return
-        known = {j for j, _ in activity.jobs}
-        in_reply = set(re.findall(r"(?<![\w.])\d{3,12}(?![\w.])", reply or ""))
-        for jid in new:
-            if jid in known or (jid not in activity.numbers and jid not in in_reply):
-                continue
-            rec = self.store.get_job(jid)
-            if rec and rec.by_agent:
-                continue
-            command = activity.numbers.get(jid) or "(the job id is in the agent's reply)"
-            activity.jobs.append((jid, command))
-            activity.on_job(jid, command)
-
-    def _record_job(self, s: Session, job_id: str) -> None:
-        job_id = array_parent(job_id)  # a job array is tracked under the id sbatch printed
-        rec = self.store.get_job(job_id) or JobRecord(job_id=job_id, state="PENDING", first_seen=time.time(),
-                                                      last_status_at=time.time())
-        rec.by_agent = 1
-        rec.session_id = s.id
-        rec.project = s.project
-        self.store.upsert_job(rec)
-        if self.monitor:
-            self.monitor.poke()

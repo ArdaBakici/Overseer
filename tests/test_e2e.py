@@ -28,6 +28,7 @@ import pytest
 
 from fake_model_server import FakeModel
 from overseer.core.agent import Agent
+from overseer.hpc.domain import HpcDomain
 from overseer.core.config import Config
 from overseer.hpc.remote import HPC
 from overseer.core.runners import _toml
@@ -213,16 +214,16 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         from overseer.core.ctl import ControlServer
         from overseer.core.projects import Projects
-        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.domain.hpc)
         await ctl.start()
         s = agent.general_session()
         # The wake-up instructions must reach the model through each CLI's own mechanism.
         from overseer.core.autopilot import Autopilot
-        autopilot = Autopilot(cfg, store, agent, notes, agent.hpc)
+        autopilot = Autopilot(cfg, store, agent, notes, agent.domain.hpc)
         try:
             await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
         finally:
@@ -325,7 +326,7 @@ async def test_compaction_end_to_end(hpc, backend, cli_name):
             cfg.agent.codex.extra_config.append("model_auto_compact_token_limit=20000")
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         s = agent.general_session()
         await asyncio.wait_for(agent.handle(s, "Run the checks."), 180)
@@ -369,7 +370,7 @@ async def test_only_tools_that_work_within_a_turn(hpc, backend, cli_name):
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         await asyncio.wait_for(agent.handle(agent.general_session(), "Run the checks."), 180)
         main = next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"]))
@@ -410,15 +411,15 @@ async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, plann
             configure_backend(cfg, b, clis[b], fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(planner)
         from overseer.core.autopilot import Autopilot
         from overseer.core.ctl import ControlServer
         from overseer.core.projects import Projects
         from overseer.core.subagents import Subagents
-        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.domain.hpc)
         await ctl.start()
-        Autopilot(cfg, store, agent, notes, agent.hpc)
+        Autopilot(cfg, store, agent, notes, agent.domain.hpc)
         subs = Subagents(cfg, store, agent, notes)
         s = agent.general_session()
         try:
@@ -467,7 +468,7 @@ async def test_installed_skills_reach_the_cli(hpc, backend, cli_name):
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         Addons(store, agent, notes)
         text = ("---\nname: cluster-long-jobs\ndescription: How to run jobs longer than 24 h on this cluster "
