@@ -64,6 +64,12 @@ class Domain:
     async def after_run(self, s: Session, activity: Activity, state: Any, reply: str) -> None:
         """After the CLI answered, before the reply is sent."""
 
+    # ------------------------------------------------------------------ the agent's control command (ctl.py)
+    def ctl_commands(self, ctl):
+        """The domain's commands for the agent: an object with help, errors, register(subparsers), dispatch(session,
+        args) -> answer or None, and optionally preprocess(argv) and status_lines(session). None: only the platform's."""
+        return None
+
     # ------------------------------------------------------------------ wake-ups (autopilot.py)
     def attach_autopilot(self, autopilot) -> None:
         """The wake-up engine exists: register the domain's watch kinds (autopilot.WatchKind)."""

@@ -116,10 +116,12 @@ class RunResult:
 
 @dataclass
 class Sandbox:
-    """What a domain adds to the agent's sandbox (on top of the platform's own rules, below)."""
+    """What a domain adds to the agent's sandbox (on top of the platform's own rules, below), and the skills its
+    agent gets."""
     deny_read: list[Path] = field(default_factory=list)  # more local paths its commands must never read
     unix_sockets: list[Path] = field(default_factory=list)  # local sockets its commands may connect to
     writable: list[Path] = field(default_factory=list)  # local folders it may write besides its scratch folder
+    skills: dict[str, str] = field(default_factory=dict)  # skills that come with the domain: name -> SKILL.md
 
 
 def agent_bin_dir(cfg: Config) -> Path:
@@ -688,10 +690,9 @@ class CodexRunner(Runner):
     async def _run(self, prompt: str, *, system: str | None, session_id: str | None, key: str,
                    activity: Activity, writable: bool, network: bool, ephemeral: bool) -> RunResult:
         workdir = self.workdir(key)
-        if writable:  # the `overseer` skill, where codex finds it and its sandbox can read it
+        if writable and self.sandbox.skills:  # the domain's skills, where codex finds them and its sandbox can read them
             from .addons import write_skills
-            from .ctl import SKILL
-            write_skills(workdir, (".agents", "skills"), {"overseer": SKILL.read_text()}, prune=False)
+            write_skills(workdir, (".agents", "skills"), self.sandbox.skills, prune=False)
         out_file = workdir / f".last-{uuid.uuid4().hex[:8]}.txt"
         argv = self._argv(session_id=session_id, out_file=out_file, ephemeral=ephemeral,
                           overrides=self.overrides(workdir, system=system, writable=writable, network=network))

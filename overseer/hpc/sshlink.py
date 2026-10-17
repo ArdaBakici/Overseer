@@ -119,9 +119,10 @@ def write_configs(cfg: Config) -> None:
     # ssh again, with the login-node CPU limit, and hpc-run (see compute.py); ov talks to Overseer (ctl.py)
     from .compute import write_agent_tools
     from ..core.ctl import write_ov_tool, write_skills
+    from .domain import skills
     write_agent_tools(cfg, bin_dir, real_binary("ssh", cfg), _write)
     write_ov_tool(cfg, bin_dir, _write)
-    write_skills(cfg)
+    write_skills(cfg, skills())
 
 
 def agent_bin_dir(cfg: Config) -> Path:

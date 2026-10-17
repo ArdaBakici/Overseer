@@ -218,7 +218,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         agent.set_backend(backend)
         from overseer.core.ctl import ControlServer
         from overseer.core.projects import Projects
-        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.domain.hpc)
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes)
         await ctl.start()
         s = agent.general_session()
         # The wake-up instructions must reach the model through each CLI's own mechanism.
@@ -417,7 +417,7 @@ async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, plann
         from overseer.core.ctl import ControlServer
         from overseer.core.projects import Projects
         from overseer.core.subagents import Subagents
-        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.domain.hpc)
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes)
         await ctl.start()
         Autopilot(cfg, store, agent, notes)
         subs = Subagents(cfg, store, agent, notes)

@@ -141,7 +141,7 @@ def build(cfg: Config):
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)
-    ctl = ControlServer(cfg, agent, projects, notifier, hpc)
+    ctl = ControlServer(cfg, agent, projects, notifier)
     from .core.digest import Digest
     digest = Digest(cfg, store, hpc, notifier, agent, monitor)  # the morning digest, in the general topic
     bot = Bot(cfg, app, store, hpc, monitor, agent, notifier, projects)

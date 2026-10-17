@@ -888,7 +888,7 @@ async def make_autopilot(env):
     from overseer.core.ctl import ControlServer
     from overseer.core.projects import Projects
     ap = Autopilot(env.cfg, env.store, env.agent, env.notifier)  # (the domain links its job watches to the monitor)
-    env.ctl = ControlServer(env.cfg, env.agent, Projects(env.cfg, env.store, env.agent), env.notifier, env.hpc)
+    env.ctl = ControlServer(env.cfg, env.agent, Projects(env.cfg, env.store, env.agent), env.notifier)
     await env.ctl.start()
     return ap
 
@@ -1971,7 +1971,7 @@ async def test_ov_interface(env):
     """The agent's `ov` command, run by the (fake) agent CLI through the generated client and the socket."""
     from overseer.core.ctl import ControlServer
     projects = make_projects(env)
-    ctl = ControlServer(env.cfg, env.agent, projects, env.notifier, env.hpc)
+    ctl = ControlServer(env.cfg, env.agent, projects, env.notifier)
     await ctl.start()
     try:
         assert "## Talking to Overseer: `ov`" in env.agent.system_prompt()
@@ -2026,7 +2026,7 @@ async def test_ov_interface(env):
 async def test_ov_job_add_needs_slurm(env):
     """Jobs that finished long ago are still found in accounting; ids that aren't numbers are refused."""
     from overseer.core.ctl import ControlServer
-    ctl = ControlServer(env.cfg, env.agent, make_projects(env), env.notifier, env.hpc)
+    ctl = ControlServer(env.cfg, env.agent, make_projects(env), env.notifier)
     s = env.agent.general_session()
     token = ctl.open(s.id)
     ok, text = await ctl.handle(token, ["job", "add", "12;rm"])

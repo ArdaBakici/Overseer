@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..core.autopilot import human_interval
@@ -37,9 +38,16 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+SKILL = Path(__file__).parent / "skills" / "overseer" / "SKILL.md"  # how to use ov, for the agent
+
+
+def skills() -> dict[str, str]:
+    return {"overseer": SKILL.read_text()}
+
+
 def hpc_sandbox(cfg) -> Sandbox:
     """The HPC is reached through the unix socket of Overseer's SSH master; its key folder stays unreadable."""
-    return Sandbox(deny_read=[cfg.ssh_dir], unix_sockets=[cfg.control_socket])
+    return Sandbox(deny_read=[cfg.ssh_dir], unix_sockets=[cfg.control_socket], skills=skills())
 
 
 class HpcDomain(Domain):
@@ -62,6 +70,11 @@ class HpcDomain(Domain):
         self._monitor = monitor
         if monitor is not None and self.jobs is not None:
             monitor.autopilot = self.jobs
+
+    # ------------------------------------------------------------------ the agent's ov command
+    def ctl_commands(self, ctl):
+        from .commands import HpcCommands
+        return HpcCommands(ctl, self)
 
     # ------------------------------------------------------------------ wake-ups
     def attach_autopilot(self, autopilot) -> None:
