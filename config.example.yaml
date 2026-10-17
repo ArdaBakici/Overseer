@@ -4,6 +4,10 @@
 #   ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN - only if you don't use `overseer login claude_code`
 #   OPENAI_API_KEY / CODEX_API_KEY           - only if you don't use `overseer login codex`
 
+# Which bot this is: hpc (Overseer: SLURM jobs on the cluster). Each domain runs as its own bot and process, with
+# its own config file, state folder and secrets.
+domain: hpc
+
 local:
   # On THIS machine, Overseer and the agent only write inside these folders.
   # Relative paths are relative to the folder containing this config file (Overseer's folder).

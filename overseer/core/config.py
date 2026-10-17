@@ -7,6 +7,7 @@ file, so the config can be committed or shared safely.
 from __future__ import annotations
 
 import logging
+import importlib
 import os
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -94,83 +95,6 @@ class LocalConfig:
     @property
     def audit_log(self) -> Path:
         return self.state("audit.log")
-
-
-@dataclass
-class SSHConfig:
-    """How to reach the HPC. Overseer keeps its own key, ssh config and known_hosts in ``dir``
-    (inside the Overseer folder) and never uses ~/.ssh. Set it up with `overseer ssh setup`."""
-
-    host: str = "hpc"  # the name the agent uses: `ssh hpc '...'`
-    hostname: str = ""  # e.g. login.cluster.edu
-    user: str = ""  # your HPC username
-    port: int = 22
-    proxy_jump: str | None = None  # e.g. "netid@gateway.cluster.edu" (uses the same key)
-    dir: str = "./state/ssh"  # key, ssh config, known_hosts
-    key_name: str = "id_ed25519"
-    extra_options: dict[str, str] = field(default_factory=dict)  # extra ssh_config options for the host
-    connect_timeout: int = 15
-    command_timeout: int = 90
-    max_concurrent: int = 4
-
-
-@dataclass
-class ComputeConfig:
-    """Where the agent runs anything heavier than a quick command (`hpc-run` on the HPC side).
-
-    A shared "worker" job holds a compute node so commands start without queueing; it ends
-    itself after `idle_minutes` unused. Commands asking for other resources (or a GPU) get an
-    allocation of their own."""
-
-    partition: str = "compute"
-    cpus: int = 8
-    mem: str = "32G"
-    worker_hours: float = 8  # time limit of the worker job
-    idle_minutes: int = 45  # the worker ends itself after this long unused (clusters cancel idle jobs too)
-    wait_minutes: int = 15  # how long hpc-run waits for a node before giving up
-    gpu_partition: str = "nvidia"  # for `hpc-run --gpu`
-    gpu_gres: str = "gpu:1"
-    sbatch_args: list[str] = field(default_factory=list)  # extra flags for every allocation, e.g. ["--account=x"]
-    # Guardrail against mistakes (not a security boundary): commands the agent runs directly on
-    # the login node get this many CPU seconds (ulimit -t); 0 = no limit. Commands that hand work
-    # to SLURM (sbatch, srun, salloc, hpc-run) aren't limited - SLURM would pass the limit on to the job.
-    login_cpu_seconds: int = 120
-    login_warn_seconds: int = 120  # flag commands that ran this long on the login node
-
-
-@dataclass
-class SlurmConfig:
-    poll_interval: int = 60  # seconds between squeue/sacct polls
-    # How often a running job's live card is refreshed (edited in place, silently) and the agent's alerts on it
-    # are checked; 0 = only when it starts and ends.
-    status_interval_minutes: int = 10
-    # Graphs from the agent's plotting command (ov plots set): refreshed in place this often while a job runs.
-    plot_interval_minutes: int = 60
-    # "all": every job of your user. "agent": only jobs the agent submitted.
-    track: str = "all"
-    notify_queued: bool = True
-    log_tail_lines: int = 12  # lines of the (training) log shown in status messages
-    # Run `srun --overlap nvidia-smi` inside running jobs for GPU utilisation in status updates.
-    gpu_stats: bool = False
-    # Idle GPUs: a running job whose GPUs all stay at most idle_gpu_percent busy for idle_gpu_minutes gets a 💤 line
-    # on its card, you're told, and the conversations watching it (ov watch) are woken. 0 minutes = off.
-    # Its GPUs are sampled every idle_gpu_sample_minutes (srun --overlap nvidia-smi inside the job).
-    idle_gpu_minutes: float = 30
-    idle_gpu_percent: int = 5
-    idle_gpu_sample_minutes: float = 10
-    # Jobs whose names match any of these globs are ignored (e.g. interactive sessions).
-    ignore_name_globs: list[str] = field(default_factory=lambda: ["interactive", "sys/dashboard*", "ood-*"])
-    # SSH commands run in a non-login shell, where SLURM is often not on PATH. Overseer picks up
-    # PATH from a login shell (`bash -lc`) once per connection. If SLURM still isn't found, put
-    # what you'd type to get it here, e.g. "module load slurm" - it runs before PATH is read.
-    setup: str = ""
-    compute: ComputeConfig = field(default_factory=ComputeConfig)
-    # Disk quota: the command that prints it ("" = don't check). Overseer reads it at startup and every quota_check_hours,
-    # gives the agent the limits (space and number of files), and warns you and the agent when a filesystem
-    # passes quota_warn_percent. Understood: tables like `myquota`'s (size, quota (%), files, quota (%)).
-    quota_command: str = "myquota"
-    quota_check_hours: float = 24
-    quota_warn_percent: int = 80
 
 
 @dataclass
@@ -310,56 +234,54 @@ class DashboardConfig:
     url: str = ""  # what Telegram opens (https, e.g. https://homelab.tail1234.ts.net); "" = not reachable yet
 
 
+def domain_module(name: str):
+    """A domain's configuration module (overseer/<domain>/config.py): its SECTIONS of config.yaml, the DERIVED values
+    reached as cfg.<name>, and validate(cfg). Loaded by name, so the platform never imports a domain itself."""
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name or ""):
+        raise ConfigError(f"domain {name!r}: a lowercase name such as hpc")
+    try:
+        return importlib.import_module(f"overseer.{name}.config")
+    except ModuleNotFoundError as e:
+        raise ConfigError(f"unknown domain {name!r} (there is no overseer/{name}/config.py)") from e
+
+
 @dataclass
 class Config:
     local: LocalConfig = field(default_factory=LocalConfig)
-    ssh: SSHConfig = field(default_factory=SSHConfig)
-    slurm: SlurmConfig = field(default_factory=SlurmConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    domain: str = "hpc"  # which bot this is: hpc (Overseer's SLURM jobs), ...
+    sections: dict[str, Any] = field(default_factory=dict)  # the domain's own config (hpc: ssh, slurm)
 
-    # ---- derived SSH paths (all inside the allowed local folders)
+    def __post_init__(self) -> None:
+        for name, cls in domain_module(self.domain).SECTIONS.items():
+            self.sections.setdefault(name, cls())
+
+    def __getattr__(self, name: str) -> Any:
+        """cfg.ssh, cfg.slurm, cfg.ssh_dir, ...: the domain's sections and the values derived from them."""
+        if name.startswith("__") or "sections" not in self.__dict__:
+            raise AttributeError(name)
+        if name in self.sections:
+            return self.sections[name]
+        derived = getattr(domain_module(self.domain), "DERIVED", {})
+        if name in derived:
+            return derived[name](self)
+        raise AttributeError(f"config has no {name!r} (domain {self.domain})")
+
     @property
     def ctl_socket(self) -> Path:
         """Overseer's control socket for the agent's `ov` command."""
         return self.local.tmp("ctl.sock")
 
-    @property
-    def ssh_dir(self) -> Path:
-        return self.local.resolve(self.ssh.dir)
-
-    @property
-    def ssh_config_file(self) -> Path:
-        return self.ssh_dir / "config"
-
-    @property
-    def ssh_key(self) -> Path:
-        return self.ssh_dir / self.ssh.key_name
-
-    @property
-    def control_socket(self) -> Path:
-        return self.local.tmp("ssh", "master.sock")
-
-    @property
-    def agent_ssh_config(self) -> Path:
-        # Lives outside ssh_dir: the agent may read this one (it holds no secrets).
-        return self.local.tmp("agent-ssh", "config")
-
     def validate(self) -> None:
         for name, proj in self.projects.items():
             if not PROJECT_NAME_RE.match(name) or name in RESERVED_PROJECT_NAMES:
                 raise ConfigError(f"project name {name!r}: use lowercase letters, digits, - and _ (not main/all)")
-            if not proj.dir.startswith(("/", "~")):
-                raise ConfigError(f"projects.{name}.dir must be an absolute path on the HPC")
             if proj.backend and proj.backend not in BACKENDS:
                 raise ConfigError(f"projects.{name}.backend must be one of {', '.join(BACKENDS)}")
-        if not self.ssh.hostname:
-            raise ConfigError("ssh.hostname is required (the HPC login node, e.g. login.cluster.edu)")
-        if not self.ssh.host or any(c.isspace() for c in self.ssh.host) or self.ssh.host in ("*", "localhost"):
-            raise ConfigError("ssh.host must be a simple alias such as 'hpc'")
         if not self.local.allowed_roots:
             raise ConfigError("local.allowed_roots must list at least one folder")
         for r in self.local.roots:
@@ -367,9 +289,8 @@ class Config:
                 raise ConfigError(f"local.allowed_roots entry {r} is too broad; use specific folders")
         self.local.state("x")  # both dirs must sit inside an allowed root
         self.local.tmp("x")
-        self.ssh_dir  # noqa: B018 - validates it is inside allowed roots
-        if len(str(self.control_socket)) > UNIX_SOCKET_MAX:
-            raise ConfigError(f"local.tmp_dir is too long for a unix socket path ({self.control_socket}); use e.g. /tmp/overseer")
+        if len(str(self.ctl_socket)) > UNIX_SOCKET_MAX:
+            raise ConfigError(f"local.tmp_dir is too long for a unix socket path ({self.ctl_socket}); use e.g. /tmp/overseer")
         if self.agent.backend not in BACKENDS:
             raise ConfigError(f"agent.backend must be one of {', '.join(BACKENDS)}")
         if self.agent.report_commands not in ("summary", "live", "off"):
@@ -385,10 +306,9 @@ class Config:
                               "`tailscale serve` prints")
         if self.digest.time and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", self.digest.time.strip()):
             raise ConfigError("digest.time must be HH:MM, e.g. 08:00")
-        if self.slurm.track not in ("all", "agent"):
-            raise ConfigError("slurm.track must be 'all' or 'agent'")
         if not self.telegram.allowed_chat_ids:
             raise ConfigError("telegram.allowed_chat_ids must list at least one chat id")
+        domain_module(self.domain).validate(self)
 
 
 RENAMED: dict[str, dict[str, str]] = {}
@@ -403,6 +323,20 @@ def _build(cls: type, data: dict[str, Any] | None, path: str) -> Any:
     data = data or {}
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must be a mapping")
+    if cls is Config:  # the domain's sections (e.g. ssh, slurm) are built by its own classes
+        if "sections" in data:
+            raise ConfigError("unknown keys in config: sections")
+        domain = str(data.get("domain") or "hpc")
+        section_types = domain_module(domain).SECTIONS
+        sections = {k: _build(t, data.get(k), k) for k, t in section_types.items()}
+        data = {k: v for k, v in data.items() if k not in section_types}
+        cfg = _build_fields(cls, data, path)
+        cfg.sections.update(sections)
+        return cfg
+    return _build_fields(cls, data, path)
+
+
+def _build_fields(cls: type, data: dict[str, Any], path: str) -> Any:
     known = {f.name: f for f in fields(cls)}
     for old_name, new_name in RENAMED.get(cls.__name__, {}).items():  # settings renamed since: still accepted
         if old_name in data and new_name not in data:

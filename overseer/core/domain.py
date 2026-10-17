@@ -35,6 +35,20 @@ class Domain:
     def attach(self, agent: Agent) -> None:
         self.agent = agent
 
+    # ------------------------------------------------------------------ the app (app.py)
+    def prepare(self) -> None:
+        """Before anything else starts (e.g. write the files the agent's tools need)."""
+
+    def build(self) -> None:
+        """The domain's own parts, once the agent exists (e.g. a monitor)."""
+
+    def services(self) -> list[tuple[str, object]]:
+        """Background loops to run while the bot runs: (name, coroutine)."""
+        return []
+
+    async def start(self, notifier, projects) -> None:
+        """Once Telegram's topics are known: the domain's own topics (e.g. the HPC's jobs topics)."""
+
     # ------------------------------------------------------------------ the sandbox
     def sandbox(self) -> Sandbox:
         return Sandbox()

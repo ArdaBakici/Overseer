@@ -468,24 +468,51 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 - `tests/test_integration.py` covers the monitor, agent sessions, job detection, the runners' sandbox settings and the bot. It uses fake SLURM (`tests/fake_slurm/`) and fake CLIs (`tests/fake_cli/`).
 - `tests/test_e2e.py` runs the real Claude Code and Codex against a scripted model (`tests/fake_model_server.py`) and a local sshd. It is skipped unless sshd, bubblewrap, socat and the CLIs are available.
 
+### Architecture: a platform and its domains
+
+Overseer is a platform (`overseer/core`) with a domain plugged into it (`overseer/hpc`, the SLURM jobs). The platform
+runs agent conversations from Telegram: the Claude Code / Codex runners and their sandbox, the Telegram layer,
+the agent's control command, wake-ups, transcripts and search, usage, the digest and the dashboard. A domain adds
+what is its own through the hooks in `core/domain.py`: the agent's instructions and context, its sandbox additions
+and skills, what it watches in the agent's commands, its watch kinds, `ov` commands, Telegram commands and buttons,
+digest sections, dashboard tabs and searchable records. `config.yaml`'s `domain:` picks it (`hpc` by default), and
+its own config sections (`ssh`, `slurm`) live in `overseer/<domain>/config.py`.
+
+Each domain runs as its own process and Telegram bot, with its own config, state folder and secrets
+(`overseer run -c <its config>`). The platform never imports a domain's code (a test enforces it): it loads the
+domain by name.
+
+**The platform (`overseer/core`)**
+
 | module | role |
 |---|---|
-| `config.py` | config schema, `.env` loading; keeps local writes inside `local.allowed_roots` |
-| `sshlink.py` | Overseer's own key/config/known_hosts, the master connection, the agent's ssh wrappers |
-| `ssh.py`, `hpc.py` | Overseer's own read-only queries (squeue/sacct/scontrol, log tails) |
-| `monitor.py`, `slurm.py`, `diagnose.py` | polling → queued/started/status/final-report messages |
-| `runners.py` | Claude Code / Codex: sandbox settings, scrubbed env, event parsing, job detection |
-| `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
+| `domain.py` | the Domain interface: every hook a domain can fill, with neutral defaults |
+| `app.py` | one bot: the platform wired around its domain (`overseer run`) |
+| `config.py` | config schema, the domain's sections, `.env` loading; keeps local writes inside `local.allowed_roots` |
+| `runners.py` | Claude Code / Codex: sandbox settings (plus the domain's), scrubbed env, event parsing |
+| `agent.py` | conversations, backend switching, command reports, the domain's hooks around each run |
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
-| `autopilot.py` | watches and timers that wake conversations, check-ins, pausing after a failed wake-up |
-| `metrics.py` | what matters in a job (`ov metrics`): critical/important metrics, progress, the extraction command, alerts |
-| `usage.py` | `/usage`: tokens and cost per day, by origin, backend and conversation |
-| `cluster.py` | `ov cluster`, `/cluster`, queued cards' estimated start: free GPUs/CPUs per partition, SLURM's start estimates, fairshare |
-| `dashboard.py`, `dashboard.html`, `dashboard.js` | the Mini App: a small read-only HTTP server (Telegram initData auth) and its page |
-| `search.py` | `ov history`, `/search`: a full-text index (SQLite FTS5, `state/search.db`) of transcripts, results, findings and jobs |
-| `digest.py` | the morning digest (and `/digest`): jobs, GPU time, results, agents, tokens |
-| `projects.py` | projects from config and Telegram, folder matching for jobs |
-| `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches and timers, notifications); installs the `overseer` skill |
-| `compute.py` | `hpc-run` and the shared compute worker, the agent's ssh wrapper with the login-node CPU limit |
-| `richtext.py` | Markdown → Telegram HTML (fallback) and Rich Markdown, tag-safe message splitting, collapsible sections |
-| `bot.py` | Telegram commands, buttons, message → conversation routing |
+| `autopilot.py` | timers and the domain's watch kinds that wake conversations, pausing after a failed wake-up |
+| `ctl.py` | the agent's control command over a unix socket (projects, wake-ups, feedback, skills, subagents, history), plus the domain's commands |
+| `bot.py` | Telegram: the platform's commands and buttons, message → conversation routing, the domain's commands |
+| `subagents.py`, `feedback.py`, `addons.py` | planner mode; agents' feedback about Overseer; skills as addons |
+| `search.py` | `/search`, `ov history`: a full-text index (SQLite FTS5) of transcripts and the domain's records |
+| `digest.py` | the morning digest: the domain's sections, the agents, tokens, what waits for you |
+| `dashboard.py`, `dashboard.html` | the Mini App's server (Telegram initData auth) and page; the domain gives its tabs |
+| `usage.py`, `projects.py`, `store.py`, `notify.py`, `richtext.py` | `/usage`; projects; the database; messages; Markdown → Telegram |
+
+**The HPC domain (`overseer/hpc`)**
+
+| module | role |
+|---|---|
+| `domain.py` | HpcDomain: the hooks, filled in for SLURM jobs on the cluster |
+| `config.py` | the `ssh` and `slurm` sections and the paths derived from them |
+| `prompts.py` | the agent's instructions for the HPC |
+| `activity.py` | jobs the agent submits (sbatch), cancels (scancel), heavy work on the login node |
+| `sshlink.py`, `ssh.py`, `remote.py` | Overseer's own key/config/known_hosts, the master connection, the agent's ssh wrappers; Overseer's read-only queries |
+| `monitor.py`, `slurm.py`, `diagnose.py` | polling → live job cards, final reports, alerts, idle GPUs |
+| `watches.py` | job watches (`ov watch`), check-ins, alert and idle-GPU wake-ups |
+| `commands.py`, `telegram.py` | the HPC's `ov` commands; its Telegram commands and job-card buttons |
+| `metrics.py`, `plots.py`, `results.py` | what matters in a job, its graphs, results and findings |
+| `compute.py`, `cluster.py`, `quota.py` | `hpc-run` and the compute worker; `ov cluster`; disk quota |
+| `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | the HPC's digest sections, dashboard tabs and searchable records |

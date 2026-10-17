@@ -50,6 +50,13 @@ def hpc_sandbox(cfg) -> Sandbox:
     return Sandbox(deny_read=[cfg.ssh_dir], unix_sockets=[cfg.control_socket], skills=skills())
 
 
+def make_domain(cfg, store, notifier) -> HpcDomain:
+    """The app's way in (core/app.py): the HPC domain with its SSH connection."""
+    from .remote import HPC
+    from .ssh import SSHRunner
+    return HpcDomain(cfg, store, notifier, HPC(SSHRunner(cfg), cfg.slurm.setup))
+
+
 class HpcDomain(Domain):
     name = "hpc"
     command = "ov"
@@ -135,6 +142,29 @@ class HpcDomain(Domain):
 
     def ledger_context(self, project: str | None, session_id: str | None = None) -> str:
         return results_context(self.store, project, session_id)
+
+    # ------------------------------------------------------------------ the app
+    def prepare(self) -> None:
+        from .sshlink import write_configs
+        write_configs(self.cfg)  # Overseer's ssh config, the agent's, and the agent's ssh/hpc-run/ov tools
+
+    def build(self) -> None:
+        from .diagnose import Reporter
+        from .monitor import Monitor
+        agent = self.agent
+
+        async def report_text(system: str, prompt: str) -> str:
+            return await agent.runner().text(system=system, prompt=prompt)
+
+        reporter = Reporter(report_text, self.cfg.agent.enabled, self.cfg.agent.llm_status_updates)
+        self.monitor = Monitor(self.cfg, self.hpc, self.store, self.notifier, reporter)
+
+    def services(self) -> list[tuple[str, object]]:
+        return [("monitor", self.monitor.run_forever())] if self.monitor else []
+
+    async def start(self, notifier, projects) -> None:
+        if hasattr(notifier, "ensure_jobs_topics"):
+            await notifier.ensure_jobs_topics([p.name for p in projects.active()])  # live job cards
 
     # ------------------------------------------------------------------ the sandbox
     def sandbox(self) -> Sandbox:

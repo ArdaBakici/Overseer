@@ -181,6 +181,23 @@ def test_config_validation(tmp_path, short_tmp):
             c.validate()
 
 
+def test_app_builds_around_its_domain(env, monkeypatch):
+    """`overseer run`: the platform wired around config.yaml's domain (hpc by default), the domain's commands
+    registered next to the platform's; an unknown domain is refused."""
+    from telegram.ext import CommandHandler
+    from overseer.core.app import build
+    from overseer.core.config import Config
+    app = build(env.cfg)
+    commands = {c for h in app.handlers[0] if isinstance(h, CommandHandler) for c in h.commands}
+    assert {"ask", "new", "auto", "search", "dashboard"} <= commands  # the platform's
+    assert {"jobs", "job", "log", "fix", "results", "cluster"} <= commands, commands  # the HPC's
+    assert env.cfg.domain == "hpc" and env.cfg.ssh.hostname and env.cfg.ssh_dir.name == "ssh"
+    with pytest.raises(ConfigError, match="unknown domain 'nope'"):
+        Config(domain="nope")
+    with pytest.raises(ConfigError, match="a lowercase name"):
+        Config(domain="../x")
+
+
 def test_load_config_resolves_relative_to_config_file(tmp_path):
     from overseer.core.config import load_config
 
