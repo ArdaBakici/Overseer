@@ -30,12 +30,14 @@ CORE_MENU = [
 
 
 def prepare_local_dirs(cfg: Config) -> None:
-    """Create the local state and tmp dirs (inside local.allowed_roots), private to this user."""
+    """Create the local state and tmp dirs (inside local.allowed_roots), private to this user, and note them for the
+    other bots (their agents are kept out of them)."""
     for d in (cfg.local.state(), cfg.local.tmp()):
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
         if d.is_symlink() or d.stat().st_uid != os.getuid():
             raise ConfigError(f"{d} must be a real directory owned by you")
         os.chmod(d, 0o700)
+    cfg.local.register(cfg.domain)
 
 
 def domain_factory(cfg: Config):

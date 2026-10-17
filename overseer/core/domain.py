@@ -11,6 +11,7 @@ Every hook has a neutral default, so a domain overrides only what it needs.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .runners import Activity, Sandbox
@@ -22,9 +23,18 @@ if TYPE_CHECKING:
     from .store import Store
 
 
+@dataclass
+class RunNote:
+    """What a domain adds to the agent's reply after a run (e.g. the notes it changed, with an Undo button)."""
+
+    lines: list[str] = field(default_factory=list)  # Telegram HTML, after the reply
+    buttons: list[list[tuple[str, str]]] = field(default_factory=list)  # rows of (label, callback data)
+
+
 class Domain:
     name = "base"
     command = "ov"  # the agent's command for talking to this bot
+    planner = True  # planner mode (subagents) is offered to its agents
 
     def __init__(self, cfg: Config, store: Store, notifier: Notifier):
         self.cfg = cfg
@@ -48,6 +58,10 @@ class Domain:
 
     async def start(self, notifier, projects) -> None:
         """Once Telegram's topics are known: the domain's own topics (e.g. the HPC's jobs topics)."""
+
+    async def check(self) -> list[tuple[str, bool, str]]:
+        """`overseer check`: the domain's own checks, (what, ok, detail)."""
+        return []
 
     # ------------------------------------------------------------------ the sandbox
     def sandbox(self) -> Sandbox:
@@ -75,8 +89,9 @@ class Domain:
         """Right before the CLI starts (e.g. make sure a connection is up). Its result goes to after_run."""
         return None
 
-    async def after_run(self, s: Session, activity: Activity, state: Any, reply: str) -> None:
-        """After the CLI answered, before the reply is sent."""
+    async def after_run(self, s: Session, activity: Activity, state: Any, reply: str) -> RunNote | None:
+        """After the CLI answered, before the reply is sent: what to add to the reply, if anything."""
+        return None
 
     # ------------------------------------------------------------------ the agent's control command (ctl.py)
     def ctl_commands(self, ctl):

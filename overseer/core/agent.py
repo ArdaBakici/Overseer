@@ -595,7 +595,7 @@ class Agent:
     def system_prompt(self, session_id: str | None = None) -> str:
         sess = self.get(session_id)
         prompt = self.domain.system_prompt(sess)
-        if self.ctl and self.subagents and sess and sess.rec.role != "reviewer":
+        if self.ctl and self.subagents and sess and sess.rec.role != "reviewer" and self.domain.planner:
             prompt += self._subagent_section(sess)
         if sess and sess.rec.role == "reviewer":
             from .feedback import SOURCE
@@ -778,7 +778,7 @@ class Agent:
             if progress:
                 await progress.close()
             await self._report_activity(s, activity, buffer)
-        await self.domain.after_run(s, activity, state, res.text)
+        note = await self.domain.after_run(s, activity, state, res.text)  # e.g. the notes it changed, ↩️ Undo
         if res.session_id:
             s.rec.backend, s.rec.cli_session_id = backend, res.session_id
             self.store.upsert_session(s.rec)
@@ -799,12 +799,13 @@ class Agent:
         transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer})
         skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
         compacted = compaction_line(res.compactions)
-        extra = [x for x in (compacted, autopilot_line, skipped) if x]  # HTML, which Rich Markdown accepts as well
+        extra = [x for x in (*(note.lines if note else []), compacted, autopilot_line, skipped) if x]
+        # (HTML, which Rich Markdown accepts as well)
         await self.notifier.send(Outgoing(
             f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + "".join(f"\n\n{x}" for x in extra)
             + f"\n\n<i>{esc(footer)}</i>",
             markdown="\n\n".join([rich_markdown(text) or "(no answer)", *extra, f"<i>{esc(footer)}</i>"]),
-            session_id=s.id, job_id=s.job_id, silent=quiet,
+            session_id=s.id, job_id=s.job_id, silent=quiet, buttons=note.buttons if note else [],
             photos=photos, files=docs))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:

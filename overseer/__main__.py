@@ -1,6 +1,6 @@
 """Entry point.
 
-    overseer ssh setup [--import KEY]   create Overseer's own SSH key/config in the Overseer folder
+    overseer ssh setup [--import KEY]   (the HPC bot) create Overseer's own SSH key/config in the Overseer folder
     overseer ssh connect                open the SSH connection interactively (for 2FA clusters)
     overseer ssh test                   check the connection works
     overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
@@ -34,11 +34,9 @@ from .core.app import build, prepare_local_dirs  # noqa: E402 (the app: core/app
 
 
 async def check(cfg: Config) -> int:
-    """Verify SSH, SLURM, the agent CLI and credentials without starting the bot."""
+    """Verify the bot's setup (for the HPC: SSH and SLURM), the agent CLI and credentials without starting it."""
     from .core.agent import Agent
-    from .hpc.remote import HPC
-    from .hpc.ssh import SSHRunner
-    from .hpc.sshlink import ensure_master, key_permissions_ok, write_configs
+    from .core.app import domain_factory
     from .core.store import Store
 
     ok = True
@@ -50,38 +48,23 @@ async def check(cfg: Config) -> int:
 
     prepare_local_dirs(cfg)
     report("local folders", True, f"state={cfg.local.state()} tmp={cfg.local.tmp()}")
-    write_configs(cfg)
-    report("ssh key", key_permissions_ok(cfg), str(cfg.ssh_key) if key_permissions_ok(cfg)
-           else f"missing or group/world-readable: {cfg.ssh_key} (run: overseer ssh setup)")
-    try:
-        await ensure_master(cfg)
-        hpc = HPC(SSHRunner(cfg), cfg.slurm.setup)
-        await hpc.connect()
-        report("ssh connection", True, f"{cfg.ssh.host} -> {hpc.user}@{cfg.ssh.hostname} (home {hpc.home})")
-    except Exception as e:
-        report("ssh connection", False, str(e))
-        return 1
-    slurm_ok = True
-    for name, coro in [("squeue", hpc.squeue()), ("sacct", hpc.sacct_recent(60))]:
-        try:
-            jobs = await coro
-            report(name, True, f"{len(jobs)} job(s)")
-        except Exception as e:
-            slurm_ok = False
-            report(name, False, str(e))
-    if not slurm_ok:
-        print("  SLURM isn't on PATH even in a login shell on the HPC. Log in and run `type squeue`;\n"
-              "  if you normally need e.g. `module load slurm`, put that in slurm.setup in config.yaml.\n"
-              f"  (login-shell PATH Overseer saw: {hpc.path or 'none - could not run bash -lc'})")
+    store = Store(cfg.local.db_path)
+    if cfg.domain == "hpc":
+        domain = await check_hpc(cfg, store, report)
+        if domain is None:
+            return 1
+    else:
+        domain = domain_factory(cfg)(cfg, store, None)
+        domain.prepare()
+        for name, good, detail in await domain.check():
+            report(name, good, detail)
     try:
         cfg.telegram.token
         report("telegram token", True)
     except ConfigError as e:
         report("telegram token", False, str(e))
     if cfg.agent.enabled:
-        store = Store(cfg.local.db_path)
-        from .hpc.domain import HpcDomain
-        agent = Agent(cfg, store, None, HpcDomain(cfg, store, None, hpc))  # type: ignore[arg-type]
+        agent = Agent(cfg, store, None, domain)  # type: ignore[arg-type]
         for backend in BACKENDS:
             runner = agent.runner(backend)
             cmd = runner.c.command
@@ -102,7 +85,43 @@ async def check(cfg: Config) -> int:
     return 0 if ok else 1
 
 
+async def check_hpc(cfg: Config, store, report):
+    """SSH and SLURM; the HPC domain, or None if the HPC can't be reached."""
+    from .hpc.domain import HpcDomain
+    from .hpc.remote import HPC
+    from .hpc.ssh import SSHRunner
+    from .hpc.sshlink import ensure_master, key_permissions_ok, write_configs
+
+    write_configs(cfg)
+    report("ssh key", key_permissions_ok(cfg), str(cfg.ssh_key) if key_permissions_ok(cfg)
+           else f"missing or group/world-readable: {cfg.ssh_key} (run: overseer ssh setup)")
+    try:
+        await ensure_master(cfg)
+        hpc = HPC(SSHRunner(cfg), cfg.slurm.setup)
+        await hpc.connect()
+        report("ssh connection", True, f"{cfg.ssh.host} -> {hpc.user}@{cfg.ssh.hostname} (home {hpc.home})")
+    except Exception as e:
+        report("ssh connection", False, str(e))
+        return None
+    slurm_ok = True
+    for name, coro in [("squeue", hpc.squeue()), ("sacct", hpc.sacct_recent(60))]:
+        try:
+            jobs = await coro
+            report(name, True, f"{len(jobs)} job(s)")
+        except Exception as e:
+            slurm_ok = False
+            report(name, False, str(e))
+    if not slurm_ok:
+        print("  SLURM isn't on PATH even in a login shell on the HPC. Log in and run `type squeue`;\n"
+              "  if you normally need e.g. `module load slurm`, put that in slurm.setup in config.yaml.\n"
+              f"  (login-shell PATH Overseer saw: {hpc.path or 'none - could not run bash -lc'})")
+    return HpcDomain(cfg, store, None, hpc)
+
+
 def ssh_command(cfg: Config, action: str, import_from: str | None) -> int:
+    if cfg.domain != "hpc":
+        print(f"overseer ssh is for the HPC bot (this config's domain is {cfg.domain})", file=sys.stderr)
+        return 2
     from .hpc.sshlink import connect_interactive, ensure_master, setup_key
 
     prepare_local_dirs(cfg)
@@ -180,7 +199,6 @@ INTERACTIVE_TERM_ENV = ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "CO
 
 def open_command(cfg: Config, target: str | None) -> int:
     from .core.runners import make_runner
-    from .hpc.sshlink import ensure_master, write_configs
     from .core.store import Store
 
     prepare_local_dirs(cfg)
@@ -195,13 +213,21 @@ def open_command(cfg: Config, target: str | None) -> int:
         print(f"{target!r} matches several conversations: {', '.join(r.id for r in rows)}", file=sys.stderr)
         return 1
     rec = rows[0]
-    write_configs(cfg)
-    try:
-        asyncio.run(ensure_master(cfg))
-    except ConfigError as e:
-        print(f"note: SSH connection to the HPC is not available, `ssh hpc` won't work in this session: {e}")
-    from .hpc.domain import hpc_sandbox
-    runner = make_runner(cfg, rec.backend, hpc_sandbox(cfg))  # the bot's sandbox, exactly
+    if cfg.domain == "hpc":
+        from .hpc.domain import hpc_sandbox
+        from .hpc.sshlink import ensure_master, write_configs
+        write_configs(cfg)
+        try:
+            asyncio.run(ensure_master(cfg))
+        except ConfigError as e:
+            print(f"note: SSH connection to the HPC is not available, `ssh hpc` won't work in this session: {e}")
+        sandbox = hpc_sandbox(cfg)
+    else:
+        from .core.app import domain_factory
+        domain = domain_factory(cfg)(cfg, Store(cfg.local.db_path), None)
+        domain.prepare()
+        sandbox = domain.sandbox()
+    runner = make_runner(cfg, rec.backend, sandbox)  # the bot's sandbox, exactly
     argv, env, cwd = runner.interactive_command(rec.cli_session_id, rec.id)
     # The bot runs the CLIs without a terminal (TERM=dumb, NO_COLOR); here they get the user's terminal.
     env.pop("NO_COLOR", None)
@@ -211,7 +237,8 @@ def open_command(cfg: Config, target: str | None) -> int:
         print(f"{argv[0]!r} not found on PATH (install it, or set agent.{rec.backend}.command)", file=sys.stderr)
         return 1
     print(f"Opening {rec.id} in {rec.backend} (session {rec.cli_session_id}), in {cwd}.")
-    print("Same sandbox and `ssh hpc` access as the bot. Anything you add here becomes part of the conversation,")
+    print("Same sandbox" + (" and `ssh hpc` access" if cfg.domain == "hpc" else "") + " as the bot. Anything you add "
+          "here becomes part of the conversation,")
     print("so don't type while the bot is working on it.\n")
     return subprocess.call(argv, env=env, cwd=str(cwd))
 

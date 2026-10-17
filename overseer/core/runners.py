@@ -121,6 +121,7 @@ class Sandbox:
     deny_read: list[Path] = field(default_factory=list)  # more local paths its commands must never read
     unix_sockets: list[Path] = field(default_factory=list)  # local sockets its commands may connect to
     writable: list[Path] = field(default_factory=list)  # local folders it may write besides its scratch folder
+    deny_write: list[Path] = field(default_factory=list)  # folders inside those it must not write (e.g. .obsidian)
     skills: dict[str, str] = field(default_factory=dict)  # skills that come with the domain: name -> SKILL.md
 
 
@@ -284,7 +285,7 @@ class Runner:
         home = Path.home()
         uid = os.getuid()
         candidates = [
-            *self.sandbox.deny_read, home / ".ssh", self.cfg.local.state(), self.cfg.local.env_path,
+            *self.sandbox.deny_read, home / ".ssh", *self.cfg.local.secrets(),
             home / ".gnupg", home / ".docker", home / ".aws", home / ".config" / "gcloud",
             Path("/var/run/docker.sock"), Path("/run/docker.sock"), Path("/run/containerd"),
             Path("/run/podman"), Path("/var/run/podman"), Path(f"/run/user/{uid}"),
@@ -468,8 +469,11 @@ class ClaudeCodeRunner(Runner):
                 "allowUnsandboxedCommands": False,  # no dangerouslyDisableSandbox escape hatch
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": [],
-                "filesystem": {"allowWrite": [str(workdir), *map(str, self.sandbox.writable)], "denyRead": deny},
-                # Overseer's control socket, and the domain's (e.g. the SSH master that reaches the HPC).
+                "filesystem": {"allowWrite": [str(workdir), *map(str, self.sandbox.writable)],
+                               "denyWrite": [str(p) for p in self.sandbox.deny_write], "denyRead": deny},
+                # Overseer's control socket, and the domain's (e.g. the SSH master that reaches the HPC). On Linux the
+                # sandbox can't tell sockets apart by path (seccomp), so it's all or none: other bots' sockets are kept
+                # out by their folders being unreadable (LocalConfig.secrets).
                 "network": {"allowAllUnixSockets": True, "allowedDomains": list(self.cfg.agent.allowed_domains)},
             },
             "permissions": {
@@ -478,7 +482,10 @@ class ClaudeCodeRunner(Runner):
                 # all. Without this, Claude Code still asks for approval on some sandboxed commands (e.g.
                 # `ssh hpc 'bash -lc "echo $HOME"'`), and in -p mode nobody can answer, so they're refused.
                 "allow": ["Bash", "WebSearch", "WebFetch"],
-                "deny": [rule for p in deny for rule in (f"Read(/{p}/**)", f"Read(/{p})", f"Edit(/{p}/**)")],
+                "deny": [rule for p in deny for rule in (f"Read(/{p}/**)", f"Read(/{p})", f"Edit(/{p}/**)")]
+                + [f"Edit(/{p}/**)" for p in self.sandbox.deny_write],
+                # The domain's writable folders (e.g. the vault) are the agent's to edit, like its scratch folder.
+                "additionalDirectories": [str(p) for p in self.sandbox.writable],
             },
         }
         return _merge(self.c.extra_settings, enforced)
@@ -645,6 +652,8 @@ class CodexRunner(Runner):
             fs[str(workdir)] = "write"
             for p in self.sandbox.writable:
                 fs[str(p)] = "write"
+            for p in self.sandbox.deny_write:
+                fs[str(p)] = "read"
         for p in self.deny_read():
             fs[p] = "deny"
         net: dict[str, Any] = {"enabled": network}

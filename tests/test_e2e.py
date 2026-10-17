@@ -477,3 +477,95 @@ async def test_installed_skills_reach_the_cli(hpc, backend, cli_name):
         await asyncio.wait_for(agent.handle(agent.general_session(), "Run the checks."), 120)
         body = json.dumps(next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"])))
         assert "cluster-long-jobs" in body and "jobs longer than 24 h on this cluster" in body, body[:3000]
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_assistant_sandbox_end_to_end(hpc, backend, cli_name, tmp_path):
+    """The assistant bot next to the HPC bot, on the same machine: its agent writes the vault (not Obsidian's
+    settings), uses `ov`, and can't reach anything of the HPC bot's - its SSH master connection, key or folders."""
+    from overseer.assistant.domain import AssistantDomain
+    from overseer.core.ctl import ControlServer
+    from overseer.core.projects import Projects
+    from overseer.hpc.sshlink import ensure_master
+
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    hcfg, remote, state, app = hpc
+    hcfg.local.register("hpc")  # the HPC bot ran from this folder: its folders are noted
+    await ensure_master(hcfg)  # ...and its SSH connection to the HPC is open
+    sock = hcfg.control_socket
+    assert sock.exists()
+    vault = tmp_path / "Vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".obsidian" / "app.json").write_text("{}")
+    (vault / "Journal.md").write_text("# Journal\n")
+    short = tempfile.mkdtemp(prefix="ova-", dir="/tmp")
+    cfg = Config(domain="assistant")
+    cfg.local.base_dir = str(app)
+    cfg.local.state_dir = "./state/assistant"
+    cfg.local.tmp_dir = short
+    cfg.telegram.token_env = "ASSISTANT_BOT_TOKEN"
+    cfg.telegram.allowed_chat_ids = [1]
+    cfg.vault.path = str(vault)
+    cfg.agent.timeout_minutes = 3
+    cfg.validate()
+    for d in (cfg.local.state(), cfg.local.tmp()):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg.local.register("assistant")
+    (app / ".env").write_text("ASSISTANT_BOT_TOKEN=999:assistant-secret\n")
+    probe = f"import socket; s = socket.socket(socket.AF_UNIX); s.connect({str(sock)!r}); print('MASTER-CONNECTED')"
+    script = [
+        f"echo '- written by the agent' >> {vault / 'Journal.md'} && echo VAULT-WRITE-OK",
+        f"echo hacked > {vault / '.obsidian' / 'app.json'} 2>&1; cat {vault / '.obsidian' / 'app.json'}; echo OBSIDIAN-DONE",
+        f"python3 -c \"{probe}\" 2>&1 | tail -1; echo MASTER-DONE",
+        f"ssh -S {sock} -O check hpc 2>&1; ssh -S {sock} hpc 'echo REMOTE-REACHED' 2>&1 | tail -1; echo SSH-DONE",
+        f"ls {Path(hcfg.local.tmp_dir)} 2>&1; echo HPCTMP-DONE",
+        f"cat {hcfg.ssh_key} 2>&1 | head -c 60; echo; echo KEY-DONE",
+        f"cat {app / '.env'} 2>&1; echo ENV-DONE",
+        f"touch {app / 'assistant-was-here'} 2>&1; echo APPWRITE-DONE",
+        "ov task add 'E2E task' --due tomorrow",
+        "cat .agents/skills/assistant/SKILL.md 2>&1 | head -2; echo SKILL-DONE",
+    ]
+    try:
+        with FakeModel(script) as fm:
+            configure_backend(cfg, backend, cli, fm)
+            store = Store(cfg.local.db_path)
+            notes = Notes()
+            domain = AssistantDomain(cfg, store, notes)
+            domain.prepare()
+            agent = Agent(cfg, store, notes, domain)
+            agent.set_backend(backend)
+            ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes)
+            await ctl.start()
+            s = agent.general_session()
+            try:
+                await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+            finally:
+                await ctl.stop()
+        outs = fm.outputs
+        detail = f"\n\nTELEGRAM:\n{notes.texts()}\n\nTOOL OUTPUTS:\n" + "\n====\n".join(outs)
+        if os.environ.get("OVERSEER_E2E_VERBOSE"):
+            print(detail)
+        assert len(outs) >= len(script), detail
+        assert "VAULT-WRITE-OK" in outs[0] and "written by the agent" in (vault / "Journal.md").read_text(), detail
+        assert (vault / ".obsidian" / "app.json").read_text() == "{}", detail       # Obsidian's settings: refused
+        assert "MASTER-CONNECTED" not in outs[2] and "MASTER-DONE" in outs[2], detail  # the HPC's SSH master: no
+        assert "REMOTE-REACHED" not in outs[3] and "SSH-DONE" in outs[3], detail
+        assert "master.sock" not in outs[4] and "agent-ssh" not in outs[4], detail  # the HPC bot's tmp folder
+        assert "PRIVATE KEY" not in outs[5] and "KEY-DONE" in outs[5], detail
+        assert "assistant-secret" not in outs[6] and "ENV-DONE" in outs[6], detail
+        assert not (app / "assistant-was-here").exists(), detail
+        assert "✓ added to Assistant/Tasks.md: E2E task 📅" in outs[8], detail
+        assert "E2E task" in (vault / "Assistant" / "Tasks.md").read_text()
+        if backend == "codex":
+            assert "name: assistant" in outs[9], detail
+        reply = notes.sent[-1]
+        assert reply.buttons and reply.buttons[0][0][0] == "↩️ Undo", detail
+        assert "Journal.md" in reply.text and "Assistant/Tasks.md" in reply.text, detail
+        body = json.dumps([r["body"] for r in fm.requests if r["body"].get("tools")][0])
+        assert "a personal assistant" in body and "You are Overseer's agent" not in body
+        assert "assistant: How to work as the user's personal assistant" in body  # its skill, not the HPC's
+        assert "overseer: How to talk to Overseer" not in body
+    finally:
+        shutil.rmtree(short, ignore_errors=True)

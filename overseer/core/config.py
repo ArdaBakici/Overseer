@@ -6,8 +6,10 @@ file, so the config can be committed or shared safely.
 
 from __future__ import annotations
 
-import logging
+import hashlib
 import importlib
+import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -87,6 +89,51 @@ class LocalConfig:
     @property
     def env_path(self) -> Path:
         return self._resolve(self.env_file)
+
+    # ------------------------------------------------------------------ the bots on this machine
+    @property
+    def bots_dir(self) -> Path:
+        """Where each of Overseer's bots notes its folders (in ./state, which no agent can read)."""
+        return Path(self.base_dir or os.getcwd()).resolve() / "state" / "bots"
+
+    def other_bots(self) -> list[dict]:
+        """The other bots that ran from this folder: {"domain", "state", "tmp"}."""
+        own = str(self._resolve(self.tmp_dir))
+        out = []
+        for f in sorted(self.bots_dir.glob("*.json")) if self.bots_dir.is_dir() else []:
+            try:
+                info = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(info, dict) and info.get("tmp") != own:
+                out.append(info)
+        return out
+
+    def register(self, domain: str) -> None:
+        """Note this bot's folders, so the other bots' agents are kept out of them. Its folders must not lie inside
+        another bot's (or hold one): an agent can't be kept out of a folder its own is in."""
+        state, tmp = self._resolve(self.state_dir), self._resolve(self.tmp_dir)
+        shared = self.bots_dir.parent  # ./state: the HPC bot's, and the other bots' folders below it are fine
+        mine = [tmp] + ([state] if state != shared else [])
+        for other in self.other_bots():
+            for key in ("tmp", "state"):
+                p = Path(other.get(key) or "/nonexistent")
+                if p != shared and any(_path_within(m, p) or _path_within(p, m) for m in mine):
+                    raise ConfigError(f"local.state_dir/tmp_dir overlap the {other.get('domain')} bot's {key} folder "
+                                      f"{p}: give each bot folders of its own")
+        self.bots_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        name = hashlib.sha1(str(tmp).encode()).hexdigest()[:12]
+        (self.bots_dir / f"{name}.json").write_text(json.dumps({"domain": domain, "state": str(state),
+                                                                 "tmp": str(tmp)}))
+
+    def secrets(self) -> list[Path]:
+        """What no agent of any of Overseer's bots may read: every bot's state (./state and the bots' folders below
+        it), the other bots' tmp folders (their sockets: e.g. the HPC's SSH master), and every .env file in Overseer's
+        folder (the bots may share one)."""
+        base = Path(self.base_dir or os.getcwd()).resolve()
+        others = [Path(p) for b in self.other_bots() for p in (b.get("state"), b.get("tmp"))
+                  if p and Path(p).is_absolute() and Path(p) != Path("/")]
+        return [base / "state", self._resolve(self.state_dir), self.env_path, *sorted(base.glob(".env*")), *others]
 
     @property
     def db_path(self) -> Path:

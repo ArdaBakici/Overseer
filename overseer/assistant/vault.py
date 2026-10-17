@@ -1,0 +1,205 @@
+"""The Obsidian vault: the assistant's memory, and its history.
+
+The vault is a folder of Markdown notes (kept in sync with your devices by Syncthing). The agent reads and edits it
+directly. Overseer keeps a history of it in a git repository in the bot's state folder - outside the vault, so no
+`.git` folder is synced and the agent can't touch the history: before each run what changed meanwhile (your edits)
+is recorded, after it what the agent changed, as its own commit. That commit is what ↩️ Undo reverts.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Not part of the history: Obsidian's per-device UI state, Syncthing's own folders, the trash.
+EXCLUDE = """.obsidian/workspace*.json
+.obsidian/cache
+.trash/
+.stfolder
+.stversions/
+.stignore
+"""
+CONFLICT_RE = re.compile(r"\.sync-conflict-\d{8}-\d{6}")
+DEFAULT_PERSONA = """# Persona
+
+How the assistant talks and behaves. Edit freely: it reads this before every reply.
+
+- Name: Ada
+- Tone: warm but brief; no filler, no flattery.
+- Language: English.
+- Be proactive about deadlines and overdue tasks, but don't nag about the same thing twice a day.
+- Ask before deleting or rewriting a note; small additions are fine without asking.
+"""
+DEFAULT_ABOUT = """# About me
+
+What the assistant knows about me: routines, preferences, people, ongoing things. It proposes additions here when it
+learns something lasting; I can edit or delete anything.
+"""
+
+# Obsidian's (moment.js) date tokens -> strftime, for daily note names.
+MOMENT = [("YYYY", "%Y"), ("YY", "%y"), ("MMMM", "%B"), ("MMM", "%b"), ("MM", "%m"), ("DD", "%d"),
+          ("dddd", "%A"), ("ddd", "%a"), ("Do", "%-d"), ("D", "%-d"), ("M", "%-m")]
+
+
+def moment_to_strftime(fmt: str) -> str:
+    out, i = "", 0
+    while i < len(fmt):
+        if fmt[i] == "[":  # [literal]
+            j = fmt.find("]", i)
+            out += fmt[i + 1:j] if j > 0 else fmt[i + 1:]
+            i = j + 1 if j > 0 else len(fmt)
+            continue
+        for tok, rep in MOMENT:
+            if fmt.startswith(tok, i):
+                out += rep
+                i += len(tok)
+                break
+        else:
+            out += fmt[i]
+            i += 1
+    return out
+
+
+@dataclass
+class Change:
+    commit: str
+    when: float
+    message: str
+    files: list[tuple[str, str]] = field(default_factory=list)  # (status A/M/D/R, path)
+
+
+class Vault:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.root: Path = cfg.vault_dir
+        self.git_dir: Path = cfg.vault_git_dir
+        self._lock = asyncio.Lock()
+        self.history = bool(cfg.vault.history and shutil.which("git"))
+
+    # ------------------------------------------------------------------ the assistant's files
+    @property
+    def assistant_dir(self) -> Path:
+        return self.root / self.cfg.vault.assistant_dir
+
+    @property
+    def tasks_file(self) -> Path:
+        rel = self.cfg.vault.tasks_file or f"{self.cfg.vault.assistant_dir}/Tasks.md"
+        return self.root / rel
+
+    def ensure_files(self) -> None:
+        """The persona and "about me" notes, with a starting text, if they don't exist yet."""
+        d = self.assistant_dir
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "Memory").mkdir(exist_ok=True)
+        for name, text in (("Persona.md", DEFAULT_PERSONA), ("About me.md", DEFAULT_ABOUT)):
+            if not (d / name).exists():
+                (d / name).write_text(text)
+
+    def read_note(self, rel: str, limit: int = 20_000) -> str:
+        p = self.root / rel
+        try:
+            if p.is_symlink() or not p.resolve().is_relative_to(self.root):
+                return ""
+            return p.read_text(errors="replace")[:limit]
+        except OSError:
+            return ""
+
+    def rel(self, p: Path) -> str:
+        return str(p.relative_to(self.root))
+
+    def daily_note(self, day: float | None = None) -> str:
+        """Today's daily note (relative path), by Obsidian's settings (or the config's)."""
+        folder, fmt = self.cfg.vault.daily_folder, self.cfg.vault.daily_format
+        if folder is None or fmt is None:
+            try:
+                st = json.loads((self.root / ".obsidian" / "daily-notes.json").read_text())
+            except (OSError, ValueError):
+                st = {}
+            folder = st.get("folder", "") if folder is None else folder
+            fmt = st.get("format") or "YYYY-MM-DD" if fmt is None else fmt
+        name = time.strftime(moment_to_strftime(fmt), time.localtime(day or time.time()))
+        return str(Path(folder.strip("/")) / f"{name}.md") if folder.strip("/") else f"{name}.md"
+
+    def notes(self) -> list[Path]:
+        """Every note (Markdown file) in the vault, not following links, skipping dot-folders."""
+        out = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            out += [Path(dirpath) / f for f in filenames if f.endswith(".md")]
+        return out
+
+    def conflicts(self) -> list[str]:
+        """Syncthing's conflict copies: two devices changed a note at once."""
+        return sorted(self.rel(p) for p in self.notes() if CONFLICT_RE.search(p.name))
+
+    # ------------------------------------------------------------------ the history (git, outside the vault)
+    async def _git(self, *args: str, check: bool = True) -> tuple[int, str]:
+        env = {**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "TZ", "HOME")},
+               "GIT_DIR": str(self.git_dir), "GIT_WORK_TREE": str(self.root), "GIT_TERMINAL_PROMPT": "0"}
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-c", "core.quotepath=off", "-c", "user.name=Overseer", "-c", "user.email=overseer@localhost",
+            "-c", "commit.gpgsign=false", *args, cwd=str(self.root), env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        text = out.decode(errors="replace")
+        if check and proc.returncode:
+            raise RuntimeError(f"git {' '.join(args[:2])}: {text.strip()[:500]}")
+        return proc.returncode, text
+
+    async def init(self) -> None:
+        if not self.history or (self.git_dir / "HEAD").exists():
+            return
+        self.git_dir.parent.mkdir(parents=True, exist_ok=True)
+        await self._git("init", "-q")
+        (self.git_dir / "info").mkdir(exist_ok=True)
+        (self.git_dir / "info" / "exclude").write_text(EXCLUDE)
+        await self.snapshot("Vault history starts")
+
+    async def snapshot(self, message: str) -> Change | None:
+        """Record what changed since the last snapshot as one commit (None if nothing did)."""
+        if not self.history:
+            return None
+        async with self._lock:
+            await self._git("add", "-A")
+            rc, _ = await self._git("diff", "--cached", "--quiet", check=False)
+            if rc == 0:
+                return None
+            await self._git("commit", "-q", "--no-verify", "-m", message)
+            return await self._change("HEAD")
+
+    async def _change(self, ref: str) -> Change:
+        _, out = await self._git("show", "--no-renames", "--name-status", "--format=%H%x00%ct%x00%s", ref)
+        lines = out.strip().splitlines()
+        commit, when, message = lines[0].split("\x00")
+        files = [tuple(x.split("\t", 1)) for x in lines[1:] if "\t" in x]
+        return Change(commit, float(when), message, files)  # type: ignore[arg-type]
+
+    async def log(self, limit: int = 30) -> list[Change]:
+        if not self.history or not (self.git_dir / "HEAD").exists():
+            return []
+        rc, out = await self._git("log", f"-{limit}", "--format=%H", check=False)
+        return [await self._change(h) for h in out.split()] if rc == 0 else []
+
+    async def undo(self, commit: str) -> tuple[bool, str]:
+        """Revert one turn's changes; your edits since are kept (recorded first). (ok, what happened)"""
+        if not self.history or not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+            return False, "no such change"
+        await self.snapshot("Your edits")
+        async with self._lock:
+            rc, out = await self._git("revert", "--no-edit", commit, check=False)
+            if rc:
+                await self._git("revert", "--abort", check=False)
+                if "conflict" in out.lower():
+                    return False, "those notes changed since: undo it by hand (or ask the assistant)"
+                return False, out.strip()[:300]
+        change = await self._change("HEAD")
+        return True, ", ".join(p for _, p in change.files) or "nothing to undo"

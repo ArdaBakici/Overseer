@@ -442,6 +442,48 @@ overseer.example.com {
 
 `tls internal` (Caddy's own CA) only works where you install Caddy's root certificate: iOS (and enable full trust) and desktops yes, Android most likely not, since apps there ignore user-installed CAs.
 
+## The personal assistant: a second bot
+
+The same platform runs a second, separate bot: a daily assistant whose memory is your **Obsidian vault**. It runs
+from Overseer's folder next to the HPC bot, as its own process with its own Telegram bot, config, state and
+logins, and it can't reach anything of the HPC bot's.
+
+```bash
+cp assistant.example.yaml assistant.yaml        # set vault.path and your chat id
+echo 'ASSISTANT_BOT_TOKEN=123456789:...' >> .env  # a second bot from @BotFather (telegram.token_env names it)
+overseer login claude_code -c assistant.yaml    # its own login (./state/assistant/claude)
+overseer check -c assistant.yaml
+overseer run -c assistant.yaml                  # e.g. a second systemd service
+```
+
+- **The vault is its memory.** Point `vault.path` at the folder Syncthing keeps in sync on the homelab. The agent
+  reads and edits notes there with real commands (`rg`, editing files): your daily note, notes it keeps in
+  `Assistant/Memory/`, anything you ask about. It follows Obsidian's conventions ([[links]], #tags) and never
+  writes `.obsidian/` (Obsidian's settings) or Syncthing's own files: the sandbox refuses it.
+- **Personality.** `Assistant/Persona.md` in the vault says how it talks and behaves (its name, tone,
+  language, ...): edit it in Obsidian, or ask it to change. `Assistant/About me.md` is what it knows about you;
+  it adds lasting facts there and tells you. Both go into its instructions on every reply. `/persona` shows it.
+- **↩️ Undo.** Overseer keeps a history of the vault in a git repository in the bot's state folder, outside the
+  vault (so nothing extra is synced and the agent can't touch it). Before each reply it records your edits since,
+  after it the reply's changes; a reply that changed notes lists them with a ↩️ Undo button, which reverts exactly
+  those changes and keeps yours (if you edited the same lines since, it says so and changes nothing). `/undo`
+  lists recent changes, `/vault` shows the history and Syncthing's conflict copies.
+- **Tasks** are the Obsidian Tasks plugin's checklist lines, anywhere in the vault (`- [ ] Call the bank 📅
+  2026-10-20 ⏫ #home`, with 🔁 recurrences). `/tasks [today|week|#tag|words]` lists them with ✅ buttons,
+  `/task <text>` adds one; the agent uses `ov task list|add|done`. Completing a recurring task adds its next
+  occurrence, like the plugin. New tasks go to `Assistant/Tasks.md` unless it belongs in a particular note.
+- **Reminders.** "Remind me tomorrow at 9 to call the dentist": `ov remind` (or `/remind tomorrow 9am call the
+  dentist`) sends you the message then, with 💤 snooze buttons, without waking the agent. `ov wake` is for when
+  the agent has work to do later.
+- **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
+  **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
+  also searches the vault's notes.
+- **Kept apart from the HPC bot.** On Linux the sandbox can't filter unix sockets by path, so each bot notes its
+  folders in `./state/bots/` and every bot's agent is denied the others' state and tmp folders (the HPC bot's SSH
+  connection socket is in its tmp folder), all of `./state`, and every `.env*` file. Its folders must be its own
+  (`./state/assistant`, `/tmp/overseer-assistant`), and the vault must be outside Overseer's folder.
+  The end-to-end test runs both bots side by side with the real CLIs and checks this.
+
 ## Configuration notes
 
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
@@ -466,11 +508,13 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 ```
 
 - `tests/test_integration.py` covers the monitor, agent sessions, job detection, the runners' sandbox settings and the bot. It uses fake SLURM (`tests/fake_slurm/`) and fake CLIs (`tests/fake_cli/`).
+- `tests/test_assistant.py` covers the assistant: tasks, reminders, the vault's history and undo, its config and sandbox, a whole turn.
 - `tests/test_e2e.py` runs the real Claude Code and Codex against a scripted model (`tests/fake_model_server.py`) and a local sshd. It is skipped unless sshd, bubblewrap, socat and the CLIs are available.
 
 ### Architecture: a platform and its domains
 
-Overseer is a platform (`overseer/core`) with a domain plugged into it (`overseer/hpc`, the SLURM jobs). The platform
+Overseer is a platform (`overseer/core`) with domains plugged into it (`overseer/hpc`, the SLURM jobs;
+`overseer/assistant`, the personal assistant). The platform
 runs agent conversations from Telegram: the Claude Code / Codex runners and their sandbox, the Telegram layer,
 the agent's control command, wake-ups, transcripts and search, usage, the digest and the dashboard. A domain adds
 what is its own through the hooks in `core/domain.py`: the agent's instructions and context, its sandbox additions
@@ -516,3 +560,16 @@ domain by name.
 | `metrics.py`, `plots.py`, `results.py` | what matters in a job, its graphs, results and findings |
 | `compute.py`, `cluster.py`, `quota.py` | `hpc-run` and the compute worker; `ov cluster`; disk quota |
 | `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | the HPC's digest sections, dashboard tabs and searchable records |
+
+**The assistant domain (`overseer/assistant`)**
+
+| module | role |
+|---|---|
+| `domain.py` | AssistantDomain: the vault-writing sandbox, persona and context, the vault's history around each reply (↩️ Undo) |
+| `config.py` | the `vault` section; its own state, tmp folders and token required |
+| `prompts.py`, `skills/assistant/SKILL.md` | the agent's instructions and its skill |
+| `vault.py` | the vault: persona and "about me" notes, daily notes, Syncthing conflicts, the history (git outside the vault) and undo |
+| `tasks.py`, `when.py` | Obsidian Tasks: parsing, selecting, adding, completing, recurrences; days and times as people write them |
+| `reminders.py` | reminders sent at their time, with snooze |
+| `commands.py`, `telegram.py` | `ov task`, `ov remind`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
+| `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |
