@@ -329,8 +329,10 @@ class Runner:
         env["HOME"] = str(h)
         env["TERM"] = "dumb"
         env["NO_COLOR"] = "1"
-        if workdir:
-            env["TMPDIR"] = str(workdir / ".tmp")
+        if workdir:  # the sandboxes only let commands write the scratch dir, so temp files go there too
+            tmp = str(workdir / ".tmp")
+            env["TMPDIR"] = env["TMP"] = env["TEMP"] = tmp
+            env["TMPPREFIX"] = f"{tmp}/zsh"  # zsh's here-documents (it ignores TMPDIR; /tmp/zsh is read-only)
         return env
 
     # ------------------------------------------------------------------ process handling

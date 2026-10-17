@@ -195,6 +195,9 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         "ov wake in 1h check the curves",
         # The overseer skill: Codex has the model read it with a command, so its sandbox must allow that.
         "cat .agents/skills/overseer/SKILL.md 2>&1 | head -2; echo SKILL-DONE",
+        # Temp files (FB3: zsh's here-documents went to the read-only /tmp): in the scratch dir.
+        "zsh -c 'cat <<X\nZSH-HEREDOC-OK\nX' 2>&1; mktemp >/dev/null && echo MKTEMP-OK; "
+        "python3 -c 'import tempfile; tempfile.NamedTemporaryFile(); print(\"PYTMP-OK\")'",
     ]
     (remote / "proj" / "reward.png").write_bytes(b"\x89PNG\r\n\x1a\n made on the HPC")
     # A login shell may reset PATH; on a real cluster this is where "module load slurm" goes.
@@ -301,6 +304,9 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         if backend == "codex":
             assert "name: overseer" in outs[19], detail
             assert re.search(r"r\d+` = `[^`]*/agents/" + re.escape(s.id) + r"/\.agents/skills`", body), body[:3000]
+        if shutil.which("zsh"):
+            assert "ZSH-HEREDOC-OK" in outs[20], detail
+        assert "MKTEMP-OK" in outs[20] and "PYTMP-OK" in outs[20], detail
 
 
 @pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
