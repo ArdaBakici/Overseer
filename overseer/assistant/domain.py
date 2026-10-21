@@ -110,6 +110,27 @@ class AssistantDomain(Domain):
         m = NAME_RE.search(self.vault.read_note(self._rel("Persona.md"), 4000))
         return m.group(1).strip()[:40] if m else "the assistant"
 
+    # ------------------------------------------------------------------ projects: a topic each, maybe a vault folder
+    def check_project_dir(self, path: str) -> str:
+        """A project's folder in the vault (optional): a relative path, e.g. Projects/Japan trip."""
+        path = (path or "").strip().rstrip("/")
+        if not path:
+            return ""
+        parts = Path(path).parts
+        if path.startswith(("/", "~")) or ".." in parts or any(x.startswith(".") for x in parts):
+            raise ValueError(f"{path!r}: give a folder inside the vault, e.g. Projects/Japan (no .., no dot-folders)")
+        return str(Path(*parts))
+
+    def _project_section(self, s: Session | None) -> str:
+        proj = self.store.get_project(s.project) if s and s.project else None
+        if not proj:
+            return ""
+        about = f"\nWhat it's about, from the user:\n{proj.context.strip()}" if proj.context.strip() else ""
+        where = (f"Its notes live in `{proj.dir}/` in the vault: read them first, keep them up to date."
+                 if proj.dir else f"It has no folder in the vault yet: when there's something worth keeping, make one "
+                 f"(e.g. `Projects/{proj.name}/`) and set it: `ov project set {proj.name} --dir <folder>`.")
+        return P.PROJECT_SECTION.format(name=proj.name, about=about, where=where)
+
     def _rel(self, name: str) -> str:
         return f"{self.cfg.vault.assistant_dir.strip('/')}/{name}" if self.cfg.vault.assistant_dir.strip("/") else name
 
@@ -127,7 +148,7 @@ class AssistantDomain(Domain):
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
         if self.agent and self.agent.ctl:
             prompt += P.OV_SECTION
-        return prompt
+        return prompt + self._project_section(s)
 
     def wake_instructions(self, s: Session) -> str:
         return P.WAKE_INSTRUCTIONS

@@ -1,6 +1,6 @@
 """Projects: separate contexts (e.g. dreamer, chemistry), each with its own Telegram topic.
 
-A project has a folder on the HPC, standing instructions for the agent, its own conversations,
+A project has a folder (its domain's: on the HPC, in the vault), standing instructions for the agent, its own conversations,
 jobs, research log and agent settings (backend / model / effort, copied from the main chat when the
 project is created). Projects come from config.yaml (`projects:`) or `/project new` in Telegram.
 
@@ -38,19 +38,21 @@ def check_name(name: str) -> str:
     return name
 
 
-def check_dir(path: str) -> str:
-    path = path.strip()
-    if not path.startswith(("/", "~/")) or any(c.isspace() for c in path):
-        raise ProjectError(f"{path!r}: give the project's folder on the HPC as an absolute path (or ~/...)")
-    return path.rstrip("/") or "/"
-
-
 class Projects:
     def __init__(self, cfg: Config, store: Store, agent: Agent):
         self.cfg = cfg
         self.store = store
         self.agent = agent
         self.notifier = None  # set by the app: creates and closes Telegram topics
+
+    def check_dir(self, path: str) -> str:
+        """The project's folder, as its domain understands it (the HPC: a folder there; the assistant: in the vault)."""
+        try:
+            return self.agent.domain.check_project_dir(path or "")
+        except ProjectError:
+            raise
+        except ValueError as e:
+            raise ProjectError(str(e)) from e
 
     def get(self, name: str | None) -> ProjectRecord | None:
         return self.store.get_project(name) if name else None
@@ -61,7 +63,7 @@ class Projects:
     def create(self, name: str, dir: str, context: str = "", source: str = "telegram",
                backend: str | None = None, model: str | None = None, effort: str | None = None) -> ProjectRecord:
         """Create a project (or restore an archived one). Its agent settings start as the main chat's."""
-        name, dir = check_name(name), check_dir(dir)
+        name, dir = check_name(name), self.check_dir(dir)
         if backend and backend not in BACKENDS:
             raise ProjectError(f"backend must be one of {', '.join(BACKENDS)}")
         p = self.store.get_project(name)
@@ -91,7 +93,7 @@ class Projects:
         if not p:
             raise ProjectError(f"no project {name!r}")
         if dir is not None:
-            p.dir = check_dir(dir)
+            p.dir = self.check_dir(dir)
         if context is not None:
             p.context = context.strip()
         self.store.upsert_project(p)
@@ -107,7 +109,7 @@ class Projects:
                 self.create(name, pc.dir, pc.context, "config", pc.backend, pc.model, pc.effort)
                 created.append(name)
             else:
-                p.dir, p.source = check_dir(pc.dir), "config"
+                p.dir, p.source = self.check_dir(pc.dir), "config"
                 p.context = pc.context.strip() or p.context
                 self.store.upsert_project(p)
             for field, value in (("backend", pc.backend), ("model", pc.model), ("effort", pc.effort)):

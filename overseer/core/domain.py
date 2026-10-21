@@ -59,6 +59,9 @@ class Domain:
     async def start(self, notifier, projects) -> None:
         """Once Telegram's topics are known: the domain's own topics (e.g. the HPC's jobs topics)."""
 
+    async def project_created(self, notifier, name: str) -> None:
+        """A project was created (or restored), with its topic: the domain's own topics for it (the HPC's jobs)."""
+
     async def check(self) -> list[tuple[str, bool, str]]:
         """`overseer check`: the domain's own checks, (what, ok, detail)."""
         return []
@@ -124,6 +127,15 @@ class Domain:
         return (f"Work on this on your own, over as many runs as it takes: {goal}\nSet wake-ups (`{self.command} wake`) "
                 "for what you're waiting for and end your reply; carry on when woken until the goal is reached or "
                 "nothing sensible is left, then tell me. Ask me when you need a decision.")
+
+    # A project's folder: what it is, for /project new ("folder on the HPC": it must be given), and what having it
+    # means (shown when a project is created). "": projects need none (it can be set later).
+    project_folder = ""
+    project_folder_note = ""
+
+    def check_project_dir(self, path: str) -> str:
+        """A project's folder as given: checked and normalised (raise ValueError if it isn't one)."""
+        return (path or "").strip()
 
     async def project_notes_file(self, project) -> tuple[str, str] | None:
         """A project's notes file for /project notes: (where it is, its beginning); None if the domain keeps none."""

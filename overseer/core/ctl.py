@@ -65,7 +65,7 @@ def _parser(ext=None) -> _Parser:
     proj.add_parser("list", add_help=False)
     a = proj.add_parser("new", add_help=False)
     a.add_argument("name")
-    a.add_argument("--dir", required=True)
+    a.add_argument("--dir", default="")
     a.add_argument("--about", default="")
     a.add_argument("--move-here", action="store_true", help="also move this conversation into it")
     a = proj.add_parser("set", add_help=False)
@@ -415,11 +415,10 @@ class ControlServer:
         p = self.projects.create(args.name, args.dir, args.about, "agent")
         if hasattr(self.notifier, "ensure_topic"):
             await self.notifier.ensure_topic(p.name)
-            if hasattr(self.notifier, "ensure_jobs_topics"):
-                await self.notifier.ensure_jobs_topics([p.name])
-        await self._announce(None, f"📁 The agent created project {code(p.name)}: {code(p.dir)}"
+        await self.agent.domain.project_created(self.notifier, p.name)  # e.g. the HPC's jobs topic for it
+        await self._announce(None, f"📁 The agent created project {code(p.name)}" + (f": {code(p.dir)}" if p.dir else "")
                                    + (f"\n{esc(p.context)}" if p.context else ""), project=p.name)
-        msg = f"✓ project {p.name} created ({p.dir})"
+        msg = f"✓ project {p.name} created" + (f" ({p.dir})" if p.dir else "")
         if args.move_here:
             msg += "\n" + await self.conversation_move(session, argparse.Namespace(project=p.name))
         return msg

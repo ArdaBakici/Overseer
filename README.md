@@ -254,7 +254,7 @@ Each project gets a topic in your chat with the bot, so the main chat stays uncl
 
 **The "general" topic: anything that isn't about a project.** With topics on, Overseer also creates a 💬 general topic. Use it for questions like "how much quota do I have left?" or "which partitions have free GPUs?". It is the main chat's conversation, so `/new`, `/ask`, `/auto` and `/stop` there act on the main conversation. Jobs that belong to no project are reported there too, and if the topic is deleted, Overseer makes a new one.
 
-Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
+Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `telegram.topics` decides whether Overseer uses them: `null` (the default) follows the bot's mode, `true` uses them (and warns at startup if the mode is off), `false` keeps one conversation in a plain chat even if the mode is on. `/health` shows whether topics are on, and why not. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
 
 **Job cards and the jobs topics.** Job news lives apart from your conversations, so the agent's replies don't get buried:
 - **Where:** with topics on, each project has a "📊 dreamer · jobs" topic, and one "📊 jobs" topic holds the jobs that belong to no project.
@@ -475,6 +475,11 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
 - **Reminders.** "Remind me tomorrow at 9 to call the dentist": `ov remind` (or `/remind tomorrow 9am call the
   dentist`) sends you the message then, with 💤 snooze buttons, without waking the agent. `ov wake` is for when
   the agent has work to do later.
+- **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
+  @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
+  subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
+  `ov project new`, optionally with a notes folder in the vault). Writing in "All" is refused, as for the HPC
+  bot. With `topics: false` (the example's default) it's one plain chat.
 - **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
   **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
   also searches the vault's notes.

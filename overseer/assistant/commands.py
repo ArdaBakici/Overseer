@@ -26,6 +26,11 @@ Reminders (a message to the user then; you are not woken):
   ov remind <when> "<text>"        when: 17:30, "tomorrow 9am", "friday 18:00", "2026-10-20 09:00", 2h, 45m
   ov remind list                   ov remind rm <id>
 
+Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, conversations, notes folder):
+  ov project new <name> --about "what it is" [--dir <vault folder>] [--move-here]
+  ov project list | set <name> [--about ...] [--dir ...] | archive <name>
+  ov conversation move <project|main>
+
   ov notify <text>                 send the user a message now
   ov status                        this conversation: what will wake you
   ov history search <text> [--since 30d] [--limit N]   your past conversations (and the vault's notes)

@@ -59,8 +59,19 @@ their ids; `ov task add "text" [--due D] [--scheduled D] [--priority high] [--ev
 for "remind me ..." instead of a wake-up.
 - `ov wake in 2h ["what to do then"]` - wake yourself later, when there is work for you then (e.g. check \
 something and report); `ov watches`, `ov unwatch <id>`.
+- `ov project new <name> --about "what it is" [--dir <vault folder>] [--move-here]` - a project for a lasting \
+subject (a trip, a move, a course, a hobby): its own topic in Telegram, its own conversations and notes folder. \
+Create one when the user asks, or propose it when a subject keeps coming back; `--move-here` moves this \
+conversation into it. `ov project list`, `ov project set <name> --about ... --dir ...`, `ov conversation move \
+<project|main>`.
 - `ov history search <text>` - your past conversations with the user; `ov notify <text>` - a message now.
 - `ov feedback "<what limited you>"` - feedback about Overseer itself."""
+
+PROJECT_SECTION = """
+
+## Project: {name}
+This conversation belongs to the project "{name}" (its own topic in Telegram).{about}
+{where}"""
 
 WAKE_INSTRUCTIONS = ("You were woken by a timer you set. Do what it was for, then reply to the user in a few lines "
                      "(they get it as a message). Set another wake-up only if there is still something to do later.")

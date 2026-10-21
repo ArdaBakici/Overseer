@@ -3703,3 +3703,14 @@ async def test_cards_read_json_records_and_skip_parameter_counts(env):
     card = env.notifier.card_text("960")
     assert "🎯 <b>achievement_pct 7.9 · return_mean 2.31</b>" in card and "656" not in card, card
     assert json.loads(env.store.get_result("960").metrics)["achievement_pct"] == "7.9"
+
+
+async def test_a_new_hpc_project_gets_its_jobs_topic(env):
+    """The jobs topics are the HPC's: made through its project_created hook (not by the platform)."""
+    from overseer.core.bot import TelegramNotifier
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    make_projects(env).create("dreamer", "/scratch/me/rf-dreamer")
+    await env.agent.domain.project_created(notifier, "dreamer")
+    assert [name for _, name, _ in tg.created] == ["📊 jobs", "📊 dreamer · jobs"]

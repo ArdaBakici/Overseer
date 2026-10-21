@@ -154,6 +154,10 @@ class TelegramConfig:
     # Stream the agent's progress as a live draft with a Stop button (private chats), instead of
     # a message that is edited every few seconds.
     streaming: bool = True
+    # Topics in the chat with the bot (Telegram's threaded mode for bots, switched on in @BotFather): "general",
+    # a topic per project, ... - Overseer makes them; null = whatever the bot's mode in @BotFather is, true = topics
+    # (warns if the bot's topic mode is off), false = one conversation in the plain chat, even if it's on.
+    topics: bool | None = None
     # With topics: a message written outside them (Telegram's "All" view) starts a new conversation of its own.
     # Off: it's refused, with a note to write in a project's topic or in "general".
     new_threads: bool = False

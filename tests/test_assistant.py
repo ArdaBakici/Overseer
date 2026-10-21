@@ -464,3 +464,111 @@ def test_the_assistant_bot_loads_from_its_config_file(tmp_path, monkeypatch):
         assert bots == [{"domain": "assistant", "state": str(app_dir / "state/assistant"), "tmp": tmp}]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------- topics (telegram.topics) and projects
+def topic_bot(aenv, monkeypatch, use_topics, topic_mode=True):
+    from types import SimpleNamespace as NS
+
+    from overseer.core.bot import Bot, TelegramNotifier
+    from test_integration import FakeTelegram
+    tg = FakeTelegram(topics=topic_mode)
+    deleted = []
+
+    async def delete_forum_topic(chat_id, message_thread_id):
+        deleted.append(message_thread_id)
+    tg.delete_forum_topic = delete_forum_topic
+    notifier = TelegramNotifier(NS(bot=tg), [1], aenv.store, use_topics=use_topics)
+    aenv.cfg.telegram.topics = use_topics
+    projects = Projects(aenv.cfg, aenv.store, aenv.agent)
+    projects.notifier = notifier
+    bot = Bot(aenv.cfg, app=NS(bot=tg), store=aenv.store, agent=aenv.agent, notifier=notifier, projects=projects)
+    started = []
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        started.append((session.id, text))
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+    return NS(tg=tg, notifier=notifier, bot=bot, projects=projects, started=started, deleted=deleted)
+
+
+async def drain(bot):
+    for t in list(bot._tasks):
+        await t
+
+
+async def test_with_topics_the_assistant_works_like_the_hpc_bot(aenv, monkeypatch):
+    """telegram.topics: true - Overseer makes the topics ("general", one per project, made by you or the
+    assistant), and nothing written outside them ("All") reaches the agent."""
+    from test_integration import topic_update
+    t = topic_bot(aenv, monkeypatch, use_topics=True)
+    assert await t.notifier.detect_topics()
+    await t.notifier.ensure_general_topic()
+    gen = t.notifier.general_thread(1)
+    # A message in "All" (Telegram made a topic for it): refused, that topic deleted.
+    await t.bot.on_text(topic_update("what's on today?", thread=901), None)
+    await drain(t.bot)
+    assert not t.started and t.deleted == [901] and "outside the topics" in t.tg.sent[-1][2]
+    # In "general": the everyday conversation.
+    await t.bot.on_text(topic_update("what's on today?", thread=gen), None)
+    await drain(t.bot)
+    assert t.started[-1] == (aenv.agent.general_session().id, "what's on today?")
+    # /project new: no folder needed (it can get a vault folder later); it gets its own topic.
+    replies = []
+
+    async def reply(update, text):
+        replies.append(text)
+    monkeypatch.setattr(t.bot, "reply", reply)
+    await t.bot.cmd_project(topic_update("/project new japan Trip in April", thread=gen),
+                            type("C", (), {"args": ["new", "japan", "Trip", "in", "April"]})())
+    p = aenv.store.get_project("japan")
+    assert p.dir == "" and p.context == "Trip in April" and "japan" in [n for _, n, _ in t.tg.created]
+    assert p.thread_map["1"] != gen and t.notifier.general_thread(1) == gen  # (typed in general: general stays)
+    assert not [n for _, n, _ in t.tg.created if "jobs" in n]  # the HPC's jobs topics are the HPC bot's
+    assert "Project <code>japan</code> created." in replies[-1] and "folder" not in replies[-1].split("\n")[0]
+    await t.bot.on_text(topic_update("book the ryokan", thread=p.thread_map["1"]), None)
+    await drain(t.bot)
+    assert aenv.agent.get(t.started[-1][0]).project == "japan"
+    # The assistant makes one itself: ov project new (and its notes folder must be in the vault).
+    aenv.ctl.projects = t.projects
+    aenv.ctl.notifier = t.notifier
+    s = aenv.agent.general_session()
+    token = aenv.ctl.open(s.id)
+    ok, text = await aenv.ctl.handle(token, ["project", "new", "move", "--about", "Moving flats", "--dir",
+                                             "Projects/Move/", "--move-here"])
+    assert "✓ project move created (Projects/Move)" in text and "now in move" in text, text
+    assert "move" in [n for _, n, _ in t.tg.created] and aenv.agent.get(s.id).project == "move"
+    for bad in ("../outside", "/etc", ".obsidian/x"):
+        ok, text = await aenv.ctl.handle(token, ["project", "new", "x", "--dir", bad])
+        assert "inside the vault" in text, text
+    prompt = aenv.agent.system_prompt(s.id)
+    assert '## Project: move' in prompt and "Moving flats" in prompt and "`Projects/Move/`" in prompt
+    ok, text = await aenv.ctl.handle(token, ["help"])
+    assert "ov project new <name>" in text
+
+
+async def test_with_topics_off_it_is_one_plain_chat(aenv, monkeypatch):
+    """telegram.topics: false - even with topic mode on in @BotFather, no topics are made and every message is the
+    main conversation (nothing refused); true without topic mode: the same, until it's switched on there."""
+    from test_integration import topic_update
+    t = topic_bot(aenv, monkeypatch, use_topics=False)
+    assert not await t.notifier.detect_topics() and t.notifier.topic_mode
+    await t.notifier.ensure_general_topic()
+    assert t.tg.created == []
+    await t.bot.on_text(topic_update("hi", thread=901), None)
+    await drain(t.bot)
+    assert t.started == [(aenv.agent.general_session().id, "hi")] and t.deleted == []
+    assert t.bot._topics_state() == "off (telegram.topics: false)"
+    t2 = topic_bot(aenv, monkeypatch, use_topics=True, topic_mode=False)
+    assert not await t2.notifier.detect_topics()
+    assert "threaded mode" in t2.bot._topics_state()
+    t3 = topic_bot(aenv, monkeypatch, use_topics=None)  # (the HPC bot's default: the bot's own mode)
+    assert await t3.notifier.detect_topics()
+
+
+def test_hpc_projects_still_need_their_folder(tmp_path):
+    from overseer.hpc.domain import HpcDomain
+    d = HpcDomain.__new__(HpcDomain)
+    assert d.check_project_dir("~/dreamer/") == "~/dreamer"
+    for bad in ("", "relative/dir", "/with space"):
+        with pytest.raises(ValueError, match="on the HPC"):
+            d.check_project_dir(bad)

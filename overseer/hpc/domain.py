@@ -57,9 +57,19 @@ def make_domain(cfg, store, notifier) -> HpcDomain:
     return HpcDomain(cfg, store, notifier, HPC(SSHRunner(cfg), cfg.slurm.setup))
 
 
+def check_dir(path: str) -> str:
+    """A project's folder on the HPC: required, absolute (or ~/...)."""
+    path = path.strip()
+    if not path.startswith(("/", "~/")) or any(c.isspace() for c in path):
+        raise ValueError(f"{path!r}: give the project's folder on the HPC as an absolute path (or ~/...)")
+    return path.rstrip("/") or "/"
+
+
 class HpcDomain(Domain):
     name = "hpc"
     command = "ov"
+    project_folder = "folder on the HPC"
+    project_folder_note = "Jobs running under that folder are reported there."
 
     def __init__(self, cfg, store, notifier, hpc: HPC):
         super().__init__(cfg, store, notifier)
@@ -78,6 +88,13 @@ class HpcDomain(Domain):
         self._monitor = monitor
         if monitor is not None and self.jobs is not None:
             monitor.autopilot = self.jobs
+
+    def check_project_dir(self, path: str) -> str:
+        return check_dir(path)
+
+    async def project_created(self, notifier, name: str) -> None:
+        if hasattr(notifier, "ensure_jobs_topics"):
+            await notifier.ensure_jobs_topics([name])  # its live job cards
 
     # ------------------------------------------------------------------ the agent's ov command
     def ctl_commands(self, ctl):

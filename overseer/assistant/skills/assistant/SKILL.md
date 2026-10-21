@@ -60,6 +60,20 @@ ov watches            ov unwatch w12
 
 Use `ov remind` for "remind me ...". Use `ov wake` only when you will have to do something then.
 
+## Projects
+
+A project is a lasting subject (a trip, a move, a course, a hobby): it gets its own topic in
+Telegram, its own conversations, and a notes folder in the vault.
+
+```bash
+ov project new japan --about "Trip to Japan in April: flights, hotels, itinerary" --dir "Projects/Japan" --move-here
+ov project list
+ov project set japan --about "..."     # or --dir
+ov conversation move japan             # this conversation belongs to it (main: to none)
+```
+
+Create one when the user asks for it, or propose one when a subject keeps coming back.
+
 ## Other
 
 ```bash

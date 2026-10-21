@@ -112,7 +112,7 @@ def build(cfg: Config):
         .build()
     )
     notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store, rich=cfg.telegram.rich_messages,
-                                streaming=cfg.telegram.streaming)
+                                streaming=cfg.telegram.streaming, use_topics=cfg.telegram.topics)
     domain = domain_factory(cfg)(cfg, store, notifier)  # this bot: the HPC (Overseer), ...
     domain.prepare()  # e.g. the HPC's ssh configs and the agent's ssh wrappers
     agent = Agent(cfg, store, notifier, domain)

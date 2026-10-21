@@ -80,22 +80,32 @@ class TelegramNotifier:
     in private chats enabled); otherwise they are labelled with the project's name."""
 
     def __init__(self, app: Application, chat_ids: list[int], store: Store, rich: bool = True,
-                 streaming: bool = True):
+                 streaming: bool = True, use_topics: bool | None = None):
         self.app = app
         self.chat_ids = chat_ids
         self.store = store
         self.rich = rich  # native rich messages; switched off if this Telegram server doesn't have them
         self.streaming = streaming
+        self.use_topics = use_topics  # telegram.topics: None = the bot's own mode (@BotFather)
         self.topics = False  # set by detect_topics()
+        self.topic_mode = False  # the bot's mode in @BotFather
         self._drafts: dict[int, str | None] = {}  # live draft id -> conversation
         self._recreated: dict[str, float] = {}  # project -> when its topic was last recreated
 
     async def detect_topics(self) -> bool:
+        """Topics if the bot has topic mode on in @BotFather, unless telegram.topics turns them off."""
         try:
             me = await self.app.bot.get_me()
-            self.topics = bool(getattr(me, "has_topics_enabled", False))
+            self.topic_mode = bool(getattr(me, "has_topics_enabled", False))
         except Exception:
             log.warning("could not check whether the bot has topics enabled", exc_info=True)
+        if self.use_topics and not self.topic_mode:
+            log.warning("telegram.topics is on, but the bot's topic mode is off: switch on threaded mode for the bot "
+                        "in @BotFather (until then, one conversation in the plain chat)")
+        elif self.use_topics is False and self.topic_mode:
+            log.warning("telegram.topics is off, but the bot has topic mode on in @BotFather: everything is one "
+                        "conversation and Overseer makes no topics; switch topic mode off there for a plain chat")
+        self.topics = self.topic_mode and self.use_topics is not False
         return self.topics
 
     def _conversation(self, msg: Outgoing):
@@ -845,6 +855,8 @@ class Bot:
 
     def _thread(self, update: Update | None) -> int | None:
         msg = update.effective_message if update else None
+        if not getattr(self.notifier, "topics", True):  # topics off (telegram.topics): every message is the main chat's
+            return None
         return msg.message_thread_id if msg is not None and getattr(msg, "is_topic_message", False) else None
 
     def _scope(self, update: Update | None) -> str | None:
@@ -862,6 +874,14 @@ class Bot:
         thread = self._thread(update)
         gen = self.notifier.general_thread(update.effective_chat.id) if hasattr(self.notifier, "general_thread") else None
         return bool(thread) and thread == gen
+
+    def _own_topic(self, update: Update) -> bool:
+        """One of the topics Overseer made for itself (not a conversation's): general, feedback, a jobs topic."""
+        thread, chat_id = self._thread(update), update.effective_chat.id
+        fb = self.notifier.feedback_thread(chat_id) if hasattr(self.notifier, "feedback_thread") else None
+        is_jobs = (self.notifier.jobs_topic_owner(chat_id, thread)[0]
+                   if hasattr(self.notifier, "jobs_topic_owner") else False)
+        return bool(thread) and (self._is_general(update) or thread == fb or is_jobs)
 
     def _here(self, update: Update | None) -> Session | None:
         """The conversation of the place a message was sent: its thread's, a project topic's, or the main
@@ -1124,6 +1144,13 @@ class Bot:
         else:
             await self.reply(update, "\n".join(lines) or "No agent CLI is installed.")
 
+    def _topics_state(self) -> str:
+        if getattr(self.notifier, "topics", False):
+            return "on"
+        if self.cfg.telegram.topics is False:
+            return "off (telegram.topics: false)"
+        return "off (switch on threaded mode for the bot in @BotFather)"
+
     async def cmd_health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         running = len(self.agent.running_sessions())
         auto = {w.session_id for w in self.store.watches()}
@@ -1131,8 +1158,7 @@ class Bot:
         await self.reply(update, "\n".join(domain + [
             f"agent runs in progress: {running} · conversations with wake-ups pending: {len(auto)}",
             await self._versions_line(),
-            f"projects: {len(self.store.list_projects())} · topics "
-            f"{'on' if getattr(self.notifier, 'topics', False) else 'off (enable threaded mode in BotFather)'}"])
+            f"projects: {len(self.store.list_projects())} · topics {self._topics_state()}"])
             + f"\n\n{self._agents_summary(self._scope(update))}")
 
     async def _versions_line(self) -> str:
@@ -1430,19 +1456,20 @@ class Bot:
     def _projects_summary(self) -> str:
         rows = self.store.list_projects(include_archived=True)
         if not rows:
-            return ("No projects yet. /project new &lt;name&gt; &lt;folder on the HPC&gt; [what it's about] creates one "
-                    "with its own topic, conversations and jobs (or add them under projects: in config.yaml).")
+            return (f"No projects yet. /project new {self._project_new_args()} creates one with its own topic and "
+                    "conversations (or add them under projects: in the config file).")
         lines = []
         for p in rows:
             if p.archived:
-                lines.append(f"🗄 {code(p.name)} (archived) · {code(p.dir)}")
+                lines.append(f"🗄 {code(p.name)} (archived)" + (f" · {code(p.dir)}" if p.dir else ""))
                 continue
             running = [j for j in self.store.project_jobs(p.name, 50) if not j.ended_at]
             auto = [w for w in self.store.watches()
                     if (sess := self.store.get_session(w.session_id)) and sess.project == p.name]
             b = self.agent.backend_of(p.name)
             r = self.agent.runner(b, p.name)
-            bits = [f"📁 <b>{esc(p.name)}</b> · {code(p.dir)}", f"{esc(b)} {esc(r.model or 'default model')}"]
+            bits = [f"📁 <b>{esc(p.name)}</b>" + (f" · {code(p.dir)}" if p.dir else ""),
+                    f"{esc(b)} {esc(r.model or 'default model')}"]
             if running:
                 bits.append(f"{len(running)} job(s) active")
             if auto:
@@ -1458,10 +1485,14 @@ class Bot:
             if sub in ("list", "ls"):
                 await self.reply(update, self._projects_summary())
             elif sub == "new":
-                if len(args) < 3:
-                    await self.reply(update, "Usage: /project new &lt;name&gt; &lt;folder on the HPC&gt; [what it's about]")
+                needs_folder = bool(self.agent.domain.project_folder)
+                if len(args) < (3 if needs_folder else 2):
+                    await self.reply(update, f"Usage: /project new {self._project_new_args()}")
                     return
-                await self._new_project(update, args[1], args[2], " ".join(args[3:]))
+                if needs_folder:
+                    await self._new_project(update, args[1], args[2], " ".join(args[3:]))
+                else:
+                    await self._new_project(update, args[1], "", " ".join(args[2:]))
             elif sub in ("context", "dir", "notes", "archive", "restore"):
                 name = scope
                 rest = args[1:]
@@ -1472,15 +1503,21 @@ class Bot:
                     return
                 await self._project_sub(update, sub, name, " ".join(rest))
             else:
-                await self.reply(update, "Usage: /project [list] · new &lt;name&gt; &lt;dir&gt; [about] · context [text] · "
+                await self.reply(update, f"Usage: /project [list] · new {self._project_new_args()} · context [text] · "
                                          "dir &lt;path&gt; · notes · archive · restore &lt;name&gt;")
         except ProjectError as e:
             await self.reply(update, f"⛔ {esc(e)}")
+
+    def _project_new_args(self) -> str:
+        folder = self.agent.domain.project_folder
+        return f"&lt;name&gt; &lt;{esc(folder)}&gt; [what it's about]" if folder else "&lt;name&gt; [what it's about]"
 
     async def _new_project(self, update: Update, name: str, folder: str, context: str) -> None:
         thread = self._thread(update)
         if thread and self._scope(update):
             raise ProjectError(f"this topic already belongs to project {self._scope(update)}")
+        if thread and self._own_topic(update):  # "general", "🛠 feedback", a jobs topic: the project gets its own
+            thread = None
         existing = self.store.get_project(name.strip().lower())
         p = self.projects.create(name, folder, context, "telegram")
         chat_id = update.effective_chat.id if update else None
@@ -1489,14 +1526,15 @@ class Bot:
             self.store.upsert_project(p)
         if hasattr(self.notifier, "ensure_topic"):
             await self.notifier.ensure_topic(p.name)
-            if hasattr(self.notifier, "ensure_jobs_topics"):
-                await self.notifier.ensure_jobs_topics([p.name])
+        await self.agent.domain.project_created(self.notifier, p.name)  # e.g. the HPC's jobs topic for it
         verb = "restored" if existing else "created"
         settings = self._agents_summary(p.name)
         where = "this topic" if thread else ("its topic" if self.store.get_project(p.name).thread_map else "the main chat")
-        await self.reply(update, f"📁 Project {code(p.name)} {verb}: {code(p.dir)}. Messages in {where} go to its agent; "
-                                 f"jobs running under that folder are reported there.\nAgent (copied from the main "
-                                 f"chat; change it in the project with /backend, /model, /effort):\n{settings}")
+        note = self.agent.domain.project_folder_note
+        await self.reply(update, f"📁 Project {code(p.name)} {verb}" + (f": {code(p.dir)}" if p.dir else "")
+                         + f". Messages in {where} go to its agent." + (f" {esc(note)}" if note and p.dir else "")
+                         + "\nAgent (copied from the main chat; change it in the project with /backend, /model, "
+                         f"/effort):\n{settings}")
 
     async def _project_sub(self, update: Update, sub: str, name: str, rest: str) -> None:
         p = self.store.get_project(name)
@@ -1512,7 +1550,8 @@ class Bot:
                                          "/project context &lt;text&gt;.")
         elif sub == "dir":
             if not rest:
-                await self.reply(update, f"{code(name)} lives in {code(p.dir)}.")
+                await self.reply(update, f"{code(name)} lives in {code(p.dir)}." if p.dir else
+                                 f"{code(name)} has no folder yet: /project dir {esc(name)} &lt;folder&gt; sets one.")
                 return
             p = self.projects.update(name, dir=rest)
             await self.reply(update, f"{code(name)} now lives in {code(p.dir)}.")
