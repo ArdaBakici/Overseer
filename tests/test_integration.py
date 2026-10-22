@@ -3714,3 +3714,29 @@ async def test_a_new_hpc_project_gets_its_jobs_topic(env):
     make_projects(env).create("dreamer", "/scratch/me/rf-dreamer")
     await env.agent.domain.project_created(notifier, "dreamer")
     assert [name for _, name, _ in tg.created] == ["📊 jobs", "📊 dreamer · jobs"]
+
+
+async def test_telegram_network_trouble_is_one_quiet_line(env, caplog):
+    """A 502 from Telegram while polling (it retries by itself) is logged as one line, not a traceback each time;
+    other errors keep their traceback."""
+    import logging
+    from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
+    from overseer.core.bot import Bot
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent, notifier=env.notifier, projects=make_projects(env))
+    caplog.set_level(logging.WARNING, logger="overseer")
+    for err in (NetworkError("Bad Gateway"), TimedOut(), NetworkError("Bad Gateway")):
+        await bot.on_error(None, NS(error=err))
+    lines = [r for r in caplog.records if "unreachable" in r.getMessage()]
+    assert len(lines) == 1 and "Bad Gateway" in lines[0].getMessage() and not lines[0].exc_info
+    bot._net_errors = (0.0, 2)  # five minutes later: one more line, saying how many were quiet
+    await bot.on_error(None, NS(error=NetworkError("Bad Gateway")))
+    assert "and 2 more" in caplog.records[-1].getMessage()
+    await bot.on_error(None, NS(error=Conflict("terminated by other getUpdates request")))
+    assert "same token" in caplog.records[-1].getMessage()
+    try:
+        raise RuntimeError("boom")
+    except RuntimeError as e:
+        await bot.on_error(NS(), NS(error=e))
+    assert caplog.records[-1].exc_info and caplog.records[-1].levelname == "ERROR"
+    await bot.on_error(NS(), NS(error=BadRequest("Message is too long")))  # (not network trouble: a real error)
+    assert caplog.records[-1].levelname == "ERROR"

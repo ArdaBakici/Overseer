@@ -19,7 +19,7 @@ from pathlib import Path
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Message, ReplyParameters,
                       Update)
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, EndPointNotFound
+from telegram.error import BadRequest, Conflict, EndPointNotFound, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -62,6 +62,9 @@ HELP = """<b>Overseer</b>
 /project — projects (each gets its own topic)
 
 Send pictures and files too (up to 20 MB): with a caption, or followed by a message about them."""
+
+
+NET_ERROR_LOG_SECONDS = 300
 
 
 def _preview(rec: dict, limit: int = 120) -> str:
@@ -854,6 +857,7 @@ class Bot:
         self.agent = agent
         self.notifier = notifier
         self._tasks: set[asyncio.Task] = set()
+        self._net_errors = (0.0, 0)  # (when the last one was logged, how many since)
         self._pending: dict[tuple[int, int | None], str] = {}  # new thread -> its first message, until a project is picked
         self._pending_files: dict[tuple[int, int | None], list[tuple[str, Path]]] = {}  # ...and the files sent with it
         self._uploads: dict[tuple[int, int | None], dict] = {}  # files received, not yet given to the agent
@@ -865,7 +869,28 @@ class Bot:
         self.help = getattr(self.ext, "help", None) or HELP
         self.errors = tuple(getattr(self.ext, "errors", ()))
 
+    async def on_error(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Errors from polling and the handlers. Telegram's passing network trouble (a 502, a timeout: polling
+        retries by itself) is one line every NET_ERROR_LOG_SECONDS at most; anything else with its traceback."""
+        err = ctx.error
+        if isinstance(err, NetworkError) and not isinstance(err, BadRequest):
+            last, count = self._net_errors
+            if time.time() - last >= NET_ERROR_LOG_SECONDS:
+                more = f" (and {count} more since the last notice)" if count else ""
+                log.warning("Telegram unreachable for now: %s%s - retrying", err, more)
+                self._net_errors = (time.time(), 0)
+            else:
+                self._net_errors = (last, count + 1)
+            return
+        if isinstance(err, Conflict):
+            log.error("Telegram: %s - another process is polling with this bot's token (a second copy of this bot, "
+                      "or another bot's config using the same token)", err)
+            return
+        log.error("error while handling %s", type(update).__name__ if update is not None else "polling",
+                  exc_info=(type(err), err, err.__traceback__) if err else None)
+
     def register(self) -> None:
+        self.app.add_error_handler(self.on_error)
         allowed = filters.Chat(chat_id=self.cfg.telegram.allowed_chat_ids)
         add = self.app.add_handler
         add(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
