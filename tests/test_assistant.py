@@ -19,6 +19,7 @@ from overseer.assistant.when import parse_day, parse_moment
 from overseer.core.agent import Agent
 from overseer.core.config import Config, ConfigError
 from overseer.core.ctl import ControlServer
+from overseer.core.notify import Outgoing
 from overseer.core.projects import Projects
 from overseer.core.runners import ClaudeCodeRunner, CodexRunner
 from overseer.core.store import Store
@@ -825,3 +826,220 @@ async def test_answers_go_into_the_daily_note_and_buttons_work(aenv, monkeypatch
     await rem.fire_due()
     await rem.act(x["id"], "skip")
     assert not daily.exists() and rem.log()[-1]["text"] == "Stretch"
+
+
+# ---------------------------------------------------------------------------- media, time zone, reactions, notes
+GIF = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"
+PUBLIC = "93.184.216.34"
+
+
+def fake_web(routes: dict):
+    """An httpx transport answering by host+path (the request goes to the pinned address: Host says which)."""
+    import httpx
+    seen = []
+
+    def handler(request):
+        host = request.headers["host"].split(":")[0]
+        seen.append((str(request.url), host, request.extensions.get("sni_hostname")))
+        status, headers, body = routes.get(host + request.url.path, (404, {}, b""))
+        return httpx.Response(status, headers=headers, content=body)
+    return httpx.MockTransport(handler), seen
+
+
+def resolver(table):
+    import socket
+
+    def resolve(host, port, type=None):
+        import ipaddress
+        try:
+            literal = str(ipaddress.ip_address(host))  # (an address as the host: itself, like the real resolver)
+        except ValueError:
+            literal = None
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (literal or table.get(host, PUBLIC), port))]
+    return resolve
+
+
+async def test_fetching_media_is_kept_to_the_public_internet(tmp_path):
+    from overseer.assistant import media
+    transport, seen = fake_web({
+        "pics.example/cat.gif": (200, {"content-type": "image/gif"}, GIF),
+        "pics.example/page": (200, {"content-type": "text/html"}, b"<html>hi</html>"),
+        "pics.example/huge.png": (200, {}, b"\x89PNG\r\n\x1a\n" + b"0" * 3000),
+        "pics.example/to-lan": (302, {"location": "http://router.lan/admin.png"}, b""),
+        "pics.example/hop": (301, {"location": "/cat.gif"}, b""),
+    })
+    resolve = resolver({"router.lan": "192.168.1.1", "tailnet.example": "100.101.102.103", "me.example": "127.0.0.1",
+                        "v6.example": "::1"})
+    fetch = lambda url, **kw: media.fetch(url, tmp_path, 2000, transport=transport, resolve=resolve, **kw)  # noqa: E731
+    f = await fetch("https://pics.example/cat.gif")
+    assert (f.kind, f.size, f.path.name) == ("gif", len(GIF), "cat.gif") and f.path.read_bytes() == GIF
+    url, host, sni = seen[-1]
+    assert url.startswith(f"https://{PUBLIC}/") and host == "pics.example" and sni == "pics.example"
+    f = await fetch("https://pics.example/hop", name="Funny cat!")
+    assert f.path.name == "Funny-cat.gif" and f.url.endswith("/cat.gif")  # redirects are followed (and checked)
+    for url, why in [("https://pics.example/page", "isn't a picture"), ("https://pics.example/huge.png", "limit"),
+                     ("https://pics.example/to-lan", "private address"),
+                     ("http://tailnet.example/x.gif", "private address"), ("http://me.example/x", "private"),
+                     ("http://v6.example/x", "private"), ("ftp://pics.example/x", "only http"),
+                     ("https://user:pw@pics.example/cat.gif", "passwords")]:
+        with pytest.raises(media.FetchError, match=why):
+            await fetch(url)
+    assert media.sniff(b"\x00\x00\x00\x18ftypmp42") == "mp4" and media.sniff(b"RIFF\x00\x00\x00\x00WEBPVP8") == "webp"
+
+
+async def test_ov_fetch_and_gif_send_playable_media(aenv, monkeypatch):
+    from overseer.assistant import media
+    from overseer.core.agent import collect_outbox
+    transport, _ = fake_web({"pics.example/cat.gif": (200, {}, GIF),
+                             "media.giphy.com/media/abc/giphy.gif": (200, {}, GIF)})
+    real = media.fetch
+    monkeypatch.setattr(media, "fetch", lambda url, folder, max_bytes, name="": real(
+        url, folder, max_bytes, name, transport=transport, resolve=resolver({})))
+    await aenv.ctl.start()
+    try:
+        s = aenv.agent.general_session()
+        token = aenv.ctl.open(s.id)
+        ok, text = await aenv.ctl.handle(token, ["fetch", "https://pics.example/cat.gif"])
+        assert text.startswith("✓ cat.gif (gif") and "./outbox/" in text, text
+        notice = aenv.notifier.sent[-1]
+        assert notice.topic == "web" and notice.silent and "cat.gif" in notice.text and "pics.example" in notice.text
+        outbox = aenv.agent.session_runner(s).workdir(s.id) / "outbox"
+        photos, docs, notes, played = collect_outbox(outbox)
+        assert played == [("animation", "cat.gif", GIF)] and not photos and not docs
+        ok, text = await aenv.ctl.handle(token, ["fetch", "http://127.0.0.1:8765/api/x"])
+        assert "private address" in text
+        # GIF search: off until a Giphy key is configured.
+        ok, text = await aenv.ctl.handle(token, ["gif", "happy", "dance"])
+        assert "GIF search is off" in text
+        aenv.cfg.media.giphy_key_env = "GIPHY_TEST_KEY"
+        monkeypatch.setenv("GIPHY_TEST_KEY", "k")
+
+        async def search(query, key, rating="pg-13", limit=8, transport=None):
+            assert (query, key, rating) == ("happy dance", "k", "pg-13")
+            return [{"title": "Happy Dance", "url": "https://media.giphy.com/media/abc/giphy.gif", "page": ""},
+                    {"title": "Other", "url": "https://media.giphy.com/media/def/giphy.gif", "page": ""}]
+        monkeypatch.setattr(media, "giphy_search", search)
+        ok, text = await aenv.ctl.handle(token, ["gif", "happy", "dance"])
+        assert "happy-dance.gif" in text and "Happy Dance" in text and "2. Other" in text, text
+        assert "GIF for “happy dance”" in aenv.notifier.sent[-1].text
+        aenv.cfg.media.fetch = False
+        ok, text = await aenv.ctl.handle(token, ["fetch", "https://pics.example/cat.gif"])
+        assert "is off" in text
+        ok, text = await aenv.ctl.handle(token, ["capabilities"])
+        assert "OFF (media.fetch)" in text and "on (Giphy)" in text and ".gif" in text and "stickers" in text
+    finally:
+        await aenv.ctl.stop()
+
+
+async def test_gifs_and_videos_play_in_telegram_and_the_web_topic(aenv):
+    from types import SimpleNamespace as NS
+    from overseer.core.bot import TelegramNotifier
+    from test_integration import FakeTelegram
+    tg = FakeTelegram()
+    played = []
+
+    async def send_animation(chat_id, animation=None, message_thread_id=None, **kw):
+        played.append(("animation", animation.filename, message_thread_id))
+        return NS(message_id=99)
+
+    async def send_video(chat_id, video=None, message_thread_id=None, **kw):
+        played.append(("video", video.filename, kw.get("supports_streaming")))
+        return NS(message_id=98)
+    tg.send_animation, tg.send_video = send_animation, send_video
+    n = TelegramNotifier(NS(bot=tg), [1], aenv.store)
+    await n.detect_topics()
+    await n.send(Outgoing("🤖 here", media=[("animation", "cat.gif", GIF), ("video", "clip.mp4", b"x")]))
+    assert tg.sent[-1][2] == "🤖 here" and played == [("animation", "cat.gif", None), ("video", "clip.mp4", True)]
+    await n.send(Outgoing("🌐 Fetched cat.gif", topic="web", silent=True))
+    await n.send(Outgoing("🌐 Fetched dog.gif", topic="web", silent=True))
+    web = n.side_thread(1, "web")
+    assert [name for _, name, _ in tg.created] == ["🌐 web"] and tg.sent[-1] == (1, web, "🌐 Fetched dog.gif")
+    plain = TelegramNotifier(NS(bot=FakeTelegram(topics=False)), [1], aenv.store)
+    await plain.detect_topics()
+    await plain.send(Outgoing("🌐 Fetched cat.gif", topic="web"))
+    assert plain.app.bot.sent[-1] == (1, None, "🌐 Fetched cat.gif")
+
+
+def test_the_time_zone_is_the_users(tmp_path, monkeypatch):
+    from overseer.assistant.reminders import exact_text
+    from overseer.core.config import apply_timezone
+    cfg = assistant_cfg(tmp_path)
+    cfg.local.timezone = "Asia/Dubaii"
+    with pytest.raises(ConfigError, match="Asia/Dubai"):
+        cfg.validate()
+    monkeypatch.setenv("TZ", "Europe/Istanbul")  # (the homelab's)
+    time.tzset()
+    try:
+        apply_timezone("Asia/Dubai")
+        assert os.environ["TZ"] == "Asia/Dubai" and time.strftime("%z") == "+0400"
+        ts = datetime(2026, 10, 22, 10, 0).timestamp()
+        assert exact_text(ts).startswith("Thu 2026-10-22 10:00 (+04:00, ")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+async def test_ov_react_to_the_last_message(aenv, monkeypatch):
+    from types import SimpleNamespace as NS
+    from overseer.core.bot import Bot
+    reactions = []
+
+    async def react(chat_id, message_id, emoji):
+        reactions.append((chat_id, message_id, emoji))
+    aenv.notifier.react = react
+    bot = Bot(aenv.cfg, app=None, store=aenv.store, agent=aenv.agent, notifier=aenv.notifier,
+              projects=Projects(aenv.cfg, aenv.store, aenv.agent))
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        pass
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+    await aenv.ctl.start()
+    try:
+        s = aenv.agent.general_session()
+        token = aenv.ctl.open(s.id)
+        ok, text = await aenv.ctl.handle(token, ["react", "👍"])
+        assert "no message of theirs" in text
+        msg = NS(text="I did it!", message_id=4242, reply_to_message=None, message_thread_id=None,
+                 is_topic_message=False)
+        await bot.on_text(NS(effective_message=msg, effective_chat=NS(id=1)), None)
+        ok, text = await aenv.ctl.handle(token, ["react", "🎉"])
+        assert text == "✓ reacted 🎉" and reactions == [(1, 4242, "🎉")]
+        ok, text = await aenv.ctl.handle(token, ["react", "❤️"])  # (with the variation selector)
+        assert reactions[-1][2] == "❤"
+        ok, text = await aenv.ctl.handle(token, ["react", "🦖"])
+        assert "only these" in text and len(reactions) == 2
+    finally:
+        await aenv.ctl.stop()
+
+
+def test_notes_flagged_to_always_load(aenv):
+    v = aenv.vault
+    (v.root / "Assistant/Writing style.md").write_text("---\nassistant: always\n---\n# Writing style\nShort sentences.\n")
+    (v.root / "People.md").write_text("---\nassistant: index\ndescription: who's who\n---\nJane - colleague\n")
+    (v.root / "Big.md").write_text("---\nassistant: [always]\n---\n" + "x" * 30_000)
+    (v.root / "Big2.md").write_text("---\nassistant: always\n---\n" + "y" * 30_000)
+    (v.root / "Plain.md").write_text("---\ntags: [a]\n---\nnothing\n")
+    (v.root / "Broken.md").write_text("---\nassistant: [unclosed\n---\n")
+    prompt = aenv.agent.system_prompt(aenv.agent.general_session().id)
+    assert "## Notes you always keep in mind" in prompt and "Short sentences." in prompt
+    assert "- People.md: who's who" in prompt and "Jane - colleague" not in prompt
+    assert "x" * 12_000 in prompt and "x" * 12_001 not in prompt and "[... cut here" in prompt  # (too long: cut)
+    assert "- Big2.md: (flagged always, left out" in prompt and "y" * 100 not in prompt  # (over the budget)
+    assert "Plain.md" not in prompt and "assistant: always" in prompt  # (and it's told how to flag one)
+    assert [r for r, _, _ in v.flagged()] == ["Assistant/Writing style.md", "Big.md", "Big2.md", "People.md"]
+
+
+def test_ov_history_day(aenv):
+    from overseer.core.live import Transcript
+    from overseer.core.search import Search, render_day
+    a = aenv.agent.general_session()
+    b = aenv.agent.new_conversation()
+    today = datetime.combine(date.today(), datetime.min.time()).timestamp()
+    for sid, ts, text, reply in [(a.id, today - 3600, "yesterday's", "old"), (a.id, today + 3600, "plan my day",
+                                 "Top 3: ..."), (b.id, today + 7200, "remind me", "Done")]:
+        t = Transcript(aenv.cfg, sid)
+        t.write({"kind": "turn", "text": text, "ts": ts})
+        t.write({"kind": "end", "status": "done", "text": reply, "ts": ts + 5})
+    out = render_day(Search(aenv.cfg, aenv.store, aenv.domain).day(today, today + 86400))
+    assert "plan my day" in out and "Top 3" in out and "remind me" in out and "yesterday's" not in out
+    assert out.index("plan my day") < out.index("remind me")

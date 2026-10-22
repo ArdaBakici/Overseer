@@ -35,10 +35,12 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+  ov react <emoji>                 react to the researcher's last message (👍 👀 🎉 ...) instead of a message
   ov history search <text> [--project p|main] [--kind conversation|result|finding|job] [--since 30d] [--limit N]
                                    search past work: every conversation's requests, replies and commands, the
                                    results, findings and jobs. "quoted phrase", OR, the last word as a prefix
   ov history show <conversation> [--last 5] [--grep text]   read a past conversation's turns
+  ov history day [today|yesterday|YYYY-MM-DD]   every conversation of a day, condensed
   ov cluster [-p <partition>] [--fresh]   what's free now per partition (GPUs, CPUs, RAM, time limits), SLURM's
                                    estimated start of your queued jobs, and your fairshare. Check it before
                                    choosing a partition and a job size.

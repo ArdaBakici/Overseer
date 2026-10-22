@@ -25,7 +25,20 @@ class VaultConfig:
     history: bool = True  # keep a history of the vault's changes (git, in the state folder) and offer Undo
 
 
-SECTIONS = {"vault": VaultConfig}
+@dataclass
+class MediaConfig:
+    """Pictures, GIFs and videos from the internet for the assistant's replies (its shell has no internet: Overseer
+    downloads them, from public addresses only, checking what the file is)."""
+
+    fetch: bool = True  # `ov fetch <url>`: download a picture, GIF or video into the reply
+    max_mb: int = 20  # the largest file it fetches
+    # `ov gif <query>`: Giphy's search. The name of the variable holding your Giphy API key in .env (e.g.
+    # GIPHY_API_KEY); "" = off.
+    giphy_key_env: str = ""
+    giphy_rating: str = "pg-13"  # g | pg | pg-13 | r
+
+
+SECTIONS = {"vault": VaultConfig, "media": MediaConfig}
 
 
 def _vault_dir(cfg) -> Path:
@@ -56,6 +69,10 @@ def validate(cfg) -> None:
                           "bot's)")
     if cfg.local._resolve(cfg.local.tmp_dir) == Path("/tmp/overseer").resolve():
         raise ConfigError("local.tmp_dir: give the assistant its own, e.g. /tmp/overseer-assistant")
+    if not 1 <= cfg.media.max_mb <= 50:
+        raise ConfigError("media.max_mb: 1 to 50 (Telegram's limit for files bots send)")
+    if cfg.media.giphy_rating not in ("g", "pg", "pg-13", "r"):
+        raise ConfigError("media.giphy_rating: g, pg, pg-13 or r")
     if cfg.telegram.token_env == "TELEGRAM_BOT_TOKEN":
         raise ConfigError("telegram.token_env: the assistant is its own bot - name its token, e.g. "
                           "ASSISTANT_BOT_TOKEN (in the .env file)")

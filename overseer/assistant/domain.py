@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 SKILL = Path(__file__).parent / "skills" / "assistant" / "SKILL.md"  # how to use ov, for the agent
 NAME_RE = re.compile(r"^\s*[-*]?\s*\**name\**\s*:\s*\**(.+?)\**\s*$", re.I | re.M)
 PROTECTED = (".obsidian", ".stfolder", ".stversions", ".stignore")  # Obsidian's settings, Syncthing's markers
+ALWAYS_BUDGET = 24_000  # characters of `assistant: always` notes in the instructions, all together
+ALWAYS_NOTE_MAX = 12_000  # ... and of one of them
 
 
 def skills() -> dict[str, str]:
@@ -100,6 +102,16 @@ class AssistantDomain(Domain):
                 "on (git)" if self.vault.history else "git not found" if self.cfg.vault.history else "off")]
         if not (root / ".obsidian").is_dir():
             out.append(("obsidian", True, "no .obsidian folder: is this the vault's top folder?"))
+        from .media import local_tools
+        tools = await asyncio.to_thread(local_tools)
+        missing = [n for n, ok in tools.items() if not ok]
+        have = ", ".join(n for n, ok in tools.items() if ok) or "none"
+        out.append(("image tools", True, have + (f" (not installed: {', '.join(missing)} - e.g. sudo apt install "
+                                                 "python3-pil ffmpeg imagemagick)" if missing else "")))
+        m = self.cfg.media
+        out.append(("media", True, f"ov fetch {'on' if m.fetch else 'off'} (up to {m.max_mb} MB) · ov gif "
+                    + ("on" if m.giphy_key_env and os.environ.get(m.giphy_key_env) else
+                       f"off ({m.giphy_key_env} not set)" if m.giphy_key_env else "off")))
         return out
 
     # ------------------------------------------------------------------ the sandbox
@@ -152,9 +164,42 @@ class AssistantDomain(Domain):
             routines_path=self.scheduler.rel, routines_state=self.scheduler.state_line(),
             domains=f" (except {', '.join(domains)})" if domains else "",
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
+        prompt += self._flagged_section()
         if self.agent and self.agent.ctl:
             prompt += P.OV_SECTION
         return prompt + self._project_section(s)
+
+    def _flagged_section(self) -> str:
+        """Notes flagged `assistant: always` (their text, within a budget) and `assistant: index` (name and
+        description), besides the persona and "about me"."""
+        skip = {self._rel("Persona.md"), self._rel("About me.md")}
+        always, index, left_out = [], [], []
+        budget = ALWAYS_BUDGET
+        for rel, mode, desc in self.vault.flagged():
+            if rel in skip:
+                continue
+            if mode == "always":
+                text = self.vault.read_note(rel, ALWAYS_NOTE_MAX + 4001)
+                if text.startswith("---") and (end := text.find("\n---", 3)) > 0:  # (its frontmatter: not needed)
+                    text = text[end + 4:]
+                text = text.strip()
+                if len(text) > ALWAYS_NOTE_MAX:  # (too long to keep in mind whole: its beginning, and say so)
+                    text = text[:ALWAYS_NOTE_MAX] + "\n[... cut here: the note goes on - read it for the rest, and keep it shorter]"
+                if len(text) > budget:
+                    left_out.append(rel)
+                    continue
+                budget -= len(text)
+                always.append(f"<note path='{rel}'>\n{text}\n</note>")
+            else:
+                index.append(f"- {rel}" + (f": {desc}" if desc else ""))
+        if left_out:
+            index += [f"- {rel}: (flagged always, left out: over the budget - read it when it matters)" for rel in left_out]
+        out = ""
+        if always:
+            out += "\n\n## Notes you always keep in mind\n" + "\n".join(always)
+        if index:
+            out += "\n\n## Notes to read when they matter\n" + "\n".join(index)
+        return out
 
     def wake_instructions(self, s: Session) -> str:
         return P.WAKE_INSTRUCTIONS

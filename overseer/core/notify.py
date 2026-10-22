@@ -17,6 +17,8 @@ class Outgoing:
     buttons: list[list[tuple[str, str]]] = field(default_factory=list)  # rows of (label, callback_data)
     files: list[tuple[str, bytes]] = field(default_factory=list)  # (filename, content)
     photos: list[tuple[str, bytes]] = field(default_factory=list)  # images, sent as pictures (an album if several)
+    # GIFs and videos, sent after the message as playable ones: (animation | video, filename, content)
+    media: list[tuple[str, str, bytes]] = field(default_factory=list)
     silent: bool = False
     project: str | None = None  # the project topic to post in; by default the conversation's or job's
     # Telegram Rich Markdown version of the message, used when rich messages are available
@@ -24,7 +26,16 @@ class Outgoing:
     markdown: str | None = None
     jobs: bool = False  # job news: goes to the jobs topic of the job's project (or the general jobs topic)
     reply_to: dict[str, int] = field(default_factory=dict)  # chat id -> message to reply to (e.g. the job's card)
-    topic: str | None = None  # "feedback": the 🛠 feedback topic (agents' feedback about Overseer)
+    # "feedback": the 🛠 feedback topic (agents' feedback about Overseer); a side topic's name (SIDE_TOPICS, e.g.
+    # "web": what the agent fetched from the internet) - made when first needed
+    topic: str | None = None
+
+
+# Side topics: small notices that shouldn't land in the conversation. name -> (title, intro)
+SIDE_TOPICS = {
+    "web": ("🌐 web", "🌐 <b>web</b> - what the agent downloaded from the internet (ov fetch, ov gif): one short line "
+                     "each, so you can see it. Writing here talks to the main conversation."),
+}
 
 
 class Notifier(Protocol):

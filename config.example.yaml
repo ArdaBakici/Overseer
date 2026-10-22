@@ -15,6 +15,7 @@ local:
   state_dir: ./state        # DB, audit log, SSH key/config, the CLIs' logins and sessions
   tmp_dir: /tmp/overseer    # SSH connection socket + the agent's scratch directories (keep the path short)
   env_file: .env            # secrets (TELEGRAM_BOT_TOKEN, API keys); the agent can't read it
+  timezone: ""              # e.g. Europe/Istanbul; "" = this machine's time zone
 
 ssh:
   # Overseer uses its OWN key, ssh config and known_hosts in ./state/ssh - never ~/.ssh.

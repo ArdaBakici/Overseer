@@ -34,7 +34,7 @@ from .agent import Agent, Session
 from .projects import ProjectError, Projects
 from .richtext import RICH_LIMIT, strip_html
 from .config import BACKENDS, Config
-from .notify import TG_LIMIT, Outgoing, code, esc, pre, split_message
+from .notify import SIDE_TOPICS, TG_LIMIT, Outgoing, code, esc, pre, split_message
 from .store import ProjectRecord, Store
 from .subagents import ENDED
 from .usage import usage_report
@@ -132,6 +132,8 @@ class TelegramNotifier:
             return None, (f"📁 <b>{esc(proj.name)}</b> · " if proj else ""), False
         if msg.topic == "feedback":
             return (self.feedback_thread(chat_id) if self.topics else None), ("" if self.topics else "🛠 "), False
+        if msg.topic in SIDE_TOPICS:
+            return (self.side_thread(chat_id, msg.topic) if self.topics else None), "", False
         if self.topics and not msg.project:
             sess, _ = self._conversation(msg)
             thread = self.store.session_thread(sess.id, chat_id) if sess else None
@@ -556,6 +558,35 @@ class TelegramNotifier:
         return topic.message_thread_id
 
     # ------------------------------------------------------------------ the 🛠 feedback topic (feedback.py)
+    async def react(self, chat_id: int, message_id: int, emoji: str) -> None:
+        """A reaction on a message (`ov react`). Raises if Telegram refuses."""
+        await self.app.bot.set_message_reaction(chat_id, message_id, reaction=emoji)
+
+    # ------------------------------------------------------------------ side topics (e.g. 🌐 web)
+    def side_thread(self, chat_id: int, name: str) -> int | None:
+        v = self.store.get(f"side_topic:{name}:{chat_id}")
+        return int(v) if v else None
+
+    def side_topic_owner(self, chat_id: int, thread: int | None) -> str | None:
+        return next((n for n in SIDE_TOPICS if thread and self.side_thread(chat_id, n) == thread), None)
+
+    async def _side_topic_for(self, msg: Outgoing, chat_id: int) -> None:
+        """A side topic is made the first time something is posted to it."""
+        if not (self.topics and msg.topic in SIDE_TOPICS) or self.side_thread(chat_id, msg.topic):
+            return
+        title, intro = SIDE_TOPICS[msg.topic]
+        try:
+            topic = await self.app.bot.create_forum_topic(chat_id, name=title)
+        except Exception:
+            log.warning("could not create the %s topic", title, exc_info=True)
+            return
+        self.store.set(f"side_topic:{msg.topic}:{chat_id}", str(topic.message_thread_id))
+        try:
+            await self.app.bot.send_message(chat_id, intro, parse_mode=ParseMode.HTML,
+                                            message_thread_id=topic.message_thread_id, disable_notification=True)
+        except Exception:
+            log.debug("side topic intro failed", exc_info=True)
+
     def feedback_thread(self, chat_id: int) -> int | None:
         v = self.store.get(f"feedback_topic:{chat_id}")
         return int(v) if v else None
@@ -596,6 +627,7 @@ class TelegramNotifier:
         proj = self.project_of(msg)
         for chat_id in self.chat_ids:
             await self._jobs_topic_for(msg, chat_id)
+            await self._side_topic_for(msg, chat_id)
             thread, label, own = self._target(msg, chat_id)
             try:
                 await self._deliver_any(chat_id, thread, label, msg)
@@ -632,7 +664,26 @@ class TelegramNotifier:
                 await self._deliver_any(chat_id, None, f"📁 <b>{esc(proj.name)}</b> · " if proj else "", msg)
 
     async def _deliver_any(self, chat_id: int, thread: int | None, label: str, msg: Outgoing) -> None:
-        """A rich message when there is one and Telegram takes it, else the regular formatted message."""
+        """A rich message when there is one and Telegram takes it, else the regular formatted message. Then its
+        GIFs and videos."""
+        await self._deliver_message(chat_id, thread, label, msg)
+        for kind, name, data in msg.media:  # (the message is out: a failure here mustn't send it again)
+            try:
+                try:
+                    send = self.app.bot.send_animation if kind == "animation" else self.app.bot.send_video
+                    kw = {"animation" if kind == "animation" else "video": InputFile(data, filename=name)}
+                    if kind == "video":
+                        kw["supports_streaming"] = True
+                    sent = await send(chat_id, message_thread_id=thread, disable_notification=True, **kw)
+                except BadRequest as e:  # (e.g. a format Telegram won't play): as a file instead
+                    log.info("%s %s rejected (%s); sending it as a file", kind, name, e)
+                    sent = await self.app.bot.send_document(chat_id, document=data, filename=name,
+                                                            disable_notification=True, message_thread_id=thread)
+                self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+            except Exception:
+                log.warning("could not send %s", name, exc_info=True)
+
+    async def _deliver_message(self, chat_id: int, thread: int | None, label: str, msg: Outgoing) -> None:
         if msg.markdown and self.rich:
             try:
                 await self._deliver_rich(chat_id, thread, label + msg.markdown, msg)
@@ -881,7 +932,8 @@ class Bot:
         fb = self.notifier.feedback_thread(chat_id) if hasattr(self.notifier, "feedback_thread") else None
         is_jobs = (self.notifier.jobs_topic_owner(chat_id, thread)[0]
                    if hasattr(self.notifier, "jobs_topic_owner") else False)
-        return bool(thread) and (self._is_general(update) or thread == fb or is_jobs)
+        side = self.notifier.side_topic_owner(chat_id, thread) if hasattr(self.notifier, "side_topic_owner") else None
+        return bool(thread) and (self._is_general(update) or thread == fb or is_jobs or bool(side))
 
     def _here(self, update: Update | None) -> Session | None:
         """The conversation of the place a message was sent: its thread's, a project topic's, or the main
@@ -900,6 +952,8 @@ class Bot:
                             if hasattr(self.notifier, "jobs_topic_owner") else (False, None))
         if is_jobs:  # a jobs topic: its project's conversation
             return self.agent.general_session(project=project)
+        if hasattr(self.notifier, "side_topic_owner") and self.notifier.side_topic_owner(chat_id, thread):
+            return self.agent.general_session()  # a side topic (🌐 web): the main conversation
         return self.agent.get(self.store.thread_session(chat_id, thread))
 
     def _outside_topics(self, update: Update) -> bool:
@@ -1199,6 +1253,9 @@ class Bot:
         if session is None:  # a thread the user just started
             await self._new_thread(update, text, files)
             return
+        msg = update.effective_message
+        if msg is not None and isinstance(getattr(msg, "message_id", None), int):  # what `ov react` reacts to
+            self.store.set(f"last_user_message:{session.id}", json.dumps([update.effective_chat.id, msg.message_id]))
         proj = self.store.get_project(session.project)
         if proj and proj.archived:
             for _, path in files:

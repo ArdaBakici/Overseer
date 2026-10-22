@@ -44,6 +44,13 @@ def when_text(ts: float) -> str:
     return f"{day} {d:%H:%M}"
 
 
+def exact_text(ts: float) -> str:
+    """The exact moment, so a misunderstanding shows: "Thu 2026-10-22 10:00 (+04:00, tomorrow)"."""
+    d = datetime.fromtimestamp(ts).astimezone()
+    off = d.strftime("%z")
+    return f"{d:%a %Y-%m-%d %H:%M} ({off[:3]}:{off[3:]}, {when_text(ts).rsplit(' ', 1)[0]})"
+
+
 def _minutes(seconds: float) -> int:
     return max(0, int((seconds + 59) // 60))
 

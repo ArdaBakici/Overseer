@@ -48,6 +48,9 @@ class LocalConfig:
     # Secrets file (TELEGRAM_BOT_TOKEN=..., API keys) loaded at startup. Variables already set in
     # the real environment win. The agent can never read this file.
     env_file: str = ".env"
+    # The time zone this bot thinks in - its times, reminders, routines, digest - and the agent's `date`, if not this
+    # machine's: e.g. Asia/Dubai. "" = this machine's.
+    timezone: str = ""
     # Set by load_config to the config file's folder; relative paths resolve against it.
     base_dir: str = ""
 
@@ -338,6 +341,12 @@ class Config:
         for r in self.local.roots:
             if r == Path("/") or r == Path.home():
                 raise ConfigError(f"local.allowed_roots entry {r} is too broad; use specific folders")
+        if self.local.timezone:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+            try:
+                ZoneInfo(self.local.timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ConfigError(f"local.timezone {self.local.timezone!r}: a time zone name like Asia/Dubai") from None
         self.local.state("x")  # both dirs must sit inside an allowed root
         self.local.tmp("x")
         if len(str(self.ctl_socket)) > UNIX_SOCKET_MAX:
@@ -450,6 +459,15 @@ def load_env_file(path: Path) -> list[str]:
     return loaded
 
 
+def apply_timezone(name: str) -> None:
+    """This process (and the agents it starts: TZ is passed on) thinks in this time zone."""
+    if not name:
+        return
+    os.environ["TZ"] = name
+    import time
+    time.tzset()
+
+
 def load_config(path: str | os.PathLike) -> Config:
     with open(path) as fh:
         raw = yaml.safe_load(fh) or {}
@@ -457,4 +475,5 @@ def load_config(path: str | os.PathLike) -> Config:
     cfg.local.base_dir = str(Path(path).resolve().parent)
     cfg.validate()
     load_env_file(cfg.local.env_path)
+    apply_timezone(cfg.local.timezone)
     return cfg

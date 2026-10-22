@@ -71,6 +71,31 @@ def moment_to_strftime(fmt: str) -> str:
     return out
 
 
+def _frontmatter_flag(p: Path) -> tuple[str, str] | None:
+    """(always | index, description) from a note's YAML frontmatter, if it has the `assistant:` flag."""
+    try:
+        with open(p, errors="replace") as fh:
+            head = fh.read(4000)
+    except OSError:
+        return None
+    if not head.startswith("---"):
+        return None
+    end = head.find("\n---", 3)
+    if end < 0:
+        return None
+    try:
+        import yaml
+        meta = yaml.safe_load(head[3:end]) or {}
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    flag = meta.get("assistant")
+    flags = {str(x).lower() for x in flag} if isinstance(flag, list) else {str(flag).lower()} if flag else set()
+    mode = "always" if "always" in flags or "always-load" in flags else "index" if "index" in flags else ""
+    return (mode, " ".join(str(meta.get("description") or "").split())[:300]) if mode else None
+
+
 @dataclass
 class Change:
     commit: str
@@ -170,6 +195,27 @@ class Vault:
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             out += [Path(dirpath) / f for f in filenames if f.endswith(".md")]
         return out
+
+    def flagged(self) -> list[tuple[str, str, str]]:
+        """Notes whose frontmatter says `assistant: always` (their text goes into the assistant's instructions) or
+        `assistant: index` (just their name and `description:`): [(path, always|index, description)]."""
+        out = []
+        cache = self.__dict__.setdefault("_flag_cache", {})
+        for p in self.notes():
+            try:
+                st = p.stat()
+                if p.is_symlink():
+                    continue
+            except OSError:
+                continue
+            rel = self.rel(p)
+            hit = cache.get(rel)
+            if hit is None or hit[0] != (st.st_mtime, st.st_size):
+                hit = ((st.st_mtime, st.st_size), _frontmatter_flag(p))
+                cache[rel] = hit
+            if hit[1]:
+                out.append((rel, *hit[1]))
+        return sorted(out)
 
     def conflicts(self) -> list[str]:
         """Syncthing's conflict copies: two devices changed a note at once."""

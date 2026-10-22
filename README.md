@@ -491,6 +491,17 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
   `ov project new`, optionally with a notes folder in the vault). Writing in "All" is refused, as for the HPC
   bot. With `topics: false` (the example's default) it's one plain chat.
+- **Media and reactions.** `.gif` files in a reply play as animations and videos as videos. Its shell has no
+  internet, so `ov fetch <url>` has Overseer download a picture, GIF or video for it: public addresses only (never
+  this machine, the LAN or the tailnet; the address is checked and pinned, redirects too), recognised by its
+  bytes, up to `media.max_mb`; each download is noted in a 🌐 web topic. `ov gif <query>` searches Giphy, if
+  you give it a key (`media.giphy_key_env`). `ov react 🎉` reacts to your last message instead of replying.
+  Image tools (Pillow, ffmpeg, ImageMagick) work in its sandbox if they're installed on the homelab;
+  `ov capabilities` tells it what it can send and do.
+- **Notes it always keeps in mind**: besides Persona and About me, any note with frontmatter `assistant: always`
+  (e.g. a writing style it maintains for you); `assistant: index` lists one by name and description.
+- **Its time zone** is `local.timezone` (e.g. Asia/Dubai), whatever the homelab's is; reminders confirm the exact
+  moment (`Thu 2026-10-22 10:00 (+04:00, tomorrow)`).
 - **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
   **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
   also searches the vault's notes.
@@ -587,6 +598,7 @@ domain by name.
 | `vault.py` | the vault: persona and "about me" notes, daily notes, Syncthing conflicts, the history (git outside the vault) and undo |
 | `tasks.py`, `when.py` | Obsidian Tasks: parsing, selecting, adding, completing, recurrences; days and times as people write them |
 | `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first-run set-up |
+| `media.py` | `ov fetch` (public addresses only, media only, size-limited) and Giphy search; `ov capabilities` |
 | `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions - back until answered |
 | `commands.py`, `telegram.py` | `ov task`, `ov remind`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
 | `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |

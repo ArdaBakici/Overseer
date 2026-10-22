@@ -15,6 +15,7 @@ local:
   state_dir: ./state/assistant  # its DB, the vault's history (vault.git), its CLIs' logins and sessions
   tmp_dir: /tmp/overseer-assistant
   env_file: .env
+  timezone: Asia/Dubai          # the time zone you live in: its times, reminders, routines ("" = this machine's)
 
 # The Obsidian vault: the folder Syncthing keeps in sync on this machine. The agent may write it (except .obsidian/
 # and Syncthing's own files); it must be outside Overseer's folder.
@@ -25,6 +26,14 @@ vault:
   daily_folder: null            # daily notes; null = Obsidian's own setting (.obsidian/daily-notes.json)
   daily_format: null            # e.g. YYYY-MM-DD; null = Obsidian's setting
   history: true                 # record every change (git, in state_dir/vault.git) and offer ↩️ Undo
+
+# Pictures, GIFs and videos from the internet (its shell has none: Overseer downloads them - public addresses only,
+# media only - and notes each one in a 🌐 web topic).
+media:
+  fetch: true                   # ov fetch <url>
+  max_mb: 20
+  giphy_key_env: ""             # ov gif <query>: the .env variable with your Giphy API key, e.g. GIPHY_API_KEY; "" = off
+  giphy_rating: pg-13
 
 telegram:
   token_env: ASSISTANT_BOT_TOKEN  # the name of the variable in .env (not the token itself)

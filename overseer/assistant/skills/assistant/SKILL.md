@@ -1,6 +1,6 @@
 ---
 name: assistant
-description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, memory notes, daily notes), tasks in the Obsidian Tasks format (`ov task list|add|done`), routines (Assistant/Routines.md), reminders and check-ins that come back until answered (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), waking yourself later (`ov wake`), and searching past conversations. Use it whenever the user asks about tasks, todos, plans, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
+description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, memory notes, daily notes), tasks in the Obsidian Tasks format (`ov task list|add|done`), routines (Assistant/Routines.md), reminders and check-ins that come back until answered (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), pictures/GIFs/videos from the internet (`ov fetch`, `ov gif`), reactions (`ov react`), notes always in mind (`assistant: always`), waking yourself later (`ov wake`), and searching past conversations (`ov history`). Use it whenever the user asks about tasks, todos, plans, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
 ---
 
 # The assistant and `ov`
@@ -112,9 +112,40 @@ ov conversation move japan             # this conversation belongs to it (main: 
 
 Create one when the user asks for it, or propose one when a subject keeps coming back.
 
+## Pictures, GIFs, videos and reactions
+
+Run `ov capabilities` for the full list of what you can send and do. In short: files in `./outbox/` go
+with your reply - pictures (.png .jpg .webp), GIFs (.gif, played as animations), videos (.mp4 .mov .webm),
+anything else as a document.
+
+```bash
+ov fetch https://example.com/cat.gif          # downloads it into ./outbox/ (public addresses only, media only)
+ov fetch https://example.com/photo.jpg --keep # into ./inbox/ to work on (e.g. with ffmpeg / Pillow, if installed)
+ov gif "happy dance"                          # Giphy's first match into ./outbox/; --pick 2 for another
+ov react 🎉                                    # a reaction on their last message - often better than a reply
+```
+
+Your shell has no internet: find a URL with your web search, then `ov fetch` it.
+
+## Notes you always keep in mind
+
+A note with frontmatter `assistant: always` is in your instructions every time (keep such notes short);
+`assistant: index` plus `description: ...` lists it by name, for ones to open when relevant:
+
+```markdown
+---
+assistant: always
+---
+# Writing style
+...
+```
+
+When the user asks you to keep something up to date for them (a writing style, preferences), flag its note.
+
 ## Other
 
 ```bash
+ov history day                         # every conversation of today, condensed (e.g. for a nightly reflection)
 ov history search "flight to Berlin"   # past conversations (and notes)
 ov notify "text"                       # a message to the user now, before your reply
 ov feedback "what limited you"         # about Overseer itself

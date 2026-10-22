@@ -249,6 +249,44 @@ class Search:
         return turns[-max(last, 1):]
 
 
+    def day(self, start: float, end: float) -> list[tuple[str, str, list[dict]]]:
+        """Every conversation's turns between start and end: [(conversation, project, turns)], the earliest first."""
+        folder = self.cfg.local.state("transcripts")
+        projects = self._projects()
+        out = []
+        for path in sorted(folder.glob("*.jsonl")) if folder.is_dir() else []:
+            try:
+                if path.stat().st_mtime < start:
+                    continue  # (nothing written to it since)
+            except OSError:
+                continue
+            turns = [t for t in self.conversation(path.stem, last=100_000) if start <= t["ts"] < end]
+            if turns:
+                out.append((path.stem, projects.get(path.stem, ""), turns))
+        return sorted(out, key=lambda c: c[2][0]["ts"])
+
+    async def aday(self, start: float, end: float) -> list[tuple[str, str, list[dict]]]:
+        return await asyncio.to_thread(self.day, start, end)
+
+
+def render_day(convs: list[tuple[str, str, list[dict]]], limit: int = 40_000) -> str:
+    """A day's conversations for the agent (e.g. for a nightly reflection): requests and replies, condensed."""
+    if not convs:
+        return "no conversations that day"
+    parts = []
+    for sid, project, turns in convs:
+        parts.append(f"=== conversation {sid}" + (f" (project {project})" if project else ""))
+        for t in turns:
+            req = " ".join(t["request"].split())
+            rep = " ".join((t["reply"] or f"({t['status'] or 'no reply'})").split())
+            parts.append(f"[{time.strftime('%H:%M', time.localtime(t['ts']))}] user/trigger: "
+                         f"{req[:700]}{'…' if len(req) > 700 else ''}\n  reply: {rep[:900]}{'…' if len(rep) > 900 else ''}")
+    text = "\n".join(parts)
+    if len(text) > limit:
+        text = text[:limit] + f"\n[... cut: {len(text) - limit} more characters; read a conversation with ov history show]"
+    return text
+
+
 def _when(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
 

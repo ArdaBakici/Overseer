@@ -109,6 +109,7 @@ def _parser(ext=None) -> _Parser:
     a.add_argument("text", nargs="+")
     sub.add_parser("planner", add_help=False).add_argument("mode", choices=["off"])
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
+    sub.add_parser("react", add_help=False).add_argument("emoji")
     hist = sub.add_parser("history", add_help=False).add_subparsers(dest="action")
     a = hist.add_parser("search", add_help=False)
     a.add_argument("text", nargs="+")
@@ -116,6 +117,7 @@ def _parser(ext=None) -> _Parser:
     a.add_argument("--kind", action="append")
     a.add_argument("--since")
     a.add_argument("--limit", type=int, default=12)
+    hist.add_parser("day", add_help=False).add_argument("date", nargs="?", default="today")
     a = hist.add_parser("show", add_help=False)
     a.add_argument("conversation")
     a.add_argument("--last", type=int, default=5)
@@ -130,9 +132,11 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project list | new <name> --dir <folder> [--about "..."] [--move-here] | set <name> ... | archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+  ov react <emoji>                 react to the researcher's last message here (👍 ❤ 🔥 🎉 👏 🙏 👀 ...)
   ov status                        this conversation: project, what will wake you
   ov history search <text> [--project p|main] [--kind conversation|...] [--since 30d] [--limit N]
   ov history show <conversation> [--last 5] [--grep text]   read a past conversation's turns
+  ov history day [today|yesterday|YYYY-MM-DD]   every conversation of a day, condensed
 
 Feedback about Overseer itself (what limited you; shown in the researcher's 🛠 feedback topic):
   ov feedback "<what limited you>" [--kind limitation|bug|idea] [--context "what you were doing"]
@@ -245,6 +249,8 @@ class ControlServer:
                 return True, await getattr(self, f"agent_{args.action}")(session, args)
             if area == "notify":
                 return True, await self.notify(session, " ".join(args.text))
+            if area == "react":
+                return True, await self.react(session, args.emoji)
             if area == "status":
                 return True, self.status(session)
             if area == "history" and args.action:
@@ -269,6 +275,20 @@ class ControlServer:
         hits, total = await self._search().asearch(text, project=project, kinds=tuple(args.kind or ()),
                                                    since=parse_since(args.since), limit=max(1, min(args.limit, 50)))
         return render_hits(hits, total, text, domain=self.agent.domain)
+
+    async def history_day(self, session, args) -> str:
+        """`ov history day [today|yesterday|YYYY-MM-DD]`: every conversation of that day, condensed."""
+        import datetime as dt
+        from .search import render_day
+        today = dt.date.today()
+        word = args.date.lower()
+        try:
+            day = today if word == "today" else today - dt.timedelta(days=1) if word == "yesterday" \
+                else dt.date.fromisoformat(word)
+        except ValueError:
+            raise CtlError("ov history day [today | yesterday | YYYY-MM-DD]") from None
+        start = dt.datetime.combine(day, dt.time()).timestamp()
+        return render_day(await self._search().aday(start, start + 86400))
 
     async def history_show(self, session, args) -> str:
         from .search import render_turns
@@ -466,6 +486,21 @@ class ControlServer:
     async def notify(self, session, text: str) -> str:
         await self.notifier.send(Outgoing(f"📣 {esc(text[:3500])}", session_id=session.id))
         return "✓ sent"
+
+    async def react(self, session, emoji: str) -> str:
+        """A reaction on the researcher's last message in this conversation (instead of a message)."""
+        from telegram.constants import ReactionEmoji
+        allowed = {e.value for e in ReactionEmoji}
+        emoji = next((e for e in (emoji.strip(), emoji.strip().replace("\ufe0f", "")) if e in allowed), emoji.strip())
+        if emoji not in allowed:
+            raise CtlError(f"Telegram allows only these as reactions: {' '.join(sorted(allowed))}")
+        ref = json.loads(self.store.get(f"last_user_message:{session.id}") or "null")
+        if not ref:
+            raise CtlError("no message of theirs in this conversation to react to")
+        if not hasattr(self.notifier, "react"):
+            raise CtlError("reactions aren't available here")
+        await self.notifier.react(ref[0], ref[1], emoji)
+        return f"✓ reacted {emoji}"
 
     def status(self, session) -> str:
         lines = [f"conversation {session.id}, project: {session.project or 'none'}"]

@@ -54,6 +54,11 @@ What I do, and when. The assistant reads and edits this note; so can I.
 - when: sunday 18:00
 - do: Look back at the week and plan the next one with me.
 
+## Nightly reflection
+- when: every day 23:30
+- do: Read today's conversations (ov history day) and update what you keep about me - About me, and the notes
+  flagged `assistant: always` - with anything lasting you learned. Then one short line saying what you updated.
+
 # Follow-ups
 
 How often an unanswered reminder comes back.

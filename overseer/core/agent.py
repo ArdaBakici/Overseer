@@ -86,7 +86,9 @@ what you did, the key numbers, where the results are (at most ~15 lines). If you
 wrong, say so in that report rather than guessing."""
 
 
-IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
+ANIMATION_TYPES = {".gif"}  # sent with sendAnimation (a GIF as a picture would show only its first frame)
+VIDEO_TYPES = {".mp4", ".mov", ".m4v", ".webm"}
 MAX_PHOTO = 10 * 1024 * 1024  # Telegram's limits for pictures and documents sent by bots
 MAX_FILE = 50 * 1024 * 1024
 MAX_ATTACHMENTS = 10
@@ -151,20 +153,23 @@ def uploads_note(items: list[tuple[str, int]], backend: str) -> str:
             "there with scp.]")
 
 
-def collect_outbox(folder: Path) -> tuple[list[tuple[str, bytes]], list[tuple[str, bytes]], list[str]]:
-    """Take the files the agent left in its outbox: (pictures, documents, notes about skipped files).
+def collect_outbox(folder: Path) -> tuple[list[tuple[str, bytes]], list[tuple[str, bytes]], list[str],
+                                         list[tuple[str, str, bytes]]]:
+    """Take the files the agent left in its outbox: (pictures, documents, notes about skipped files, GIFs and
+    videos as (animation | video, name, content)).
     Overseer isn't sandboxed, so only regular files are read - never symlinks or hard links, which
     could point at something the agent itself can't read."""
     photos: list[tuple[str, bytes]] = []
     docs: list[tuple[str, bytes]] = []
     notes: list[str] = []
+    media: list[tuple[str, str, bytes]] = []
     try:
         entries = sorted((e for e in os.scandir(folder) if not e.name.startswith(".")),
                          key=lambda e: e.stat(follow_symlinks=False).st_mtime)
     except OSError:
-        return photos, docs, notes
+        return photos, docs, notes, media
     for e in entries:
-        if len(photos) + len(docs) >= MAX_ATTACHMENTS:
+        if len(photos) + len(docs) + len(media) >= MAX_ATTACHMENTS:
             notes.append(f"more than {MAX_ATTACHMENTS} files: the rest are sent with the next reply")
             break
         path = Path(e.path)
@@ -182,10 +187,13 @@ def collect_outbox(folder: Path) -> tuple[list[tuple[str, bytes]], list[tuple[st
                 notes.append(f"{e.name}: not sent ({st.st_size / 2**20:.0f} MB, the limit is 50 MB)")
             elif path.suffix.lower() in IMAGE_TYPES and st.st_size <= MAX_PHOTO:
                 photos.append((e.name, fh.read()))
+            elif path.suffix.lower() in ANIMATION_TYPES | VIDEO_TYPES:
+                kind = "animation" if path.suffix.lower() in ANIMATION_TYPES else "video"
+                media.append((kind, e.name, fh.read()))
             else:
                 docs.append((e.name, fh.read()))
         path.unlink(missing_ok=True)
-    return photos, docs, notes
+    return photos, docs, notes, media
 
 
 def _command_fold(commands: list[str]) -> str:
@@ -793,9 +801,10 @@ class Agent:
         text, autopilot_line = res.text, ""
         if self.autopilot:
             autopilot_line = self.autopilot.after_turn(s, activity)
-        photos, docs, notes = collect_outbox(outbox)
-        if photos or docs:
-            transcript.write({"kind": "tool", "name": "attachments", "detail": ", ".join(n for n, _ in photos + docs)})
+        photos, docs, notes, media = collect_outbox(outbox)
+        if photos or docs or media:
+            transcript.write({"kind": "tool", "name": "attachments",
+                              "detail": ", ".join([*(n for n, _ in photos + docs), *(n for _, n, _ in media)])})
         transcript.write({"kind": "end", "status": "done", "text": text, "footer": footer})
         skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
         compacted = compaction_line(res.compactions)
@@ -806,7 +815,7 @@ class Agent:
             + f"\n\n<i>{esc(footer)}</i>",
             markdown="\n\n".join([rich_markdown(text) or "(no answer)", *extra, f"<i>{esc(footer)}</i>"]),
             session_id=s.id, job_id=s.job_id, silent=quiet, buttons=note.buttons if note else [],
-            photos=photos, files=docs))
+            photos=photos, files=docs, media=media))
 
     def _activity(self, s: Session) -> tuple[Activity, asyncio.Task | None, list[str]]:
         activity = self.domain.new_activity(s)  # (the domain's: it watches the commands, e.g. for submitted jobs)

@@ -5,15 +5,20 @@ server (core/ctl.py) runs them for the agent."""
 from __future__ import annotations
 
 import asyncio
+import os
+from urllib.parse import urlsplit
+
+import httpx
 
 from ..core.ctl import CtlError
-from ..core.notify import esc
+from ..core.notify import Outgoing, esc
+from . import media
 from . import tasks as T
 from . import routines as R
-from .reminders import when_text
+from .reminders import exact_text, when_text
 from .when import parse_day, parse_moment
 
-AREAS = ("task", "remind", "commit", "focus", "followup", "routine")
+AREAS = ("task", "remind", "commit", "focus", "followup", "routine", "fetch", "gif", "capabilities")
 ACTIONS = ("done", "later", "skip", "stuck", "cancel")
 
 HELP = """ov - talk to Overseer (the system that runs you and sends your replies to the user on Telegram)
@@ -36,6 +41,11 @@ Reminders and follow-ups (messages to the user with buttons, again until answere
                                    <policy>: a name from the routines note's # Follow-ups, "again after 10m, up
                                    to 3 more times", or none
   ov routine check                 the routines note: problems, and when each runs next
+Pictures, GIFs and videos from the internet (your shell has none: Overseer downloads them, public addresses only):
+  ov fetch <url> [--name n] [--keep]   into ./outbox/ (sent with your reply), --keep: into ./inbox/ to work on
+  ov gif <query> [--pick N]        a GIF from Giphy into ./outbox/ (if turned on)
+  ov react <emoji>                 react to the user's last message (👍 ❤ 🔥 🎉 👏 🙏 💯 🤝 ...)
+  ov capabilities                  what you can send and do here
 
 Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, conversations, notes folder):
   ov project new <name> --about "what it is" [--dir <vault folder>] [--move-here]
@@ -46,6 +56,7 @@ Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, 
   ov status                        this conversation: what will wake you
   ov history search <text> [--since 30d] [--limit N]   your past conversations (and the vault's notes)
   ov history show <conversation> [--last 5] [--grep text]
+  ov history day [today|yesterday|YYYY-MM-DD]   every conversation of that day (e.g. for a nightly reflection)
   ov wake in 90m ["what to do then"]   ov wake every 1d [--for 7d] ["..."]   ov watches   ov unwatch <w12 | all>
   ov feedback "<what limited you>" [--kind limitation|bug|idea]   ov feedback list
   ov skill propose skill.md | list | show <name>
@@ -93,6 +104,14 @@ class AssistantCommands:
         a.add_argument("action", nargs="?", default="list")
         a.add_argument("id", nargs="?")
         sub.add_parser("routine", add_help=False).add_argument("action", nargs="?", default="check")
+        a = sub.add_parser("fetch", add_help=False)
+        a.add_argument("url")
+        a.add_argument("--name", default="")
+        a.add_argument("--keep", action="store_true", help="into ./inbox (to work on) instead of the reply")
+        sub.add_parser("capabilities", add_help=False)
+        a = sub.add_parser("gif", add_help=False)
+        a.add_argument("query", nargs="+")
+        a.add_argument("--pick", type=int, default=1)
 
     async def dispatch(self, session, args) -> str | None:
         """The answer, or None when the command isn't the assistant's."""
@@ -104,6 +123,14 @@ class AssistantCommands:
             return await self.focus(session, args.words)
         if args.area == "followup":
             return await self.followup(session, args.action, args.id)
+        if args.area == "capabilities":
+            m = self.cfg.media
+            return await asyncio.to_thread(media.capabilities, self.cfg,
+                                           bool(m.giphy_key_env and os.environ.get(m.giphy_key_env)))
+        if args.area == "fetch":
+            return await self.fetch(session, args.url, args.name, args.keep)
+        if args.area == "gif":
+            return await self.gif(session, " ".join(args.query), args.pick)
         if args.area == "routine":
             if args.action not in ("check", "list"):
                 raise CtlError("ov routine check (edit the routines note itself to change them)")
@@ -173,7 +200,7 @@ class AssistantCommands:
         what = "🎯 I'll check in" if kind == "commit" else "⏰ Reminder set for"
         await self._announce(session, f"{what} {esc(when_text(r['at']))}: {esc(r['text'])}",
                              buttons=[[("✖ Cancel", f"fu:{r['id']}:cancel")]])
-        return (f"✓ {r['id']}: {when_text(r['at'])}; if unanswered: "
+        return (f"✓ {r['id']}: {exact_text(r['at'])}; if unanswered: "
                 f"{R.describe_policy(r['policy'])}")
 
     async def focus(self, session, words: list[str]) -> str:
@@ -196,7 +223,7 @@ class AssistantCommands:
                                       policy=self._default_policy())
         except ValueError as e:
             raise CtlError(str(e)) from None
-        return f"✓ {f['id']}: focus until {when_text(f['at'])} (a countdown message is up; a ping at the end)"
+        return f"✓ {f['id']}: focus until {exact_text(f['at'])} (a countdown message is up; a ping at the end)"
 
     async def followup(self, session, action: str, rid: str | None) -> str:
         rem = self.domain.reminders
@@ -213,6 +240,51 @@ class AssistantCommands:
         if not r:
             raise CtlError(f"no follow-up {rid} waiting (ov followup list)")
         return f"✓ {r['id']} {r['state']}" + (f", again {when_text(r['at'])}" if r["state"] == "pending" else "")
+
+    # ------------------------------------------------------------------ media from the internet
+    def _folder(self, session, keep: bool):
+        workdir = self.agent.session_runner(session).workdir(session.id)
+        return workdir / ("inbox" if keep else "outbox")
+
+    async def _notice(self, session, text: str) -> None:
+        """A small line in the 🌐 web topic (or quietly in the chat without topics): what was downloaded."""
+        await self.notifier.send(Outgoing(text, session_id=session.id, silent=True, topic="web"))
+
+    async def fetch(self, session, url: str, name: str = "", keep: bool = False, label: str = "") -> str:
+        m = self.cfg.media
+        if not m.fetch:
+            raise CtlError("fetching from the internet is off (media.fetch in the config)")
+        try:
+            f = await media.fetch(url, self._folder(session, keep), m.max_mb * 2**20, name)
+        except media.FetchError as e:
+            raise CtlError(f"not fetched: {e}") from None
+        except httpx.HTTPError as e:
+            raise CtlError(f"not fetched: {type(e).__name__}: {str(e)[:200]}") from None
+        host = urlsplit(f.url).hostname or ""
+        await self._notice(session, f"🌐 {esc(label or 'Fetched')} <code>{esc(f.path.name)}</code> · "
+                                    f"{f.size / 2**20:.1f} MB · from {esc(host)}")
+        where = "./inbox/ (not sent: work on it, then put the result in ./outbox/)" if keep else \
+            "./outbox/: it's sent with your reply"
+        return f"✓ {f.path.name} ({f.kind}, {f.size / 2**20:.2f} MB) in {where}"
+
+    async def gif(self, session, query: str, pick: int = 1) -> str:
+        m = self.cfg.media
+        key = os.environ.get(m.giphy_key_env, "") if m.giphy_key_env else ""
+        if not key:
+            raise CtlError("GIF search is off (media.giphy_key_env in the config, with the key in .env); "
+                           "`ov fetch <url>` works for a GIF you found")
+        try:
+            results = await media.giphy_search(query, key, m.giphy_rating)
+        except media.FetchError as e:
+            raise CtlError(str(e)) from None
+        if not results:
+            raise CtlError(f"no GIFs for {query!r}")
+        if not 1 <= pick <= len(results):
+            raise CtlError(f"--pick 1 to {len(results)}")
+        chosen = results[pick - 1]
+        done = await self.fetch(session, chosen["url"], query, label=f"GIF for “{query}”:")
+        others = "\n".join(f"  {i}. {r['title']}" for i, r in enumerate(results, 1) if i != pick)
+        return f"{done} - “{chosen['title']}” (Powered by GIPHY)\nothers (--pick N):\n{others}"
 
     def _split_when(self, words: list[str]):
         """The longest start of the words that reads as a moment ("tomorrow 9am"), the rest is the text."""
