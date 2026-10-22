@@ -1045,25 +1045,51 @@ def test_ov_history_day(aenv):
     assert out.index("plan my day") < out.index("remind me")
 
 
-async def test_overseer_reset_wipes_the_flags(aenv, monkeypatch):
+async def test_overseer_reset_wipes_the_flags_and_asks_about_conversations(aenv, monkeypatch, capsys):
     from overseer.__main__ import reset_command
+    from overseer.core.live import Transcript
     from overseer.core.store import WatchRecord
     rem = aenv.domain.reminders
     rem.add(time.time() + 600, "Call the bank")
     aenv.store.set("assistant:onboarding_started", "1")
     aenv.store.set("assistant:log:2026-10-22", "[]")
     s = aenv.agent.general_session()
+    s.rec.cli_session_id = "cli-123"
+    aenv.store.upsert_session(s.rec)
+    Transcript(aenv.cfg, s.id).write({"kind": "turn", "text": "my visa plan"})
     aenv.store.set(f"wakeups_paused:{s.id}", "1")
     aenv.store.set("side_topic:web:1", "77")  # (not a flag: kept)
     aenv.store.add_watch(WatchRecord(session_id=s.id, kind="timer", due=time.time() + 3600, note="check in"))
-    answers = iter(["n", "y"])
-    assert reset_command(aenv.cfg, yes=False, ask=lambda _: next(answers)) == 1  # "no": nothing removed
-    assert aenv.store.get("assistant:onboarding_started") == "1"
-    assert reset_command(aenv.cfg, yes=False, ask=lambda _: next(answers)) == 0
+    Projects(aenv.cfg, aenv.store, aenv.agent).create("japan", "", "trip")
+    claude = aenv.cfg.local.resolve(aenv.cfg.agent.claude_code.home)
+    (claude / "projects" / "x").mkdir(parents=True)
+    (claude / "projects" / "x" / "cli-123.jsonl").write_text("{}")
+    (claude / ".credentials.json").write_text("{}")  # (the login: kept)
+
+    def answers(*a):
+        it = iter(a)
+        return lambda _: next(it)
+    # "no" to both: nothing changes.
+    assert reset_command(aenv.cfg, yes=False, ask=answers("n", "n")) == 0
+    assert aenv.store.get("assistant:onboarding_started") == "1" and aenv.store.get("general_session") == s.id
+    # Flags yes, conversations no.
+    assert reset_command(aenv.cfg, yes=False, ask=answers("y", "n")) == 0
     assert aenv.store.keys("assistant:") == [] and not aenv.store.get(f"wakeups_paused:{s.id}")
-    assert aenv.store.watches() == [] and aenv.store.get("side_topic:web:1") == "77"
-    assert rem.pending() == []
-    assert reset_command(aenv.cfg, yes=True) == 0  # (nothing left)
+    assert aenv.store.watches() == [] and aenv.store.get("side_topic:web:1") == "77" and rem.pending() == []
+    assert aenv.store.get_session(s.id) and (claude / "projects").exists()
+    # --yes: flags only; conversations are only forgotten when asked.
+    assert reset_command(aenv.cfg, yes=True) == 0
+    assert "Conversations kept" in capsys.readouterr().out and aenv.store.get_session(s.id)
+    # Now forget them: records, transcripts, the CLI's sessions; logins, projects and topics stay.
+    assert reset_command(aenv.cfg, yes=False, ask=answers("y")) == 0  # (no flags left: just that question)
+    out = capsys.readouterr().out
+    assert "Forgot 1 conversation(s)" in out and "Remove these?" not in out, out
+    assert aenv.store.get_session(s.id) is None and aenv.store.get("general_session") is None
+    assert not aenv.cfg.local.state("transcripts").exists() and not (claude / "projects").exists()
+    assert (claude / ".credentials.json").exists() and aenv.store.get_project("japan")
+    assert aenv.store.get("side_topic:web:1") == "77"
+    aenv.agent.sessions.clear()
+    assert aenv.agent.general_session().id != s.id  # a fresh one
     await aenv.ctl.start()  # while the bot runs: refused
     try:
         aenv.store.set("assistant:x", "1")

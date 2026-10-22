@@ -504,8 +504,10 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   moment (`Thu 2026-10-22 10:00 (+04:00, tomorrow)`).
 - **Starting over.** `uv run overseer reset -c assistant.yaml` (with the bot stopped) lists and wipes its
   flags: pending reminders and check-ins, the day logs, the first-run set-up flag, wake-ups it set itself, paused
-  wake-ups. Your notes, conversations, settings and logins stay. Delete `Assistant/Routines.md` too to get the
-  set-up conversation again.
+  wake-ups. Then it asks whether to forget the conversations too: their records, transcripts and search index,
+  and the agent CLIs' own sessions - without them it can't resume or search old chats. Your notes, projects,
+  settings and logins stay either way (`--yes` answers only the first question). Delete
+  `Assistant/Routines.md` too to get the set-up conversation again.
 - **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
   **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
   also searches the vault's notes.

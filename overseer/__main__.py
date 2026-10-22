@@ -13,7 +13,8 @@
     overseer config                     bring the config file up to date: what you changed, what's new, and
                                         <file>.new - the current example with your values (yours isn't touched)
     overseer reset [--yes]              wipe the bot's flags: its wake-ups, paused wake-ups, and the domain's own
-                                        (the assistant's reminders, day logs, set-up flag); the bot must be stopped
+                                        (the assistant's reminders, day logs, set-up flag); then asks whether to
+                                        forget its conversations too. The bot must be stopped
     overseer run                        start the bot
 All take -c/--config (default: config.yaml).
 """
@@ -272,9 +273,6 @@ def config_command(path: str) -> int:
     return 0
 
 
-PLATFORM_FLAGS = ("wakeups_paused:", "last_user_message:")  # (kv) per-conversation flags the platform keeps
-
-
 def bot_running(cfg: Config) -> bool:
     """Is this bot running? (its control socket answers)"""
     import socket
@@ -290,8 +288,9 @@ def bot_running(cfg: Config) -> bool:
 
 
 def reset_command(cfg: Config, yes: bool, ask=input) -> int:
-    """Wipe the bot's flags (not its conversations, notes, settings or logins): the wake-ups its agent set, paused
-    wake-ups, and the domain's own (e.g. the assistant's follow-ups, day logs and first-run flag)."""
+    """Wipe the bot's flags (core/reset.py), then ask whether to forget its conversations too. --yes answers the
+    first question only: conversations are forgotten only when you say so here."""
+    from .core import reset as R
     from .core.app import domain_factory
     from .core.store import Store
 
@@ -303,26 +302,37 @@ def reset_command(cfg: Config, yes: bool, ask=input) -> int:
         return 0
     store = Store(cfg.local.db_path)
     domain = domain_factory(cfg)(cfg, store, None)
-    keys = [k for p in (*PLATFORM_FLAGS, *domain.reset_prefixes) for k in store.keys(p)]
-    watches = store.watches()
+    keys, watches = R.flags(store, domain)
     if not keys and not watches:
-        print("Nothing to reset.")
+        print("No flags to reset.")
+    else:
+        print(f"The {cfg.domain} bot's flags ({cfg.local.db_path}):")
+        for k in keys:
+            print(f"  {k}")
+        for w in watches:
+            print(f"  wake-up w{w.id} ({w.kind}) of conversation {w.session_id}" + (f": {w.note}" if w.note else ""))
+        if yes or ask("Remove these? [y/N] ").strip().lower() in ("y", "yes"):
+            R.remove_flags(store, keys, watches)
+            print(f"Removed {len(keys)} flag(s) and {len(watches)} wake-up(s).")
+        else:
+            print("Flags kept.")
+    n, files = R.conversations(store), R.conversation_files(cfg)
+    if not n and not files:
         return 0
-    print(f"The {cfg.domain} bot's flags ({cfg.local.db_path}):")
-    for k in keys:
-        print(f"  {k}")
-    for w in watches:
-        print(f"  wake-up w{w.id} ({w.kind}) of conversation {w.session_id}" + (f": {w.note}" if w.note else ""))
-    print("Conversations, notes, settings and logins are kept.")
-    if not yes and ask("Remove these? [y/N] ").strip().lower() not in ("y", "yes"):
-        print("Nothing removed.")
-        return 1
-    for k in keys:
-        store.unset(k)
-    for w in watches:
-        w.state = "cancelled"
-        store.update_watch(w)
-    print(f"Removed {len(keys)} flag(s) and {len(watches)} wake-up(s).")
+    if yes:
+        print(f"Conversations kept ({n}): run `overseer reset` without --yes to be asked about them.")
+        return 0
+    print(f"\nIts conversations: {n}, and their transcripts, search index and the agent CLIs' sessions "
+          f"({R.size(files) / 2**20:.1f} MB):")
+    for p in files:
+        print(f"  {p}")
+    print("Forgetting them means a fresh start: the agent can't resume or search them any more. Notes, projects, "
+          "jobs and results, settings, usage and logins are kept.")
+    if ask("Forget the conversations too? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Conversations kept.")
+        return 0
+    removed = R.forget_conversations(cfg, store)
+    print("Forgot " + removed[0] + (f"; removed {len(removed) - 1} file(s)/folder(s)." if len(removed) > 1 else "."))
     return 0
 
 
