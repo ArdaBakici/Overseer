@@ -517,6 +517,12 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
 
 ## Configuration notes
 
+- **Updating an old config file**: `uv run overseer config` (or `-c assistant.yaml`) lists what you changed from
+  the defaults, the settings that are new since your file (with the example's suggestion), and the ones no longer
+  used; and writes `config.yaml.new`: the current example, comments and all, with your values in it. Settings
+  you never set keep their default, so it means exactly what your file did (that's checked before it's written).
+  Your file isn't touched: look the new one over, then `mv config.yaml.new config.yaml`.
+
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).

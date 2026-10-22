@@ -10,6 +10,8 @@
     overseer watch [conversation]       follow what the agent is doing live: reasoning, commands, output
                                         (default: every conversation; --full for complete outputs)
     overseer check                      verify everything without starting the bot
+    overseer config                     bring the config file up to date: what you changed, what's new, and
+                                        <file>.new - the current example with your values (yours isn't touched)
     overseer reset [--yes]              wipe the bot's flags: its wake-ups, paused wake-ups, and the domain's own
                                         (the assistant's reminders, day logs, set-up flag); the bot must be stopped
     overseer run                        start the bot
@@ -25,6 +27,8 @@ import os
 import shutil
 import subprocess
 import sys
+
+import yaml
 
 from .core.config import BACKENDS, Config, ConfigError, load_config
 
@@ -245,6 +249,29 @@ def open_command(cfg: Config, target: str | None) -> int:
     return subprocess.call(argv, env=env, cwd=str(cwd))
 
 
+def config_command(path: str) -> int:
+    """`overseer config`: the report, and <file>.new to look over and move into place."""
+    from pathlib import Path
+
+    from .core.configtool import update
+    src = Path(path)
+    try:
+        report, text = update(src)
+    except (OSError, ConfigError, yaml.YAMLError) as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+    print(report)
+    if text is None or text == src.read_text():
+        print("\nYour file is up to date.")
+        return 0
+    new = src.with_name(src.name + ".new")
+    new.write_text(text)
+    shutil.copymode(src, new)
+    print(f"\nWrote {new}: the current example with your values (and defaults for the rest) - it means the same "
+          f"as your file. Look it over, then:\n  mv {new} {src}")
+    return 0
+
+
 PLATFORM_FLAGS = ("wakeups_paused:", "last_user_message:")  # (kv) per-conversation flags the platform keeps
 
 
@@ -319,7 +346,8 @@ async def update_command(cfg: Config) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset"])
+    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset",
+                                           "config"])
     ap.add_argument("target", nargs="?",
                     help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest); "
                          "watch: conversation (default: all)")
@@ -337,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    if args.command == "config":  # (before loading it: an old file may not load any more)
+        return config_command(args.config)
     try:
         cfg = load_config(args.config)
     except (OSError, ConfigError) as e:
