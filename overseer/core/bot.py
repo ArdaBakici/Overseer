@@ -19,7 +19,7 @@ from pathlib import Path
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Message, ReplyParameters,
                       Update)
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Conflict, EndPointNotFound, NetworkError
+from telegram.error import BadRequest, Conflict, EndPointNotFound, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -683,6 +683,8 @@ class TelegramNotifier:
                     sent = await self.app.bot.send_document(chat_id, document=data, filename=name,
                                                             disable_notification=True, message_thread_id=thread)
                 self.store.link_message(chat_id, sent.message_id, msg.job_id, msg.session_id)
+            except TimedOut:  # (not sent again: Telegram may have it already - a second copy would be worse)
+                log.warning("sending %s timed out: Telegram didn't answer in time (it may have arrived anyway)", name)
             except Exception:
                 log.warning("could not send %s", name, exc_info=True)
 

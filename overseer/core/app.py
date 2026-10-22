@@ -16,6 +16,11 @@ from .config import Config, ConfigError
 
 log = logging.getLogger("overseer")
 
+TG_CONNECT_TIMEOUT = 15
+TG_READ_TIMEOUT = 60
+TG_WRITE_TIMEOUT = 30
+TG_MEDIA_WRITE_TIMEOUT = 120  # (uploading a picture, GIF, video or file)
+
 CORE_MENU = [
     ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
     ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
@@ -106,6 +111,12 @@ def build(cfg: Config):
         Application.builder()
         .token(cfg.telegram.token)
         .concurrent_updates(True)
+        # Telegram's answer can take a while: e.g. it converts a GIF to a video before answering the upload (the
+        # library's default is 5 s for everything, which cut such uploads off).
+        .connect_timeout(TG_CONNECT_TIMEOUT)
+        .read_timeout(TG_READ_TIMEOUT)
+        .write_timeout(TG_WRITE_TIMEOUT)
+        .media_write_timeout(TG_MEDIA_WRITE_TIMEOUT)
         .post_init(post_init)
         .post_stop(post_stop)
         .post_shutdown(post_shutdown)

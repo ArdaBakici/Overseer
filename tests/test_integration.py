@@ -3740,3 +3740,28 @@ async def test_telegram_network_trouble_is_one_quiet_line(env, caplog):
     assert caplog.records[-1].exc_info and caplog.records[-1].levelname == "ERROR"
     await bot.on_error(NS(), NS(error=BadRequest("Message is too long")))  # (not network trouble: a real error)
     assert caplog.records[-1].levelname == "ERROR"
+
+
+async def test_slow_media_uploads_are_given_time_and_not_sent_twice(env, caplog):
+    """A GIF upload Telegram takes long to answer (it converts it first) mustn't be cut off after 5 s, and if it
+    still times out it isn't sent again (it may have arrived) - one quiet line instead of a traceback."""
+    import logging
+    from telegram.error import TimedOut
+    from overseer.core.app import build
+    from overseer.core.bot import TelegramNotifier
+    app = build(env.cfg)
+    req = app.bot._request[1]  # (the request used for everything but getUpdates)
+    assert req.read_timeout >= 60 and req._media_write_timeout >= 120
+    tg = FakeTelegram()
+    tries = []
+
+    async def send_animation(chat_id, **kw):
+        tries.append(kw["animation"].filename)
+        raise TimedOut("Timed out")
+    tg.send_animation = send_animation
+    n = TelegramNotifier(NS(bot=tg), [1], env.store)
+    caplog.set_level(logging.WARNING, logger="overseer")
+    await n.send(Outgoing("🤖 here", media=[("animation", "shaula.gif", b"GIF89a")]))
+    assert tries == ["shaula.gif"] and tg.sent[-1][2] == "🤖 here"  # once; the message itself went out once
+    line = [r for r in caplog.records if "shaula.gif" in r.getMessage()][-1]
+    assert "may have arrived" in line.getMessage() and not line.exc_info
