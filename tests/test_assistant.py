@@ -1043,3 +1043,30 @@ def test_ov_history_day(aenv):
     out = render_day(Search(aenv.cfg, aenv.store, aenv.domain).day(today, today + 86400))
     assert "plan my day" in out and "Top 3" in out and "remind me" in out and "yesterday's" not in out
     assert out.index("plan my day") < out.index("remind me")
+
+
+async def test_overseer_reset_wipes_the_flags(aenv, monkeypatch):
+    from overseer.__main__ import reset_command
+    from overseer.core.store import WatchRecord
+    rem = aenv.domain.reminders
+    rem.add(time.time() + 600, "Call the bank")
+    aenv.store.set("assistant:onboarding_started", "1")
+    aenv.store.set("assistant:log:2026-10-22", "[]")
+    s = aenv.agent.general_session()
+    aenv.store.set(f"wakeups_paused:{s.id}", "1")
+    aenv.store.set("side_topic:web:1", "77")  # (not a flag: kept)
+    aenv.store.add_watch(WatchRecord(session_id=s.id, kind="timer", due=time.time() + 3600, note="check in"))
+    answers = iter(["n", "y"])
+    assert reset_command(aenv.cfg, yes=False, ask=lambda _: next(answers)) == 1  # "no": nothing removed
+    assert aenv.store.get("assistant:onboarding_started") == "1"
+    assert reset_command(aenv.cfg, yes=False, ask=lambda _: next(answers)) == 0
+    assert aenv.store.keys("assistant:") == [] and not aenv.store.get(f"wakeups_paused:{s.id}")
+    assert aenv.store.watches() == [] and aenv.store.get("side_topic:web:1") == "77"
+    assert rem.pending() == []
+    assert reset_command(aenv.cfg, yes=True) == 0  # (nothing left)
+    await aenv.ctl.start()  # while the bot runs: refused
+    try:
+        aenv.store.set("assistant:x", "1")
+        assert reset_command(aenv.cfg, yes=True) == 1 and aenv.store.get("assistant:x") == "1"
+    finally:
+        await aenv.ctl.stop()

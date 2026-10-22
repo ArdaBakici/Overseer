@@ -67,6 +67,7 @@ class AssistantDomain(Domain):
     name = "assistant"
     command = "ov"
     planner = False  # no planner mode: nothing here needs subagents
+    reset_prefixes = ("assistant:",)  # follow-ups, day logs, the first-run and routines flags
 
     def __init__(self, cfg, store, notifier):
         super().__init__(cfg, store, notifier)

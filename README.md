@@ -502,6 +502,10 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   (e.g. a writing style it maintains for you); `assistant: index` lists one by name and description.
 - **Its time zone** is `local.timezone` (e.g. Asia/Dubai), whatever the homelab's is; reminders confirm the exact
   moment (`Thu 2026-10-22 10:00 (+04:00, tomorrow)`).
+- **Starting over.** `uv run overseer reset -c assistant.yaml` (with the bot stopped) lists and wipes its
+  flags: pending reminders and check-ins, the day logs, the first-run set-up flag, wake-ups it set itself, paused
+  wake-ups. Your notes, conversations, settings and logins stay. Delete `Assistant/Routines.md` too to get the
+  set-up conversation again.
 - **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
   **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
   also searches the vault's notes.

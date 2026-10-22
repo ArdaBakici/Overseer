@@ -10,6 +10,8 @@
     overseer watch [conversation]       follow what the agent is doing live: reasoning, commands, output
                                         (default: every conversation; --full for complete outputs)
     overseer check                      verify everything without starting the bot
+    overseer reset [--yes]              wipe the bot's flags: its wake-ups, paused wake-ups, and the domain's own
+                                        (the assistant's reminders, day logs, set-up flag); the bot must be stopped
     overseer run                        start the bot
 All take -c/--config (default: config.yaml).
 """
@@ -243,6 +245,60 @@ def open_command(cfg: Config, target: str | None) -> int:
     return subprocess.call(argv, env=env, cwd=str(cwd))
 
 
+PLATFORM_FLAGS = ("wakeups_paused:", "last_user_message:")  # (kv) per-conversation flags the platform keeps
+
+
+def bot_running(cfg: Config) -> bool:
+    """Is this bot running? (its control socket answers)"""
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1)
+        s.connect(str(cfg.ctl_socket))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def reset_command(cfg: Config, yes: bool, ask=input) -> int:
+    """Wipe the bot's flags (not its conversations, notes, settings or logins): the wake-ups its agent set, paused
+    wake-ups, and the domain's own (e.g. the assistant's follow-ups, day logs and first-run flag)."""
+    from .core.app import domain_factory
+    from .core.store import Store
+
+    if bot_running(cfg):
+        print("The bot is running: stop it first (Ctrl-c in its window), then run this again.", file=sys.stderr)
+        return 1
+    if not cfg.local.db_path.exists():
+        print("Nothing to reset (no state yet).")
+        return 0
+    store = Store(cfg.local.db_path)
+    domain = domain_factory(cfg)(cfg, store, None)
+    keys = [k for p in (*PLATFORM_FLAGS, *domain.reset_prefixes) for k in store.keys(p)]
+    watches = store.watches()
+    if not keys and not watches:
+        print("Nothing to reset.")
+        return 0
+    print(f"The {cfg.domain} bot's flags ({cfg.local.db_path}):")
+    for k in keys:
+        print(f"  {k}")
+    for w in watches:
+        print(f"  wake-up w{w.id} ({w.kind}) of conversation {w.session_id}" + (f": {w.note}" if w.note else ""))
+    print("Conversations, notes, settings and logins are kept.")
+    if not yes and ask("Remove these? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Nothing removed.")
+        return 1
+    for k in keys:
+        store.unset(k)
+    for w in watches:
+        w.state = "cancelled"
+        store.update_watch(w)
+    print(f"Removed {len(keys)} flag(s) and {len(watches)} wake-up(s).")
+    return 0
+
+
 async def update_command(cfg: Config) -> int:
     """Update Claude Code and Codex with their own updaters (the bot does it once a day by itself)."""
     from .core.runners import make_runner
@@ -263,13 +319,14 @@ async def update_command(cfg: Config) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update"])
+    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset"])
     ap.add_argument("target", nargs="?",
                     help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest); "
                          "watch: conversation (default: all)")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("--import", dest="import_key", help="ssh setup: copy this existing private key instead of generating one")
     ap.add_argument("--full", action="store_true", help="watch: show complete command output")
+    ap.add_argument("--yes", action="store_true", help="reset: don't ask")
     ap.add_argument("-v", "--verbose", action="store_true")
     argv = list(sys.argv[1:] if argv is None else argv)
     extra: list[str] = []
@@ -299,6 +356,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "watch":
             from .core.live import watch
             return watch(cfg, args.target, full=args.full)
+        if args.command == "reset":
+            return reset_command(cfg, args.yes)
         if args.command == "update":
             return asyncio.run(update_command(cfg))
         app = build(cfg)

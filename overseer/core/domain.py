@@ -35,6 +35,7 @@ class Domain:
     name = "base"
     command = "ov"  # the agent's command for talking to this bot
     planner = True  # planner mode (subagents) is offered to its agents
+    reset_prefixes: tuple[str, ...] = ()  # its flags in the store (kv), wiped by `overseer reset`
 
     def __init__(self, cfg: Config, store: Store, notifier: Notifier):
         self.cfg = cfg
