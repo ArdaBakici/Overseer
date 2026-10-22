@@ -1,4 +1,5 @@
-"""The assistant's `ov` commands: tasks (Obsidian Tasks, anywhere in the vault) and reminders. The platform's control
+"""The assistant's `ov` commands: tasks (Obsidian Tasks, anywhere in the vault), reminders, check-backs on
+commitments, focus sessions, the follow-ups waiting for an answer, and the routines note. The platform's control
 server (core/ctl.py) runs them for the agent."""
 
 from __future__ import annotations
@@ -8,10 +9,12 @@ import asyncio
 from ..core.ctl import CtlError
 from ..core.notify import esc
 from . import tasks as T
+from . import routines as R
 from .reminders import when_text
 from .when import parse_day, parse_moment
 
-AREAS = ("task", "remind")
+AREAS = ("task", "remind", "commit", "focus", "followup", "routine")
+ACTIONS = ("done", "later", "skip", "stuck", "cancel")
 
 HELP = """ov - talk to Overseer (the system that runs you and sends your replies to the user on Telegram)
 
@@ -22,9 +25,17 @@ Tasks (checklist lines anywhere in the vault, Obsidian Tasks format):
               [--note path/in/vault.md]       (default: the tasks note)
   ov task done <id>                mark it done (✅ today); a recurring task gets its next occurrence
                                    D: YYYY-MM-DD, today, tomorrow, a weekday (the next one), +3d, +2w
-Reminders (a message to the user then; you are not woken):
-  ov remind <when> "<text>"        when: 17:30, "tomorrow 9am", "friday 18:00", "2026-10-20 09:00", 2h, 45m
-  ov remind list                   ov remind rm <id>
+Reminders and follow-ups (messages to the user with buttons, again until answered; you are not woken):
+  ov remind <when> "<text>" [--follow-up <policy>]
+                                   when: 17:30, "tomorrow 9am", "friday 18:00", "2026-10-20 09:00", 2h, 45m
+  ov commit <when> "<what they'll do>" [--follow-up <policy>]
+                                   a check-back on a commitment: "how did it go?" ✅ / 💤 / 🧱 Stuck (wakes you)
+  ov focus <25m> "<the step>"      a focus session: a quiet countdown, then a ping    ov focus stop | ov focus
+  ov followup list                 waiting for an answer, and scheduled (ids)
+  ov followup done|later|skip|stuck|cancel <id>   when they answer in words instead of a button
+                                   <policy>: a name from the routines note's # Follow-ups, "again after 10m, up
+                                   to 3 more times", or none
+  ov routine check                 the routines note: problems, and when each runs next
 
 Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, conversations, notes folder):
   ov project new <name> --about "what it is" [--dir <vault folder>] [--move-here]
@@ -73,15 +84,30 @@ class AssistantCommands:
         a.add_argument("--every", default="")
         a.add_argument("--note", default="")
         task.add_parser("done", add_help=False).add_argument("id")
-        a = sub.add_parser("remind", add_help=False)
-        a.add_argument("words", nargs="+")
+        for name in ("remind", "commit"):
+            a = sub.add_parser(name, add_help=False)
+            a.add_argument("words", nargs="+")
+            a.add_argument("--follow-up", dest="follow_up", default="")
+        sub.add_parser("focus", add_help=False).add_argument("words", nargs="*")
+        a = sub.add_parser("followup", add_help=False)
+        a.add_argument("action", nargs="?", default="list")
+        a.add_argument("id", nargs="?")
+        sub.add_parser("routine", add_help=False).add_argument("action", nargs="?", default="check")
 
     async def dispatch(self, session, args) -> str | None:
         """The answer, or None when the command isn't the assistant's."""
         if args.area not in AREAS:
             return None
-        if args.area == "remind":
-            return await self.remind(session, args.words)
+        if args.area in ("remind", "commit"):
+            return await self.remind(session, args.words, args.follow_up, kind=args.area)
+        if args.area == "focus":
+            return await self.focus(session, args.words)
+        if args.area == "followup":
+            return await self.followup(session, args.action, args.id)
+        if args.area == "routine":
+            if args.action not in ("check", "list"):
+                raise CtlError("ov routine check (edit the routines note itself to change them)")
+            return self.domain.scheduler.check_text()
         if not args.action:
             raise CtlError("ov task list | add | done (ov help)")
         return await getattr(self, f"task_{args.action}")(session, args)
@@ -89,7 +115,8 @@ class AssistantCommands:
     def status_lines(self, session) -> list[str]:
         mine = [r for r in self.domain.reminders.pending() if r.get("session") == session.id]
         return [f"reminders set in this conversation: {len(mine)}" + (f" (next: {when_text(mine[0]['at'])})"
-                                                                      if mine else "")]
+                                                                      if mine else ""),
+                f"waiting for the user's answer: {len(self.domain.reminders.open())}"]
 
     # ------------------------------------------------------------------ tasks
     def _day(self, text: str) -> str:
@@ -113,24 +140,79 @@ class AssistantCommands:
         t, remark = T.complete(self.vault, args.id, self.domain.today())
         return f"✓ done: {t.text}" + (f" ({remark})" if remark else "")
 
-    # ------------------------------------------------------------------ reminders
-    async def remind(self, session, words: list[str]) -> str:
+    # ------------------------------------------------------------------ reminders, check-backs, focus
+    def _policy(self, spec: str):
+        if not spec:
+            return None  # the default of the routines note (or Overseer's)
+        rs = self.domain.scheduler.load() or R.Routines()
+        if spec.lower() not in rs.policies and R.parse_policy(spec) is None:
+            raise CtlError(f"--follow-up {spec!r}: one of {', '.join(rs.policies) or '(no named ones yet)'}, "
+                           "\"again after 10m, up to 3 more times\", or none")
+        return rs.policy(spec)
+
+    def _default_policy(self):
+        rs = self.domain.scheduler.load()
+        return rs.policy("") if rs else None
+
+    async def remind(self, session, words: list[str], follow_up: str = "", kind: str = "remind") -> str:
+        rem = self.domain.reminders
         if words[0] == "list":
-            items = self.domain.reminders.pending()
-            return "\n".join(f"{r['id']} {when_text(r['at'])}: {r['text']}" for r in items) or "no reminders"
+            return await self.followup(session, "list", None)
         if words[0] in ("rm", "remove", "delete") and len(words) == 2:
-            r = self.domain.reminders.remove(words[1])
+            r = rem.remove(words[1])
             if not r:
-                raise CtlError(f"no reminder {words[1]} (ov remind list)")
-            await self._announce(session, f"🗑 Reminder removed: {esc(r['text'])}")
+                raise CtlError(f"no reminder {words[1]} waiting (ov followup list)")
+            await self._announce(session, f"🗑 Removed: {esc(r['text'])}")
             return f"✓ removed {r['id']}"
         if len(words) < 2:
-            raise CtlError('ov remind <when> "<text>"')
+            raise CtlError(f'ov {kind} <when> "<text>"')
         when, text = self._split_when(words)
-        r = self.domain.reminders.add(when.timestamp(), text, session.id, session.project)
-        await self._announce(session, f"⏰ Reminder set for {esc(when_text(r['at']))}: {esc(r['text'])}",
-                             buttons=[[("✖ Cancel", f"rrm:{r['id']}")]])
-        return f"✓ {r['id']}: {when_text(r['at'])}"
+        policy = self._policy(follow_up) or self._default_policy()
+        r = rem.add(when.timestamp(), text, session.id, session.project, policy=policy,
+                    kind="commit" if kind == "commit" else "reminder")
+        what = "🎯 I'll check in" if kind == "commit" else "⏰ Reminder set for"
+        await self._announce(session, f"{what} {esc(when_text(r['at']))}: {esc(r['text'])}",
+                             buttons=[[("✖ Cancel", f"fu:{r['id']}:cancel")]])
+        return (f"✓ {r['id']}: {when_text(r['at'])}; if unanswered: "
+                f"{R.describe_policy(r['policy'])}")
+
+    async def focus(self, session, words: list[str]) -> str:
+        rem = self.domain.reminders
+        if not words or words[0] in ("status", "show"):
+            f = rem.focus()
+            return (f"{f['id']}: {f['text']}, until {when_text(f['at'])}" if f else "no focus session running")
+        if words[0] in ("stop", "end", "cancel"):
+            f = rem.focus()
+            if not f:
+                raise CtlError("no focus session running")
+            await rem.act(f["id"], "cancel")
+            return f"✓ stopped {f['id']}"
+        from ..core.autopilot import parse_duration
+        secs = parse_duration(words[0] if words[0][-1:].isalpha() else words[0] + "m")
+        if not secs or len(words) < 2:
+            raise CtlError('ov focus <minutes, e.g. 25m> "<the step>"')
+        try:
+            f = await rem.start_focus(secs / 60, " ".join(words[1:]), session.id, session.project,
+                                      policy=self._default_policy())
+        except ValueError as e:
+            raise CtlError(str(e)) from None
+        return f"✓ {f['id']}: focus until {when_text(f['at'])} (a countdown message is up; a ping at the end)"
+
+    async def followup(self, session, action: str, rid: str | None) -> str:
+        rem = self.domain.reminders
+        if action == "list":
+            kinds = {"reminder": "reminder", "say": "routine", "commit": "check-back", "focus": "focus"}
+            lines = [f"{r['id']} waiting since {when_text(r['at'])} · {kinds.get(r.get('kind'), '')}: {r['text']}"
+                     for r in rem.open()]
+            lines += [f"{r['id']} at {when_text(r['at'])} · {kinds.get(r.get('kind'), '')}: {r['text']}"
+                      for r in rem.pending()]
+            return "\n".join(lines) or "nothing waiting or scheduled"
+        if action not in ACTIONS or not rid:
+            raise CtlError("ov followup list | done|later|skip|stuck|cancel <id>")
+        r = await rem.act(rid, action)
+        if not r:
+            raise CtlError(f"no follow-up {rid} waiting (ov followup list)")
+        return f"✓ {r['id']} {r['state']}" + (f", again {when_text(r['at'])}" if r["state"] == "pending" else "")
 
     def _split_when(self, words: list[str]):
         """The longest start of the words that reads as a moment ("tomorrow 9am"), the rest is the text."""

@@ -26,8 +26,25 @@ async def today(domain) -> dict:
     return {"date": day.isoformat(), "name": domain.persona_name(), "daily": domain.vault.daily_note(),
             "due": [t.to_dict() for t in T.select(items, "today", today=day)[:100]],
             "upcoming": [t.to_dict() for t in T.select(items, "upcoming", today=day)[:15]],
-            "reminders": [{"at": r["at"], "text": r["text"]} for r in domain.reminders.pending()[:30]],
+            "reminders": [{"at": r["at"], "text": r["text"], "kind": r.get("kind", "reminder")}
+                          for r in domain.reminders.pending()[:30]],
+            "waiting": [{"at": r["at"], "text": r["text"], "kind": r.get("kind", "reminder")}
+                        for r in domain.reminders.open()[:30]],
+            "log": [{"at": e["at"], "icon": e["icon"], "text": e["text"]} for e in domain.reminders.log()[-40:]],
+            "routines": routines_today(domain),
             "conflicts": await asyncio.to_thread(domain.vault.conflicts)}
+
+
+def routines_today(domain) -> list[dict]:
+    from datetime import datetime, time as dtime, timedelta
+
+    rs = domain.scheduler.load()
+    if rs is None:
+        return []
+    now = datetime.now()
+    start, end = datetime.combine(now.date(), dtime(0, 0)), datetime.combine(now.date(), dtime(23, 59))
+    return [{"at": when.timestamp(), "name": r.name, "kind": "do" if r.do else "say", "past": when <= now}
+            for r in rs.routines for when in r.occurrences(start - timedelta(seconds=1), end)]
 
 
 async def tasks(domain, when: str, q: str) -> dict:

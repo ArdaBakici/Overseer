@@ -61,10 +61,28 @@ async function renderToday() {
   }
   parts.push("<h3>Due today and overdue</h3>");
   parts.push(d.due.length ? d.due.map(taskHTML).join("") : '<div class="empty">Nothing due. 🎉</div>');
+  const ICON = {commit: "🎯", focus: "⏱", say: "🔔", reminder: "⏰"};
+  if (d.waiting.length) {
+    parts.push("<h3>Waiting for you</h3>");
+    parts.push(d.waiting.map((r) =>
+      `<div class="card"><span aria-hidden="true">${ICON[r.kind] || "⏰"}</span> ${esc(r.text)}
+       <span class="muted small">since ${esc(when(r.at))}</span></div>`).join(""));
+  }
+  if (d.routines.length) {
+    parts.push("<h3>Routines today</h3>");
+    parts.push(d.routines.sort((a, b) => a.at - b.at).map((r) =>
+      `<div class="card"${r.past ? ' style="opacity:.55"' : ""}><span aria-hidden="true">${r.kind === "do" ? "🗓" : "🔔"}</span>
+       ${esc(new Date(r.at * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}))} — ${esc(r.name)}</div>`).join(""));
+  }
   parts.push("<h3>Reminders</h3>");
   parts.push(d.reminders.length ? d.reminders.map((r) =>
-    `<div class="card"><span aria-hidden="true">⏰</span> ${esc(when(r.at))} — ${esc(r.text)}</div>`).join("")
+    `<div class="card"><span aria-hidden="true">${ICON[r.kind] || "⏰"}</span> ${esc(when(r.at))} — ${esc(r.text)}</div>`).join("")
     : '<div class="empty">No reminders.</div>');
+  if (d.log.length) {
+    parts.push("<h3>Today so far</h3>");
+    parts.push(d.log.map((e) => `<div class="card"><span aria-hidden="true">${esc(e.icon)}</span>
+      ${esc(new Date(e.at * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}))} — ${esc(e.text)}</div>`).join(""));
+  }
   if (d.upcoming.length) {
     parts.push("<h3>Coming up</h3>");
     parts.push(d.upcoming.map(taskHTML).join(""));

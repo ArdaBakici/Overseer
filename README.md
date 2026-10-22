@@ -472,9 +472,20 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   2026-10-20 ⏫ #home`, with 🔁 recurrences). `/tasks [today|week|#tag|words]` lists them with ✅ buttons,
   `/task <text>` adds one; the agent uses `ov task list|add|done`. Completing a recurring task adds its next
   occurrence, like the plugin. New tasks go to `Assistant/Tasks.md` unless it belongs in a particular note.
-- **Reminders.** "Remind me tomorrow at 9 to call the dentist": `ov remind` (or `/remind tomorrow 9am call the
-  dentist`) sends you the message then, with 💤 snooze buttons, without waking the agent. `ov wake` is for when
-  the agent has work to do later.
+- **Structure and follow-through, without commands.** It's built to coach someone with ADHD: one step at a time,
+  choices instead of open questions, small days, no shame. You just talk to it:
+  - **Routines** live in `Assistant/Routines.md`: a `do:` routine (morning planning, evening shutdown, a weekly
+    review) wakes the assistant to start the conversation; a `say:` one ("Meds 💊") just sends its message.
+    Overseer runs them at their times; the assistant sets the note up with you in your first conversation and
+    changes it when you ask ("move my evening review to 22:00", "pause the weekly review until I'm back").
+  - **Reminders come back until answered**: ✅ Done · 💤 Later · ⏭ Skip. How often is the note's `# Follow-ups`
+    section ("again after 20m, up to 2 more times"), which the assistant adjusts when you say it's too much or not
+    enough; important things can be stricter.
+  - **Accountability**: say "I'll send it by 3" and it checks in at 3 ("how did it go?" ✅ · 💤 · 🧱 Stuck - which
+    brings it in to help), on its own.
+  - **Focus sessions**: "let's do 25 minutes on the intro" - one quiet countdown message, then a ping.
+  - Every answer goes into the day's log (and under `## Log` in today's daily note, if it exists), which the
+    evening shutdown looks at. `/remind` and `/reminders` still exist as shortcuts.
 - **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
   @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
   subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
@@ -575,6 +586,7 @@ domain by name.
 | `prompts.py`, `skills/assistant/SKILL.md` | the agent's instructions and its skill |
 | `vault.py` | the vault: persona and "about me" notes, daily notes, Syncthing conflicts, the history (git outside the vault) and undo |
 | `tasks.py`, `when.py` | Obsidian Tasks: parsing, selecting, adding, completing, recurrences; days and times as people write them |
-| `reminders.py` | reminders sent at their time, with snooze |
+| `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first-run set-up |
+| `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions - back until answered |
 | `commands.py`, `telegram.py` | `ov task`, `ov remind`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
 | `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |

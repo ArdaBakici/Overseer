@@ -1,6 +1,6 @@
 ---
 name: assistant
-description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, memory notes, daily notes), tasks in the Obsidian Tasks format (`ov task list|add|done`), reminders (`ov remind`), waking yourself later (`ov wake`), and searching past conversations. Use it whenever the user asks about tasks, todos, plans, reminders, notes, or anything you should remember.
+description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, memory notes, daily notes), tasks in the Obsidian Tasks format (`ov task list|add|done`), routines (Assistant/Routines.md), reminders and check-ins that come back until answered (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), waking yourself later (`ov wake`), and searching past conversations. Use it whenever the user asks about tasks, todos, plans, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
 ---
 
 # The assistant and `ov`
@@ -46,19 +46,57 @@ ov task done 3fa9c1                # ✅ today; a recurring task gets its next o
 Days: YYYY-MM-DD, today, tomorrow, a weekday (the next one), +3d, +2w. Ids change when a task's
 line changes: list again if one isn't found. You can also edit task lines directly in notes.
 
-## Reminders and wake-ups
+## Reminders, check-ins and focus (follow-ups)
+
+Messages Overseer sends the user at a time, with buttons (✅ Done · 💤 Later · ⏭ Skip, or 🧱 Stuck), coming
+back until answered. You are not woken for them (except 🧱 Stuck: then you help).
 
 ```bash
-ov remind 17:30 "Leave for the station"         # a message to the user then; you are NOT woken
-ov remind "tomorrow 9am" "Call the dentist"
-ov remind 2h "Take the laundry out"
-ov remind list        ov remind rm r1a2b3
-ov wake in 3h "Check whether the user answered Jane and nudge if not"   # wakes YOU, for work to do then
-ov wake every 1d --for 7d "Morning check of the week's plan"
-ov watches            ov unwatch w12
+ov remind 17:30 "Leave for the station"            # when: 17:30, "tomorrow 9am", "friday 18:00", 2h, 45m
+ov remind "tomorrow 9am" "Call the dentist" --follow-up persistent
+ov commit 15:00 "Send the report to Jane"          # they said they'd do it by 3: "how did it go?" then
+ov focus 25m "Write the intro's first paragraph"   # a quiet countdown, then "how did it go?"
+ov focus stop
+ov followup list                                   # waiting for an answer, and scheduled (ids)
+ov followup done r1a2b3                            # they answered in words instead of a button
+ov wake in 3h "Check whether Jane answered and nudge if not"   # wakes YOU, for work to do then
 ```
 
-Use `ov remind` for "remind me ...". Use `ov wake` only when you will have to do something then.
+- Accountability is your job, without being asked: when they say they'll do something by a time, `ov commit`
+  it, add it under `## Commitments` in today's note, and say in a few words that you'll check in.
+- Focus sessions: only ones they agreed to; help them pick a first tiny step before starting.
+- `--follow-up`: a name from the routines note's `# Follow-ups` (e.g. persistent), "again after 10m, up to 3
+  more times", or none. Without it: the note's default.
+- Outcomes (done, skipped, unanswered, stuck) are in your context as `<today_so_far>`, and in today's note
+  under `## Log` when the note exists.
+
+## Routines: `Assistant/Routines.md`
+
+Overseer runs them at their times: a `do:` routine wakes you to start a conversation with the user, a `say:`
+one sends its message as a follow-up. You set the note up with the user in your first conversation, and change
+it whenever they ask. Keep the format; after every change run `ov routine check` and tell them what changed.
+
+```markdown
+# Routines
+
+## Morning planning
+- when: weekdays 09:00
+- do: Help me pick my top 3 for today, size them, and put them in today's note.
+
+## Meds
+- when: every day 09:30 and 21:30
+- say: Meds 💊
+- follow-up: persistent
+- paused until: 2026-11-01
+
+# Follow-ups
+- default: again after 20m, up to 2 more times
+- persistent: again after 10m, up to 5 more times
+```
+
+`when`: every day / weekdays / weekends / monday, thursday / sun, then times (09:00, 9pm, "09:30 and 21:30").
+When the user says the reminders are too much (or not enough), change `# Follow-ups` (or one routine's
+`follow-up:`) and tell them what you changed.
 
 ## Projects
 

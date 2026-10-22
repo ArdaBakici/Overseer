@@ -526,6 +526,9 @@ async def test_assistant_sandbox_end_to_end(hpc, backend, cli_name, tmp_path):
         f"touch {app / 'assistant-was-here'} 2>&1; echo APPWRITE-DONE",
         "ov task add 'E2E task' --due tomorrow",
         "cat .agents/skills/assistant/SKILL.md 2>&1 | head -2; echo SKILL-DONE",
+        "ov commit 2h 'send the e2e report' && ov focus 25m 'first paragraph' && ov followup list",
+        f"printf '# Routines\\n## Meds\\n- when: every day 09:30\\n- say: Meds\\n' > '{vault / 'Assistant' / 'Routines.md'}'"
+        " && ov routine check",
     ]
     try:
         with FakeModel(script) as fm:
@@ -560,6 +563,8 @@ async def test_assistant_sandbox_end_to_end(hpc, backend, cli_name, tmp_path):
         assert "E2E task" in (vault / "Assistant" / "Tasks.md").read_text()
         if backend == "codex":
             assert "name: assistant" in outs[9], detail
+        assert "✓ r" in outs[10] and "focus until" in outs[10] and "send the e2e report" in outs[10], detail
+        assert "✓ Meds (say): every day 09:30" in outs[11], detail
         reply = notes.sent[-1]
         assert reply.buttons and reply.buttons[0][0][0] == "↩️ Undo", detail
         assert "Journal.md" in reply.text and "Assistant/Tasks.md" in reply.text, detail

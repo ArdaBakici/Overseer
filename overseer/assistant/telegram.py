@@ -19,9 +19,12 @@ from .when import parse_moment
 
 log = logging.getLogger(__name__)
 
-HELP = """<b>Your assistant</b> — talk to it like a person: just send a message (pictures and files too).
+HELP = """<b>Your assistant</b> — talk to it like a person: just send a message (pictures and files too). No commands needed.
 Its memory is your Obsidian vault: it reads and writes notes there, and every reply that changed notes has a ↩️ Undo button.
+Just say it: "plan my day with me", "remind me at 5 to call the bank", "I'll send the report by 3", "let's do 25 minutes on the intro", "move my evening review to 22:00", "that was too many reminders".
+Your routines live in Assistant/Routines.md (it sets them up with you); reminders and check-ins come back until you answer ✅ / 💤 / ⏭ / 🧱.
 
+Shortcuts, if you want them:
 /tasks [today|week|overdue|upcoming|undated|all|#tag|words] — tasks from the whole vault, ✅ to tick them off
 /task &lt;text&gt; — add a task (Obsidian Tasks syntax works: 📅 2026-10-20 ⏫ 🔁 every week #tag)
 /remind &lt;when&gt; &lt;text&gt; — e.g. /remind tomorrow 9am call the bank · /remind 2h stretch · /reminders — pending ones
@@ -67,17 +70,10 @@ class AssistantBot:
             await self._done(update, q, arg)
         elif action == "vundo":
             await self._undo(update, q, arg)
-        elif action == "rrm":
-            r = self.domain.reminders.remove(arg)
-            await self._edit(q, f"🗑 Reminder cancelled: {esc(r['text'])}" if r else "That reminder is gone already.")
-        elif action == "rsnz":
-            rid, _, secs = arg.partition(":")
-            r = self.domain.reminders.snooze(rid, float(secs) if secs.isdigit() else 3600)
-            if r:
-                await self._edit(q, f"💤 {esc(r['text'])}\n<i>again {esc(when_text(r['at']))}</i>",
-                                 [[("✖ Cancel", f"rrm:{r['id']}")]])
-            else:
-                await self._edit(q, "That reminder was snoozed already.")
+        elif action in ("fu", "rrm", "rsnz"):  # a follow-up's buttons (rrm/rsnz: from before follow-ups)
+            rid, _, what = arg.partition(":")
+            what = {"rrm": "cancel", "rsnz": "later"}.get(action, what)
+            await self._followup(q, rid, what)
         else:
             return False
         return True
@@ -88,7 +84,10 @@ class AssistantBot:
         return [f"vault {code(str(self.vault.root))} · {len(notes)} notes · history "
                 + ("on" if self.vault.history else "off (git not found)" if self.cfg.vault.history else "off"),
                 f"sync conflicts: {len(conflicts)}" if conflicts else "no sync conflicts",
-                f"pending reminders: {len(self.domain.reminders.pending())}"]
+                f"reminders: {len(self.domain.reminders.pending())} scheduled · "
+                f"{len(self.domain.reminders.open())} waiting for you",
+                "routines: " + (self.domain.scheduler.check_text().replace("\n", " · ")[:500]
+                                if self.domain.scheduler.load() is not None else "none yet (set up in conversation)")]
 
     # ------------------------------------------------------------------ tasks
     async def cmd_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -143,7 +142,27 @@ class AssistantBot:
         buttons = [[("↩️ Undo", f"vundo:{change.commit[:12]}")]] if change else None
         await self.notifier.send(self._out(f"➕ {esc(line[6:])}\n<i>in {esc(rel)}</i>", update, buttons))
 
-    # ------------------------------------------------------------------ reminders
+    # ------------------------------------------------------------------ follow-ups and reminders
+    async def _followup(self, q, rid: str, what: str) -> None:
+        """✅ Done · 💤 Later · ⏭ Skip · 🧱 Stuck · ➕ 5 min · ✖/⏹ Cancel: the message says what happened, buttons go
+        (💤 and ➕ keep a ✖ to cancel)."""
+        try:
+            r = await self.domain.reminders.act(rid, what)
+        except ValueError:
+            return
+        if r is None:
+            await self._edit(q, "That one's settled already.")
+            return
+        text = esc(r["text"])
+        if r["state"] == "pending":
+            again = "ends" if r.get("kind") == "focus" else "again"
+            await self._edit(q, f"{'➕' if what == 'more' else '💤'} {text}\n<i>{again} {esc(when_text(r['at']))}</i>",
+                             [[("✖ Cancel", f"fu:{r['id']}:cancel")]])
+            return
+        await self._edit(q, {
+            "done": f"✅ {text}", "skipped": f"⏭ <s>{text}</s>", "cancelled": f"✖ <s>{text}</s>",
+            "stuck": f"🧱 {text}\n<i>On it - one moment.</i>"}.get(r["state"], text))
+
     async def cmd_remind(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         words = ctx.args or []
         when = None
@@ -158,17 +177,22 @@ class AssistantBot:
             await self.reply(update, "Usage: /remind &lt;when&gt; &lt;text&gt; — when: 17:30, tomorrow 9am, "
                                      "friday 18:00, 2026-10-20 09:00, 2h, 45m")
             return
-        r = self.domain.reminders.add(when.timestamp(), " ".join(words[n:]), project=self._scope(update))
+        rs = self.domain.scheduler.load()
+        r = self.domain.reminders.add(when.timestamp(), " ".join(words[n:]), project=self._scope(update),
+                                      policy=rs.policy("") if rs else None)
         await self.notifier.send(self._out(f"⏰ {esc(when_text(r['at']))}: {esc(r['text'])}", update,
-                                           [[("✖ Cancel", f"rrm:{r['id']}")]]))
+                                           [[("✖ Cancel", f"fu:{r['id']}:cancel")]]))
 
     async def cmd_reminders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        items = self.domain.reminders.pending()
+        items = self.domain.reminders.open() + self.domain.reminders.pending()
         if not items:
-            await self.reply(update, "No reminders. /remind &lt;when&gt; &lt;text&gt; sets one.")
+            await self.reply(update, "No reminders. Just tell me what to remind you of, and when.")
             return
-        lines = ["<b>Reminders</b>"] + [f"⏰ {esc(when_text(r['at']))}: {esc(r['text'])}" for r in items[:30]]
-        buttons = [[(f"✖ {when_text(r['at'])} {r['text'][:20]}", f"rrm:{r['id']}")] for r in items[:10]]
+        icon = {"commit": "🎯", "focus": "⏱"}
+        lines = ["<b>Reminders</b>"] + [
+            f"{icon.get(r.get('kind'), '⏰')} {esc(when_text(r['at']))}: {esc(r['text'])}"
+            + (" <i>(waiting for you)</i>" if r.get("state") == "open" else "") for r in items[:30]]
+        buttons = [[(f"✖ {when_text(r['at'])} {r['text'][:20]}", f"fu:{r['id']}:cancel")] for r in items[:10]]
         await self.notifier.send(self._out("\n".join(lines), update, buttons))
 
     # ------------------------------------------------------------------ the vault

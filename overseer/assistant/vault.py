@@ -31,12 +31,14 @@ EXCLUDE = """.obsidian/workspace*.json
 CONFLICT_RE = re.compile(r"\.sync-conflict-\d{8}-\d{6}")
 DEFAULT_PERSONA = """# Persona
 
-How the assistant talks and behaves. Edit freely: it reads this before every reply.
+How the assistant talks and behaves. Edit freely (or just tell it): it reads this before every reply.
 
 - Name: Ada
-- Tone: warm but brief; no filler, no flattery.
+- Role: my coach for structure and follow-through - I have ADHD.
+- Tone: warm, brief and direct; no filler, no flattery, never guilt-tripping.
 - Language: English.
-- Be proactive about deadlines and overdue tasks, but don't nag about the same thing twice a day.
+- One thing at a time; give me choices instead of open questions.
+- Keep me on track: hold me to what I said I'd do, kindly; help me re-plan when the day falls apart.
 - Ask before deleting or rewriting a note; small additions are fine without asking.
 """
 DEFAULT_ABOUT = """# About me
@@ -116,14 +118,46 @@ class Vault:
     def rel(self, p: Path) -> str:
         return str(p.relative_to(self.root))
 
+    def _daily_settings(self) -> dict:
+        try:
+            st = json.loads((self.root / ".obsidian" / "daily-notes.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        return st if isinstance(st, dict) else {}
+
+    def daily_template(self) -> str:
+        """The daily notes' template in Obsidian's settings (relative path), "" if none."""
+        t = str(self._daily_settings().get("template") or "").strip().strip("/")
+        return "" if not t else t if t.endswith(".md") else t + ".md"
+
+    def append_under(self, rel: str, heading: str, line: str) -> bool:
+        """Add a line at the end of a section of an existing note (the section is added if missing). False if the
+        note doesn't exist (not created here: Obsidian applies its template when it creates the note)."""
+        from .tasks import _safe_path, _write
+        p = _safe_path(self, rel)
+        if not p.exists():
+            return False
+        lines = p.read_text().split("\n")
+        at = next((i for i, x in enumerate(lines) if x.strip().lower() == heading.lower()), None)
+        if at is None:
+            while lines and not lines[-1].strip():
+                lines.pop()
+            lines += ["", heading, line, ""]
+        else:
+            end = at + 1
+            while end < len(lines) and not lines[end].startswith("#"):
+                end += 1
+            while end > at + 1 and not lines[end - 1].strip():
+                end -= 1
+            lines.insert(end, line)
+        _write(p, "\n".join(lines))
+        return True
+
     def daily_note(self, day: float | None = None) -> str:
         """Today's daily note (relative path), by Obsidian's settings (or the config's)."""
         folder, fmt = self.cfg.vault.daily_folder, self.cfg.vault.daily_format
         if folder is None or fmt is None:
-            try:
-                st = json.loads((self.root / ".obsidian" / "daily-notes.json").read_text())
-            except (OSError, ValueError):
-                st = {}
+            st = self._daily_settings()
             folder = st.get("folder", "") if folder is None else folder
             fmt = st.get("format") or "YYYY-MM-DD" if fmt is None else fmt
         name = time.strftime(moment_to_strftime(fmt), time.localtime(day or time.time()))

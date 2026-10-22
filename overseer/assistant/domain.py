@@ -23,7 +23,8 @@ from ..core.notify import code
 from ..core.runners import Activity, Sandbox
 from . import prompts as P
 from . import tasks as T
-from .reminders import Reminders
+from .reminders import Reminders, when_text
+from .scheduler import Scheduler
 from .vault import Vault
 
 if TYPE_CHECKING:
@@ -69,7 +70,9 @@ class AssistantDomain(Domain):
         super().__init__(cfg, store, notifier)
         self.vault = Vault(cfg)
         self.reminders = Reminders(store, notifier)
-        self._dashboard = None
+        self.reminders.on_log = self._log_to_daily_note
+        self.reminders.on_stuck = self._stuck
+        self.scheduler = Scheduler(self)  # Routines.md, and the first-run setup
 
     # ------------------------------------------------------------------ the app
     def prepare(self) -> None:
@@ -80,7 +83,7 @@ class AssistantDomain(Domain):
         write_skills(self.cfg, skills())
 
     def services(self) -> list[tuple[str, object]]:
-        return [("reminders", self.reminders.loop())]
+        return [("follow-ups", self.reminders.loop()), ("routines", self.scheduler.loop())]
 
     async def start(self, notifier, projects) -> None:
         try:
@@ -144,6 +147,9 @@ class AssistantDomain(Domain):
             persona_path=self._rel("Persona.md"), about_path=self._rel("About me.md"),
             assistant_dir=cfg.vault.assistant_dir.strip("/") or ".", daily=self.vault.daily_note(),
             tasks_file=self.vault.rel(self.vault.tasks_file),
+            template=(f", from the template `{t}`" if (t := self.vault.daily_template()) else ", with the sections "
+                      "## Top 3, ## Plan, ## Commitments, ## Log, ## Done, ## Shutdown"),
+            routines_path=self.scheduler.rel, routines_state=self.scheduler.state_line(),
             domains=f" (except {', '.join(domains)})" if domains else "",
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
         if self.agent and self.agent.ctl:
@@ -180,7 +186,57 @@ class AssistantDomain(Domain):
         conflicts = await asyncio.to_thread(self.vault.conflicts)
         if conflicts:
             lines.append("<sync_conflicts>" + ", ".join(conflicts[:10]) + "</sync_conflicts>")
+        rs = self.scheduler.load()
+        if rs is not None:
+            from .routines import today_lines
+            later = today_lines(rs, now)
+            if later:
+                lines.append("<routines_later_today>" + "; ".join(later) + "</routines_later_today>")
+        lines += self.followup_context()
         return "\n".join(lines)
+
+    def followup_context(self) -> list[str]:
+        """What's waiting for the user's answer, what's scheduled, and today's outcomes (done, skipped, ...)."""
+        out = []
+        rem = self.reminders
+        kinds = {"reminder": "reminder", "say": "routine", "commit": "check-back", "focus": "focus"}
+        waiting = [f"{r['id']} {kinds.get(r.get('kind'), '')}: {r['text']} (sent {when_text(r['at'])}"
+                   + (f", {r['attempts']} follow-up(s)" if r.get("attempts") else "") + ")" for r in rem.open()]
+        if waiting:
+            out.append("<waiting_for_their_answer>\n" + "\n".join(waiting) + "\n</waiting_for_their_answer>")
+        focus = rem.focus()
+        if focus:
+            out.append(f"<focus_session>{focus['id']}: {focus['text']} until "
+                       f"{datetime.fromtimestamp(focus['at']):%H:%M}</focus_session>")
+        planned = [f"{r['id']} {when_text(r['at'])} {kinds.get(r.get('kind'), '')}: {r['text']}"
+                   for r in rem.pending() if r.get("kind") != "focus"][:15]
+        if planned:
+            out.append("<scheduled>\n" + "\n".join(planned) + "\n</scheduled>")
+        today = rem.log()
+        if today:
+            out.append("<today_so_far>\n" + "\n".join(
+                f"{datetime.fromtimestamp(e['at']):%H:%M} {e['icon']} {e['state']}: {e['text']}" for e in today[-25:])
+                       + "\n</today_so_far>")
+        return out
+
+    async def _log_to_daily_note(self, entry: dict) -> None:
+        """A follow-up's outcome, into today's daily note under ## Log (if the note exists)."""
+        line = f"- {datetime.fromtimestamp(entry['at']):%H:%M} {entry['icon']} {entry['text']}"
+        rel = self.vault.daily_note()
+        if not (self.vault.root / rel).exists():
+            return
+        await self.record_before()
+        if await asyncio.to_thread(self.vault.append_under, rel, "## Log", line):
+            await self.record(f"Log: {entry['icon']} {entry['text'][:60]}")
+
+    async def _stuck(self, item: dict) -> None:
+        """🧱 Stuck: the assistant is woken to help, in the conversation the follow-up came from."""
+        agent = self.agent
+        if not agent or not agent.autopilot or not agent.cfg.agent.enabled:
+            return
+        s = agent.get(item.get("session")) or agent.general_session()
+        agent.autopilot.wake(s, "\n\n".join([P.STUCK_PROMPT.format(text=item["text"]), await self.now_context()]),
+                             kind="stuck")
 
     # ------------------------------------------------------------------ a run: the vault's changes
     async def before_run(self, s: Session) -> Any:
@@ -200,7 +256,12 @@ class AssistantDomain(Domain):
             return None
         if not change:
             return None
-        return RunNote(lines=[f"📝 {files_line(change.files)}"],
+        lines = [f"📝 {files_line(change.files)}"]
+        if any(path == self.scheduler.rel for _, path in change.files):
+            rs = self.scheduler.load()
+            if rs is not None and rs.errors:
+                lines.append("⚠️ Routines: " + "; ".join(code(e) for e in rs.errors[:5]))
+        return RunNote(lines=lines,
                        buttons=[[("↩️ Undo", f"vundo:{change.commit[:12]}")]])
 
     async def record_before(self) -> None:

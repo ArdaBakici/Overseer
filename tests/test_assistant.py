@@ -282,21 +282,88 @@ def test_each_bot_is_kept_out_of_the_others_folders(tmp_path):
 
 
 # ---------------------------------------------------------------------------- reminders
-async def test_reminders_fire_once_and_snooze(tmp_path):
+async def test_followups_come_back_until_answered(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     n = FakeNotifier()
     r = Reminders(store, n)
-    a = r.add(time.time() - 1, "  Call   the bank ", "s1")
-    r.add(time.time() + 3600, "Later")
-    assert await r.fire_due() == 1 and await r.fire_due() == 0
-    assert n.sent[0].text == "⏰ Call the bank" and n.sent[0].session_id == "s1"
-    assert n.sent[0].buttons[0][0] == ("💤 1h", f"rsnz:{a['id']}:3600")
-    again = r.snooze(a["id"], 600)
-    assert again and abs(again["at"] - time.time() - 600) < 5 and r.snooze(a["id"], 600) is None
-    assert [x["text"] for x in r.pending()] == ["Call the bank", "Later"]
-    assert r.remove(again["id"]) and [x["text"] for x in r.pending()] == ["Later"]
+    logged, stuck = [], []
+
+    async def on_log(e):
+        logged.append((e["state"], e["text"]))
+
+    async def on_stuck(item):
+        stuck.append(item["text"])
+    r.on_log, r.on_stuck = on_log, on_stuck
+    t0 = time.time()
+    policy = {"after": 600, "times": 2}
+    a = r.add(t0 - 1, "  Call   the bank ", "s1", policy=policy)
+    r.add(t0 + 86400, "Later on")
+    assert await r.fire_due(t0) == 1 and await r.fire_due(t0 + 1) == 0
+    first = n.sent[0]
+    assert first.text == "⏰ Call the bank" and first.session_id == "s1"
+    assert first.buttons == [[("✅ Done", f"fu:{a['id']}:done"), ("💤 Later", f"fu:{a['id']}:later"),
+                              ("⏭ Skip", f"fu:{a['id']}:skip")]]
+    # Unanswered: again after 10 minutes, twice, then it counts as unanswered (and is logged).
+    assert await r.fire_due(t0 + 601) == 1 and n.sent[-1].text == "🔁 ⏰ Call the bank"
+    assert await r.fire_due(t0 + 1202) == 1
+    assert await r.fire_due(t0 + 1803) == 0  # (no third time: it waits a while for an answer)
+    assert [x["id"] for x in r.open()] == [a["id"]]
+    assert await r.fire_due(t0 + 1202 + 3601) == 0 and r.open() == []
+    assert logged == [("unanswered", "Call the bank")] and r.log()[-1]["icon"] == "🤷"
+    # Done: no more follow-ups.
+    b = r.add(t0 - 1, "Meds", kind="say", policy=policy)
+    await r.fire_due(t0)
+    assert (await r.act(b["id"], "done"))["state"] == "done" and await r.act(b["id"], "done") is None
+    assert await r.fire_due(t0 + 5000) == 0 and logged[-1] == ("done", "Meds")
+    # Later: back after its policy's interval; Skip: logged.
+    c = r.add(t0 - 1, "Water", policy=policy)
+    await r.fire_due(t0)
+    later = await r.act(c["id"], "later")
+    assert later["state"] == "pending" and 590 < later["at"] - time.time() < 610
+    await r.act(c["id"], "skip")
+    assert logged[-1] == ("skipped", "Water")
+    # A check-back on a commitment: Stuck wakes the assistant.
+    d = r.add(t0 - 1, "Send the report", kind="commit", policy={"after": 0, "times": 0})
+    await r.fire_due(t0)
+    assert "Check-in" in n.sent[-1].text and n.sent[-1].buttons[0][2] == ("🧱 Stuck", f"fu:{d['id']}:stuck")
+    await r.act(d["id"], "stuck")
+    assert stuck == ["Send the report"] and logged[-1] == ("stuck", "Send the report")
+    # Cancel before it fires: gone, not logged.
+    e = r.add(t0 + 999, "Never mind")
+    assert r.remove(e["id"]) and all(x["id"] != e["id"] for x in r.pending())
     with pytest.raises(ValueError):
         r.add(time.time(), "   ")
+
+
+async def test_a_focus_session_counts_down_quietly(tmp_path):
+    class LiveNotifier(FakeNotifier):
+        def __init__(self):
+            super().__init__()
+            self.posted, self.edits = [], []
+
+        async def post(self, msg):
+            self.posted.append(msg)
+            return {"1": len(self.posted)}
+
+        async def edit(self, refs, text, buttons=None):
+            self.edits.append((refs, text, buttons))
+
+    n = LiveNotifier()
+    r = Reminders(Store(tmp_path / "db.sqlite"), n)
+    f = await r.start_focus(25, "Write the intro", "s1")
+    assert "25 min left" in n.posted[0].text and n.posted[0].silent
+    with pytest.raises(ValueError, match="running already"):
+        await r.start_focus(10, "another")
+    assert r.log()[-1]["state"] == "started"
+    await r.fire_due(time.time() + 70)  # a minute later: the same message, edited (no new one)
+    assert n.edits and "min left" in n.edits[-1][1] and not n.sent
+    await r.fire_due(f["at"] + 1)  # time's up: the countdown says so, and a ping asks how it went
+    assert "time's up" in n.edits[-1][1] and "Focus time's up" in n.sent[-1].text
+    assert [b[0] for b in n.sent[-1].buttons[0]] == ["✅ Done", "➕ 5 min", "🧱 Stuck"]
+    more = await r.act(f["id"], "more")
+    assert more["state"] == "pending" and len(n.posted) == 2  # a new countdown, 5 minutes
+    await r.act(f["id"], "done")
+    assert r.focus() is None and r.log()[-1]["state"] == "done"
 
 
 # ---------------------------------------------------------------------------- a whole turn
@@ -572,3 +639,189 @@ def test_hpc_projects_still_need_their_folder(tmp_path):
     for bad in ("", "relative/dir", "/with space"):
         with pytest.raises(ValueError, match="on the HPC"):
             d.check_project_dir(bad)
+
+
+# ---------------------------------------------------------------------------- routines, set-up, follow-ups
+ROUTINES = """# Routines
+
+Some words of mine, ignored.
+
+## Morning planning
+- when: weekdays 09:00
+- do: Help me pick my top 3.
+  One question at a time.
+
+## Meds
+- when: every day 09:30 and 9pm
+- say: Meds 💊
+- follow-up: persistent
+
+## Weekly review
+- when: sun 18:00
+- do: Plan the week.
+- paused until: 2026-11-01
+
+## Gym
+- when: mon, thu 7am
+- say: Gym!
+- off: yes
+
+# Follow-ups
+- default: again after 20m, up to 2 more times
+- persistent: again after 10m, up to 5 more times
+"""
+
+
+def test_the_routines_note():
+    from overseer.assistant import routines as R
+    rs = R.parse(ROUTINES)
+    assert rs.errors == []
+    m = rs.get("morning planning")
+    assert m.do == "Help me pick my top 3. One question at a time." and m.describe_when() == "weekdays 09:00"
+    meds = rs.get("Meds")
+    assert meds.describe_when() == "every day 09:30 and 21:00" and rs.policy(meds.follow_up) == {"after": 600, "times": 5}
+    assert rs.policy("") == {"after": 1200, "times": 2} and rs.policy("none") == {"after": 0, "times": 0}
+    assert rs.policy("again after 1h, up to 1 more time") == {"after": 3600, "times": 1}
+    sat = datetime(2026, 10, 17, 8, 0)  # a Saturday
+    assert m.next_time(sat) == datetime(2026, 10, 19, 9, 0)
+    assert rs.get("weekly review").next_time(sat) == datetime(2026, 11, 8, 18, 0)  # paused until Nov 1st
+    assert rs.get("gym").next_time(sat) is None  # off
+    assert meds.occurrences(datetime(2026, 10, 17, 9, 0), datetime(2026, 10, 17, 22, 0)) == [
+        datetime(2026, 10, 17, 9, 30), datetime(2026, 10, 17, 21, 0)]
+    bad = R.parse("# Routines\n## A\n- do: x\n## B\n- when: sometimes 9am\n- say: y\n## C\n- when: daily 9:00\n"
+                  "- do: x\n- say: y\n## D\n- when: 9:00\n- say: z\n- follow-up: brutal\n# Follow-ups\n- x: often\n")
+    assert len(bad.errors) == 5 and [r.name for r in bad.routines] == ["D"], bad.errors
+    assert any("brutal" in e for e in bad.errors) and any("sometimes" in e for e in bad.errors)
+
+
+def with_autopilot(aenv, monkeypatch):
+    from overseer.core.autopilot import Autopilot
+    ap = Autopilot(aenv.cfg, aenv.store, aenv.agent, aenv.notifier)
+    woken = []
+    monkeypatch.setattr(ap, "wake", lambda s, prompt, kind="wakeup", quiet=False: woken.append((s.id, kind, prompt)))
+    return woken
+
+
+async def test_routines_run_at_their_times(aenv, monkeypatch):
+    from overseer.assistant.scheduler import CHECKED_KEY
+    woken = with_autopilot(aenv, monkeypatch)
+    sch = aenv.domain.scheduler
+    (aenv.vault.root / "Assistant/Routines.md").write_text(ROUTINES)
+    monday = datetime(2026, 10, 19, 9, 31)
+    assert await sch.tick(monday) == []  # the first tick: from now on
+    aenv.store.set(CHECKED_KEY, str(datetime(2026, 10, 19, 8, 59).timestamp()))
+    assert await sch.tick(monday) == ["Morning planning", "Meds"]
+    sid, kind, prompt = woken[-1]
+    assert kind == "routine" and prompt.startswith("[Routine: Morning planning]") and "top 3" in prompt
+    assert "<now>" in prompt and sid == aenv.agent.general_session().id
+    say = aenv.domain.reminders.pending()[-1]
+    assert say["text"] == "Meds 💊" and say["kind"] == "say" and say["policy"] == {"after": 600, "times": 5}
+    assert await sch.tick(datetime(2026, 10, 19, 9, 32)) == []  # once
+    # Missed while Overseer was down: run if recent, skipped if not.
+    aenv.store.set(CHECKED_KEY, str(datetime(2026, 10, 19, 20, 0).timestamp()))
+    assert await sch.tick(datetime(2026, 10, 19, 23, 30)) == ["Meds"]  # 21:00, 2.5 h ago
+    aenv.store.set(CHECKED_KEY, str(datetime(2026, 10, 19, 20, 0).timestamp()))
+    assert await sch.tick(datetime(2026, 10, 20, 1, 0)) == []  # 4 h ago: skipped
+    # A broken note (an edit in Obsidian): told once, the rest still runs.
+    (aenv.vault.root / "Assistant/Routines.md").write_text(ROUTINES + "\n# Routines\n## Oops\n- when: whenever\n- do: x\n")
+    await sch.tick(datetime(2026, 10, 20, 1, 1))
+    await sch.tick(datetime(2026, 10, 20, 1, 2))
+    notices = [m.text for m in aenv.notifier.sent if "has problems" in m.text]
+    assert len(notices) == 1 and "Oops" in notices[0]
+    assert "Oops" in sch.check_text() and "✓ Meds (say): every day 09:30 and 21:00" in sch.check_text()
+
+
+async def test_the_first_run_sets_up_routines_in_conversation(aenv, monkeypatch):
+    woken = with_autopilot(aenv, monkeypatch)
+    sch = aenv.domain.scheduler
+    prompt = aenv.agent.system_prompt(aenv.agent.general_session().id)
+    assert "doesn't exist yet" in prompt and "## How you help" in prompt and "ADHD" in prompt
+    assert await sch.onboard() and not await sch.onboard()  # once
+    sid, kind, text = woken[0]
+    assert kind == "setup" and text.startswith("[First run: setting up]") and "# Follow-ups" in text
+    # Once the note is written, the instructions say what runs.
+    (aenv.vault.root / "Assistant/Routines.md").write_text(ROUTINES)
+    prompt = aenv.agent.system_prompt(aenv.agent.general_session().id)
+    assert "Their routines now: Morning planning (weekdays 09:00)" in prompt and "Gym" in prompt
+    # An installation that already has routines isn't asked again.
+    aenv.store.set("assistant:onboarding_started", "")
+    assert not await sch.onboard()
+
+
+async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
+    with_autopilot(aenv, monkeypatch)
+    await aenv.ctl.start()
+    try:
+        (aenv.vault.root / "Assistant/Routines.md").write_text(ROUTINES)
+        s = aenv.agent.general_session()
+        token = aenv.ctl.open(s.id)
+        ok, text = await aenv.ctl.handle(token, ["commit", "2h", "send", "the", "report"])
+        assert text.startswith("✓ r") and "again after 20m, up to 2 more times" in text, text
+        assert "🎯 I'll check in today" in aenv.notifier.texts()
+        rid = text.split(":")[0][2:]
+        c = aenv.domain.reminders.get(rid)
+        assert c["kind"] == "commit" and c["text"] == "send the report"
+        ok, text = await aenv.ctl.handle(token, ["remind", "45m", "stretch", "--follow-up", "persistent"])
+        assert "again after 10m, up to 5 more times" in text
+        ok, text = await aenv.ctl.handle(token, ["remind", "45m", "x", "--follow-up", "brutal"])
+        assert "persistent" in text and "none" in text  # the names it knows
+        ok, text = await aenv.ctl.handle(token, ["focus", "25", "write", "the", "intro"])
+        assert "focus until" in text
+        ok, text = await aenv.ctl.handle(token, ["focus"])
+        assert "write the intro" in text
+        ok, text = await aenv.ctl.handle(token, ["followup", "list"])
+        assert "send the report" in text and "stretch" in text and "write the intro" in text
+        # They answer a check-back in words: the agent records it.
+        await aenv.domain.reminders.fire_due(c["at"] + 1)  # (the focus session and the stretch are due by then too)
+        assert any("Check-in</b>: send the report" in m.text for m in aenv.notifier.sent[-3:])
+        ok, text = await aenv.ctl.handle(token, ["followup", "done", rid])
+        assert text == f"✓ {rid} done"
+        ok, text = await aenv.ctl.handle(token, ["followup", "done", rid])
+        assert "no follow-up" in text
+        ok, text = await aenv.ctl.handle(token, ["focus", "stop"])
+        assert "no focus session" in text  # (it ended: its ping is waiting for an answer)
+        ok, text = await aenv.ctl.handle(token, ["routine", "check"])
+        assert "✓ Morning planning (do): weekdays 09:00 · next" in text and "follow-up persistent" in text
+        ctx = await aenv.domain.now_context()
+        assert "<today_so_far>" in ctx and "done: send the report" in ctx
+        waiting = ctx.split("<waiting_for_their_answer>")[1].split("</waiting_for_their_answer>")[0]
+        assert "reminder: stretch" in waiting and "focus: write the intro" in waiting
+    finally:
+        await aenv.ctl.stop()
+
+
+@needs_git
+async def test_answers_go_into_the_daily_note_and_buttons_work(aenv, monkeypatch):
+    from types import SimpleNamespace as NS
+    from overseer.assistant.telegram import AssistantBot
+    with_autopilot(aenv, monkeypatch)
+    v = aenv.vault
+    await v.init()
+    daily = v.root / v.daily_note()
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    daily.write_text("# Today\n\n## Log\n- 08:00 woke up\n\n## Done\n")
+    rem = aenv.domain.reminders
+    r = rem.add(time.time() - 1, "Meds 💊", kind="say")
+    await rem.fire_due()
+    edits = []
+
+    async def edit(q, text, buttons=None):
+        edits.append((text, buttons))
+    bot = AssistantBot(NS(_edit=edit), aenv.domain)
+    await bot._followup(None, r["id"], "done")
+    assert edits[-1] == ("✅ Meds 💊", None)
+    text = daily.read_text()
+    assert text.split("## Done")[0].rstrip().endswith("✅ Meds 💊") and "- 08:00 woke up" in text
+    assert (await v.log(1))[0].message == "Log: ✅ Meds 💊"
+    await bot._followup(None, r["id"], "done")
+    assert edits[-1][0] == "That one's settled already."
+    later = rem.add(time.time() - 1, "Water", kind="say")
+    await rem.fire_due()
+    await bot._followup(None, later["id"], "later")
+    assert edits[-1][0].startswith("💤 Water") and edits[-1][1] == [[("✖ Cancel", f"fu:{later['id']}:cancel")]]
+    # Without today's note, nothing is created (Obsidian applies its template when it makes the note).
+    daily.unlink()
+    x = rem.add(time.time() - 1, "Stretch", kind="say")
+    await rem.fire_due()
+    await rem.act(x["id"], "skip")
+    assert not daily.exists() and rem.log()[-1]["text"] == "Stretch"
