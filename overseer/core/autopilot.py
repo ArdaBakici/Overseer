@@ -316,15 +316,17 @@ class Autopilot:
             except Exception:
                 log.exception("timer tick failed")
 
-    def wake(self, s: Session, prompt: str, kind: str = "wakeup", quiet: bool = False) -> None:
-        """Wake the conversation now with this prompt (a domain's alert), unless its wake-ups are paused."""
-        if self.paused(s.id):
+    def wake(self, s: Session, prompt: str, kind: str = "wakeup", quiet: bool = False, by_user: bool = False) -> None:
+        """Wake the conversation now with this prompt (a domain's alert), unless its wake-ups are paused.
+        `by_user`: something the user set up (e.g. their routine, a button they pressed), not the agent - it runs
+        even while the agent's own wake-ups are paused, and its failure doesn't pause them."""
+        if self.paused(s.id) and not by_user:
             return
-        self._spawn(self._run(s, prompt, None, kind, quiet=quiet))
+        self._spawn(self._run(s, prompt, None, kind, quiet=quiet, by_user=by_user))
 
     # ------------------------------------------------------------------ running a wake-up
     async def _run(self, s: Session, prompt: str, notice: str | None, kind: str,
-                   undo: list[tuple] | None = None, quiet: bool = False) -> None:
+                   undo: list[tuple] | None = None, quiet: bool = False, by_user: bool = False) -> None:
         if notice:
             await self.notifier.send(Outgoing(notice, session_id=s.id, silent=quiet))
         try:
@@ -333,7 +335,7 @@ class Autopilot:
             if self.agent.shutting_down:  # cut off by Overseer stopping: offered again at the next start
                 return
             raise
-        if ok or self.agent.shutting_down:
+        if ok or self.agent.shutting_down or by_user:  # (the user's own schedule isn't the agent's to pause)
             return
         # A failed or stopped wake-up pauses this conversation's wake-ups: nothing keeps going unattended after a
         # problem. The watches that fired are put back, so they fire again once the researcher writes here.

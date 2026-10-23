@@ -282,7 +282,7 @@ class AssistantDomain(Domain):
             return
         s = agent.get(item.get("session")) or agent.general_session()
         agent.autopilot.wake(s, "\n\n".join([P.STUCK_PROMPT.format(text=item["text"]), await self.now_context()]),
-                             kind="stuck")
+                             kind="stuck", by_user=True)  # (they pressed 🧱 Stuck)
 
     # ------------------------------------------------------------------ a run: the vault's changes
     async def before_run(self, s: Session) -> Any:

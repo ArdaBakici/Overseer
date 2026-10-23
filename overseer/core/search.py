@@ -249,10 +249,10 @@ class Search:
         return turns[-max(last, 1):]
 
 
-    def day(self, start: float, end: float) -> list[tuple[str, str, list[dict]]]:
+    def day(self, start: float, end: float, projects: dict[str, str] | None = None) -> list[tuple[str, str, list[dict]]]:
         """Every conversation's turns between start and end: [(conversation, project, turns)], the earliest first."""
         folder = self.cfg.local.state("transcripts")
-        projects = self._projects()
+        projects = self._projects() if projects is None else projects  # (from the event loop: the store's thread)
         out = []
         for path in sorted(folder.glob("*.jsonl")) if folder.is_dir() else []:
             try:
@@ -266,7 +266,8 @@ class Search:
         return sorted(out, key=lambda c: c[2][0]["ts"])
 
     async def aday(self, start: float, end: float) -> list[tuple[str, str, list[dict]]]:
-        return await asyncio.to_thread(self.day, start, end)
+        projects = self._projects()  # (the store can only be used from the thread that opened it: here)
+        return await asyncio.to_thread(self.day, start, end, projects)
 
 
 def render_day(convs: list[tuple[str, str, list[dict]]], limit: int = 40_000) -> str:

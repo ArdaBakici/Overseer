@@ -115,7 +115,7 @@ class Scheduler:
         prompt = "\n\n".join([
             P.ROUTINE_PROMPT.format(name=r.name, routines_path=self.rel, when=f"{when:%A %H:%M}", do=r.do),
             await d.now_context()])
-        agent.autopilot.wake(s, prompt, kind="routine")
+        agent.autopilot.wake(s, prompt, kind="routine", by_user=True)  # (yours: runs even if wake-ups are paused)
 
     async def _report(self, rs: R.Routines) -> None:
         """Problems in the note (e.g. after an edit in Obsidian): told once per version of it."""
@@ -140,7 +140,7 @@ class Scheduler:
         s = agent.general_session()
         prompt = "\n\n".join([P.ONBOARDING_PROMPT.format(routines_path=self.rel, example=R.EXAMPLE),
                               await d.now_context()])
-        agent.autopilot.wake(s, prompt, kind="setup")
+        agent.autopilot.wake(s, prompt, kind="setup", by_user=True)
         return True
 
     async def loop(self) -> None:

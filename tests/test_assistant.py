@@ -699,7 +699,8 @@ def with_autopilot(aenv, monkeypatch):
     from overseer.core.autopilot import Autopilot
     ap = Autopilot(aenv.cfg, aenv.store, aenv.agent, aenv.notifier)
     woken = []
-    monkeypatch.setattr(ap, "wake", lambda s, prompt, kind="wakeup", quiet=False: woken.append((s.id, kind, prompt)))
+    monkeypatch.setattr(ap, "wake", lambda s, prompt, kind="wakeup", quiet=False, by_user=False:
+                        woken.append((s.id, kind, prompt)))
     return woken
 
 
@@ -1096,3 +1097,53 @@ async def test_overseer_reset_wipes_the_flags_and_asks_about_conversations(aenv,
         assert reset_command(aenv.cfg, yes=True) == 1 and aenv.store.get("assistant:x") == "1"
     finally:
         await aenv.ctl.stop()
+
+async def test_ov_history_day_through_ov(aenv):
+    """FB1: `ov history day` failed - the day's conversations were read in a worker thread that touched the
+    store (SQLite objects can only be used in the thread that made them)."""
+    from overseer.core.live import Transcript
+    s = aenv.agent.general_session()
+    t = Transcript(aenv.cfg, s.id)
+    t.write({"kind": "turn", "text": "plan my day"})
+    t.write({"kind": "end", "status": "done", "text": "Top 3: visa, gym, email"})
+    await aenv.ctl.start()
+    try:
+        token = aenv.ctl.open(s.id)
+        for when in ("today", "yesterday", date.today().isoformat()):
+            ok, text = await aenv.ctl.handle(token, ["history", "day", when])
+            assert "ProgrammingError" not in text and "thread" not in text, text
+        ok, text = await aenv.ctl.handle(token, ["history", "day"])
+        assert "plan my day" in text and "Top 3: visa, gym, email" in text, text
+        ok, text = await aenv.ctl.handle(token, ["history", "day", "yesterday"])
+        assert text == "no conversations that day"
+    finally:
+        await aenv.ctl.stop()
+
+
+
+async def test_a_routine_runs_even_while_wake_ups_are_paused(aenv, monkeypatch):
+    """A failed run pauses the agent's own wake-ups until the user writes - but routines are the user's schedule:
+    they still run, and one that fails (e.g. the network was down) doesn't pause anything."""
+    from overseer.assistant.scheduler import CHECKED_KEY
+    from overseer.core.autopilot import Autopilot
+    ap = Autopilot(aenv.cfg, aenv.store, aenv.agent, aenv.notifier)
+    runs = []
+
+    async def handle(s, prompt, quiet=False, origin="user", files=None):
+        runs.append(origin)
+        return False  # (the run failed)
+    monkeypatch.setattr(aenv.agent, "handle", handle)
+    s = aenv.agent.general_session()
+    aenv.store.set(f"wakeups_paused:{s.id}", "1")  # (paused by an earlier failure)
+    (aenv.vault.root / "Assistant/Routines.md").write_text(ROUTINES)
+    aenv.store.set(CHECKED_KEY, str(datetime(2026, 10, 19, 8, 59).timestamp()))
+    assert await aenv.domain.scheduler.tick(datetime(2026, 10, 19, 9, 1)) == ["Morning planning"]
+    await ap.drain()
+    assert runs == ["routine"]
+    aenv.store.set(f"wakeups_paused:{s.id}", "")
+    ap.wake(s, "[Routine: x]", kind="routine", by_user=True)
+    await ap.drain()
+    assert runs == ["routine", "routine"] and not ap.paused(s.id)  # (a failed routine pauses nothing)
+    ap.wake(s, "agent's own", kind="wakeup")
+    await ap.drain()
+    assert ap.paused(s.id)  # (the agent's own wake-ups still pause on failure)
