@@ -9,6 +9,7 @@ Telegram account (2FA).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import re
@@ -65,6 +66,7 @@ Send pictures and files too (up to 20 MB): with a caption, or followed by a mess
 
 
 NET_ERROR_LOG_SECONDS = 300
+BACKLOG_MAX = 200  # messages kept while Telegram can't be reached
 
 
 def _preview(rec: dict, limit: int = 120) -> str:
@@ -94,6 +96,11 @@ class TelegramNotifier:
         self.topic_mode = False  # the bot's mode in @BotFather
         self._drafts: dict[int, str | None] = {}  # live draft id -> conversation
         self._recreated: dict[str, float] = {}  # project -> when its topic was last recreated
+        # Messages Telegram couldn't be reached for (the network was down): sent once it can be, oldest first.
+        self._backlog: list[tuple[float, Outgoing]] = []
+        self._backlog_task: asyncio.Task | None = None
+        self.retry_delay = 2.0  # seconds before the 2nd try of a send (then 2x, ...); the backlog retries every
+        self.backlog_retry = 30.0  # this often
 
     async def detect_topics(self) -> bool:
         """Topics if the bot has topic mode on in @BotFather, unless telegram.topics turns them off."""
@@ -236,17 +243,67 @@ class TelegramNotifier:
         return deleted
 
     async def send(self, msg: Outgoing) -> None:
-        """Deliver a message. Never raises: a Telegram hiccup must not break monitoring."""
+        """Deliver a message. Never raises: a Telegram hiccup must not break monitoring. If Telegram can't be
+        reached (the network is down), the message waits in the backlog and goes out once it can be."""
+        if self._backlog:
+            await self._flush_backlog()
+            if self._backlog:  # (still unreachable: in line behind the others, in order)
+                self._queue(msg)
+                return
+        if not await self._try_send(msg):
+            self._queue(msg)
+
+    async def _try_send(self, msg: Outgoing) -> bool:
+        """True if it was sent (or can't be: rejected, or maybe sent already); False if Telegram is unreachable."""
         for attempt in range(3):
             try:
                 await self._send(msg)
-                return
+                return True
             except BadRequest:
                 log.exception("telegram rejected message")
-                return
+                return True
+            except TimedOut:  # (it may have arrived: sending it again could make two)
+                log.warning("sending a message timed out: Telegram didn't answer in time (it may have arrived anyway)")
+                return True
+            except NetworkError as e:  # (couldn't connect: DNS, refused, reset - it didn't arrive)
+                log.warning("Telegram unreachable, message not sent yet (try %d): %s", attempt + 1, e)
             except Exception:
                 log.exception("telegram send failed (attempt %d)", attempt + 1)
-                await asyncio.sleep(2 * (attempt + 1))
+                if attempt == 2:
+                    return True  # (not a network problem: retrying later won't help)
+            await asyncio.sleep(self.retry_delay * (attempt + 1))
+        return False
+
+    def _queue(self, msg: Outgoing) -> None:
+        if len(self._backlog) >= BACKLOG_MAX:
+            self._backlog.pop(0)
+            log.warning("Telegram unreachable for long: the oldest waiting message was dropped")
+        self._backlog.append((time.time(), msg))
+        log.warning("%d message(s) waiting for Telegram to be reachable again", len(self._backlog))
+        if self._backlog_task is None or self._backlog_task.done():
+            self._backlog_task = asyncio.get_running_loop().create_task(self._backlog_loop())
+
+    async def _flush_backlog(self) -> None:
+        while self._backlog:
+            queued, msg = self._backlog[0]
+            note = f"\n\n<i>(delayed: Telegram couldn't be reached at {time.strftime('%H:%M', time.localtime(queued))})</i>"
+            late = dataclasses.replace(msg, text=msg.text + note,
+                                       markdown=msg.markdown + note if msg.markdown else None)
+            try:
+                await self._send(late)
+            except (BadRequest, TimedOut):
+                pass  # (rejected, or maybe arrived: either way not again)
+            except NetworkError:
+                return  # still unreachable
+            except Exception:
+                log.exception("telegram send failed (a delayed message)")
+            self._backlog.pop(0)
+        log.info("Telegram reachable again: the waiting messages went out")
+
+    async def _backlog_loop(self) -> None:
+        while self._backlog:
+            await asyncio.sleep(self.backlog_retry)
+            await self._flush_backlog()
 
     # ------------------------------------------------------------------ jobs topics and live job cards
     def jobs_thread(self, chat_id: int, project: str | None) -> int | None:

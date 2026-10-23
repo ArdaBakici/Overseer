@@ -3765,3 +3765,43 @@ async def test_slow_media_uploads_are_given_time_and_not_sent_twice(env, caplog)
     assert tries == ["shaula.gif"] and tg.sent[-1][2] == "🤖 here"  # once; the message itself went out once
     line = [r for r in caplog.records if "shaula.gif" in r.getMessage()][-1]
     assert "may have arrived" in line.getMessage() and not line.exc_info
+
+
+async def test_messages_wait_while_telegram_is_unreachable(env, caplog):
+    """The network is down (DNS): messages aren't lost after three quick tries - they wait, and go out in order,
+    marked as delayed, once Telegram can be reached; each failure is one line, not a traceback."""
+    import logging
+    from telegram.error import NetworkError, TimedOut
+    from overseer.core.bot import TelegramNotifier
+    tg = FakeTelegram()
+    real_send = tg.send_message
+    tg.down = True
+
+    async def send_message(chat_id, text, **kw):
+        if tg.down:
+            raise NetworkError("httpx.ConnectError: [Errno -3] Temporary failure in name resolution")
+        return await real_send(chat_id, text, **kw)
+    tg.send_message = send_message
+    n = TelegramNotifier(NS(bot=tg), [1], env.store)
+    n.retry_delay = 0
+    n.backlog_retry = 0.01
+    caplog.set_level(logging.INFO, logger="overseer")
+    await n.send(Outgoing("⏰ Meds 💊"))
+    await n.send(Outgoing("⏰ Water"))
+    assert tg.sent == [] and len(n._backlog) == 2
+    assert not any(r.exc_info for r in caplog.records)  # (no tracebacks for a network that's down)
+    tg.down = False
+    await asyncio.sleep(0.05)  # (the backlog's retry)
+    assert [t.split("\n")[0] for _, _, t in tg.sent] == ["⏰ Meds 💊", "⏰ Water"] and n._backlog == []
+    assert "delayed: Telegram couldn't be reached at" in tg.sent[0][2]
+    await n.send(Outgoing("🤖 later"))
+    assert tg.sent[-1][2] == "🤖 later"  # (no note on messages that weren't delayed)
+    # A timeout isn't retried (it may have arrived): no second copy, nothing queued.
+    calls = []
+
+    async def slow(chat_id, text, **kw):
+        calls.append(text)
+        raise TimedOut()
+    tg.send_message = slow
+    await n.send(Outgoing("🤖 slow"))
+    assert calls == ["🤖 slow"] and n._backlog == []
