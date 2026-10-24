@@ -607,7 +607,8 @@ token = os.environ.get("OVERSEER_CTL", "")
 # Folders are on the HPC: an unquoted ~/x was expanded by the local shell to this machine's home - undo that.
 home = os.environ.get("HOME", "").rstrip("/")
 argv = [("~" + a[len(home):]) if home and (a == home or a.startswith(home + "/")) else a for a in sys.argv[1:]]
-# A plan (ov propose plan.json) and long texts ("-": read from stdin) are read here, with the agent's own access.
+# A plan (ov propose plan.json, ov cal propose changes.json) and long texts ("-": read from stdin) are read here, with
+# the agent's own access.
 if argv[:1] == ["propose"] and len(argv) == 2 and not argv[1].lstrip().startswith("{"):
     try:
         argv[1] = sys.stdin.read() if argv[1] == "-" else open(os.path.expanduser(sys.argv[2])).read()
@@ -619,6 +620,12 @@ elif argv[:2] == ["skill", "propose"] and len(argv) >= 3 and not argv[2].lstrip(
         argv[2] = sys.stdin.read() if argv[2] == "-" else open(os.path.expanduser(sys.argv[3])).read()
     except OSError as e:
         sys.stderr.write("ov: can't read the skill: %s\n" % e)
+        sys.exit(1)
+elif argv[:2] == ["cal", "propose"] and len(argv) >= 3 and not argv[2].lstrip().startswith(("[", "{")):
+    try:
+        argv[2] = sys.stdin.read() if argv[2] == "-" else open(os.path.expanduser(sys.argv[3])).read()
+    except OSError as e:
+        sys.stderr.write("ov: can't read the changes: %s\n" % e)
         sys.exit(1)
 elif "-" in argv[1:] and argv[:1] in (["spawn"], ["agent"]):
     argv[argv.index("-")] = sys.stdin.read()

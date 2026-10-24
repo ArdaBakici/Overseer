@@ -46,15 +46,27 @@ are not woken):
                                    to 3 more times", or none
   ov routine check                 the routines note: problems, and when each runs next
 Calendar (Google, and read-only iCal links; if turned on - ids are the first column of a list):
-  ov cal list [today|tomorrow|week|next week|<day>] [--days N] [--calendar c] [--search words]
-  ov cal free [<day>] [--from 09:00] [--to 21:00] [--min 30m]   free stretches between events
+  ov cal list [today|tomorrow|week|next week|<day>] [--days N] [--calendar c] [--search words] [--label l]
+  ov cal free [<day>] [--days N] [--from 09:00] [--to 21:00] [--min 30m] [--buffer 10m]
+                                   free stretches between events (--buffer: kept that far from them)
   ov cal calendars                 the calendars, and which ones you may change
-  ov cal add "<title>" <start> [<length>|<end>] [--calendar c] [--where p] [--note t]
+  ov cal add "<title>" <start> [<length>|<end>] [--calendar c] [--where p] [--note t] [--label l] [--task id]
                                    start: "thursday 14:00", "tomorrow 9am"; length: 2h, 45m, or an end, 16:00
   ov cal add "<title>" <day> --all-day [--days N]
-  ov cal move <id> <start> [<length>] · ov cal edit <id> [--title t] [--where p] [--note t] · ov cal delete <id>
+  ov cal move <id> <start> [<length>] · ov cal delete <id>
+  ov cal edit <id> [--title t] [--where p] [--note t] [--label l] [--task id]   (--label "" / --task "": remove)
+  ov cal propose changes.json [--title "Thursday"]   several changes as ONE proposal (one card, one ↩️ Undo):
+                                   [{"action": "add", "title": ..., "start": ..., "length"|"end": ..., "label": ...,
+                                     "task": ..., "calendar": ..., "where": ..., "note": ...},
+                                    {"action": "move", "id": ..., "start": ...}, {"action": "edit", "id": ..., ...},
+                                    {"action": "delete", "id": ...}]          (- reads it from stdin)
                                    changes go through the user: a card to tap ✅ on (or done at once, with
-                                   ↩️ Undo, in calendars they allowed); never events with other people
+                                   ↩️ Undo, in calendars they allowed); never events with other people. Overlaps
+                                   with busy events are refused unless --overlap
+  ov cal on <id> start|end [--before 10m | --after 5m] --say "<message>" | --do "<what you'll do then>"
+                                   an action tied to an event (follows it if it moves): --say sends them the
+                                   message with ✅ / 💤 / ⏭ (✅ ticks off the event's --task); --do wakes you
+  ov cal actions · ov cal off <action id>
 Pictures, GIFs and videos from the internet (your shell has none: Overseer downloads them, public addresses only):
   ov fetch <url> [--name n] [--keep]   into ./outbox/ (sent with your reply), --keep: into ./inbox/ to work on
   ov gif <query> [--pick N]        a GIF from Giphy into ./outbox/ (if turned on)
@@ -155,11 +167,14 @@ class AssistantCommands:
         a.add_argument("--days", type=int, default=0)
         a.add_argument("--calendar", default="")
         a.add_argument("--search", default="")
+        a.add_argument("--label", default="")
         a = cal.add_parser("free", add_help=False)
         a.add_argument("day", nargs="?", default="today")
+        a.add_argument("--days", type=int, default=1)
         a.add_argument("--from", dest="from_", default="09:00")
         a.add_argument("--to", default="21:00")
         a.add_argument("--min", default="30m")
+        a.add_argument("--buffer", default="0")
         cal.add_parser("calendars", add_help=False)
         a = cal.add_parser("add", add_help=False)
         a.add_argument("title")
@@ -170,16 +185,36 @@ class AssistantCommands:
         a.add_argument("--note", default="")
         a.add_argument("--all-day", dest="all_day", action="store_true")
         a.add_argument("--days", type=int, default=1)
+        a.add_argument("--label", default="")
+        a.add_argument("--task", default="")
+        a.add_argument("--overlap", action="store_true")
         a = cal.add_parser("move", add_help=False)
         a.add_argument("id")
         a.add_argument("start")
         a.add_argument("length", nargs="?", default="")
+        a.add_argument("--overlap", action="store_true")
         a = cal.add_parser("edit", add_help=False)
         a.add_argument("id")
         a.add_argument("--title")
         a.add_argument("--where")
         a.add_argument("--note")
+        a.add_argument("--label")
+        a.add_argument("--task")
         cal.add_parser("delete", add_help=False).add_argument("id")
+        a = cal.add_parser("propose", add_help=False)
+        a.add_argument("changes")
+        a.add_argument("--title", default="")
+        a.add_argument("--overlap", action="store_true")
+        a = cal.add_parser("on", add_help=False)
+        a.add_argument("id")
+        a.add_argument("anchor", choices=["start", "end"])
+        a.add_argument("--before", default="")
+        a.add_argument("--after", default="")
+        a.add_argument("--offset", default="")  # (--offset=-10m: the same as --before 10m)
+        a.add_argument("--say", default="")
+        a.add_argument("--do", dest="do", default="")
+        cal.add_parser("actions", add_help=False)
+        cal.add_parser("off", add_help=False).add_argument("action_id")
         a = sub.add_parser("gif", add_help=False)
         a.add_argument("query", nargs="+")
         a.add_argument("--pick", type=int, default=1)
@@ -250,7 +285,7 @@ class AssistantCommands:
             raise CtlError("the calendar is off (calendar.enabled in the bot's config)")
         action = args.action or "list"
         if action == "list" and not hasattr(args, "when"):
-            args.when, args.days, args.calendar, args.search = [], 0, "", ""
+            args.when, args.days, args.calendar, args.search, args.label = [], 0, "", "", ""
         return await getattr(self, f"cal_{action}")(c, session, args)
 
     async def cal_calendars(self, c, session, args) -> str:
@@ -280,29 +315,38 @@ class AssistantCommands:
     async def cal_list(self, c, session, args) -> str:
         start, end = self._range(args.when, args.days)
         events = await c.between(start, end, args.calendar, args.search)
+        if args.label:
+            events = [e for e in events if e.label == args.label.strip()]
         if not events:
             return f"no events {start:%a %d %b}" + (f" – {end - C.timedelta(days=1):%a %d %b}"
                                                      if (end - start).days > 1 else "")
         today = self.domain.today()
-        lines = [e.line(today, show_cal=len(c.cals) > 1) for e in events[:150]]
+        acts = {(a["cal"], a["event"]) for a in c.actions()}
+        lines = [e.line(today, show_cal=len(c.cals) > 1) + (" (has actions)" if (e.cal, e.id) in acts else "")
+                 for e in events[:150]]
         return "\n".join(lines + ([f"(+{len(events) - 150} more)"] if len(events) > 150 else []))
 
     async def cal_free(self, c, session, args) -> str:
-        day = parse_day(args.day, self.domain.today())
-        frm, to = (C.local(C.datetime.combine(day, _clock(x))) for x in (args.from_, args.to))
+        first = parse_day(args.day, self.domain.today())
+        if not 1 <= args.days <= 14:
+            raise CtlError("--days: 1 to 14")
+        minimum, buffer = _length(args.min), _length(args.buffer) if args.buffer.strip("0 ") else 0
         now = C.local(C.datetime.now()).replace(second=0, microsecond=0)
-        frm = max(frm, now) if day == now.date() else frm
-        if to <= frm:
-            return f"nothing left of {day:%a %d %b} between {args.from_} and {args.to}"
-        minimum = _length(args.min)
-        events = await c.between(frm, to)
-        slots = c.free_slots(events, frm, to, minimum)
-        busy = [e for e in c.busy(events)]
-        head = f"{day:%a %d %b} {frm:%H:%M}–{to:%H:%M}: {len(busy)} event(s)"
-        if not slots:
-            return head + f"; no free stretch of {C.duration_text(minimum)} or more"
-        return head + "; free: " + ", ".join(f"{a:%H:%M}–{b:%H:%M} ({C.duration_text((b - a).total_seconds())})"
-                                              for a, b in slots)
+        out = []
+        for n in range(args.days):
+            day = first + C.timedelta(days=n)
+            frm, to = (C.local(C.datetime.combine(day, _clock(x))) for x in (args.from_, args.to))
+            frm = max(frm, now) if day == now.date() else frm
+            if to <= frm:
+                out.append(f"{day:%a %d %b}: nothing left between {args.from_} and {args.to}")
+                continue
+            events = await c.between(frm - C.timedelta(seconds=buffer), to + C.timedelta(seconds=buffer))
+            slots = c.free_slots(events, frm, to, minimum, buffer)
+            head = f"{day:%a %d %b} {frm:%H:%M}–{to:%H:%M}: {len(c.busy(events))} event(s)"
+            out.append(head + (f"; no free stretch of {C.duration_text(minimum)} or more" if not slots else
+                               "; free: " + ", ".join(f"{a:%H:%M}–{b:%H:%M} ({C.duration_text((b - a).total_seconds())})"
+                                                      for a, b in slots)))
+        return "\n".join(out) + (f"\n(free time kept {C.duration_text(buffer)} away from events)" if buffer else "")
 
     def _when(self, start_text: str, length: str, all_day: bool, days: int = 1):
         if all_day:
@@ -324,26 +368,117 @@ class AssistantCommands:
             return start, end
         return start, start + C.timedelta(seconds=_length(length))
 
+    def _task(self, tid: str | None) -> tuple[str, str] | None:
+        """--task <id>: (its id, its text) - "" unlinks."""
+        if tid is None:
+            return None
+        if not tid.strip():
+            return ("", "")
+        t = T.find(self.vault, tid)
+        return t.id, t.text
+
+    def _move_length(self, c, sid: str, length: str) -> str:
+        cal_id, eid = c.find(sid)
+        ev = next((e for e in c.events if (e.cal, e.id) == (cal_id, eid)), None)
+        if ev and ev.all_day:
+            raise CtlError(f"“{ev.title}” is an all-day event: delete it and add it again instead")
+        return length or (C.duration_text((ev.ends() - ev.starts()).total_seconds()) if ev else "")
+
+    async def _item(self, c, x: dict) -> dict:
+        """One change of a proposal (JSON) -> what Calendar.propose takes."""
+        if not isinstance(x, dict):
+            raise CtlError("each change is an object, e.g. {\"action\": \"add\", \"title\": ..., \"start\": ...}")
+        act = str(x.get("action", "")).lower()
+        known = {"add": {"title", "start", "length", "end", "all_day", "days", "calendar", "where", "note", "label",
+                         "task"},
+                 "move": {"id", "start", "length", "end"}, "edit": {"id", "title", "where", "note", "label", "task"},
+                 "delete": {"id"}}
+        if act not in known:
+            raise CtlError(f"action {act!r}: add, move, edit or delete")
+        extra = set(x) - known[act] - {"action"}
+        if extra:
+            raise CtlError(f"{act}: unknown fields {', '.join(sorted(extra))} (it takes {', '.join(sorted(known[act]))})")
+        s = lambda k: x.get(k) if x.get(k) is None else str(x.get(k))  # noqa: E731
+        length = s("end") or s("length") or ""
+        if act == "add":
+            if not s("title") or not s("start"):
+                raise CtlError("add: title and start")
+            start, end = self._when(s("start"), length, bool(x.get("all_day")), int(x.get("days") or 1))
+            return c.build_add(s("title")[:200], start, end, bool(x.get("all_day")), s("calendar") or "",
+                               (s("where") or "")[:300], (s("note") or "")[:2000], (s("label") or "")[:40],
+                               self._task(s("task")) if s("task") else None)
+        if not s("id"):
+            raise CtlError(f"{act}: id (from ov cal list)")
+        if act == "move":
+            if not s("start"):
+                raise CtlError("move: start")
+            start, end = self._when(s("start"), self._move_length(c, s("id"), length), False)
+            return await c.build_change(s("id"), start=start, end=end)
+        if act == "edit":
+            return await c.build_change(s("id"), title=s("title"), where=s("where"), note=s("note"),
+                                        label=s("label"), task=self._task(s("task")))
+        return await c.build_delete(s("id"))
+
     async def cal_add(self, c, session, args) -> str:
-        start, end = self._when(args.start, args.length, args.all_day, args.days)
-        return await c.propose_add(session, args.title.strip()[:200] or "(no title)", start, end, args.all_day,
-                                   args.calendar, args.where[:300], args.note[:2000])
+        item = await self._item(c, {"action": "add", "title": args.title.strip() or "(no title)", "start": args.start,
+                                    "length": args.length, "all_day": args.all_day, "days": args.days,
+                                    "calendar": args.calendar, "where": args.where, "note": args.note,
+                                    "label": args.label, "task": args.task or None})
+        return await c.propose(session, [item], overlap=args.overlap)
 
     async def cal_move(self, c, session, args) -> str:
-        cal_id, eid = c.find(args.id)
-        ev = next((e for e in c.events if (e.cal, e.id) == (cal_id, eid)), None)
-        length = args.length or (C.duration_text((ev.ends() - ev.starts()).total_seconds())
-                                 if ev and not ev.all_day else "")
-        if ev and ev.all_day:
-            raise CtlError("an all-day event: say what to change in Google Calendar, or delete it and add it again")
-        start, end = self._when(args.start, length, False)
-        return await c.propose_change(session, args.id, start=start, end=end)
+        item = await self._item(c, {"action": "move", "id": args.id, "start": args.start, "length": args.length})
+        return await c.propose(session, [item], overlap=args.overlap)
 
     async def cal_edit(self, c, session, args) -> str:
-        return await c.propose_change(session, args.id, title=args.title, where=args.where, note=args.note)
+        item = await self._item(c, {"action": "edit", "id": args.id, "title": args.title, "where": args.where,
+                                    "note": args.note, "label": args.label, "task": args.task})
+        return await c.propose(session, [item])
 
     async def cal_delete(self, c, session, args) -> str:
-        return await c.propose_delete(session, args.id)
+        return await c.propose(session, [await self._item(c, {"action": "delete", "id": args.id})])
+
+    async def cal_propose(self, c, session, args) -> str:
+        import json
+        try:
+            changes = json.loads(args.changes)
+        except ValueError as e:
+            raise CtlError(f"not valid JSON ({e}): a list of changes, e.g. [{{\"action\": \"add\", \"title\": "
+                           "\"Write the intro\", \"start\": \"thursday 9:30\", \"length\": \"90m\"}, "
+                           "{\"action\": \"move\", \"id\": \"a1b2c3\", \"start\": \"friday 10:00\"}]") from None
+        if isinstance(changes, dict) and "changes" in changes:
+            args.title = args.title or str(changes.get("title") or "")
+            changes = changes["changes"]
+        if not isinstance(changes, list):
+            raise CtlError("a list of changes (or {\"title\": ..., \"changes\": [...]})")
+        items = []
+        for i, x in enumerate(changes, 1):
+            try:
+                items.append(await self._item(c, x))
+            except (CtlError, C.CalendarError, T.TaskError) as e:
+                raise CtlError(f"change {i}: {e}") from None
+        return await c.propose(session, items, args.title, overlap=args.overlap)
+
+    async def cal_on(self, c, session, args) -> str:
+        if sum(bool(x.strip()) for x in (args.before, args.after, args.offset)) > 1:
+            raise CtlError("one of --before 10m or --after 5m")
+        off = args.offset.strip() or (f"-{args.before.strip()}" if args.before.strip() else args.after.strip())
+        sign = -1 if off.startswith("-") else 1
+        seconds = sign * _length(off.lstrip("+-")) if off.strip("+-0 ") else 0
+        if bool(args.say) == bool(args.do):
+            raise CtlError("one of --say \"<a message for them>\" or --do \"<what you'll do then>\"")
+        return c.add_action(session, args.id, args.anchor, seconds, "say" if args.say else "do",
+                            args.say or args.do)
+
+    async def cal_actions(self, c, session, args) -> str:
+        acts = c.actions()
+        return "\n".join(f"{a['id']} {c.action_line(a)}" for a in acts) or "no actions tied to events"
+
+    async def cal_off(self, c, session, args) -> str:
+        a = c.remove_action(args.action_id)
+        if not a:
+            raise CtlError(f"no action {args.action_id!r} (ov cal actions)")
+        return f"✓ removed {a['id']}: {c.action_line(a)}"
 
     # ------------------------------------------------------------------ reminders, check-backs, focus
     def _policy(self, spec: str):

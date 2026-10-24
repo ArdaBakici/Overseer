@@ -38,12 +38,17 @@ LIST_SCOPE = "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
 EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 EVENTS_RO_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly"
 REDIRECT = "http://127.0.0.1:8765/"  # (nothing listens there: you copy the address the browser ends up at)
+ACTION_TICK = 20  # seconds between looks at the actions tied to events
 WINDOW_DAYS = 14  # what's kept in memory, from today
 KEY = "assistant:cal:"  # + id: a change waiting for ✅ / done (for ↩️ Undo)
 REMINDERS_KEY = "assistant:cal_reminders"  # event -> the reminder set for it
 KEEP_SECONDS = 7 * 86400  # how long a change can still be approved or undone
+LABEL_PROP, TASK_PROP, TASK_TEXT_PROP = "overseer_label", "overseer_task", "overseer_task_text"  # (private to you)
+ACTIONS_KEY = "assistant:calon:"  # + id: an action tied to an event (ov cal on)
+MAX_CHANGES = 30  # in one proposal
+CATCH_UP = 3 * 3600  # an action missed while Overseer was down still runs if it's this recent
 COPY_FIELDS = ("summary", "start", "end", "location", "description", "colorId", "transparency", "visibility",
-               "reminders")
+               "reminders", "extendedProperties")
 
 
 class CalendarError(Exception):
@@ -120,6 +125,8 @@ class Event:
     declined: bool = False
     free: bool = False  # "show as available"
     recurring: bool = False
+    label: str = ""  # the assistant's own labels and task links (on Google events it made or edited)
+    task: str = ""
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -138,13 +145,14 @@ class Event:
             bits.append(f"@ {self.where[:60]}")
         tags = [self.cal_name] if show_cal else []
         tags += [t for t, on in (("with others", self.others), ("declined", self.declined), ("free", self.free),
-                                 ("repeats", self.recurring)) if on]
+                                 ("repeats", self.recurring), (f"label: {self.label}", self.label),
+                                 (f"task {self.task}", self.task)) if on]
         return " ".join(bits) + (f" [{', '.join(tags)}]" if tags else "")
 
     def to_dict(self) -> dict:
         return {"id": self.sid, "calendar": self.cal_name, "title": self.title, "where": self.where,
                 "all_day": self.all_day, "start": self.starts().timestamp(), "end": self.ends().timestamp(),
-                "others": self.others, "declined": self.declined}
+                "others": self.others, "declined": self.declined, "label": self.label}
 
 
 def short_id(cal: str, eid: str) -> str:
@@ -158,11 +166,12 @@ def make_event(cal: Cal, item: dict) -> Event | None:
     end, _ = _parse_time(item.get("end") or item["start"])
     me = next((a for a in item.get("attendees") or [] if a.get("self")), None)
     others = [a for a in item.get("attendees") or [] if not a.get("self") and not a.get("resource")]
+    mine = (item.get("extendedProperties") or {}).get("private") or {}
     return Event(cal=cal.id, cal_name=cal.name, id=item["id"], title=item.get("summary", ""), start=start, end=end,
                  all_day=all_day, where=item.get("location", ""), note=(item.get("description") or "")[:500],
                  others=len(others), declined=bool(me and me.get("responseStatus") == "declined"),
                  free=item.get("transparency") == "transparent", recurring=bool(item.get("recurringEventId")),
-                 raw=item)
+                 label=str(mine.get(LABEL_PROP, "")), task=str(mine.get(TASK_PROP, "")), raw=item)
 
 
 # ---------------------------------------------------------------------------- Google
@@ -633,13 +642,15 @@ class Calendar:
     def busy(events: list[Event]) -> list[Event]:
         return [e for e in events if not e.all_day and not e.declined and not e.free]
 
-    def free_slots(self, events: list[Event], start: datetime, end: datetime, minimum: int = 30 * 60
-                   ) -> list[tuple[datetime, datetime]]:
-        slots, at = [], start
+    def free_slots(self, events: list[Event], start: datetime, end: datetime, minimum: int = 30 * 60,
+                   buffer: int = 0) -> list[tuple[datetime, datetime]]:
+        """Free stretches of at least `minimum` seconds between busy events, kept `buffer` seconds away from them."""
+        slots, at, pad = [], start, timedelta(seconds=buffer)
         for e in sorted(self.busy(events), key=lambda e: e.starts()):
-            if e.starts() > at and (e.starts() - at).total_seconds() >= minimum:
-                slots.append((at, min(e.starts(), end)))
-            at = max(at, e.ends())
+            s = e.starts() - pad
+            if s > at and (min(s, end) - at).total_seconds() >= minimum:
+                slots.append((at, min(s, end)))
+            at = max(at, e.ends() + pad)
             if at >= end:
                 break
         if (end - at).total_seconds() >= minimum:
@@ -703,73 +714,116 @@ class Calendar:
         self.store.set(REMINDERS_KEY, json.dumps(have))
 
     async def loop(self) -> None:
+        last = 0.0
         while True:
             if self.enabled:
                 try:
-                    await self.sync()
+                    if time.time() - last >= self.cfg.calendar.sync_minutes * 60:
+                        last = time.time()
+                        await self.sync()
+                    await self.run_actions()
                 except Exception:
                     log.exception("calendar")
-            await asyncio.sleep(self.cfg.calendar.sync_minutes * 60)
+            await asyncio.sleep(ACTION_TICK)
 
-    # ---- changes
+    # ---- changes: one or several, behind one card (ask calendars) or done at once with one ↩️ Undo (auto)
     async def _get(self, cal: str, eid: str) -> dict:
         return await self.google.call("GET", f"/calendars/{_q(cal)}/events/{_q(eid)}")
+
+    def _writable(self, cal: Cal) -> Cal:
+        if cal.kind != "google":
+            raise CalendarError(f"{cal.name} is read-only (an iCal link)")
+        if cal.mode == "read":
+            raise CalendarError(f"{cal.name} is read-only for you (calendar.ask / calendar.auto in the config)")
+        return cal
 
     async def _existing(self, sid: str) -> tuple[Cal, Event]:
         cal_id, eid = self.find(sid)
         cal = next((c for c in self.cals if c.id == cal_id), None)
         if not cal:
             raise CalendarError("that calendar isn't one it sees any more")
-        if cal.kind != "google":
-            raise CalendarError(f"{cal.name} is read-only (an iCal link)")
-        if cal.mode == "read":
-            raise CalendarError(f"{cal.name} is read-only for you (calendar.ask / calendar.auto in the config)")
+        self._writable(cal)
         ev = make_event(cal, await self._get(cal_id, eid))
         if not ev:
             raise CalendarError("that event was deleted")
         if ev.others:
             raise CalendarError(f"“{ev.title}” has other people invited: Overseer leaves those to them (change it in "
                                 "Google Calendar)")
-        if cal.mode == "read":
-            raise CalendarError(f"{cal.name} is read-only for you (calendar.ask / calendar.auto in the config)")
         return cal, ev
 
-    async def propose_add(self, session, title: str, start, end, all_day: bool, cal_name: str = "",
-                          where: str = "", note: str = "") -> str:
-        cal = self.cal(cal_name) if cal_name else self.default_cal()
-        if cal.kind != "google":
-            raise CalendarError(f"{cal.name} is read-only (an iCal link)")
-        if cal.mode == "read":
-            raise CalendarError(f"{cal.name} is read-only for you (calendar.ask / calendar.auto in the config)")
+    @staticmethod
+    def _private(ev: Event | None, label: str | None, task: tuple[str, str] | None) -> dict | None:
+        """extendedProperties for a label / task link (None: unchanged)."""
+        if label is None and task is None:
+            return None
+        mine = dict(((ev.raw.get("extendedProperties") or {}).get("private") or {}) if ev else {})
+        if label is not None:
+            mine[LABEL_PROP] = label
+        if task is not None:
+            mine[TASK_PROP], mine[TASK_TEXT_PROP] = task
+        return {"private": {k: v for k, v in mine.items() if v}}
+
+    def build_add(self, title: str, start, end, all_day: bool, cal_name: str = "", where: str = "", note: str = "",
+                  label: str = "", task: tuple[str, str] | None = None) -> dict:
+        cal = self._writable(self.cal(cal_name) if cal_name else self.default_cal())
         tz = self.cfg.local.timezone or ""
         body = {"summary": title, "start": _google_time(start, tz), "end": _google_time(end, tz)}
         if where:
             body["location"] = where
         if note:
             body["description"] = note
-        return await self._propose(session, {"action": "add", "cal": cal.id, "body": body}, cal)
+        if ext := self._private(None, label or None, task):
+            body["extendedProperties"] = ext
+        return {"action": "add", "cal": cal.id, "body": body}
 
-    async def propose_change(self, session, sid: str, *, start=None, end=None, title=None, where=None,
-                             note=None) -> str:
+    async def build_change(self, sid: str, *, start=None, end=None, title=None, where=None, note=None,
+                           label: str | None = None, task: tuple[str, str] | None = None) -> dict:
         cal, ev = await self._existing(sid)
         tz = self.cfg.local.timezone or ""
         body: dict = {}
         if start is not None:
+            if ev.all_day:
+                raise CalendarError(f"“{ev.title}” is an all-day event: delete it and add it again instead")
             body["start"], body["end"] = _google_time(start, tz), _google_time(end, tz)
         for k, v in (("summary", title), ("location", where), ("description", note)):
             if v is not None:
                 body[k] = v
+        if ext := self._private(ev, label, task):
+            body["extendedProperties"] = ext
         if not body:
-            raise CalendarError("nothing to change: give a new time, --title, --where or --note")
+            raise CalendarError("nothing to change: give a new time, --title, --where, --note, --label or --task")
         old = {k: ev.raw.get(k, "" if k in ("summary", "location", "description") else None) for k in body}
-        return await self._propose(session, {"action": "change", "cal": cal.id, "event": ev.id, "body": body,
-                                             "old": old, "title": ev.title}, cal)
+        if "extendedProperties" in body:
+            old["extendedProperties"] = ev.raw.get("extendedProperties") or {"private": {}}
+        return {"action": "change", "cal": cal.id, "event": ev.id, "body": body, "old": old, "title": ev.title,
+                "sid": ev.sid}
 
-    async def propose_delete(self, session, sid: str) -> str:
+    async def build_delete(self, sid: str) -> dict:
         cal, ev = await self._existing(sid)
-        old = {k: ev.raw[k] for k in COPY_FIELDS if k in ev.raw}
-        return await self._propose(session, {"action": "delete", "cal": cal.id, "event": ev.id, "old": old,
-                                             "title": ev.title}, cal)
+        return {"action": "delete", "cal": cal.id, "event": ev.id, "title": ev.title, "sid": ev.sid,
+                "old": {k: ev.raw[k] for k in COPY_FIELDS if k in ev.raw}}
+
+    async def overlaps(self, items: list[dict]) -> list[str]:
+        """Where these changes would put timed events on top of others (busy ones, or each other)."""
+        new = []
+        for p in items:
+            if p["action"] in ("add", "change") and "start" in p["body"]:
+                (s, e), all_day = _span(p["body"])
+                if not all_day and p["body"].get("transparency") != "transparent":
+                    new.append((s, e, p["body"].get("summary") or p.get("title") or "?"))
+        if not new:
+            return []
+        gone = {(p["cal"], p.get("event")) for p in items if p["action"] in ("change", "delete")}
+        lo, hi = min(s for s, _, _ in new), max(e for _, e, _ in new)
+        existing = [e for e in self.busy(await self.between(lo, hi)) if (e.cal, e.id) not in gone]
+        out = []
+        for i, (s, e, name) in enumerate(new):
+            for ev in existing:
+                if ev.starts() < e and ev.ends() > s:
+                    out.append(f"“{name}” {s:%a %H:%M}–{e:%H:%M} overlaps “{ev.title}” ({ev.sid}, "
+                               f"{ev.starts():%H:%M}–{ev.ends():%H:%M})")
+            out += [f"“{name}” overlaps “{n2}” in the same proposal" for s2, e2, n2 in new[i + 1:] if s2 < e and e2 > s]
+        return out
 
     def describe(self, p: dict, cal: Cal | None = None, html: bool = True) -> str:
         e = esc if html else (lambda s: s)
@@ -791,32 +845,60 @@ class Calendar:
         for k, label in (("summary", "title"), ("location", "place"), ("description", "note")):
             if k in b:
                 parts.append(f"{label}: {e(str(old.get(k) or '-')[:80])} → {e(str(b[k] or '-')[:80])}")
+        if "extendedProperties" in b:
+            mine = b["extendedProperties"].get("private", {})
+            parts.append(", ".join(f"{k.removeprefix('overseer_')}: {e(str(v))}" for k, v in mine.items()
+                                   if k in (LABEL_PROP, TASK_PROP)) or "no label")
         return f"{e(p['title'])} in {e(name)}: " + "; ".join(parts)
 
-    async def _propose(self, session, p: dict, cal: Cal) -> str:
-        pid = secrets.token_hex(4)
-        p.update(session=getattr(session, "id", None), at=time.time())
-        verb = {"add": "Add", "change": "Change", "delete": "Delete"}[p["action"]]
-        if cal.mode == "auto":
-            done = await self._apply(p)
-            self.store.set(KEY + pid, json.dumps({**done, "state": "done"}))
-            await self.domain.notifier.send(Outgoing(
-                f"📅 {self._past(p)}: {self.describe(done, cal)}", session_id=p["session"], silent=True,
-                buttons=[[("↩️ Undo", f"calu:{pid}")]]))
-            return f"✓ {self._past(p).lower()} in {cal.name} (they see it, with ↩️ Undo): {self.describe(done, cal, False)}"
-        self.store.set(KEY + pid, json.dumps({**p, "state": "asked"}))
-        await self.domain.notifier.send(Outgoing(
-            f"📅 <b>{verb}?</b> {self.describe(p, cal)}", session_id=p["session"],
-            buttons=[[(f"✅ {verb}", f"cal:{pid}:ok"), ("✖ No", f"cal:{pid}:no")]]))
-        return (f"⏳ asked them (a card with ✅ {verb} / ✖ No): nothing changes until they tap; their answer reaches you "
-                "in your next turn")
-
     @staticmethod
-    def _past(p: dict) -> str:
-        return {"add": "Added", "change": "Changed", "delete": "Deleted"}[p["action"]]
+    def _verb(p: dict, past: bool = False) -> str:
+        return ({"add": "Added", "change": "Changed", "delete": "Deleted"} if past else
+                {"add": "Add", "change": "Change", "delete": "Delete"})[p["action"]]
+
+    def _summary(self, rec: dict, html: bool = True, past: bool = False) -> str:
+        """The changes, for a card or a note: one line, or a list."""
+        items = rec["items"]
+        if len(items) == 1:
+            return f"{self._verb(items[0], past)}: {self.describe(items[0], html=html)}"
+        e = esc if html else (lambda s: s)
+        head = (e(rec["name"]) + " - " if rec.get("name") else "") + f"{len(items)} changes"
+        return head + "".join("\n• " + f"{self._verb(p, past)}: {self.describe(p, html=html)}".replace("\n📍", " · 📍")
+                              for p in items)
+
+    async def propose(self, session, items: list[dict], name: str = "", overlap: bool = False) -> str:
+        """A set of changes: one card with ✅ / ✖ if any is in an "ask" calendar, else done at once with one Undo."""
+        if not items:
+            raise CalendarError("no changes in it")
+        if len(items) > MAX_CHANGES:
+            raise CalendarError(f"at most {MAX_CHANGES} changes in one proposal")
+        events = [(p["cal"], p.get("event")) for p in items if p["action"] != "add"]
+        if len(events) != len(set(events)):
+            raise CalendarError("one event is changed twice in it: put both changes in one")
+        if not overlap and (clashes := await self.overlaps(items)):
+            raise CalendarError("it would overlap: " + "; ".join(clashes[:8])
+                                + " - change the times, or add --overlap if that's intended")
+        pid = secrets.token_hex(4)
+        rec = {"items": items, "name": name.strip()[:80], "session": getattr(session, "id", None), "at": time.time()}
+        modes = {next((c.mode for c in self.cals if c.id == p["cal"]), "ask") for p in items}
+        if modes == {"auto"}:
+            rec = {**rec, "items": await self._apply_all(items), "state": "done"}
+            self.store.set(KEY + pid, json.dumps(rec))
+            await self.domain.notifier.send(Outgoing(f"📅 {self._summary(rec, past=True)}", session_id=rec["session"],
+                                                     silent=True, buttons=[[("↩️ Undo", f"calu:{pid}")]]))
+            return f"✓ done (they see it, with ↩️ Undo): {self._summary(rec, html=False, past=True)}"
+        self.store.set(KEY + pid, json.dumps({**rec, "state": "asked"}))
+        single = len(items) == 1
+        ok = f"✅ {self._verb(items[0])}" if single else "✅ Apply all"
+        text = (f"📅 <b>{self._verb(items[0])}?</b> {self.describe(items[0])}" if single else
+                f"📅 <b>Apply these?</b> {self._summary(rec)}")
+        await self.domain.notifier.send(Outgoing(text, session_id=rec["session"],
+                                                 buttons=[[(ok, f"cal:{pid}:ok"), ("✖ No", f"cal:{pid}:no")]]))
+        return (f"⏳ asked them (one card: {ok} / ✖ No): nothing changes until they tap; their answer reaches you in "
+                "your next turn. If they answer in words instead, change it and send a new proposal.")
 
     async def _apply(self, p: dict) -> dict:
-        """Make the change in Google; the record of it (for ↩️ Undo)."""
+        """Make one change in Google; the record of it (for ↩️ Undo)."""
         cal, path = p["cal"], f"/calendars/{_q(p['cal'])}/events"
         if p["action"] == "add":
             item = await self.google.call("POST", path, {"sendUpdates": "none"}, p["body"])
@@ -827,39 +909,15 @@ class Calendar:
                 raise CalendarError("it has other people invited now: change it in Google Calendar")
             p = {**p, "old": {k: current.get(k, "" if k in ("summary", "location", "description") else None)
                               for k in p["body"]}}
+            if "extendedProperties" in p["body"]:
+                p["old"]["extendedProperties"] = current.get("extendedProperties") or {"private": {}}
             await self.google.call("PATCH", f"{path}/{_q(p['event'])}", {"sendUpdates": "none"}, p["body"])
         else:
             await self.google.call("DELETE", f"{path}/{_q(p['event'])}", {"sendUpdates": "none"})
-        self.domain.schedule_sync()
         return p
 
-    async def answer(self, pid: str, ok: bool) -> tuple[str, list]:
-        """✅ / ✖ on a card: (the card's new text, its buttons)."""
-        raw = self.store.get(KEY + pid)
-        p = json.loads(raw) if raw else None
-        if not p or p.get("state") != "asked" or time.time() - p.get("at", 0) > KEEP_SECONDS:
-            return "This was already answered (or is too old).", []
-        verb = {"add": "Add", "change": "Change", "delete": "Delete"}[p["action"]]
-        if not ok:
-            self.store.set(KEY + pid, json.dumps({**p, "state": "declined"}))
-            self._tell(p, f"They said no to your calendar change: {verb.lower()} {self.describe(p, html=False)}.")
-            return f"✖ <s>{verb}: {self.describe(p)}</s>", []
-        try:
-            done = await self._apply(p)
-        except CalendarError as e:
-            self._tell(p, f"Your calendar change ({verb.lower()} {self.describe(p, html=False)}) failed: {e}")
-            return f"⚠️ {verb}: {self.describe(p)}\n<i>{esc(e)}</i>", []
-        self.store.set(KEY + pid, json.dumps({**done, "state": "done"}))
-        self._tell(p, f"They approved, and it's done: {self._past(p).lower()} {self.describe(done, html=False)}.")
-        return f"📅 {self._past(p)}: {self.describe(done)}", [[("↩️ Undo", f"calu:{pid}")]]
-
-    async def undo(self, pid: str) -> str:
-        raw = self.store.get(KEY + pid)
-        p = json.loads(raw) if raw else None
-        if not p or p.get("state") != "done" or time.time() - p.get("at", 0) > KEEP_SECONDS:
-            return "This can't be undone any more."
+    async def _revert(self, p: dict) -> None:
         path = f"/calendars/{_q(p['cal'])}/events"
-        what = self.describe(p)
         if p["action"] == "add":
             await self.google.call("DELETE", f"{path}/{_q(p['event'])}", {"sendUpdates": "none"})
         elif p["action"] == "change":
@@ -867,15 +925,169 @@ class Calendar:
                                    {k: v for k, v in p["old"].items() if v is not None})
         else:
             await self.google.call("POST", path, {"sendUpdates": "none"}, p["old"])
-        self.store.set(KEY + pid, json.dumps({**p, "state": "undone"}))
-        self._tell(p, f"They undid your calendar change: {self._past(p).lower()} {self.describe(p, html=False)}.")
-        self.domain.schedule_sync()
-        return f"↩️ <s>{self._past(p)}: {what}</s>\n<i>undone</i>"
 
-    def _tell(self, p: dict, text: str) -> None:
+    async def _apply_all(self, items: list[dict]) -> list[dict]:
+        """All or nothing: if one fails, the ones made already are reverted."""
+        done = []
+        try:
+            for p in items:
+                done.append(await self._apply(p))
+        except CalendarError as e:
+            for p in reversed(done):
+                try:
+                    await self._revert(p)
+                except CalendarError:
+                    log.warning("calendar: couldn't revert %s after a failed change", p.get("event"))
+            failed = items[len(done)]
+            raise CalendarError(f"{self._verb(failed).lower()} {self.describe(failed, html=False)}: {e}") from None
+        finally:
+            self.domain.schedule_sync()
+        return done
+
+    def _load(self, pid: str) -> dict | None:
+        raw = self.store.get(KEY + pid)
+        rec = json.loads(raw) if raw else None
+        if rec and "items" not in rec:  # (one change, from before change sets)
+            rec = {**rec, "items": [{k: v for k, v in rec.items() if k not in ("state", "session", "at")}]}
+        return rec
+
+    async def answer(self, pid: str, ok: bool) -> tuple[str, list]:
+        """✅ / ✖ on a card: (the card's new text, its buttons)."""
+        rec = self._load(pid)
+        if not rec or rec.get("state") != "asked" or time.time() - rec.get("at", 0) > KEEP_SECONDS:
+            return "This was already answered (or is too old).", []
+        if not ok:
+            self.store.set(KEY + pid, json.dumps({**rec, "state": "declined"}))
+            self._tell(rec, f"They said no to your calendar proposal ({self._summary(rec, html=False)}).")
+            return f"✖ <s>{self._summary(rec)}</s>", []
+        try:
+            done = await self._apply_all(rec["items"])
+        except CalendarError as e:
+            self._tell(rec, f"Your calendar proposal failed, so nothing was changed: {e}")
+            return f"⚠️ {self._summary(rec)}\n<i>Nothing was changed: {esc(e)}</i>", []
+        rec = {**rec, "items": done, "state": "done"}
+        self.store.set(KEY + pid, json.dumps(rec))
+        self._tell(rec, f"They approved, and it's done: {self._summary(rec, html=False, past=True)}.")
+        return f"📅 {self._summary(rec, past=True)}", [[("↩️ Undo", f"calu:{pid}")]]
+
+    async def undo(self, pid: str) -> str:
+        rec = self._load(pid)
+        if not rec or rec.get("state") != "done" or time.time() - rec.get("at", 0) > KEEP_SECONDS:
+            return "This can't be undone any more."
+        what, failed = self._summary(rec, past=True), []
+        for p in reversed(rec["items"]):
+            try:
+                await self._revert(p)
+            except CalendarError as e:
+                failed.append(f"{self.describe(p, html=False)}: {e}")
+        self.store.set(KEY + pid, json.dumps({**rec, "state": "undone"}))
+        self._tell(rec, f"They undid your calendar change ({self._summary(rec, html=False, past=True)})."
+                   + (f" Not undone: {'; '.join(failed)}" if failed else ""))
+        self.domain.schedule_sync()
+        if failed:
+            return f"↩️ {what}\n<i>undone, except: {esc('; '.join(failed))}</i>"
+        return f"↩️ <s>{what}</s>\n<i>undone</i>"
+
+    def _tell(self, rec: dict, text: str) -> None:
         agent = self.domain.agent
-        if agent and p.get("session"):
-            agent.add_note(p["session"], text)
+        if agent and rec.get("session"):
+            agent.add_note(rec["session"], text)
+
+    # ---- actions tied to an event: "10 minutes before it starts / when it ends: say ... / wake me to ..."
+    def _event(self, cal: str, eid: str) -> Event | None:
+        return next((e for e in self.events if (e.cal, e.id) == (cal, eid)), None)
+
+    @staticmethod
+    def _due(ev: Event, anchor: str, offset: int) -> datetime:
+        return (ev.starts() if anchor == "start" else ev.ends()) + timedelta(seconds=offset)
+
+    def add_action(self, session, sid: str, anchor: str, offset: int, kind: str, text: str) -> str:
+        if anchor not in ("start", "end"):
+            raise CalendarError("start or end (of the event)")
+        if kind not in ("say", "do") or not text.strip():
+            raise CalendarError("--say <a message> or --do <what you'll do then>")
+        if abs(offset) > 7 * 86400:
+            raise CalendarError("--offset: at most a week")
+        cal, eid = self.find(sid)
+        ev = self._event(cal, eid)
+        if not ev:
+            raise CalendarError("Overseer only follows events of the next two weeks")
+        due = self._due(ev, anchor, offset)
+        if due <= local(datetime.now()):
+            raise CalendarError(f"that's {due:%a %d %b %H:%M}: already past")
+        a = {"id": "a" + secrets.token_hex(3), "cal": cal, "event": eid, "title": ev.title, "anchor": anchor,
+             "offset": offset, "kind": kind, "text": " ".join(text.split())[:1000],
+             "session": getattr(session, "id", None), "known": ev.starts().timestamp(), "made": time.time()}
+        self.store.set(ACTIONS_KEY + a["id"], json.dumps(a))
+        return f"✓ {a['id']}: {self.action_line(a, ev)}"
+
+    def actions(self) -> list[dict]:
+        out = []
+        for k in self.store.keys(ACTIONS_KEY):
+            try:
+                out.append(json.loads(self.store.get(k) or ""))
+            except ValueError:
+                continue
+        return sorted(out, key=lambda a: a.get("known", 0))
+
+    def action_line(self, a: dict, ev: Event | None = None) -> str:
+        ev = ev or self._event(a["cal"], a["event"])
+        off = a["offset"]
+        rel = (f"{duration_text(abs(off))} {'before' if off < 0 else 'after'} " if off else "when ") + \
+            ("it starts" if a["anchor"] == "start" else "it ends")
+        when = f" ({self._due(ev, a['anchor'], off):%a %d %b %H:%M})" if ev else ""
+        what = f"say “{a['text']}”" if a["kind"] == "say" else f"wake you: {a['text']}"
+        return f"“{a['title']}”, {rel}{when}: {what}"
+
+    def remove_action(self, aid: str) -> dict | None:
+        key = ACTIONS_KEY + aid.strip().lower()
+        raw = self.store.get(key)
+        if raw:
+            self.store.unset(key)
+        return json.loads(raw) if raw else None
+
+    async def run_actions(self, now: datetime | None = None) -> list[str]:
+        """Due actions run (following their event if it moved); ones whose event is gone are dropped."""
+        now = now or local(datetime.now())
+        fired = []
+        for a in self.actions():
+            ev = self._event(a["cal"], a["event"])
+            if ev is None:
+                # Gone: deleted, or no longer within the two weeks read (then it's kept until it's back in view).
+                if self.window and self.window[0].timestamp() <= a["known"] < self.window[1].timestamp() \
+                        and self.synced > a["made"]:
+                    self.store.unset(ACTIONS_KEY + a["id"])
+                    self._tell(a, f"Your calendar action {a['id']} was dropped: its event “{a['title']}” is gone.")
+                continue
+            if ev.starts().timestamp() != a["known"]:
+                a["known"] = ev.starts().timestamp()
+                self.store.set(ACTIONS_KEY + a["id"], json.dumps(a))
+            due = self._due(ev, a["anchor"], a["offset"])
+            if due > now:
+                continue
+            self.store.unset(ACTIONS_KEY + a["id"])
+            if (now - due).total_seconds() > CATCH_UP or ev.declined:
+                continue
+            await self._fire(a, ev)
+            fired.append(a["id"])
+        return fired
+
+    async def _fire(self, a: dict, ev: Event) -> None:
+        d = self.domain
+        if a["kind"] == "say":
+            mine = (ev.raw.get("extendedProperties") or {}).get("private") or {}
+            d.reminders.add(time.time(), a["text"], a.get("session"), kind="say",
+                            task=(ev.task, str(mine.get(TASK_TEXT_PROP, ""))) if ev.task else None)
+            return
+        agent = d.agent
+        if not agent or not agent.autopilot or not agent.cfg.agent.enabled:
+            return
+        s = agent.get(a.get("session")) or agent.general_session()
+        moment = {("start", True): "starts soon", ("start", False): "has started", ("end", True): "ends soon",
+                  ("end", False): "has ended"}[(a["anchor"], a["offset"] < 0)]
+        prompt = (f"[Calendar: “{ev.title}” {moment} ({span_text(ev.start, ev.end, ev.all_day)}, {ev.sid}"
+                  + (f", task {ev.task}" if ev.task else "") + f")]\nWhat to do (you set this up): {a['text']}")
+        agent.autopilot.wake(s, "\n\n".join([prompt, await d.now_context()]), kind="calendar")
 
 
 def _span(body: dict) -> tuple[tuple, bool]:

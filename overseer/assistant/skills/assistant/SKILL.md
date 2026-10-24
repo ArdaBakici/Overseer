@@ -132,6 +132,30 @@ ov cal delete a1b2c3
 ov cal calendars                       # which calendars you may change, and how
 ```
 
+Tools for planning - how to plan (time-blocking or not, block lengths, breaks, check-ins) is for you and the user
+to work out; keep what works in `Assistant/System.md`:
+
+```bash
+# Several changes as ONE proposal: one card for them (✅ Apply all / ✖ No), one ↩️ Undo for all of it.
+cat > plan.json <<'JSON'
+{"title": "Thursday", "changes": [
+  {"action": "add", "title": "Write the intro", "start": "thursday 09:30", "length": "90m", "label": "block", "task": "3fa9c1"},
+  {"action": "add", "title": "Emails", "start": "thursday 14:00", "end": "14:30", "label": "block"},
+  {"action": "move", "id": "a1b2c3", "start": "thursday 16:00"}]}
+JSON
+ov cal propose plan.json               # refused if it overlaps busy events (--overlap if intended)
+ov cal list week --label block         # your labelled events again (labels are your own words)
+ov cal edit a1b2c3 --task 3fa9c1       # link an event to a task (--task "" / --label "" remove them)
+ov cal free thursday --days 2 --buffer 10m
+
+# An action tied to an event (any event, theirs and iCal ones too): follows it if it moves, goes if it's deleted.
+ov cal on a1b2c3 end --say "Intro block done?"         # a message with ✅ / 💤 / ⏭ - ✅ ticks off its --task
+ov cal on a1b2c3 start --before 10m --do "Help them pick the first tiny step"   # wakes you then
+ov cal actions · ov cal off a9f00e
+```
+
+If they answer a proposal in words ("move the emails later"), change it and send a new one.
+
 - Plan around it: check `ov cal free` before suggesting a time for anything, and leave room around events.
 - Busy day: fewer, smaller suggestions; light day: room for a bigger task or a someday item.
 - Changes go through the user. In a calendar that "changes after they tap ✅", they get a card and nothing

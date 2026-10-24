@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..core.domain import Domain, RunNote
-from ..core.notify import code
+from ..core.notify import Outgoing, code, esc
 from ..core.runners import Activity, Sandbox
 from . import prompts as P
 from . import tasks as T
@@ -75,6 +75,7 @@ class AssistantDomain(Domain):
         self.vault = Vault(cfg)
         self.reminders = Reminders(store, notifier)
         self.reminders.on_stuck = self._stuck
+        self.reminders.on_done = self._task_done
         self.scheduler = Scheduler(self)  # Routines.md, and the first hello
         self.calendar = Calendar(self)  # Google Calendar (if turned on)
         self._sync: asyncio.Task | None = None
@@ -194,7 +195,7 @@ class AssistantDomain(Domain):
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
         prompt += self._flagged_section()
         if self.calendar.enabled:
-            prompt += P.CALENDAR_SECTION.format(calendars=self._calendars_line())
+            prompt += P.CALENDAR_SECTION.format(calendars=self._calendars_line(), system_path=self._rel("System.md"))
         if self.agent and self.agent.ctl:
             prompt += P.OV_SECTION
         return prompt + self._project_section(s)
@@ -303,6 +304,27 @@ class AssistantDomain(Domain):
                 f"{datetime.fromtimestamp(e['at']):%H:%M} {e['icon']} {e['state']}: {e['text']}" for e in today[-25:])
                        + "\n</today_so_far>")
         return out
+
+    async def _task_done(self, item: dict) -> None:
+        """✅ on a follow-up linked to a task (e.g. a calendar block's check-in): the task is ticked off."""
+        await self.record_before()
+        try:
+            try:
+                t, remark = T.complete(self.vault, item["task"], self.today())
+            except T.TaskError:  # (its line changed since, so its id did: found by its text)
+                text = " ".join((item.get("task_text") or "").split())
+                hit = next((t for t in T.scan(self.vault) if t.open and text and " ".join(t.text.split()) == text), None)
+                if not hit:
+                    raise
+                t, remark = T.complete(self.vault, hit.id, self.today())
+        except T.TaskError as e:
+            await self.notifier.send(Outgoing(f"⚠️ Couldn't tick off the task: {esc(e)}", silent=True,
+                                              session_id=item.get("session")))
+            return
+        change = await self.record(f"Done: {t.text[:60]}")
+        await self.notifier.send(Outgoing(
+            f"☑️ Ticked off: {esc(t.text)}" + (f" · {esc(remark)}" if remark else ""), silent=True,
+            session_id=item.get("session"), buttons=[[("↩️ Undo", f"vundo:{change.commit[:12]}")]] if change else []))
 
     async def _stuck(self, item: dict) -> None:
         """🧱 Stuck: the assistant is woken to help, in the conversation the follow-up came from."""

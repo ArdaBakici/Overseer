@@ -60,6 +60,7 @@ class Reminders:
         self.store = store
         self.notifier = notifier
         self._wake = asyncio.Event()
+        self.on_done = None  # (item) -> awaitable: ✅ on one linked to a task
         self.on_log = None  # (entry) -> awaitable: e.g. into today's daily note
         self.on_stuck = None  # (item) -> awaitable: wake the assistant to help
 
@@ -96,7 +97,8 @@ class Reminders:
 
     # ------------------------------------------------------------------ adding
     def add(self, at: float, text: str, session_id: str | None = None, project: str | None = None, *,
-            kind: str = "reminder", policy: dict | None = None, routine: str = "") -> dict:
+            kind: str = "reminder", policy: dict | None = None, routine: str = "",
+            task: tuple[str, str] | None = None) -> dict:
         text = " ".join(text.split())[:1000]
         if not text:
             raise ValueError("what should it say?")
@@ -106,6 +108,8 @@ class Reminders:
         r = {"id": "r" + secrets.token_hex(3), "kind": kind, "at": float(at), "text": text, "session": session_id,
              "project": project, "made": time.time(), "state": "pending", "attempts": 0,
              "policy": policy or DEFAULT_POLICY, "routine": routine}
+        if task:  # (an Obsidian task it's about: ✅ Done ticks it off - id, and its text in case the id changed)
+            r["task"], r["task_text"] = task
         self._save(items + [r])
         self._wake.set()
         return r
@@ -185,6 +189,8 @@ class Reminders:
             await self._log(r, state)
         if action == "stuck" and self.on_stuck:
             await self.on_stuck(r)
+        if action == "done" and r.get("task") and self.on_done:
+            await self.on_done(r)
         self._wake.set()
         return r
 

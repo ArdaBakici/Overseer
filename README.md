@@ -496,7 +496,15 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   item, and it can offer to block time for a task. It changes events only where you allow it: in calendars under
   `calendar.ask` you get a card (✅ Add / ✖ No) and nothing happens until you tap; in ones under `calendar.auto`
   it's done at once and the notice has ↩️ Undo. It never invites anyone and leaves events with other people alone.
-  `calendar.event_reminders: 10` adds a reminder 10 minutes before each timed event. The Google login stays with
+  `calendar.event_reminders: 10` adds a reminder 10 minutes before each timed event.
+
+  **Planning with the calendar** (time-blocking, a day or week laid out, re-planning) isn't a fixed method: the
+  assistant has tools and works out with you what helps, keeping what works in `Assistant/System.md`. It can send
+  several changes as **one proposal** (one card, ✅ Apply all / ✖ No - answer in words to adjust it; one ↩️ Undo
+  for all of it; refused before it reaches you if it overlaps busy events), **label** its own events and **link**
+  them to Obsidian tasks, and tie **actions to events**: "when the intro block ends, ask me if it's done" (✅ ticks
+  the task off) or "10 minutes before the exam, wake up and help me get ready". Actions follow an event when you
+  move it in Google Calendar, go when it's deleted, and work on any event, iCal ones included. The Google login stays with
   Overseer (in the bot's state folder, which agents can't read); the agent only uses `ov cal`. Set up:
   1. In [Google Cloud](https://console.cloud.google.com): a project, enable the **Google Calendar API**; the
      **OAuth consent screen**: External, add yourself as a test user, then **publish** it (left in "Testing",

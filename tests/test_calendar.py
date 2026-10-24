@@ -57,6 +57,7 @@ class FakeGoogle:
                                       "end": {"date": (tm + timedelta(days=1)).isoformat()}}},
         }
         self.n = 0
+        self.fail_titles = set()
 
     @staticmethod
     def ev(eid, title, start, end, **kw):
@@ -86,6 +87,8 @@ class FakeGoogle:
             if request.method == "POST":
                 self.n += 1
                 body = json.loads(request.content)
+                if body.get("summary") in self.fail_titles:
+                    return httpx.Response(400, json={"error": {"message": "Bad Request"}})
                 eid = f"new{self.n}"
                 evs[eid] = {**body, "id": eid, "status": "confirmed"}
                 return httpx.Response(200, json=evs[eid])
@@ -124,6 +127,8 @@ def cenv(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("FAKE_CLI_LOG", str(tmp_path / "cli.jsonl"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     cfg = assistant_cfg(tmp_path)
     cfg.calendar.enabled = True
     cfg.calendar.ask = ["primary"]
@@ -246,7 +251,7 @@ async def test_the_agent_sees_and_changes_the_calendar(cenv):
         # In an "auto" calendar: done at once, with ↩️ Undo.
         standup = next(e for e in cenv.cal.events if e.title == "Standup")
         text = await ov("move", standup.sid, "tomorrow 11:00")
-        assert text.startswith("✓ changed in Work"), text
+        assert text.startswith("✓ done (they see it, with ↩️ Undo): Changed: Standup in Work"), text
         w1 = cenv.google.events["work@group"]["w1"]
         assert w1["start"]["dateTime"].startswith((date.today() + timedelta(days=1)).isoformat() + "T11:00")
         assert w1["end"]["dateTime"][11:16] == "11:30"  # (its length kept)
@@ -514,3 +519,198 @@ async def test_google_and_ics_together(cenv, monkeypatch):
     await cenv.cal.sync()
     assert cenv.cal.error.startswith("Google: Google no longer accepts")
     assert "Machine Learning" in {e.title for e in cenv.cal.cached_day(date.today())}
+
+
+# ---------------------------------------------------------------------------- tools for planning (time-blocking, ...)
+def with_autopilot(env, monkeypatch):
+    from overseer.core.autopilot import Autopilot
+    ap = Autopilot(env.cfg, env.store, env.agent, env.notifier)
+    woken = []
+    monkeypatch.setattr(ap, "wake", lambda s, prompt, kind="wakeup", quiet=False, by_user=False:
+                        woken.append((s.id, kind, prompt, by_user)))
+    return woken
+
+
+def press(env, data):
+    from overseer.assistant.telegram import AssistantBot
+    edits = []
+
+    async def edit(q, text, buttons=None):
+        edits.append((text, buttons))
+    bot = AssistantBot(NS(_edit=edit, notifier=env.notifier), env.domain)
+    action, _, arg = data.partition(":")
+
+    async def go():
+        assert await bot.on_button(None, None, 1, action, arg)
+        return edits[-1]
+    return go()
+
+
+async def test_a_plan_is_one_proposal(cenv):
+    from overseer.assistant import tasks as T
+    await cenv.cal.sync()
+    T.add(cenv.domain.vault, "- [ ] Write the intro")
+    tid = T.scan(cenv.domain.vault)[0].id
+    tomorrow = date.today() + timedelta(days=1)
+    dentist = next(e for e in cenv.cal.events if e.title == "Dentist")
+    plan = [{"action": "add", "title": "Write the intro", "start": "tomorrow 08:00", "length": "90m",
+             "label": "block", "task": tid},
+            {"action": "add", "title": "Emails", "start": "tomorrow 13:00", "end": "13:45", "label": "block",
+             "calendar": "Work"},
+            {"action": "move", "id": dentist.sid, "start": "tomorrow 16:00"}]
+    await cenv.ctl.start()
+    try:
+        s = cenv.agent.general_session()
+        # Through the agent's own `ov`: the file is read in its sandbox.
+        await cenv.agent.handle(s, "FAKE_OV echo '" + json.dumps({"title": "Tomorrow", "changes": plan})
+                                + "' > plan.json && ov cal propose plan.json")
+        reply = cenv.notifier.sent[-1].text
+        assert "⏳ asked them (one card: ✅ Apply all / ✖ No)" in reply, reply
+        card = next(m for m in cenv.notifier.sent if m.text.startswith("📅 <b>Apply these?</b>"))
+        assert "Tomorrow - 3 changes" in card.text and "• Add: Write the intro · tomorrow 08:00–09:30 in Personal" \
+            in card.text and "• Change: Dentist in Personal: tomorrow 10:00–10:30 → tomorrow 16:00–16:30" in card.text
+        assert [b[0] for b in card.buttons[0]] == ["✅ Apply all", "✖ No"]
+        assert len(cenv.google.events["me@gmail.com"]) == 3  # (nothing yet)
+        text, buttons = await press(cenv, card.buttons[0][0][1])
+        assert text.startswith("📅 Tomorrow - 3 changes\n• Added: Write the intro") and buttons[0][0][0] == "↩️ Undo"
+        mine = cenv.google.events["me@gmail.com"]
+        intro = next(e for e in mine.values() if e["summary"] == "Write the intro")
+        assert intro["extendedProperties"]["private"] == {"overseer_label": "block", "overseer_task": tid,
+                                                          "overseer_task_text": "Write the intro"}
+        assert any(e["summary"] == "Emails" for e in cenv.google.events["work@group"].values())
+        assert mine["e3"]["start"]["dateTime"][11:16] == "16:00"
+        await cenv.cal.sync()
+        token = cenv.ctl.open(s.id)
+        ok, listed = await cenv.ctl.handle(token, ["cal", "list", "tomorrow", "--label", "block"])
+        assert "Write the intro [Personal, label: block, task " in listed and "Emails" in listed
+        assert "Dentist" not in listed
+        # One ↩️ Undo for all of it.
+        text = await cenv.cal.undo(buttons[0][0][1].split(":")[1])
+        assert text.startswith("↩️ <s>Tomorrow - 3 changes")
+        assert "Write the intro" not in {e["summary"] for e in mine.values()}
+        assert not cenv.google.events["work@group"].get("new2") and mine["e3"]["start"]["dateTime"][11:16] == "10:00"
+
+        # Refused before bothering them: overlaps (unless --overlap), the same event twice, bad fields.
+        await cenv.cal.sync()
+        ok, text = await cenv.ctl.handle(token, ["cal", "add", "Deep work", "tomorrow 09:30", "2h"])
+        assert "overlaps “Dentist”" in text and "--overlap" in text
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", json.dumps([
+            {"action": "add", "title": "A", "start": "tomorrow 14:00", "length": "1h"},
+            {"action": "add", "title": "B", "start": "tomorrow 14:30", "length": "1h"}])])
+        assert "“A” overlaps “B” in the same proposal" in text
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", json.dumps([
+            {"action": "move", "id": dentist.sid, "start": "tomorrow 11:00"},
+            {"action": "delete", "id": dentist.sid}])])
+        assert "changed twice" in text
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", json.dumps([{"action": "add", "titel": "x"}])])
+        assert text.startswith("change 1: add: unknown fields titel")
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", "[not json"])
+        assert "not valid JSON" in text
+        # All or nothing: when one change fails, the ones made are reverted.
+        n = len(mine)
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", json.dumps([
+            {"action": "add", "title": "Fine", "start": "tomorrow 18:00", "length": "30m", "calendar": "Work"},
+            {"action": "add", "title": "Breaks", "start": "tomorrow 19:00", "length": "30m", "calendar": "Work"}])])
+        assert text.startswith("✓ done")  # (an auto calendar: at once)
+        cenv.google.fail_titles = {"Breaks"}
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", json.dumps([
+            {"action": "add", "title": "First", "start": "tomorrow 20:00", "length": "30m", "calendar": "Work"},
+            {"action": "add", "title": "Breaks", "start": "tomorrow 21:00", "length": "30m", "calendar": "Work"}])])
+        assert "add Breaks" in text and "First" not in {e["summary"] for e in cenv.google.events["work@group"].values()}
+        assert len(mine) == n
+        # Labels and task links can be changed or removed.
+        await cenv.cal.sync()
+        fine = next(e for e in cenv.cal.events if e.title == "Fine")
+        ok, text = await cenv.ctl.handle(token, ["cal", "edit", fine.sid, "--label", "buffer", "--task", tid])
+        assert text.startswith("✓ done") and "label: buffer, task: " + tid in text, text
+        ok, text = await cenv.ctl.handle(token, ["cal", "edit", fine.sid, "--label", ""])
+        assert "Fine" in text
+        await cenv.cal.sync()
+        assert next(e for e in cenv.cal.events if e.title == "Fine").label == ""
+    finally:
+        await cenv.ctl.stop()
+
+
+async def test_actions_tied_to_events(cenv, monkeypatch):
+    from overseer.assistant import tasks as T
+    woken = with_autopilot(cenv, monkeypatch)
+    T.add(cenv.domain.vault, "- [ ] Write the intro")
+    task = T.scan(cenv.domain.vault)[0]
+    soon = C.local(datetime.now() + timedelta(hours=2)).replace(second=0, microsecond=0)
+    cenv.google.events["me@gmail.com"]["b1"] = {
+        **FakeGoogle.ev("b1", "Write the intro", soon, soon + timedelta(minutes=90)),
+        "extendedProperties": {"private": {"overseer_label": "block", "overseer_task": task.id,
+                                           "overseer_task_text": task.text}}}
+    await cenv.cal.sync()
+    block = next(e for e in cenv.cal.events if e.id == "b1")
+    assert block.label == "block" and block.task == task.id
+    s = cenv.agent.general_session()
+    await cenv.ctl.start()
+    try:
+        token = cenv.ctl.open(s.id)
+        ok, text = await cenv.ctl.handle(token, ["cal", "on", block.sid, "end", "--say", "Intro block done?"])
+        assert ok and "“Write the intro”, when it ends" in text and f"{soon + timedelta(minutes=90):%H:%M}" in text
+        ok, text = await cenv.ctl.handle(token, ["cal", "on", block.sid, "start", "--before", "10m", "--do",
+                                                 "Help them pick the first tiny step"])
+        assert "10m before it starts" in text
+        ok, text = await cenv.ctl.handle(token, ["cal", "on", block.sid, "start", "--offset=-3h", "--say", "x"])
+        assert "already past" in text
+        ok, text = await cenv.ctl.handle(token, ["cal", "on", block.sid, "start", "--say", "a", "--do", "b"])
+        assert "one of --say" in text
+        ok, listed = await cenv.ctl.handle(token, ["cal", "actions"])
+        assert listed.count("\n") == 1 and "Intro block done?" in listed
+        ok, events = await cenv.ctl.handle(token, ["cal", "list", "today", "--days", "2"])
+        assert "Write the intro" in events and "(has actions)" in events
+    finally:
+        await cenv.ctl.stop()
+    # Nothing before its time.
+    assert await cenv.cal.run_actions(soon - timedelta(minutes=20)) == []
+    # They move the block in Google Calendar: the actions follow it.
+    later = soon + timedelta(hours=1)
+    cenv.google.events["me@gmail.com"]["b1"].update(start={"dateTime": later.isoformat()},
+                                                    end={"dateTime": (later + timedelta(minutes=90)).isoformat()})
+    await cenv.cal.sync()
+    assert await cenv.cal.run_actions(soon - timedelta(minutes=5)) == []
+    fired = await cenv.cal.run_actions(later - timedelta(minutes=9))
+    assert len(fired) == 1 and woken[-1][1] == "calendar" and not woken[-1][3]
+    assert woken[-1][2].startswith("[Calendar: “Write the intro” starts soon (")
+    assert f"task {task.id}" in woken[-1][2] and "Help them pick the first tiny step" in woken[-1][2]
+    assert await cenv.cal.run_actions(later) == []  # (once)
+    # When it ends: the message, with buttons; ✅ ticks the task off in the vault.
+    fired = await cenv.cal.run_actions(later + timedelta(minutes=91))
+    assert len(fired) == 1
+    rem = cenv.domain.reminders
+    r = rem.pending()[-1]
+    assert r["text"] == "Intro block done?" and r["kind"] == "say" and r["task"] == task.id
+    await rem.fire_due()
+    assert cenv.notifier.sent[-1].text == "⏰ Intro block done?"
+    await rem.act(r["id"], "done")
+    assert "[x] Write the intro ✅" in (cenv.domain.vault.root / "Assistant/Tasks.md").read_text()
+    assert cenv.notifier.sent[-1].text.startswith("☑️ Ticked off: Write the intro")
+    # An action whose event is deleted is dropped (and the agent hears it).
+    await cenv.ctl.start()
+    try:
+        token = cenv.ctl.open(s.id)
+        dentist = next(e for e in cenv.cal.events if e.title == "Dentist")
+        ok, text = await cenv.ctl.handle(token, ["cal", "on", dentist.sid, "start", "--before", "1h", "--say", "Go"])
+        assert ok, text
+    finally:
+        await cenv.ctl.stop()
+    del cenv.google.events["me@gmail.com"]["e3"]
+    await cenv.cal.sync()
+    assert await cenv.cal.run_actions() == [] and cenv.cal.actions() == []
+    assert any("was dropped" in n for n in cenv.agent.take_notes(s.id))
+
+
+async def test_free_time_over_days_with_a_buffer(cenv):
+    await cenv.cal.sync()
+    await cenv.ctl.start()
+    try:
+        token = cenv.ctl.open(cenv.agent.general_session().id)
+        ok, text = await cenv.ctl.handle(token, ["cal", "free", "tomorrow", "--days", "2", "--from", "09:00",
+                                                 "--to", "12:00", "--buffer", "15m", "--min", "30m"])
+        lines = text.split("\n")
+        assert lines[0].endswith("free: 09:00–09:45 (45m), 10:45–12:00 (1h15)"), text
+        assert lines[1].endswith("0 event(s); free: 09:00–12:00 (3h)") and "15m away from events" in lines[2]
+    finally:
+        await cenv.ctl.stop()
