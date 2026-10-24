@@ -551,7 +551,6 @@ async def test_a_plan_is_one_proposal(cenv):
     await cenv.cal.sync()
     T.add(cenv.domain.vault, "- [ ] Write the intro")
     tid = T.scan(cenv.domain.vault)[0].id
-    tomorrow = date.today() + timedelta(days=1)
     dentist = next(e for e in cenv.cal.events if e.title == "Dentist")
     plan = [{"action": "add", "title": "Write the intro", "start": "tomorrow 08:00", "length": "90m",
              "label": "block", "task": tid},
