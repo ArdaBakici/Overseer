@@ -31,42 +31,12 @@ from datetime import date, datetime, time, timedelta
 from .tasks import WEEKDAYS
 
 CATCH_UP = 3 * 3600
-DEFAULT_POLICY = {"after": 30 * 60, "times": 1}
+DEFAULT_POLICY = {"after": 30 * 60, "times": 0}  # once, unless you (or the routines note) say otherwise
 
 TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b|\b(\d{1,2})\s*(am|pm)\b", re.I)
 FIELD_RE = re.compile(r"^\s*[-*]\s+\**([A-Za-z][A-Za-z -]*?)\**\s*:\s*(.*)$")
 POLICY_RE = re.compile(r"(?:again\s+)?(?:after|every)\s+(\d+)\s*(m|min|mins|minutes?|h|hours?)\s*,?\s*"
                        r"(?:up\s+to\s+)?(\d+)\s*(?:more\s+)?times?", re.I)
-
-EXAMPLE = """# Routines
-
-What I do, and when. The assistant reads and edits this note; so can I.
-
-## Morning planning
-- when: weekdays 09:00
-- do: Help me pick my top 3 for today, size them, and put them in today's note. One question at a time.
-
-## Evening shutdown
-- when: every day 21:00
-- do: What got done, what moves to tomorrow, my commitments and anything I didn't answer today. No guilt.
-
-## Weekly review
-- when: sunday 18:00
-- do: Look back at the week and plan the next one with me.
-
-## Nightly reflection
-- when: every day 23:30
-- do: Read today's conversations (ov history day) and update what you keep about me - About me, and the notes
-  flagged `assistant: always` - with anything lasting you learned. Then one short line saying what you updated.
-
-# Follow-ups
-
-How often an unanswered reminder comes back.
-
-- default: again after 20m, up to 2 more times
-- persistent: again after 10m, up to 5 more times
-"""
-
 
 @dataclass
 class Routine:

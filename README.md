@@ -460,9 +460,12 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   reads and edits notes there with real commands (`rg`, editing files): your daily note, notes it keeps in
   `Assistant/Memory/`, anything you ask about. It follows Obsidian's conventions ([[links]], #tags) and never
   writes `.obsidian/` (Obsidian's settings) or Syncthing's own files: the sandbox refuses it.
-- **Personality.** `Assistant/Persona.md` in the vault says how it talks and behaves (its name, tone,
-  language, ...): edit it in Obsidian, or ask it to change. `Assistant/About me.md` is what it knows about you;
-  it adds lasting facts there and tells you. Both go into its instructions on every reply. `/persona` shows it.
+- **Personality: yours to give.** On its first run it just says hi and asks you who it should be - a name, how
+  to talk and behave - and writes that into `Assistant/Persona.md` (edit it in Obsidian, or ask it to change).
+  `Assistant/About me.md` is what it knows about you; it adds lasting facts there and tells you. Both go into its
+  instructions on every reply. `/persona` shows it. It also keeps two notes about you for other AI agents:
+  `Assistant/My writing style.md` (informal and formal, written so another model can imitate you) and
+  `Assistant/My personality.md`.
 - **↩️ Undo.** Overseer keeps a history of the vault in a git repository in the bot's state folder, outside the
   vault (so nothing extra is synced and the agent can't touch it). Before each reply it records your edits since,
   after it the reply's changes; a reply that changed notes lists them with a ↩️ Undo button, which reverts exactly
@@ -472,20 +475,20 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   2026-10-20 ⏫ #home`, with 🔁 recurrences). `/tasks [today|week|#tag|words]` lists them with ✅ buttons,
   `/task <text>` adds one; the agent uses `ov task list|add|done`. Completing a recurring task adds its next
   occurrence, like the plugin. New tasks go to `Assistant/Tasks.md` unless it belongs in a particular note.
-- **Structure and follow-through, without commands.** It's built to coach someone with ADHD: one step at a time,
-  choices instead of open questions, small days, no shame. You just talk to it:
-  - **Routines** live in `Assistant/Routines.md`: a `do:` routine (morning planning, evening shutdown, a weekly
-    review) wakes the assistant to start the conversation; a `say:` one ("Meds 💊") just sends its message.
-    Overseer runs them at their times; the assistant sets the note up with you in your first conversation and
-    changes it when you ask ("move my evening review to 22:00", "pause the weekly review until I'm back").
-  - **Reminders come back until answered**: ✅ Done · 💤 Later · ⏭ Skip. How often is the note's `# Follow-ups`
-    section ("again after 20m, up to 2 more times"), which the assistant adjusts when you say it's too much or not
-    enough; important things can be stricter.
-  - **Accountability**: say "I'll send it by 3" and it checks in at 3 ("how did it go?" ✅ · 💤 · 🧱 Stuck - which
-    brings it in to help), on its own.
+- **It builds the system with you.** Nothing is set up in advance: you just talk to it, and it suggests one thing at
+  a time when it notices a pattern ("a daily reminder for that at 9:30?"), with tap buttons (`ov ask`). How it
+  organizes your things is its own note, `Assistant/System.md`, which it keeps up to date. Its tools:
+  - **Routines** in `Assistant/Routines.md`, added with your agreement: a `do:` routine wakes the assistant at its
+    time (it may decide there's nothing worth saying and stay silent); a `say:` one ("Meds 💊") just sends its
+    message. You change them by asking ("move it to 22:00", "pause it until I'm back").
+  - **Reminders** fire once, with ✅ Done · 💤 Later · ⏭ Skip; ones you want to come back until answered get a
+    follow-up policy (the note's `# Follow-ups`, e.g. "again after 10m, up to 5 more times").
+  - **Check-backs**: when it thinks one would help ("I'll send it by 3"), it asks first, then checks in at 3
+    ("how did it go?" ✅ · 💤 · 🧱 Stuck - which brings it in to help).
+  - **Someday list**: things to do sometime ("learn to draw") are tasks tagged `#someday` in `Assistant/Someday.md`;
+    it brings one up now and then on a day that looks light - its judgement, not Overseer's.
   - **Focus sessions**: "let's do 25 minutes on the intro" - one quiet countdown message, then a ping.
-  - Every answer goes into the day's log (and under `## Log` in today's daily note, if it exists), which the
-    evening shutdown looks at. `/remind` and `/reminders` still exist as shortcuts.
+  - `/remind` and `/reminders` still exist as shortcuts.
 - **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
   @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
   subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
@@ -503,11 +506,11 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
 - **Its time zone** is `local.timezone` (e.g. Asia/Dubai), whatever the homelab's is; reminders confirm the exact
   moment (`Thu 2026-10-22 10:00 (+04:00, tomorrow)`).
 - **Starting over.** `uv run overseer reset -c assistant.yaml` (with the bot stopped) lists and wipes its
-  flags: pending reminders and check-ins, the day logs, the first-run set-up flag, wake-ups it set itself, paused
+  flags: pending reminders and check-ins, the day logs, the first-hello flag, wake-ups it set itself, paused
   wake-ups. Then it asks whether to forget the conversations too: their records, transcripts and search index,
   and the agent CLIs' own sessions - without them it can't resume or search old chats. Your notes, projects,
-  settings and logins stay either way (`--yes` answers only the first question). Delete
-  `Assistant/Routines.md` too to get the set-up conversation again.
+  settings and logins stay either way (`--yes` answers only the first question). For a completely fresh start,
+  also delete the `Assistant/` folder in the vault: it then says hi and asks for a personality again.
 - **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
   **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
   also searches the vault's notes.
@@ -607,10 +610,10 @@ domain by name.
 | `domain.py` | AssistantDomain: the vault-writing sandbox, persona and context, the vault's history around each reply (↩️ Undo) |
 | `config.py` | the `vault` section; its own state, tmp folders and token required |
 | `prompts.py`, `skills/assistant/SKILL.md` | the agent's instructions and its skill |
-| `vault.py` | the vault: persona and "about me" notes, daily notes, Syncthing conflicts, the history (git outside the vault) and undo |
+| `vault.py` | the vault: its own notes (persona, about me, writing style, personality), daily notes, Syncthing conflicts, the history (git outside the vault) and undo |
 | `tasks.py`, `when.py` | Obsidian Tasks: parsing, selecting, adding, completing, recurrences; days and times as people write them |
-| `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first-run set-up |
+| `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first hello |
 | `media.py` | `ov fetch` (public addresses only, media only, size-limited) and Giphy search; `ov capabilities` |
-| `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions - back until answered |
+| `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions (with follow-up policies) |
 | `commands.py`, `telegram.py` | `ov task`, `ov remind`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
 | `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |

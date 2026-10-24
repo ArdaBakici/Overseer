@@ -169,6 +169,12 @@ def ov_run():
 if prog == "claude" and "FAKE_OV" in stdin:
     ov_run()
 
+if prog == "claude" and "FAKE_SILENT" in stdin:  # a wake-up with nothing worth saying
+    sid = str(uuid.uuid4())
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake-default"})
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False, "result": "[silent]"})
+    sys.exit(0)
+
 if prog == "claude":
     if "--output-format" in args and args[args.index("--output-format") + 1] == "json":
         emit({"type": "result", "subtype": "success", "result": "OK report", "is_error": False})

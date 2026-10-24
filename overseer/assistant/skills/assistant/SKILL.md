@@ -1,6 +1,6 @@
 ---
 name: assistant
-description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, memory notes, daily notes), tasks in the Obsidian Tasks format (`ov task list|add|done`), routines (Assistant/Routines.md), reminders and check-ins that come back until answered (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), pictures/GIFs/videos from the internet (`ov fetch`, `ov gif`), reactions (`ov react`), notes always in mind (`assistant: always`), waking yourself later (`ov wake`), and searching past conversations (`ov history`). Use it whenever the user asks about tasks, todos, plans, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
+description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, their writing style and personality, memory notes), tasks in the Obsidian Tasks format (`ov task list|add|done`) and a someday list, questions with tap buttons (`ov ask`), routines (Assistant/Routines.md), reminders and check-backs (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), pictures/GIFs/videos from the internet (`ov fetch`, `ov gif`), reactions (`ov react`), notes always in mind (`assistant: always`), waking yourself later (`ov wake`), and searching past conversations (`ov history`). Use it whenever the user asks about tasks, todos, plans, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
 ---
 
 # The assistant and `ov`
@@ -18,8 +18,10 @@ answers at once; it only works inside a run Overseer started.
   entries (`- 2026-10-17: ...`). Link notes with [[wikilinks]].
 - Before answering from memory, search: `rg -i 'words' "$VAULT"` (the vault's path is in your
   instructions). Read whole notes before changing them.
-- Daily note: today's path is in your instructions. Append under a heading like `## Log` rather
-  than rewriting.
+- Two notes you keep for other AI agents: `My writing style.md` (informal and formal, as
+  instructions to imitate them) and `My personality.md`. Update them from what you actually see.
+- Daily note: today's path is in your instructions; what goes into daily notes is up to you and the
+  user. Append rather than rewrite.
 - Every reply's changes are recorded and the user can undo them with one button. Don't delete or
   rewrite notes without asking; adding is fine. `.obsidian/` can't be written.
 
@@ -41,15 +43,30 @@ ov task add "Call the bank" --due tomorrow --priority high
 ov task add "Pay rent" --due 2026-11-01 --every "month"
 ov task add "Ask about the visa" --note "People/Jane.md"
 ov task done 3fa9c1                # ✅ today; a recurring task gets its next occurrence
+ov task add "Learn to draw" --someday   # no date: tagged #someday, in Assistant/Someday.md
+ov task list --when someday
 ```
 
 Days: YYYY-MM-DD, today, tomorrow, a weekday (the next one), +3d, +2w. Ids change when a task's
 line changes: list again if one isn't found. You can also edit task lines directly in notes.
 
-## Reminders, check-ins and focus (follow-ups)
+Someday items: bring one up now and then when their day looks light - you judge that - with a small
+first step; rotate, and bring up less often what they keep postponing.
 
-Messages Overseer sends the user at a time, with buttons (✅ Done · 💤 Later · ⏭ Skip, or 🧱 Stuck), coming
-back until answered. You are not woken for them (except 🧱 Stuck: then you help).
+## Questions with buttons
+
+```bash
+ov ask "Want a daily reminder for your meds at 9:30?" --options "Yes|Another time|No"
+```
+
+Their tap comes back to you as a message ("[They tapped “Yes” on your question: ...]"). Use it for
+suggestions and check-backs: one question at a time.
+
+## Reminders, check-backs and focus (follow-ups)
+
+Messages Overseer sends the user at a time, with buttons (✅ Done · 💤 Later · ⏭ Skip, or 🧱 Stuck). They are
+sent once unless you give them `--follow-up` (then they come back until answered). You are not woken for them
+(except 🧱 Stuck: then you help).
 
 ```bash
 ov remind 17:30 "Leave for the station"            # when: 17:30, "tomorrow 9am", "friday 18:00", 2h, 45m
@@ -62,26 +79,27 @@ ov followup done r1a2b3                            # they answered in words inst
 ov wake in 3h "Check whether Jane answered and nudge if not"   # wakes YOU, for work to do then
 ```
 
-- Accountability is your job, without being asked: when they say they'll do something by a time, `ov commit`
-  it, add it under `## Commitments` in today's note, and say in a few words that you'll check in.
+- Check-backs: when you think a commitment of theirs would benefit from one, ask first (`ov ask`), and
+  `ov commit` it only if they want it.
+- Persistent reminders (`--follow-up`) only when they ask, or agree when you ask.
 - Focus sessions: only ones they agreed to; help them pick a first tiny step before starting.
 - `--follow-up`: a name from the routines note's `# Follow-ups` (e.g. persistent), "again after 10m, up to 3
-  more times", or none. Without it: the note's default.
-- Outcomes (done, skipped, unanswered, stuck) are in your context as `<today_so_far>`, and in today's note
-  under `## Log` when the note exists.
+  more times", or none. Without it: the note's `default` if it has one, else once.
+- Outcomes (done, skipped, unanswered, stuck) are in your context as `<today_so_far>`.
 
 ## Routines: `Assistant/Routines.md`
 
-Overseer runs them at their times: a `do:` routine wakes you to start a conversation with the user, a `say:`
-one sends its message as a follow-up. You set the note up with the user in your first conversation, and change
-it whenever they ask. Keep the format; after every change run `ov routine check` and tell them what changed.
+Overseer runs them at their times: a `do:` routine wakes you (reply exactly `[silent]` if there's nothing worth
+saying then - nothing is sent), a `say:` one sends its message as a follow-up. There are none at first: add
+one when it would clearly help, with the user's agreement. Keep the format; after every change run
+`ov routine check` and tell them what changed.
 
 ```markdown
 # Routines
 
-## Morning planning
-- when: weekdays 09:00
-- do: Help me pick my top 3 for today, size them, and put them in today's note.
+## Someday nudge
+- when: every day 16:00
+- do: If today looks light, bring up one someday item with a small first step; on a busy day stay silent.
 
 ## Meds
 - when: every day 09:30 and 21:30
@@ -90,7 +108,6 @@ it whenever they ask. Keep the format; after every change run `ov routine check`
 - paused until: 2026-11-01
 
 # Follow-ups
-- default: again after 20m, up to 2 more times
 - persistent: again after 10m, up to 5 more times
 ```
 
@@ -145,7 +162,7 @@ When the user asks you to keep something up to date for them (a writing style, p
 ## Other
 
 ```bash
-ov history day                         # every conversation of today, condensed (e.g. for a nightly reflection)
+ov history day                         # every conversation of today, condensed (e.g. for a reflection)
 ov history search "flight to Berlin"   # past conversations (and notes)
 ov notify "text"                       # a message to the user now, before your reply
 ov feedback "what limited you"         # about Overseer itself

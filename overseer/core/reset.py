@@ -16,8 +16,9 @@ from .store import Store
 
 PLATFORM_FLAGS = ("wakeups_paused:", "last_user_message:")
 # kv entries that belong to conversations: the main chat's / projects' current one, runs cut off by a restart,
-# notes for an agent's next turn, planner proposals, the feedback reviewer.
-CONVERSATION_KEYS = ("general_session", "run:", "cutoff:", "notes:", "proposal:", "proposal_id:", "feedback_reviewer")
+# notes for an agent's next turn, planner proposals, the feedback reviewer, questions asked with buttons (ov ask).
+CONVERSATION_KEYS = ("general_session", "run:", "cutoff:", "notes:", "proposal:", "proposal_id:", "feedback_reviewer",
+                     "ask:")
 CLAUDE_SESSION_FILES = ("projects", "history.jsonl", "todos", "file-history", "shell-snapshots", "session-env")
 CODEX_SESSION_FILES = ("sessions", "archived_sessions", "history.jsonl")
 

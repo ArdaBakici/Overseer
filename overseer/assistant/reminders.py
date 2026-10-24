@@ -30,7 +30,7 @@ MAX_ITEMS = 300
 GIVE_UP = 3600  # after the last follow-up, how long until it counts as unanswered (at least)
 LATER = 30 * 60  # 💤 Later, when its policy has no follow-ups
 FOCUS_MORE = 5 * 60
-DEFAULT_POLICY = {"after": 30 * 60, "times": 1}
+DEFAULT_POLICY = {"after": 30 * 60, "times": 0}  # sent once; --follow-up makes one come back
 ACTIVE = ("pending", "open")
 ICONS = {"done": "✅", "skipped": "⏭", "unanswered": "🤷", "stuck": "🧱", "cancelled": "✖", "later": "💤",
          "started": "🎯"}

@@ -24,7 +24,7 @@ from .config import BACKENDS, Config
 from .ctl import TOKEN_ENV
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
-from .notify import Notifier, Outgoing, code, esc, pre
+from .notify import SILENT, Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, make_runner
 from .store import SessionRecord, Store
 
@@ -809,6 +809,12 @@ class Agent:
         skipped = "\n".join(f"📎 {esc(n)}" for n in notes)
         compacted = compaction_line(res.compactions)
         extra = [x for x in (*(note.lines if note else []), compacted, autopilot_line, skipped) if x]
+        if s.origin != "user" and (text or "").strip() == SILENT and not (photos or docs or media):
+            # A wake-up with nothing worth saying: no message (what it changed, if anything, quietly).
+            if extra:
+                await self.notifier.send(Outgoing("\n\n".join(extra), session_id=s.id, job_id=s.job_id, silent=True,
+                                                  buttons=note.buttons if note else []))
+            return
         # (HTML, which Rich Markdown accepts as well)
         await self.notifier.send(Outgoing(
             f"🤖 {fold_long(md_to_html(text)) or '(no answer)'}" + "".join(f"\n\n{x}" for x in extra)

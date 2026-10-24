@@ -24,13 +24,16 @@ ACTIONS = ("done", "later", "skip", "stuck", "cancel")
 HELP = """ov - talk to Overseer (the system that runs you and sends your replies to the user on Telegram)
 
 Tasks (checklist lines anywhere in the vault, Obsidian Tasks format):
-  ov task list [--when open|today|overdue|week|upcoming|undated|done|all] [--tag t] [--search words] [--limit N]
+  ov task list [--when open|today|overdue|week|upcoming|undated|someday|done|all] [--tag t] [--search words]
+               [--limit N]
                                    ids are the first column (they change when a task's line changes)
   ov task add "text" [--due D] [--scheduled D] [--priority highest|high|medium|low|lowest] [--every "week"]
               [--note path/in/vault.md]       (default: the tasks note)
+              [--someday]                     something to do sometime: tagged #someday, into the someday note
   ov task done <id>                mark it done (✅ today); a recurring task gets its next occurrence
                                    D: YYYY-MM-DD, today, tomorrow, a weekday (the next one), +3d, +2w
-Reminders and follow-ups (messages to the user with buttons, again until answered; you are not woken):
+Reminders and follow-ups (messages to the user with buttons; again until answered only with --follow-up; you
+are not woken):
   ov remind <when> "<text>" [--follow-up <policy>]
                                    when: 17:30, "tomorrow 9am", "friday 18:00", "2026-10-20 09:00", 2h, 45m
   ov commit <when> "<what they'll do>" [--follow-up <policy>]
@@ -52,6 +55,8 @@ Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, 
   ov project list | set <name> [--about ...] [--dir ...] | archive <name>
   ov conversation move <project|main>
 
+  ov ask "<question>" [--options "Yes|Another time|No"]   a question with tap buttons; their tap comes back to
+                                   you as their answer (2-6 choices)
   ov notify <text>                 send the user a message now
   ov status                        this conversation: what will wake you
   ov history search <text> [--since 30d] [--limit N]   your past conversations (and the vault's notes)
@@ -94,6 +99,7 @@ class AssistantCommands:
         a.add_argument("--priority", default="")
         a.add_argument("--every", default="")
         a.add_argument("--note", default="")
+        a.add_argument("--someday", action="store_true")
         task.add_parser("done", add_help=False).add_argument("id")
         for name in ("remind", "commit"):
             a = sub.add_parser(name, add_help=False)
@@ -157,10 +163,13 @@ class AssistantCommands:
         return self.domain.task_lines(hits, max(1, min(args.limit, 200)))
 
     async def task_add(self, session, args) -> str:
-        line = T.line_for(" ".join(args.text), due=self._day(args.due), scheduled=self._day(args.scheduled),
+        text = " ".join(args.text)
+        if args.someday and T.SOMEDAY not in text.split():
+            text += " " + T.SOMEDAY
+        line = T.line_for(text, due=self._day(args.due), scheduled=self._day(args.scheduled),
                           priority=args.priority.lower(),
                           recurrence=("every " + args.every.removeprefix("every ").strip()) if args.every else "")
-        rel = T.add(self.vault, line, args.note or None)
+        rel = T.add(self.vault, line, args.note or (self.domain._rel("Someday.md") if args.someday else None))
         return f"✓ added to {rel}: {line[6:]}"
 
     async def task_done(self, session, args) -> str:

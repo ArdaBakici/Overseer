@@ -1738,6 +1738,19 @@ class Bot:
         if update.effective_chat:
             log.warning("ignored message from unauthorised chat %s", update.effective_chat.id)
 
+    async def _answer_ask(self, q, chat_id: int, arg: str) -> None:
+        qid, _, i = arg.partition(":")
+        raw = self.store.get(f"ask:{qid}")
+        rec = json.loads(raw) if raw else None
+        if not rec or not i.isdigit() or int(i) >= len(rec["options"]):
+            await self._edit(q, "This question was already answered.")
+            return
+        self.store.unset(f"ask:{qid}")
+        choice = rec["options"][int(i)]
+        await self._edit(q, f"❓ {esc(rec['question'])}\n→ <b>{esc(choice)}</b>")
+        session = self.agent.get(rec.get("session")) or self.agent.general_session()
+        self._spawn(self._run_agent(chat_id, session, f"[They tapped “{choice}” on your question: {rec['question']}]"))
+
     async def on_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
         chat = update.effective_chat
@@ -1771,6 +1784,8 @@ class Bot:
                     await self._edit(q, result)
             elif action == "noop":
                 pass
+            elif action == "ask":  # a question the agent asked (ov ask): the tap is the researcher's answer
+                await self._answer_ask(q, chat.id, arg)
             elif action == "fb" and getattr(self.agent, "feedback", None):  # 👀 Noted / ✅ Fixed / ✖ Won't fix
                 fid, _, status = arg.partition(":")
                 if not (fid.isdigit() and await self.agent.feedback.set_status(int(fid), status)):

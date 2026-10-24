@@ -733,21 +733,118 @@ async def test_routines_run_at_their_times(aenv, monkeypatch):
     assert "Oops" in sch.check_text() and "✓ Meds (say): every day 09:30 and 21:00" in sch.check_text()
 
 
-async def test_the_first_run_sets_up_routines_in_conversation(aenv, monkeypatch):
+async def test_the_first_run_says_hi_and_asks_for_a_personality(aenv, monkeypatch):
     woken = with_autopilot(aenv, monkeypatch)
     sch = aenv.domain.scheduler
+    v = aenv.vault
+    # Nothing is set up in advance: a placeholder persona, no routines, and the two notes about the user.
+    assert not aenv.domain.persona_set() and not (v.root / "Assistant/Routines.md").exists()
+    for name in ("My writing style.md", "My personality.md"):
+        assert "assistant: index" in (v.root / "Assistant" / name).read_text()
+    assert "## Informal" in (v.root / "Assistant/My writing style.md").read_text()
     prompt = aenv.agent.system_prompt(aenv.agent.general_session().id)
-    assert "doesn't exist yet" in prompt and "## How you help" in prompt and "ADHD" in prompt
+    assert prompt.startswith("You are the assistant,") and "They haven't set it yet" in prompt
+    assert "No routines yet" in prompt and "## How you help: you build the system" in prompt
+    assert "Assistant/My writing style.md" in prompt and "Assistant/My personality.md" in prompt
+    assert "Assistant/System.md" in prompt and "Assistant/Someday.md" in prompt and "[silent]" in prompt
+    assert "Top 3" not in prompt  # (no fixed daily-note sections)
     assert await sch.onboard() and not await sch.onboard()  # once
     sid, kind, text = woken[0]
-    assert kind == "setup" and text.startswith("[First run: setting up]") and "# Follow-ups" in text
-    # Once the note is written, the instructions say what runs.
-    (aenv.vault.root / "Assistant/Routines.md").write_text(ROUTINES)
+    assert kind == "setup" and text.startswith("[First run]") and "give you a personality" in text
+    assert "Don't ask for their name" in text and "Assistant/Persona.md" in text and "# Follow-ups" not in text
+    # They give it one: the instructions follow it.
+    (v.root / "Assistant/Persona.md").write_text("# Persona\n- Name: Pip\n- Tone: cheeky\n")
+    prompt = aenv.agent.system_prompt(aenv.agent.general_session().id)
+    assert prompt.startswith("You are Pip,") and "They haven't set it yet" not in prompt
+    (v.root / "Assistant/Routines.md").write_text(ROUTINES)
     prompt = aenv.agent.system_prompt(aenv.agent.general_session().id)
     assert "Their routines now: Morning planning (weekdays 09:00)" in prompt and "Gym" in prompt
-    # An installation that already has routines isn't asked again.
+    # After `overseer reset` (the flag gone), one that already has a persona isn't asked again.
     aenv.store.set("assistant:onboarding_started", "")
     assert not await sch.onboard()
+
+
+def test_a_name_on_its_own_line(aenv):
+    """"Name:" with nothing after it isn't a name (it doesn't take the next line's text)."""
+    (aenv.vault.root / "Assistant/Persona.md").write_text("# Persona\n- Name:\n- Tone: calm\n")
+    assert not aenv.domain.persona_set() and aenv.domain.persona_name() == "the assistant"
+
+
+async def test_reminders_fire_once_unless_told_otherwise(aenv):
+    rem = aenv.domain.reminders
+    r = rem.add(time.time() - 1, "Call mum")
+    assert r["policy"]["times"] == 0
+    await rem.fire_due()
+    assert sum("Call mum" in m.text for m in aenv.notifier.sent) == 1
+    item = rem.get(r["id"])
+    await rem.fire_due(item["next"] + 1)  # nobody answered: given up on, not sent again
+    assert sum("Call mum" in m.text for m in aenv.notifier.sent) == 1 and rem.get(r["id"])["state"] == "unanswered"
+
+
+def test_someday_tasks(aenv):
+    v = aenv.vault
+    T.add(v, "- [ ] Learn to draw #someday", "Assistant/Someday.md")
+    T.add(v, "- [ ] Pay rent 📅 2026-11-01")
+    T.add(v, "- [x] Read Dune #someday ✅ 2026-10-01", "Assistant/Someday.md")
+    hits = T.select(T.scan(v), "someday")
+    assert [t.text for t in hits] == ["Learn to draw #someday"]
+
+
+async def test_ov_task_add_someday_and_ov_ask(aenv):
+    from types import SimpleNamespace as NS
+    from overseer.core.bot import Bot
+    await aenv.ctl.start()
+    try:
+        s = aenv.agent.general_session()
+        token = aenv.ctl.open(s.id)
+        ok, text = await aenv.ctl.handle(token, ["task", "add", "Learn", "to", "draw", "--someday"])
+        assert text == "✓ added to Assistant/Someday.md: Learn to draw #someday", text
+        ok, text = await aenv.ctl.handle(token, ["task", "list", "--when", "someday"])
+        assert "Learn to draw" in text
+        # A question with tap buttons.
+        ok, text = await aenv.ctl.handle(token, ["ask", "A daily reminder for your meds at 9:30?",
+                                                 "--options", "Yes | Another time | No"])
+        assert ok and text.startswith("✓ asked"), text
+        msg = aenv.notifier.sent[-1]
+        assert msg.text == "❓ A daily reminder for your meds at 9:30?" and msg.session_id == s.id
+        labels = [label for label, _ in msg.buttons[0]]
+        assert labels == ["Yes", "Another time", "No"] and all(len(d) <= 64 for _, d in msg.buttons[0])
+        ok, text = await aenv.ctl.handle(token, ["ask", "Which?", "--options", "only one"])
+        assert not ok and "2 to 6 choices" in text
+    finally:
+        await aenv.ctl.stop()
+    # Their tap: the message says what they chose, and the agent gets it as their answer.
+    bot = Bot(aenv.cfg, app=None, store=aenv.store, agent=aenv.agent, notifier=aenv.notifier)
+    started, edits = [], []
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        started.append((session.id, text))
+    bot._run_agent = fake_run_agent
+
+    async def press(data):
+        async def answer(*a, **kw):
+            pass
+
+        async def edit_message_text(text, **kw):
+            edits.append(text)
+        q = NS(data=data, message=NS(message_thread_id=None), answer=answer, edit_message_text=edit_message_text)
+        await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1), effective_message=q.message), None)
+        for t in list(bot._tasks):
+            await t
+    await press(msg.buttons[0][1][1])
+    assert edits[-1] == "❓ A daily reminder for your meds at 9:30?\n→ <b>Another time</b>"
+    assert started == [(s.id, "[They tapped “Another time” on your question: A daily reminder for your meds at 9:30?]")]
+    await press(msg.buttons[0][0][1])  # answered already
+    assert len(started) == 1 and "already answered" in edits[-1]
+
+
+async def test_a_wake_up_with_nothing_to_say_sends_nothing(aenv):
+    s = aenv.agent.general_session()
+    n = len(aenv.notifier.sent)
+    await aenv.agent.handle(s, "FAKE_SILENT", origin="routine")
+    assert len(aenv.notifier.sent) == n
+    await aenv.agent.handle(s, "FAKE_SILENT")  # (to the user's own message, it's a reply like any other)
+    assert aenv.notifier.sent[-1].text.startswith("🤖 [silent]")
 
 
 async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
@@ -792,16 +889,10 @@ async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
         await aenv.ctl.stop()
 
 
-@needs_git
-async def test_answers_go_into_the_daily_note_and_buttons_work(aenv, monkeypatch):
+async def test_follow_up_buttons_work(aenv, monkeypatch):
     from types import SimpleNamespace as NS
     from overseer.assistant.telegram import AssistantBot
     with_autopilot(aenv, monkeypatch)
-    v = aenv.vault
-    await v.init()
-    daily = v.root / v.daily_note()
-    daily.parent.mkdir(parents=True, exist_ok=True)
-    daily.write_text("# Today\n\n## Log\n- 08:00 woke up\n\n## Done\n")
     rem = aenv.domain.reminders
     r = rem.add(time.time() - 1, "Meds 💊", kind="say")
     await rem.fire_due()
@@ -811,22 +902,16 @@ async def test_answers_go_into_the_daily_note_and_buttons_work(aenv, monkeypatch
         edits.append((text, buttons))
     bot = AssistantBot(NS(_edit=edit), aenv.domain)
     await bot._followup(None, r["id"], "done")
-    assert edits[-1] == ("✅ Meds 💊", None)
-    text = daily.read_text()
-    assert text.split("## Done")[0].rstrip().endswith("✅ Meds 💊") and "- 08:00 woke up" in text
-    assert (await v.log(1))[0].message == "Log: ✅ Meds 💊"
+    assert edits[-1] == ("✅ Meds 💊", None) and rem.log()[-1]["text"] == "Meds 💊"
     await bot._followup(None, r["id"], "done")
     assert edits[-1][0] == "That one's settled already."
     later = rem.add(time.time() - 1, "Water", kind="say")
     await rem.fire_due()
     await bot._followup(None, later["id"], "later")
     assert edits[-1][0].startswith("💤 Water") and edits[-1][1] == [[("✖ Cancel", f"fu:{later['id']}:cancel")]]
-    # Without today's note, nothing is created (Obsidian applies its template when it makes the note).
-    daily.unlink()
-    x = rem.add(time.time() - 1, "Stretch", kind="say")
-    await rem.fire_due()
-    await rem.act(x["id"], "skip")
-    assert not daily.exists() and rem.log()[-1]["text"] == "Stretch"
+    # Outcomes aren't written into the daily note: what goes there is up to the assistant.
+    daily = aenv.vault.root / aenv.vault.daily_note()
+    assert not daily.exists()
 
 
 # ---------------------------------------------------------------------------- media, time zone, reactions, notes
@@ -1027,7 +1112,8 @@ def test_notes_flagged_to_always_load(aenv):
     assert "x" * 12_000 in prompt and "x" * 12_001 not in prompt and "[... cut here" in prompt  # (too long: cut)
     assert "- Big2.md: (flagged always, left out" in prompt and "y" * 100 not in prompt  # (over the budget)
     assert "Plain.md" not in prompt and "assistant: always" in prompt  # (and it's told how to flag one)
-    assert [r for r, _, _ in v.flagged()] == ["Assistant/Writing style.md", "Big.md", "Big2.md", "People.md"]
+    assert [r for r, _, _ in v.flagged()] == ["Assistant/My personality.md", "Assistant/My writing style.md",
+                                              "Assistant/Writing style.md", "Big.md", "Big2.md", "People.md"]
 
 
 def test_ov_history_day(aenv):

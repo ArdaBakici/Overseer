@@ -31,6 +31,8 @@ class Outgoing:
     topic: str | None = None
 
 
+SILENT = "[silent]"  # a reply to a wake-up that is exactly this isn't sent: nothing worth saying this time
+
 # Side topics: small notices that shouldn't land in the conversation. name -> (title, intro)
 SIDE_TOPICS = {
     "web": ("🌐 web", "🌐 <b>web</b> - what the agent downloaded from the internet (ov fetch, ov gif): one short line "

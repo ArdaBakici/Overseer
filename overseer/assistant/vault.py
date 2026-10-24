@@ -31,21 +31,38 @@ EXCLUDE = """.obsidian/workspace*.json
 CONFLICT_RE = re.compile(r"\.sync-conflict-\d{8}-\d{6}")
 DEFAULT_PERSONA = """# Persona
 
-How the assistant talks and behaves. Edit freely (or just tell it): it reads this before every reply.
-
-- Name: Ada
-- Role: my coach for structure and follow-through - I have ADHD.
-- Tone: warm, brief and direct; no filler, no flattery, never guilt-tripping.
-- Language: English.
-- One thing at a time; give me choices instead of open questions.
-- Keep me on track: hold me to what I said I'd do, kindly; help me re-plan when the day falls apart.
-- Ask before deleting or rewriting a note; small additions are fine without asking.
+Who the assistant is: its name, personality and way of talking. Not set yet - tell it who you'd like it to be (or
+write it here, e.g. "- Name: ...").
 """
 DEFAULT_ABOUT = """# About me
 
-What the assistant knows about me: routines, preferences, people, ongoing things. It proposes additions here when it
-learns something lasting; I can edit or delete anything.
+What the assistant knows about me: routines, preferences, people, ongoing things. It adds what it learns that
+lasts; I can edit or delete anything.
 """
+DEFAULT_WRITING = """---
+assistant: index
+description: how I write, informal and formal - kept up to date; for other AI agents to write like me
+---
+# My writing style
+
+Kept by the assistant from how I write. Give this note to another AI agent to have it write like me.
+
+## Informal
+(chats, messages)
+
+## Formal
+(emails, documents)
+"""
+DEFAULT_PERSONALITY = """---
+assistant: index
+description: who I am - temperament, values, interests, how I decide; for other AI agents to understand me
+---
+# My personality
+
+Kept by the assistant from what it learns about me. Give this note to another AI agent to have it understand me.
+"""
+NOTES = (("Persona.md", DEFAULT_PERSONA), ("About me.md", DEFAULT_ABOUT), ("My writing style.md", DEFAULT_WRITING),
+         ("My personality.md", DEFAULT_PERSONALITY))
 
 # Obsidian's (moment.js) date tokens -> strftime, for daily note names.
 MOMENT = [("YYYY", "%Y"), ("YY", "%y"), ("MMMM", "%B"), ("MMM", "%b"), ("MM", "%m"), ("DD", "%d"),
@@ -123,11 +140,12 @@ class Vault:
         return self.root / rel
 
     def ensure_files(self) -> None:
-        """The persona and "about me" notes, with a starting text, if they don't exist yet."""
+        """The assistant's own notes (persona, about me, writing style, personality), with a starting text, if they
+        don't exist yet."""
         d = self.assistant_dir
         d.mkdir(parents=True, exist_ok=True)
         (d / "Memory").mkdir(exist_ok=True)
-        for name, text in (("Persona.md", DEFAULT_PERSONA), ("About me.md", DEFAULT_ABOUT)):
+        for name, text in NOTES:
             if not (d / name).exists():
                 (d / name).write_text(text)
 

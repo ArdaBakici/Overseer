@@ -111,10 +111,13 @@ def scan(vault) -> list[Task]:
     return out
 
 
+SOMEDAY = "#someday"  # things to do sometime, no date: the assistant brings one up on a light day
+
+
 def select(tasks: list[Task], when: str = "open", tag: str = "", search: str = "", today: date | None = None
            ) -> list[Task]:
     """when: open | today (due or scheduled today, or overdue) | overdue | week (the next 7 days, and overdue) |
-    upcoming (dated, after today) | undated | done | all."""
+    upcoming (dated, after today) | undated | someday (tagged #someday) | done | all."""
     today = today or date.today()
     t0, t7 = today.isoformat(), (today + timedelta(days=7)).isoformat()
     keep = {
@@ -124,11 +127,12 @@ def select(tasks: list[Task], when: str = "open", tag: str = "", search: str = "
         "week": lambda t: t.open and t.when and t.when <= t7,
         "upcoming": lambda t: t.open and t.when and t.when > t0,
         "undated": lambda t: t.open and not t.when,
+        "someday": lambda t: t.open and any(x == SOMEDAY or x.startswith(SOMEDAY + "/") for x in t.tags),
         "done": lambda t: t.status == "x",
         "all": lambda t: True,
     }.get(when)
     if keep is None:
-        raise TaskError("when: open, today, overdue, week, upcoming, undated, done or all")
+        raise TaskError("when: open, today, overdue, week, upcoming, undated, someday, done or all")
     out = [t for t in tasks if keep(t)]
     if tag:
         tag = tag if tag.startswith("#") else "#" + tag

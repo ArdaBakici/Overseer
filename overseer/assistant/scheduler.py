@@ -1,5 +1,5 @@
 """Runs Routines.md: each routine at its times (a `do:` one wakes the assistant, a `say:` one is a follow-up
-message), the first-run setup conversation while the note doesn't exist, and a notice when the note can't be read.
+message), the first hello, and a notice when the note can't be read.
 Overseer decides the times; the model never does."""
 
 from __future__ import annotations
@@ -130,15 +130,15 @@ class Scheduler:
             silent=True))
 
     async def onboard(self) -> bool:
-        """The first run: no routines note yet, and never set up - the assistant starts the setup conversation."""
+        """The first run (or the first after `overseer reset`): the assistant says hi and asks who it should be."""
         d = self.domain
         agent = d.agent
-        if self.path.exists() or self.store.get(ONBOARDED_KEY) or not agent or not agent.cfg.agent.enabled \
+        if self.store.get(ONBOARDED_KEY) or d.persona_set() or not agent or not agent.cfg.agent.enabled \
                 or not agent.autopilot:
             return False
         self.store.set(ONBOARDED_KEY, str(time.time()))
         s = agent.general_session()
-        prompt = "\n\n".join([P.ONBOARDING_PROMPT.format(routines_path=self.rel, example=R.EXAMPLE),
+        prompt = "\n\n".join([P.ONBOARDING_PROMPT.format(persona_path=d._rel("Persona.md")),
                               await d.now_context()])
         agent.autopilot.wake(s, prompt, kind="setup", by_user=True)
         return True

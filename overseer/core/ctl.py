@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 TOKEN_ENV = "OVERSEER_CTL"  # (codex hides variables named *TOKEN*/*KEY*/*SECRET* from commands)
 
 
+ASK_MAX_OPTIONS = 6
+ASK_OPTION_MAX = 40
+
+
 class CtlError(Exception):
     pass
 
@@ -110,6 +114,9 @@ def _parser(ext=None) -> _Parser:
     sub.add_parser("planner", add_help=False).add_argument("mode", choices=["off"])
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
     sub.add_parser("react", add_help=False).add_argument("emoji")
+    a = sub.add_parser("ask", add_help=False)
+    a.add_argument("question", nargs="+")
+    a.add_argument("--options", default="Yes|No")
     hist = sub.add_parser("history", add_help=False).add_subparsers(dest="action")
     a = hist.add_parser("search", add_help=False)
     a.add_argument("text", nargs="+")
@@ -133,6 +140,7 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
   ov react <emoji>                 react to the researcher's last message here (👍 ❤ 🔥 🎉 👏 🙏 👀 ...)
+  ov ask "<question>" [--options "Yes|No"]   a question with tap buttons; the tap comes back to you
   ov status                        this conversation: project, what will wake you
   ov history search <text> [--project p|main] [--kind conversation|...] [--since 30d] [--limit N]
   ov history show <conversation> [--last 5] [--grep text]   read a past conversation's turns
@@ -251,6 +259,8 @@ class ControlServer:
                 return True, await self.notify(session, " ".join(args.text))
             if area == "react":
                 return True, await self.react(session, args.emoji)
+            if area == "ask":
+                return True, await self.ask(session, " ".join(args.question), args.options)
             if area == "status":
                 return True, self.status(session)
             if area == "history" and args.action:
@@ -486,6 +496,24 @@ class ControlServer:
     async def notify(self, session, text: str) -> str:
         await self.notifier.send(Outgoing(f"📣 {esc(text[:3500])}", session_id=session.id))
         return "✓ sent"
+
+    async def ask(self, session, question: str, options: str) -> str:
+        """A question with tap buttons; the tap comes back to the agent as the researcher's answer (bot.on_button)."""
+        opts = [o.strip() for o in options.split("|") if o.strip()]
+        question = question.strip()
+        if not question:
+            raise CtlError('ov ask "<question>" --options "Yes|Another time|No"')
+        if not 2 <= len(opts) <= ASK_MAX_OPTIONS or any(len(o) > ASK_OPTION_MAX for o in opts):
+            raise CtlError(f"--options: 2 to {ASK_MAX_OPTIONS} choices separated by |, each up to {ASK_OPTION_MAX} "
+                           'characters, e.g. "Yes|Another time|No"')
+        qid = secrets.token_hex(4)
+        self.store.set(f"ask:{qid}", json.dumps({"session": session.id, "question": question[:1000],
+                                                  "options": opts, "at": time.time()}))
+        buttons = [opts[i:i + 3] for i in range(0, len(opts), 3)]
+        n = iter(range(len(opts)))
+        await self.notifier.send(Outgoing(f"❓ {esc(question[:1000])}", session_id=session.id, buttons=[
+            [(o, f"ask:{qid}:{next(n)}") for o in row] for row in buttons]))
+        return "✓ asked: their tap comes back to you as a message (or they may answer in words)"
 
     async def react(self, session, emoji: str) -> str:
         """A reaction on the researcher's last message in this conversation (instead of a message)."""

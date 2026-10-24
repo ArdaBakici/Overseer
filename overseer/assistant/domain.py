@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 SKILL = Path(__file__).parent / "skills" / "assistant" / "SKILL.md"  # how to use ov, for the agent
-NAME_RE = re.compile(r"^\s*[-*]?\s*\**name\**\s*:\s*\**(.+?)\**\s*$", re.I | re.M)
+NAME_RE = re.compile(r"^[ \t]*[-*]?[ \t]*\**name\**[ \t]*:[ \t]*\**(.+?)\**[ \t]*$", re.I | re.M)
 PROTECTED = (".obsidian", ".stfolder", ".stversions", ".stignore")  # Obsidian's settings, Syncthing's markers
 ALWAYS_BUDGET = 24_000  # characters of `assistant: always` notes in the instructions, all together
 ALWAYS_NOTE_MAX = 12_000  # ... and of one of them
@@ -73,15 +73,14 @@ class AssistantDomain(Domain):
         super().__init__(cfg, store, notifier)
         self.vault = Vault(cfg)
         self.reminders = Reminders(store, notifier)
-        self.reminders.on_log = self._log_to_daily_note
         self.reminders.on_stuck = self._stuck
-        self.scheduler = Scheduler(self)  # Routines.md, and the first-run setup
+        self.scheduler = Scheduler(self)  # Routines.md, and the first hello
 
     # ------------------------------------------------------------------ the app
     def prepare(self) -> None:
         from ..core.ctl import write_ov_tool, write_skills
         from ..core.runners import agent_bin_dir
-        self.vault.ensure_files()  # the persona and "about me" notes, if they don't exist yet
+        self.vault.ensure_files()  # its own notes (persona, about me, ...), if they don't exist yet
         write_ov_tool(self.cfg, agent_bin_dir(self.cfg), _write)
         write_skills(self.cfg, skills())
 
@@ -126,6 +125,10 @@ class AssistantDomain(Domain):
         m = NAME_RE.search(self.vault.read_note(self._rel("Persona.md"), 4000))
         return m.group(1).strip()[:40] if m else "the assistant"
 
+    def persona_set(self) -> bool:
+        """Whether the user gave the assistant a persona yet (the placeholder note has no name in it)."""
+        return bool(NAME_RE.search(self.vault.read_note(self._rel("Persona.md"), 4000)))
+
     # ------------------------------------------------------------------ projects: a topic each, maybe a vault folder
     def check_project_dir(self, path: str) -> str:
         """A project's folder in the vault (optional): a relative path, e.g. Projects/Japan trip."""
@@ -158,10 +161,12 @@ class AssistantDomain(Domain):
         prompt = P.SYSTEM_PROMPT.format(
             name=self.persona_name(), persona=persona, about=about, vault=self.vault.root,
             persona_path=self._rel("Persona.md"), about_path=self._rel("About me.md"),
+            persona_unset="" if self.persona_set() else P.PERSONA_UNSET,
+            writing_path=self._rel("My writing style.md"), personality_path=self._rel("My personality.md"),
+            system_path=self._rel("System.md"), someday_path=self._rel("Someday.md"), silent=P.SILENT,
             assistant_dir=cfg.vault.assistant_dir.strip("/") or ".", daily=self.vault.daily_note(),
             tasks_file=self.vault.rel(self.vault.tasks_file),
-            template=(f", from the template `{t}`" if (t := self.vault.daily_template()) else ", with the sections "
-                      "## Top 3, ## Plan, ## Commitments, ## Log, ## Done, ## Shutdown"),
+            template=f", from the template `{t}`" if (t := self.vault.daily_template()) else "",
             routines_path=self.scheduler.rel, routines_state=self.scheduler.state_line(),
             domains=f" (except {', '.join(domains)})" if domains else "",
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
@@ -264,16 +269,6 @@ class AssistantDomain(Domain):
                 f"{datetime.fromtimestamp(e['at']):%H:%M} {e['icon']} {e['state']}: {e['text']}" for e in today[-25:])
                        + "\n</today_so_far>")
         return out
-
-    async def _log_to_daily_note(self, entry: dict) -> None:
-        """A follow-up's outcome, into today's daily note under ## Log (if the note exists)."""
-        line = f"- {datetime.fromtimestamp(entry['at']):%H:%M} {entry['icon']} {entry['text']}"
-        rel = self.vault.daily_note()
-        if not (self.vault.root / rel).exists():
-            return
-        await self.record_before()
-        if await asyncio.to_thread(self.vault.append_under, rel, "## Log", line):
-            await self.record(f"Log: {entry['icon']} {entry['text'][:60]}")
 
     async def _stuck(self, item: dict) -> None:
         """🧱 Stuck: the assistant is woken to help, in the conversation the follow-up came from."""
