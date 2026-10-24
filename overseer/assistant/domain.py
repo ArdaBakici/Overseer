@@ -125,8 +125,9 @@ class AssistantDomain(Domain):
         if self.calendar.enabled:
             c = self.calendar
             await c.sync()
-            out.append(("calendar", not c.error, c.error or "Google · " + ", ".join(
-                f"{x.name} ({x.mode})" for x in c.cals) + f" · {len(c.events)} events in the next two weeks"))
+            out.append(("calendar", not c.error, (c.error + " · " if c.error else "") + ", ".join(
+                f"{x.name} ({'iCal link' if x.kind == 'ics' else 'Google'}: {x.mode})" for x in c.cals)
+                + f" · {len(c.events)} events in the next two weeks"))
         else:
             out.append(("calendar", True, "off"))
         m = self.cfg.media
@@ -203,7 +204,8 @@ class AssistantDomain(Domain):
         if not c.cals:
             return "(not read yet" + (f": {c.error}" if c.error else "") + " - `ov cal calendars`)"
         what = {"read": "read-only", "ask": "changes after they tap ✅", "auto": "changes at once, with ↩️ Undo"}
-        return "; ".join(f"{x.name}{' (primary)' if x.primary else ''}: {what[x.mode]}" for x in c.cals)
+        return "; ".join(f"{x.name}{' (primary)' if x.primary else ''}{' (iCal link)' if x.kind == 'ics' else ''}: "
+                         f"{what[x.mode]}" for x in c.cals)
 
     def _flagged_section(self) -> str:
         """Notes flagged `assistant: always` (their text, within a budget) and `assistant: index` (name and

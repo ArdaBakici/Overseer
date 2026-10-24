@@ -6,6 +6,7 @@ from the .env file), state folder and tmp folder - never the HPC bot's.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,17 +41,22 @@ class MediaConfig:
 
 @dataclass
 class CalendarConfig:
-    """Your Google Calendar: the assistant sees your events (and plans around them), and can add or change events in
-    the calendars you allow - after you tap ✅, or on its own where you say so. Set up: your own OAuth client in Google
-    Cloud (a "Desktop app"; its id and secret in .env), then `overseer login google -c <this config>`."""
+    """Your calendars: the assistant sees your events (and plans around them). Google Calendar: it can add or change
+    events in the calendars you allow - after you tap ✅, or on its own where you say so; set up with your own OAuth
+    client in Google Cloud (a "Desktop app"; its id and secret in .env), then `overseer login google -c <config>`.
+    iCal links (ics): read-only calendars, e.g. a timetable or a calendar someone shared or published."""
 
-    enabled: bool = False
+    enabled: bool = False  # Google Calendar
     client_id_env: str = "GOOGLE_CLIENT_ID"  # the names of the variables in .env holding your OAuth client's
     client_secret_env: str = "GOOGLE_CLIENT_SECRET"  # id and secret
     # Calendars by name (as in Google) or id; "primary" is your main one.
     read: list[str] = field(default_factory=list)  # the ones it sees; [] = all of them
     ask: list[str] = field(default_factory=lambda: ["primary"])  # it may change these after you tap ✅ Yes
     auto: list[str] = field(default_factory=list)  # ... and these on its own (each change shown, with ↩️ Undo)
+    # Read-only calendars from iCal links: name -> the link (https:// or webcal://), or the name of a variable in .env
+    # holding it (such links often work like a password).
+    ics: dict[str, str] = field(default_factory=dict)
+    ics_minutes: int = 30  # how often an iCal link is fetched again
     event_reminders: int = 0  # minutes before a timed event to remind you of it; 0 = off (Google's own still work)
     sync_minutes: int = 5  # how often Overseer reads the next two weeks of events
 
@@ -98,6 +104,18 @@ def validate(cfg) -> None:
             raise ConfigError(f"calendar.{name}: a list of calendar names or ids, e.g. [primary]")
     if not 0 <= c.event_reminders <= 24 * 60:
         raise ConfigError("calendar.event_reminders: minutes, 0 (off) to 1440")
+    if not isinstance(c.ics, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+                                              for k, v in c.ics.items()):
+        raise ConfigError("calendar.ics: a mapping of name -> iCal link (or the .env variable holding it), e.g. "
+                          "{Uni: UNI_ICS_URL}")
+    for name, v in c.ics.items():
+        v = v.strip()
+        if "://" in v and not v.lower().startswith(("https://", "http://", "webcal://")):
+            raise ConfigError(f"calendar.ics.{name}: an https:// or webcal:// link (or a .env variable's name)")
+        if "://" not in v and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", v):
+            raise ConfigError(f"calendar.ics.{name}: a link, or the name of a variable in .env holding it")
+    if not 5 <= c.ics_minutes <= 24 * 60:
+        raise ConfigError("calendar.ics_minutes: 5 to 1440")
     if not 1 <= c.sync_minutes <= 120:
         raise ConfigError("calendar.sync_minutes: 1 to 120")
     if c.enabled and not (c.client_id_env and c.client_secret_env):

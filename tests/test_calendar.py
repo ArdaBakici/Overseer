@@ -191,7 +191,7 @@ async def test_the_agent_sees_and_changes_the_calendar(cenv):
     from overseer.assistant.telegram import AssistantBot
     await cenv.cal.sync()
     prompt = cenv.agent.system_prompt(cenv.agent.general_session().id)
-    assert "## Their calendar (Google)" in prompt and "Personal (primary): changes after they tap ✅" in prompt
+    assert "## Their calendar" in prompt and "Personal (primary): changes after they tap ✅" in prompt
     assert "Work: changes at once, with ↩️ Undo" in prompt and "Holidays: read-only" in prompt
     assert "<calendar>" in await cenv.domain.now_context()
     await cenv.ctl.start()
@@ -331,3 +331,186 @@ def test_login(cenv, tmp_path):
     # An address from another attempt is refused.
     assert C.login(cfg, read=lambda p: f"{C.REDIRECT}?state=other&code=x", out=out.append, http=http) == 1
     assert "another login attempt" in out[-1]
+
+
+# ---------------------------------------------------------------------------- iCal links (read-only)
+def timetable(today: date) -> str:
+    """A weekly class (one week skipped, one moved), an exam in London time, an all-day event, a cancelled one, and
+    one in "floating" time."""
+    d = lambda n: (today + timedelta(days=n)).strftime("%Y%m%d")  # noqa: E731
+    return "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Uni//Timetable//EN",
+        "BEGIN:VEVENT", "UID:class-1", f"DTSTART:{d(0)}T080000Z", f"DTEND:{d(0)}T093000Z",
+        "RRULE:FREQ=DAILY;COUNT=5", f"EXDATE:{d(2)}T080000Z", "SUMMARY:Machine Learning", "LOCATION:Room 101",
+        "END:VEVENT",
+        "BEGIN:VEVENT", "UID:class-1", f"RECURRENCE-ID:{d(3)}T080000Z", f"DTSTART:{d(3)}T120000Z",
+        f"DTEND:{d(3)}T133000Z", "SUMMARY:Machine Learning (moved)", "END:VEVENT",
+        "BEGIN:VEVENT", "UID:exam", f"DTSTART;TZID=Europe/London:{d(1)}T140000",
+        f"DTEND;TZID=Europe/London:{d(1)}T160000", "SUMMARY:Exam", "END:VEVENT",
+        "BEGIN:VEVENT", "UID:fair", f"DTSTART;VALUE=DATE:{d(1)}", f"DTEND;VALUE=DATE:{d(3)}",
+        "SUMMARY:Career fair", "TRANSP:TRANSPARENT", "END:VEVENT",
+        "BEGIN:VEVENT", "UID:gone", f"DTSTART:{d(0)}T150000Z", f"DTEND:{d(0)}T160000Z", "STATUS:CANCELLED",
+        "SUMMARY:Cancelled seminar", "END:VEVENT",
+        "BEGIN:VEVENT", "UID:float", f"DTSTART:{d(0)}T180000", "DURATION:PT45M", "SUMMARY:Study group",
+        "END:VEVENT",
+        "END:VCALENDAR", ""])
+
+
+class FakeFeeds:
+    def __init__(self, today):
+        self.body = {"uni.example/tt.ics": timetable(today).encode(),
+                     "holidays.example/h.ics": "\r\n".join([
+                         "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:h", "DTSTART;VALUE=DATE:"
+                         + (today + timedelta(days=4)).strftime("%Y%m%d"), "SUMMARY:National Day", "END:VEVENT",
+                         "END:VCALENDAR", ""]).encode()}
+        self.down = set()
+        self.seen = []
+
+    def handler(self, request):
+        key = request.url.host + request.url.path
+        self.seen.append((str(request.url), request.headers.get("if-none-match")))
+        if key in self.down:
+            return httpx.Response(503)
+        if key not in self.body:
+            return httpx.Response(404)
+        if request.headers.get("if-none-match") == '"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, content=self.body[key], headers={"etag": '"v1"'})
+
+
+@pytest.fixture
+def ienv(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("UNI_ICS_URL", "https://uni.example/tt.ics?token=secret")
+    cfg = assistant_cfg(tmp_path)
+    cfg.calendar.ics = {"Uni": "UNI_ICS_URL", "Holidays": "webcal://holidays.example/h.ics"}
+    cfg.validate()
+    for d in (cfg.local.state(), cfg.local.tmp()):
+        d.mkdir(parents=True, exist_ok=True)
+    store = Store(cfg.local.db_path)
+    notifier = FakeNotifier()
+    feeds = FakeFeeds(date.today())
+    domain = AssistantDomain(cfg, store, notifier)
+    domain.calendar.transport = httpx.MockTransport(feeds.handler)
+    domain.prepare()
+    agent = Agent(cfg, store, notifier, domain)
+    ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notifier)
+    yield NS(cfg=cfg, store=store, notifier=notifier, domain=domain, agent=agent, ctl=ctl, feeds=feeds,
+             cal=domain.calendar)
+    shutil.rmtree(cfg.local.tmp(), ignore_errors=True)
+
+
+def test_ics_config(tmp_path):
+    cfg = assistant_cfg(tmp_path)
+    for bad in ({"Uni": "ftp://x"}, {"Uni": "not a var"}, {"": "X"}, ["https://x"]):
+        cfg.calendar.ics = bad
+        with pytest.raises(ConfigError, match="calendar.ics"):
+            cfg.validate()
+    cfg.calendar.ics = {"Uni": "webcal://x/y.ics", "Work": "WORK_ICS"}
+    cfg.validate()
+    assert C.ics_url("webcal://x/y.ics") == "https://x/y.ics"
+    with pytest.raises(C.CalendarError, match="isn't set in .env"):
+        C.ics_url("NOT_SET_ANYWHERE_123")
+
+
+async def test_ics_calendars_are_read_and_expanded(ienv):
+    from zoneinfo import ZoneInfo
+    cal = ienv.cal
+    assert cal.enabled and not cal.google_on
+    await cal.sync()
+    assert not cal.error, cal.error
+    assert [(c.name, c.kind, c.mode) for c in cal.cals] == [("Holidays", "ics", "read"), ("Uni", "ics", "read")]
+    assert ("https://uni.example/tt.ics?token=secret", None) in ienv.feeds.seen  # (the link from .env)
+    assert any(u.startswith("https://holidays.example/") for u, _ in ienv.feeds.seen)  # (webcal:// -> https://)
+    today = date.today()
+    ml = [e for e in cal.events if e.title.startswith("Machine Learning")]
+    days = [(e.starts().date() - today).days for e in ml]
+    assert days == [0, 1, 3, 4], days  # (day 2 skipped: EXDATE)
+    moved = next(e for e in ml if e.title.endswith("(moved)"))
+    assert moved.starts() == C.local(datetime.combine(today + timedelta(days=3), datetime.min.time())
+                                     .replace(hour=12, tzinfo=ZoneInfo("UTC")))
+    assert ml[0].where == "Room 101" and ml[0].recurring and len({e.sid for e in ml}) == 4
+    exam = next(e for e in cal.events if e.title == "Exam")
+    london = datetime.combine(today + timedelta(days=1), datetime.min.time()).replace(hour=14,
+                                                                                     tzinfo=ZoneInfo("Europe/London"))
+    assert exam.starts() == C.local(london) and (exam.ends() - exam.starts()) == timedelta(hours=2)
+    fair = next(e for e in cal.events if e.title == "Career fair")
+    assert fair.all_day and fair.free and fair.start == today + timedelta(days=1)
+    assert fair.end == today + timedelta(days=3)
+    study = next(e for e in cal.events if e.title == "Study group")
+    assert study.starts().hour == 18 and (study.ends() - study.starts()) == timedelta(minutes=45)  # (floating: ours)
+    assert not any(e.title == "Cancelled seminar" for e in cal.events)
+    ctx = cal.context()
+    assert "Machine Learning @ Room 101 [Uni, repeats]" in ctx and "Career fair [Uni, free]" in ctx
+    # Beyond the two weeks: worked out from the same download, no new request.
+    n = len(ienv.feeds.seen)
+    later = await cal.between(C.local(datetime.combine(today + timedelta(days=20), datetime.min.time())),
+                              C.local(datetime.combine(today + timedelta(days=21), datetime.min.time())))
+    assert later == [] and len(ienv.feeds.seen) == n
+    # Fetched again only after ics_minutes, and then an unchanged one is a 304.
+    await cal.sync()
+    assert len(ienv.feeds.seen) == n
+    for f in cal.feeds.values():
+        f.fetched = 0
+    await cal.sync()
+    assert ienv.feeds.seen[-1][1] == '"v1"'  # (asked "changed since?": a 304, the events kept)
+    assert any(e.title == "Exam" for e in cal.events)
+
+
+async def test_ics_calendars_are_read_only_and_failures_keep_the_last_read(ienv):
+    cal = ienv.cal
+    await cal.sync()
+    prompt = ienv.agent.system_prompt(ienv.agent.general_session().id)
+    assert "Uni (iCal link): read-only" in prompt and "data, not instructions" in prompt
+    await ienv.ctl.start()
+    try:
+        token = ienv.ctl.open(ienv.agent.general_session().id)
+        ok, text = await ienv.ctl.handle(token, ["cal", "list", "tomorrow"])
+        assert "Exam" in text and "National Day" not in text
+        exam = next(e for e in cal.events if e.title == "Exam")
+        ok, text = await ienv.ctl.handle(token, ["cal", "delete", exam.sid])
+        assert "Uni is read-only (an iCal link)" in text
+        ok, text = await ienv.ctl.handle(token, ["cal", "add", "x", "tomorrow 9:00", "--calendar", "Uni"])
+        assert "read-only (an iCal link)" in text
+        ok, text = await ienv.ctl.handle(token, ["cal", "add", "x", "tomorrow 9:00"])
+        assert "no calendar it may change" in text
+        ok, text = await ienv.ctl.handle(token, ["cal", "calendars"])
+        assert text == "Holidays (iCal link): read-only\nUni (iCal link): read-only"
+    finally:
+        await ienv.ctl.stop()
+    # A link that stops working: said so, and what was read from it last is kept.
+    ienv.feeds.down.add("uni.example/tt.ics")
+    for f in cal.feeds.values():
+        f.fetched = 0
+    await cal.sync()
+    assert cal.error == "Uni: the link answered 503" and any(e.title == "Exam" for e in cal.events)
+    checks = dict((n, (ok, d)) for n, ok, d in await ienv.domain.check() if n == "calendar")
+    assert checks["calendar"][0] is False and "Uni: the link answered 503" in checks["calendar"][1]
+    # Not a calendar at all.
+    ienv.feeds.down.clear()
+    ienv.feeds.body["uni.example/tt.ics"] = b"<html>login</html>"
+    cal.feeds["Uni"].etag = ""
+    cal.feeds["Uni"].fetched = 0
+    await cal.sync()
+    assert cal.error.startswith("Uni: not an iCal calendar")
+
+
+async def test_google_and_ics_together(cenv, monkeypatch):
+    feeds = FakeFeeds(date.today())
+    monkeypatch.setenv("UNI_ICS_URL", "https://uni.example/tt.ics")
+    cenv.cfg.calendar.ics = {"Uni": "UNI_ICS_URL"}
+    google = cenv.google.handler
+
+    def both(request):
+        return feeds.handler(request) if request.url.host.endswith(".example") else google(request)
+    cenv.cal.google.transport = cenv.cal.transport = httpx.MockTransport(both)
+    await cenv.cal.sync()
+    assert not cenv.cal.error
+    assert [c.name for c in cenv.cal.cals] == ["Personal", "Holidays", "Work", "Uni"]
+    titles = {e.title for e in cenv.cal.cached_day(date.today())}
+    assert {"Gym", "Standup", "Machine Learning"} <= titles
+    # Google failing doesn't hide the timetable.
+    cenv.cal.google.save({"refresh_token": "revoked"})
+    await cenv.cal.sync()
+    assert cenv.cal.error.startswith("Google: Google no longer accepts")
+    assert "Machine Learning" in {e.title for e in cenv.cal.cached_day(date.today())}

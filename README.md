@@ -489,7 +489,8 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
     it brings one up now and then on a day that looks light - its judgement, not Overseer's.
   - **Focus sessions**: "let's do 25 minutes on the intro" - one quiet countdown message, then a ping.
   - `/remind` and `/reminders` still exist as shortcuts.
-- **Your Google Calendar** (optional). The assistant sees today's and tomorrow's events in every request and looks
+- **Your calendars** (optional): Google Calendar, and read-only calendars from iCal links. The assistant sees
+  today's and tomorrow's events in every request and looks
   further with `ov cal`. It plans around them: it checks free time before suggesting when to do something, it
   reads a packed day as "smaller and fewer suggestions" and a light one as room for a bigger task or a someday
   item, and it can offer to block time for a task. It changes events only where you allow it: in calendars under
@@ -506,6 +507,13 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
      fails to load a `127.0.0.1` page - copy that page's address back into the terminal. It lists your calendars
      and what the assistant may do with each.
   4. `calendar.enabled: true` (and `ask` / `auto` as you like), restart the bot. `overseer check` shows it.
+
+  **iCal links** are read-only calendars it sees and plans around but never changes: a university timetable, a
+  calendar someone shared, Outlook's or Apple's "publish calendar" link, a holidays feed. List them under
+  `calendar.ics` by name; the value is the link (`https://` or `webcal://`), or - since such links usually work
+  like a password - the name of a variable in `.env` holding it: `ics: {Uni: UNI_ICS_URL}` and
+  `UNI_ICS_URL=https://...` in `.env`. Overseer fetches each one every `ics_minutes` (30) and works out repeating
+  events, their exceptions and time zones itself. They work without Google too (`enabled: false`).
 - **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
   @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
   subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
@@ -632,6 +640,6 @@ domain by name.
 | `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first hello |
 | `media.py` | `ov fetch` (public addresses only, media only, size-limited) and Giphy search; `ov capabilities` |
 | `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions (with follow-up policies) |
-| `calendar.py` | Google Calendar: the login, reading events (every few minutes, two weeks ahead), free time, changes behind ✅ cards or with ↩️ Undo, reminders before events |
+| `calendar.py` | Google Calendar and iCal links: the login, reading events (every few minutes, two weeks ahead), free time, changes behind ✅ cards or with ↩️ Undo, reminders before events |
 | `commands.py`, `telegram.py` | `ov task`, `ov remind`, `ov cal`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
 | `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |

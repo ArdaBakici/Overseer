@@ -45,7 +45,7 @@ are not woken):
                                    <policy>: a name from the routines note's # Follow-ups, "again after 10m, up
                                    to 3 more times", or none
   ov routine check                 the routines note: problems, and when each runs next
-Calendar (Google; if turned on - ids are the first column of a list):
+Calendar (Google, and read-only iCal links; if turned on - ids are the first column of a list):
   ov cal list [today|tomorrow|week|next week|<day>] [--days N] [--calendar c] [--search words]
   ov cal free [<day>] [--from 09:00] [--to 21:00] [--min 30m]   free stretches between events
   ov cal calendars                 the calendars, and which ones you may change
@@ -259,7 +259,8 @@ class AssistantCommands:
         if not c.cals:
             raise C.CalendarError(c.error or "no calendars")
         what = {"read": "read-only", "ask": "changes after they tap ✅", "auto": "changes on your own (with ↩️ Undo)"}
-        return "\n".join(f"{x.name}{' (primary)' if x.primary else ''}: {what[x.mode]}" for x in c.cals)
+        return "\n".join(f"{x.name}{' (primary)' if x.primary else ''}{' (iCal link)' if x.kind == 'ics' else ''}: "
+                         f"{what[x.mode]}" for x in c.cals)
 
     def _range(self, words: list[str], days: int):
         today = self.domain.today()

@@ -1,6 +1,7 @@
-"""Your Google Calendar, for the assistant: Overseer reads the next two weeks of events every few minutes (the agent
-sees today's and tomorrow's in its context, and asks for more with `ov cal`), and makes the changes the agent asks for
-- in the calendars you allow: after you tap ✅ on a card (calendar.ask), or on its own with ↩️ Undo (calendar.auto).
+"""Your calendars, for the assistant: Google Calendar, and read-only ones from iCal links (calendar.ics: a timetable,
+a shared or published calendar). Overseer reads the next two weeks of events every few minutes (the agent sees today's
+and tomorrow's in its context, and asks for more with `ov cal`), and makes the changes the agent asks for - in the
+Google calendars you allow: after you tap ✅ on a card (calendar.ask), or on its own with ↩️ Undo (calendar.auto).
 
 The agent never holds the Google login: the token is in the bot's state folder, which agents can't read, and only
 Overseer talks to Google. It can't invite anyone, and events with other people are left alone (change those in
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -100,6 +102,7 @@ class Cal:
     mode: str = "read"  # read | ask | auto
     role: str = "reader"  # Google's accessRole: owner | writer | reader | freeBusyReader
     tz: str = ""
+    kind: str = "google"  # google | ics (an iCal link: read-only)
 
 
 @dataclass
@@ -353,6 +356,120 @@ def login(cfg, read=input, out=print, http: httpx.Client | None = None) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------- iCal links (read-only)
+ICS_MAX_BYTES = 10 * 1024 * 1024
+
+
+def ics_url(source: str) -> str:
+    """calendar.ics's value: the link itself (webcal:// works too), or the name of a variable in .env holding it."""
+    s = source.strip()
+    if "://" not in s:
+        s = os.environ.get(s, "").strip()
+        if not s:
+            raise CalendarError(f"{source} isn't set in .env")
+    if s.lower().startswith("webcal://"):
+        s = "https://" + s[9:]
+    if not s.lower().startswith(("https://", "http://")):
+        raise CalendarError("not an http(s) or webcal link")
+    return s
+
+
+class Feed:
+    """One iCal link: fetched again at most every few minutes (unchanged ones cost a 304), expanded locally -
+    repeating events, their exceptions and time zones by recurring-ical-events."""
+
+    def __init__(self, name: str, source: str, transport: httpx.AsyncBaseTransport | None = None):
+        self.name = name
+        self.source = source
+        self.transport = transport
+        self.ical = None
+        self.series: set[str] = set()  # the UIDs of repeating events
+        self.etag = self.modified = ""
+        self.fetched = 0.0
+
+    def cal(self) -> Cal:
+        return Cal(id=f"ics:{self.name}", name=self.name, mode="read", kind="ics")
+
+    async def refresh(self, every: float) -> None:
+        if self.ical is not None and time.time() - self.fetched < every:
+            return
+        url = ics_url(self.source)
+        headers = {"User-Agent": "Overseer (calendar)"}
+        if self.ical is not None:  # (unchanged since: a 304, nothing to read again)
+            headers |= {**({"If-None-Match": self.etag} if self.etag else {}),
+                        **({"If-Modified-Since": self.modified} if self.modified else {})}
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True, transport=self.transport) as h:
+                async with h.stream("GET", url, headers=headers) as r:
+                    if r.status_code == 304 and self.ical is not None:
+                        self.fetched = time.time()
+                        return
+                    if r.status_code != 200:
+                        raise CalendarError(f"the link answered {r.status_code}")
+                    body = b""
+                    async for chunk in r.aiter_bytes():
+                        body += chunk
+                        if len(body) > ICS_MAX_BYTES:
+                            raise CalendarError(f"bigger than {ICS_MAX_BYTES // 2**20} MB")
+                    etag, modified = r.headers.get("etag", ""), r.headers.get("last-modified", "")
+        except httpx.HTTPError as e:
+            raise CalendarError(f"couldn't fetch it ({type(e).__name__})") from None
+        self.ical = await asyncio.to_thread(parse_ics, body)
+        self.series = {str(c.get("UID", "")) for c in self.ical.walk("VEVENT")
+                       if any(k in c for k in ("RRULE", "RDATE", "RECURRENCE-ID"))}
+        self.etag, self.modified, self.fetched = etag, modified, time.time()
+
+    def events(self, cal: Cal, start: datetime, end: datetime) -> list[Event]:
+        if self.ical is None:
+            return []
+        import recurring_ical_events
+        try:
+            items = recurring_ical_events.of(self.ical, skip_bad_series=True).between(start, end)
+        except Exception as e:  # (a broken repeat rule in someone else's calendar: say so, don't crash)
+            raise CalendarError(f"couldn't read its events ({type(e).__name__}: {str(e)[:100]})") from None
+        return [ev for item in items if (ev := ics_event(cal, item, self.series))]
+
+
+def parse_ics(body: bytes):
+    import icalendar
+    try:
+        cal = icalendar.Calendar.from_ical(body)
+    except Exception as e:
+        raise CalendarError(f"not an iCal calendar ({str(e)[:100]})") from None
+    if not isinstance(cal, icalendar.Calendar):
+        raise CalendarError("not an iCal calendar")
+    return cal
+
+
+def _ics_time(v) -> tuple[datetime | date, bool]:
+    if isinstance(v, datetime):
+        return local(v), False  # (no time zone = "floating": this bot's)
+    return v, True
+
+
+def ics_event(cal: Cal, item, series: set[str] = frozenset()) -> Event | None:
+    if str(item.get("STATUS", "")).upper() == "CANCELLED" or "DTSTART" not in item:
+        return None
+    start, all_day = _ics_time(item.decoded("DTSTART"))
+    if "DTEND" in item:
+        end, _ = _ics_time(item.decoded("DTEND"))
+    elif "DURATION" in item:
+        end = start + item.decoded("DURATION")
+    else:
+        end = start + timedelta(days=1) if all_day else start
+    if all_day and isinstance(end, datetime):
+        end = end.date()
+    uid = str(item.get("UID", "")) or hashlib.sha1(str(item.get("SUMMARY", "")).encode()).hexdigest()[:12]
+    stamp = start.isoformat()
+    attendees = item.get("ATTENDEE") or []
+    people = len(attendees) if isinstance(attendees, list) else 1
+    return Event(cal=cal.id, cal_name=cal.name, id=f"{uid}@{stamp}", title=str(item.get("SUMMARY", "")),
+                 start=start, end=end, all_day=all_day, where=str(item.get("LOCATION", "")),
+                 note=str(item.get("DESCRIPTION", ""))[:500], others=max(0, people - 1),
+                 free=str(item.get("TRANSP", "")).upper() == "TRANSPARENT",
+                 recurring=str(item.get("UID", "")) in series)
+
+
 # ---------------------------------------------------------------------------- the service
 class Calendar:
     """Owned by the AssistantDomain: the events cache, its sync loop, reminders before events, and changes."""
@@ -362,6 +479,9 @@ class Calendar:
         self.cfg = domain.cfg
         self.store = domain.store
         self.google = Google(domain.cfg, transport)
+        self.transport = transport
+        self.feeds: dict[str, Feed] = {}  # name -> an iCal link
+        self._sources: dict[str, tuple[list[Cal], list[Event]]] = {}  # "google" / "ics:<name>" -> what was read last
         self.cals: list[Cal] = []
         self.events: list[Event] = []
         self.window: tuple[datetime, datetime] | None = None
@@ -371,7 +491,18 @@ class Calendar:
 
     @property
     def enabled(self) -> bool:
+        return self.google_on or bool(self.cfg.calendar.ics)
+
+    @property
+    def google_on(self) -> bool:
         return bool(self.cfg.calendar.enabled)
+
+    def feed(self, name: str) -> Feed:
+        source = self.cfg.calendar.ics[name]
+        f = self.feeds.get(name)
+        if f is None or f.source != source:
+            f = self.feeds[name] = Feed(name, source, self.transport)
+        return f
 
     # ---- calendars and their modes
     @staticmethod
@@ -422,29 +553,58 @@ class Calendar:
 
     # ---- reading
     async def sync(self) -> None:
+        """Read every source again; one that fails keeps what was read from it last (and says so)."""
         if not self.enabled:
             return
-        try:
-            self.cals = await self.fetch_calendars(self.cfg, self.google)
-            start = local(datetime.combine(date.today(), dtime(0, 0)))
-            end = start + timedelta(days=WINDOW_DAYS)
-            self.events = await self._fetch(start, end)
-            self.window, self.synced, self.error = (start, end), time.time(), ""
-        except CalendarError as e:
-            if str(e) != self.error:
-                log.warning("calendar: %s", e)
-            self.error = str(e)
+        start = local(datetime.combine(date.today(), dtime(0, 0)))
+        end = start + timedelta(days=WINDOW_DAYS)
+        sources: list[tuple[str, Any]] = []
+        if self.google_on:
+            sources.append(("google", self._read_google))
+        sources += [(f"ics:{n}", lambda s, e, n=n: self._read_feed(n, s, e)) for n in self.cfg.calendar.ics]
+        for key in [k for k in self._sources if k not in dict(sources)]:  # (taken out of the config since)
+            del self._sources[key]
+        errors, read = [], 0
+        for key, reader in sources:
+            try:
+                self._sources[key] = await reader(start, end)
+                read += 1
+            except CalendarError as e:
+                label = "Google" if key == "google" else key[4:]
+                errors.append(f"{label}: {e}")
+        error = "; ".join(errors)
+        if error and error != self.error:
+            log.warning("calendar: %s", error)
+        self.error = error
+        if not read and not self._sources:
             return
+        self.cals = [c for cals, _ in self._sources.values() for c in cals]
+        self.cals.sort(key=lambda c: (not c.primary, c.kind != "google", c.name.lower()))
+        self.events = sorted((e for _, evs in self._sources.values() for e in evs), key=lambda e: (e.starts(), e.cal_name))
+        if read:
+            self.window, self.synced = (start, end), time.time()
         await self._event_reminders()
+
+    async def _read_google(self, start: datetime, end: datetime) -> tuple[list[Cal], list[Event]]:
+        cals = await self.fetch_calendars(self.cfg, self.google)
+        return cals, await self._fetch(start, end, cals)
+
+    async def _read_feed(self, name: str, start: datetime, end: datetime) -> tuple[list[Cal], list[Event]]:
+        f = self.feed(name)
+        await f.refresh(self.cfg.calendar.ics_minutes * 60)
+        cal = f.cal()
+        return [cal], await self._fetch(start, end, [cal])
 
     async def _fetch(self, start: datetime, end: datetime, cals: list[Cal] | None = None) -> list[Event]:
         out = []
         for cal in cals or self.cals:
-            for item in await self.google.events(cal.id, start, end):
-                ev = make_event(cal, item)
-                if ev:
-                    out.append(ev)
-                    self.ids[ev.sid] = (ev.cal, ev.id)
+            if cal.kind == "ics":
+                evs = await asyncio.to_thread(self.feed(cal.name).events, cal, start, end)
+            else:
+                evs = [ev for item in await self.google.events(cal.id, start, end) if (ev := make_event(cal, item))]
+            for ev in evs:
+                out.append(ev)
+                self.ids[ev.sid] = (ev.cal, ev.id)
         return sorted(out, key=lambda e: (e.starts(), e.cal_name))
 
     async def between(self, start: datetime, end: datetime, cal: str = "", search: str = "") -> list[Event]:
@@ -560,6 +720,10 @@ class Calendar:
         cal = next((c for c in self.cals if c.id == cal_id), None)
         if not cal:
             raise CalendarError("that calendar isn't one it sees any more")
+        if cal.kind != "google":
+            raise CalendarError(f"{cal.name} is read-only (an iCal link)")
+        if cal.mode == "read":
+            raise CalendarError(f"{cal.name} is read-only for you (calendar.ask / calendar.auto in the config)")
         ev = make_event(cal, await self._get(cal_id, eid))
         if not ev:
             raise CalendarError("that event was deleted")
@@ -573,6 +737,8 @@ class Calendar:
     async def propose_add(self, session, title: str, start, end, all_day: bool, cal_name: str = "",
                           where: str = "", note: str = "") -> str:
         cal = self.cal(cal_name) if cal_name else self.default_cal()
+        if cal.kind != "google":
+            raise CalendarError(f"{cal.name} is read-only (an iCal link)")
         if cal.mode == "read":
             raise CalendarError(f"{cal.name} is read-only for you (calendar.ask / calendar.auto in the config)")
         tz = self.cfg.local.timezone or ""
