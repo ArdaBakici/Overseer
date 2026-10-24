@@ -1,6 +1,6 @@
 ---
 name: assistant
-description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, their writing style and personality, memory notes), tasks in the Obsidian Tasks format (`ov task list|add|done`) and a someday list, questions with tap buttons (`ov ask`), routines (Assistant/Routines.md), reminders and check-backs (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), pictures/GIFs/videos from the internet (`ov fetch`, `ov gif`), reactions (`ov react`), notes always in mind (`assistant: always`), waking yourself later (`ov wake`), and searching past conversations (`ov history`). Use it whenever the user asks about tasks, todos, plans, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
+description: How to work as the user's personal assistant through Overseer - the Obsidian vault as your memory (your persona, what you know about the user, their writing style and personality, memory notes), tasks in the Obsidian Tasks format (`ov task list|add|done`) and a someday list, questions with tap buttons (`ov ask`), their Google Calendar (`ov cal list|free|add|move|edit|delete`), routines (Assistant/Routines.md), reminders and check-backs (`ov remind`, `ov commit`, `ov followup`), focus sessions (`ov focus`), pictures/GIFs/videos from the internet (`ov fetch`, `ov gif`), reactions (`ov react`), notes always in mind (`assistant: always`), waking yourself later (`ov wake`), and searching past conversations (`ov history`). Use it whenever the user asks about tasks, todos, plans, their calendar or schedule, routines, reminders, focus, notes, or anything you should remember, and whenever they commit to doing something by a time.
 ---
 
 # The assistant and `ov`
@@ -114,6 +114,31 @@ one when it would clearly help, with the user's agreement. Keep the format; afte
 `when`: every day / weekdays / weekends / monday, thursday / sun, then times (09:00, 9pm, "09:30 and 21:30").
 When the user says the reminders are too much (or not enough), change `# Follow-ups` (or one routine's
 `follow-up:`) and tell them what you changed.
+
+## Calendar (Google, if it's turned on)
+
+Today's and tomorrow's events are in your context (`<calendar>`); the rest with `ov cal`. Ids (first column of a
+list) are what `move`, `edit` and `delete` take.
+
+```bash
+ov cal list week                       # the next 7 days; also today, tomorrow, next week, friday, 2026-11-03
+ov cal list --days 30 --search dentist
+ov cal free thursday --from 09:00 --to 18:00 --min 1h   # free stretches between events
+ov cal add "Write the intro" "thursday 14:00" 2h        # or an end time: 16:00; default 1h
+ov cal add "Trip to Muscat" 2026-11-06 --all-day --days 3
+ov cal move a1b2c3 "friday 10:00"      # keeps its length unless you give one
+ov cal edit a1b2c3 --where "Room 204"
+ov cal delete a1b2c3
+ov cal calendars                       # which calendars you may change, and how
+```
+
+- Plan around it: check `ov cal free` before suggesting a time for anything, and leave room around events.
+- Busy day: fewer, smaller suggestions; light day: room for a bigger task or a someday item.
+- Changes go through the user. In a calendar that "changes after they tap ✅", they get a card and nothing
+  happens until they tap (don't ask again in words); their answer reaches you in your next turn. In one that
+  "changes at once", it's done and they get ↩️ Undo. Events with other people invited can't be changed, and you
+  can't invite anyone.
+- Move or delete their events only when they asked, or agreed when you asked.
 
 ## Projects
 

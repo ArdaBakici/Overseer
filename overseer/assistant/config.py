@@ -6,7 +6,7 @@ from the .env file), state folder and tmp folder - never the HPC bot's.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core.config import ConfigError
@@ -38,7 +38,24 @@ class MediaConfig:
     giphy_rating: str = "pg-13"  # g | pg | pg-13 | r
 
 
-SECTIONS = {"vault": VaultConfig, "media": MediaConfig}
+@dataclass
+class CalendarConfig:
+    """Your Google Calendar: the assistant sees your events (and plans around them), and can add or change events in
+    the calendars you allow - after you tap ✅, or on its own where you say so. Set up: your own OAuth client in Google
+    Cloud (a "Desktop app"; its id and secret in .env), then `overseer login google -c <this config>`."""
+
+    enabled: bool = False
+    client_id_env: str = "GOOGLE_CLIENT_ID"  # the names of the variables in .env holding your OAuth client's
+    client_secret_env: str = "GOOGLE_CLIENT_SECRET"  # id and secret
+    # Calendars by name (as in Google) or id; "primary" is your main one.
+    read: list[str] = field(default_factory=list)  # the ones it sees; [] = all of them
+    ask: list[str] = field(default_factory=lambda: ["primary"])  # it may change these after you tap ✅ Yes
+    auto: list[str] = field(default_factory=list)  # ... and these on its own (each change shown, with ↩️ Undo)
+    event_reminders: int = 0  # minutes before a timed event to remind you of it; 0 = off (Google's own still work)
+    sync_minutes: int = 5  # how often Overseer reads the next two weeks of events
+
+
+SECTIONS = {"vault": VaultConfig, "media": MediaConfig, "calendar": CalendarConfig}
 
 
 def _vault_dir(cfg) -> Path:
@@ -48,6 +65,7 @@ def _vault_dir(cfg) -> Path:
 DERIVED = {
     "vault_dir": _vault_dir,
     "vault_git_dir": lambda cfg: cfg.local.state("vault.git"),
+    "google_token_path": lambda cfg: cfg.local.state("google-token.json"),  # (agents can't read the state folder)
 }
 
 
@@ -73,6 +91,18 @@ def validate(cfg) -> None:
         raise ConfigError("media.max_mb: 1 to 50 (Telegram's limit for files bots send)")
     if cfg.media.giphy_rating not in ("g", "pg", "pg-13", "r"):
         raise ConfigError("media.giphy_rating: g, pg, pg-13 or r")
+    c = cfg.calendar
+    for name in ("read", "ask", "auto"):
+        v = getattr(c, name)
+        if not isinstance(v, list) or not all(isinstance(x, str) and x.strip() for x in v):
+            raise ConfigError(f"calendar.{name}: a list of calendar names or ids, e.g. [primary]")
+    if not 0 <= c.event_reminders <= 24 * 60:
+        raise ConfigError("calendar.event_reminders: minutes, 0 (off) to 1440")
+    if not 1 <= c.sync_minutes <= 120:
+        raise ConfigError("calendar.sync_minutes: 1 to 120")
+    if c.enabled and not (c.client_id_env and c.client_secret_env):
+        raise ConfigError("calendar.client_id_env and client_secret_env: the names of your OAuth client's id and "
+                          "secret in .env")
     if cfg.telegram.token_env == "TELEGRAM_BOT_TOKEN":
         raise ConfigError("telegram.token_env: the assistant is its own bot - name its token, e.g. "
                           "ASSISTANT_BOT_TOKEN (in the .env file)")

@@ -35,6 +35,20 @@ media:
   giphy_key_env: ""             # ov gif <query>: the .env variable with your Giphy API key, e.g. GIPHY_API_KEY; "" = off
   giphy_rating: pg-13
 
+# Your Google Calendar: the assistant sees your events and plans around them; it changes events only in the calendars
+# listed under ask (after you tap ✅) or auto (at once, with ↩️ Undo), never ones with other people invited.
+# Set up: a Google Cloud project with the Calendar API, an OAuth client of type "Desktop app" (its id and secret in
+# .env), then: uv run overseer login google -c assistant.yaml
+calendar:
+  enabled: false
+  client_id_env: GOOGLE_CLIENT_ID
+  client_secret_env: GOOGLE_CLIENT_SECRET
+  read: []                      # calendars it sees, by name or id; [] = all of yours
+  ask: [primary]                # it may add/change events here after you tap ✅ (primary = your main calendar)
+  auto: []                      # ... and here at once (you see each change, with ↩️ Undo)
+  event_reminders: 0            # a reminder this many minutes before each timed event; 0 = off
+  sync_minutes: 5
+
 telegram:
   token_env: ASSISTANT_BOT_TOKEN  # the name of the variable in .env (not the token itself)
   allowed_chat_ids: [123456789]

@@ -13,6 +13,7 @@ from telegram.ext import ContextTypes
 
 from ..core.notify import Outgoing, code, esc
 from . import tasks as T
+from .calendar import CalendarError
 from .domain import files_line
 from .reminders import when_text
 from .when import parse_moment
@@ -22,7 +23,7 @@ log = logging.getLogger(__name__)
 HELP = """<b>Your assistant</b> — talk to it like a person: just send a message (pictures and files too). No commands needed.
 Its memory is your Obsidian vault: it reads and writes notes there, and every reply that changed notes has a ↩️ Undo button.
 Just say it: "plan my day with me", "remind me at 5 to call the bank", "I'll send the report by 3", "let's do 25 minutes on the intro", "move my evening review to 22:00", "that was too many reminders".
-Your routines live in Assistant/Routines.md (it sets them up with you); reminders and check-ins come back until you answer ✅ / 💤 / ⏭ / 🧱.
+It sets things up with you as you go: routines (in Assistant/Routines.md), reminders, check-backs, a someday list, and - if it's connected - your Google Calendar (changes there need your ✅, or come with ↩️ Undo).
 
 Shortcuts, if you want them:
 /tasks [today|week|overdue|upcoming|undated|all|#tag|words] — tasks from the whole vault, ✅ to tick them off
@@ -47,7 +48,7 @@ class AssistantBot:
 
     help = HELP
     menu = MENU
-    errors = (T.TaskError,)
+    errors = (T.TaskError, CalendarError)
 
     def __init__(self, bot, domain):
         self.bot = bot
@@ -70,6 +71,15 @@ class AssistantBot:
             await self._done(update, q, arg)
         elif action == "vundo":
             await self._undo(update, q, arg)
+        elif action == "cal":  # a calendar change: ✅ / ✖
+            pid, _, what = arg.partition(":")
+            text, buttons = await self.domain.calendar.answer(pid, what == "ok")
+            await self._edit(q, text, buttons or None)
+        elif action == "calu":  # ↩️ Undo on a calendar change
+            try:
+                await self._edit(q, await self.domain.calendar.undo(arg))
+            except CalendarError as e:
+                await self.notifier.send(Outgoing(f"⚠️ Couldn't undo it: {esc(e)}"))
         elif action in ("fu", "rrm", "rsnz"):  # a follow-up's buttons (rrm/rsnz: from before follow-ups)
             rid, _, what = arg.partition(":")
             what = {"rrm": "cancel", "rsnz": "later"}.get(action, what)

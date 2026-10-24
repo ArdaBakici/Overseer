@@ -1,4 +1,4 @@
-"""The assistant's dashboard tabs (core/dashboard.py serves them): today (what's due, reminders), every task, and the
+"""The assistant's dashboard tabs (core/dashboard.py serves them): today (events, what's due, reminders), every task, and the
 vault's history (what changed, by whom). Read-only: ticking tasks off and undoing are in the chat."""
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ async def today(domain) -> dict:
                         for r in domain.reminders.open()[:30]],
             "log": [{"at": e["at"], "icon": e["icon"], "text": e["text"]} for e in domain.reminders.log()[-40:]],
             "routines": routines_today(domain),
+            "events": [e.to_dict() for e in domain.calendar.cached_day(day)] if domain.calendar.enabled else None,
             "conflicts": await asyncio.to_thread(domain.vault.conflicts)}
 
 

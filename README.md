@@ -489,6 +489,23 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
     it brings one up now and then on a day that looks light - its judgement, not Overseer's.
   - **Focus sessions**: "let's do 25 minutes on the intro" - one quiet countdown message, then a ping.
   - `/remind` and `/reminders` still exist as shortcuts.
+- **Your Google Calendar** (optional). The assistant sees today's and tomorrow's events in every request and looks
+  further with `ov cal`. It plans around them: it checks free time before suggesting when to do something, it
+  reads a packed day as "smaller and fewer suggestions" and a light one as room for a bigger task or a someday
+  item, and it can offer to block time for a task. It changes events only where you allow it: in calendars under
+  `calendar.ask` you get a card (✅ Add / ✖ No) and nothing happens until you tap; in ones under `calendar.auto`
+  it's done at once and the notice has ↩️ Undo. It never invites anyone and leaves events with other people alone.
+  `calendar.event_reminders: 10` adds a reminder 10 minutes before each timed event. The Google login stays with
+  Overseer (in the bot's state folder, which agents can't read); the agent only uses `ov cal`. Set up:
+  1. In [Google Cloud](https://console.cloud.google.com): a project, enable the **Google Calendar API**; the
+     **OAuth consent screen**: External, add yourself as a test user, then **publish** it (left in "Testing",
+     Google drops the login after 7 days; unverified is fine for just you); **Credentials → OAuth client ID →
+     Desktop app**.
+  2. Its id and secret into `.env`: `GOOGLE_CLIENT_ID=...` and `GOOGLE_CLIENT_SECRET=...`.
+  3. `uv run overseer login google -c assistant.yaml`: open the link on any device, allow access; the browser then
+     fails to load a `127.0.0.1` page - copy that page's address back into the terminal. It lists your calendars
+     and what the assistant may do with each.
+  4. `calendar.enabled: true` (and `ask` / `auto` as you like), restart the bot. `overseer check` shows it.
 - **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
   @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
   subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
@@ -511,7 +528,7 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   and the agent CLIs' own sessions - without them it can't resume or search old chats. Your notes, projects,
   settings and logins stay either way (`--yes` answers only the first question). For a completely fresh start,
   also delete the `Assistant/` folder in the vault: it then says hi and asks for a personality again.
-- **Every morning**: today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
+- **Every morning**: today's events, today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
   **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
   also searches the vault's notes.
 - **Kept apart from the HPC bot.** On Linux the sandbox can't filter unix sockets by path, so each bot notes its
@@ -615,5 +632,6 @@ domain by name.
 | `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first hello |
 | `media.py` | `ov fetch` (public addresses only, media only, size-limited) and Giphy search; `ov capabilities` |
 | `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions (with follow-up policies) |
-| `commands.py`, `telegram.py` | `ov task`, `ov remind`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
+| `calendar.py` | Google Calendar: the login, reading events (every few minutes, two weeks ahead), free time, changes behind ✅ cards or with ↩️ Undo, reminders before events |
+| `commands.py`, `telegram.py` | `ov task`, `ov remind`, `ov cal`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
 | `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |

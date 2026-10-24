@@ -23,6 +23,7 @@ from ..core.notify import code
 from ..core.runners import Activity, Sandbox
 from . import prompts as P
 from . import tasks as T
+from .calendar import Calendar
 from .reminders import Reminders, when_text
 from .scheduler import Scheduler
 from .vault import Vault
@@ -75,6 +76,8 @@ class AssistantDomain(Domain):
         self.reminders = Reminders(store, notifier)
         self.reminders.on_stuck = self._stuck
         self.scheduler = Scheduler(self)  # Routines.md, and the first hello
+        self.calendar = Calendar(self)  # Google Calendar (if turned on)
+        self._sync: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ the app
     def prepare(self) -> None:
@@ -85,7 +88,18 @@ class AssistantDomain(Domain):
         write_skills(self.cfg, skills())
 
     def services(self) -> list[tuple[str, object]]:
-        return [("follow-ups", self.reminders.loop()), ("routines", self.scheduler.loop())]
+        out = [("follow-ups", self.reminders.loop()), ("routines", self.scheduler.loop())]
+        if self.calendar.enabled:
+            out.append(("calendar", self.calendar.loop()))
+        return out
+
+    def schedule_sync(self) -> None:
+        """Read the calendar again soon (after a change)."""
+        if self.calendar.enabled and not (self._sync and not self._sync.done()):
+            try:
+                self._sync = asyncio.get_running_loop().create_task(self.calendar.sync())
+            except RuntimeError:
+                pass
 
     async def start(self, notifier, projects) -> None:
         try:
@@ -108,6 +122,13 @@ class AssistantDomain(Domain):
         have = ", ".join(n for n, ok in tools.items() if ok) or "none"
         out.append(("image tools", True, have + (f" (not installed: {', '.join(missing)} - e.g. sudo apt install "
                                                  "python3-pil ffmpeg imagemagick)" if missing else "")))
+        if self.calendar.enabled:
+            c = self.calendar
+            await c.sync()
+            out.append(("calendar", not c.error, c.error or "Google · " + ", ".join(
+                f"{x.name} ({x.mode})" for x in c.cals) + f" · {len(c.events)} events in the next two weeks"))
+        else:
+            out.append(("calendar", True, "off"))
         m = self.cfg.media
         out.append(("media", True, f"ov fetch {'on' if m.fetch else 'off'} (up to {m.max_mb} MB) · ov gif "
                     + ("on" if m.giphy_key_env and os.environ.get(m.giphy_key_env) else
@@ -171,9 +192,18 @@ class AssistantDomain(Domain):
             domains=f" (except {', '.join(domains)})" if domains else "",
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
         prompt += self._flagged_section()
+        if self.calendar.enabled:
+            prompt += P.CALENDAR_SECTION.format(calendars=self._calendars_line())
         if self.agent and self.agent.ctl:
             prompt += P.OV_SECTION
         return prompt + self._project_section(s)
+
+    def _calendars_line(self) -> str:
+        c = self.calendar
+        if not c.cals:
+            return "(not read yet" + (f": {c.error}" if c.error else "") + " - `ov cal calendars`)"
+        what = {"read": "read-only", "ask": "changes after they tap ✅", "auto": "changes at once, with ↩️ Undo"}
+        return "; ".join(f"{x.name}{' (primary)' if x.primary else ''}: {what[x.mode]}" for x in c.cals)
 
     def _flagged_section(self) -> str:
         """Notes flagged `assistant: always` (their text, within a budget) and `assistant: index` (name and
@@ -224,6 +254,8 @@ class AssistantDomain(Domain):
         """The date and time (the agent can't know them), what's due, and Syncthing's conflicts."""
         now = datetime.now()
         lines = [f"<now>{now:%A %d %B %Y, %H:%M} {time.strftime('%Z')}</now>"]
+        if self.calendar.enabled:
+            lines.append(self.calendar.context())
         try:
             all_tasks = await asyncio.to_thread(T.scan, self.vault)
         except OSError:

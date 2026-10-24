@@ -59,6 +59,17 @@ async function renderToday() {
   if (d.conflicts.length) {
     parts.push(`<div class="error">Sync conflicts (two devices changed a note at once): ${esc(d.conflicts.join(", "))}</div>`);
   }
+  if (d.events) {
+    const hm = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    const now = Date.now() / 1000;
+    parts.push("<h3>Calendar today</h3>");
+    parts.push(d.events.length ? d.events.map((e) =>
+      `<div class="card"${e.end <= now || e.declined ? ' style="opacity:.55"' : ""}><span aria-hidden="true">📅</span>
+       ${e.all_day ? "all day" : esc(hm(e.start) + "–" + hm(e.end))} — ${esc(e.title || "(no title)")}
+       ${e.where ? `<span class="muted small">@ ${esc(e.where)}</span>` : ""}
+       <span class="muted small">${esc(e.calendar)}</span></div>`).join("")
+      : '<div class="empty">Nothing in the calendar today.</div>');
+  }
   parts.push("<h3>Due today and overdue</h3>");
   parts.push(d.due.length ? d.due.map(taskHTML).join("") : '<div class="empty">Nothing due. 🎉</div>');
   const ICON = {commit: "🎯", focus: "⏱", say: "🔔", reminder: "⏰"};

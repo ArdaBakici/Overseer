@@ -4,6 +4,7 @@
     overseer ssh connect                open the SSH connection interactively (for 2FA clusters)
     overseer ssh test                   check the connection works
     overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
+    overseer login google               (the assistant) connect your Google Calendar
     overseer sessions                   list agent conversations
     overseer open [conversation]        open a conversation in Claude Code / Codex (default: latest)
     overseer update                     update Claude Code and Codex (the bot also does it once a day)
@@ -161,6 +162,14 @@ def ssh_command(cfg: Config, action: str, import_from: str | None) -> int:
 
 def login(cfg: Config, backend: str, extra: list[str]) -> int:
     from .core.runners import make_runner
+
+    if backend == "google":
+        if cfg.domain != "assistant":
+            print("Google Calendar is the assistant's: overseer login google -c assistant.yaml", file=sys.stderr)
+            return 2
+        from .assistant.calendar import login as google_login
+        prepare_local_dirs(cfg)
+        return google_login(cfg)
 
     if backend not in BACKENDS:
         print(f"usage: overseer login {'|'.join(BACKENDS)}", file=sys.stderr)
@@ -359,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset",
                                            "config"])
     ap.add_argument("target", nargs="?",
-                    help="login: claude_code|codex; ssh: setup|connect|test; open: conversation (default: latest); "
+                    help="login: claude_code|codex|google; ssh: setup|connect|test; open: conversation (default: latest); "
                          "watch: conversation (default: all)")
     ap.add_argument("-c", "--config", default="config.yaml")
     ap.add_argument("--import", dest="import_key", help="ssh setup: copy this existing private key instead of generating one")

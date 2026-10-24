@@ -1,5 +1,5 @@
 """The assistant's `ov` commands: tasks (Obsidian Tasks, anywhere in the vault), reminders, check-backs on
-commitments, focus sessions, the follow-ups waiting for an answer, and the routines note. The platform's control
+commitments, focus sessions, the follow-ups waiting for an answer, the routines note, and the calendar. The platform's control
 server (core/ctl.py) runs them for the agent."""
 
 from __future__ import annotations
@@ -12,13 +12,14 @@ import httpx
 
 from ..core.ctl import CtlError
 from ..core.notify import Outgoing, esc
+from . import calendar as C
 from . import media
 from . import tasks as T
 from . import routines as R
 from .reminders import exact_text, when_text
 from .when import parse_day, parse_moment
 
-AREAS = ("task", "remind", "commit", "focus", "followup", "routine", "fetch", "gif", "capabilities")
+AREAS = ("task", "remind", "commit", "focus", "followup", "routine", "fetch", "gif", "capabilities", "cal")
 ACTIONS = ("done", "later", "skip", "stuck", "cancel")
 
 HELP = """ov - talk to Overseer (the system that runs you and sends your replies to the user on Telegram)
@@ -44,6 +45,16 @@ are not woken):
                                    <policy>: a name from the routines note's # Follow-ups, "again after 10m, up
                                    to 3 more times", or none
   ov routine check                 the routines note: problems, and when each runs next
+Calendar (Google; if turned on - ids are the first column of a list):
+  ov cal list [today|tomorrow|week|next week|<day>] [--days N] [--calendar c] [--search words]
+  ov cal free [<day>] [--from 09:00] [--to 21:00] [--min 30m]   free stretches between events
+  ov cal calendars                 the calendars, and which ones you may change
+  ov cal add "<title>" <start> [<length>|<end>] [--calendar c] [--where p] [--note t]
+                                   start: "thursday 14:00", "tomorrow 9am"; length: 2h, 45m, or an end, 16:00
+  ov cal add "<title>" <day> --all-day [--days N]
+  ov cal move <id> <start> [<length>] · ov cal edit <id> [--title t] [--where p] [--note t] · ov cal delete <id>
+                                   changes go through the user: a card to tap ✅ on (or done at once, with
+                                   ↩️ Undo, in calendars they allowed); never events with other people
 Pictures, GIFs and videos from the internet (your shell has none: Overseer downloads them, public addresses only):
   ov fetch <url> [--name n] [--keep]   into ./outbox/ (sent with your reply), --keep: into ./inbox/ to work on
   ov gif <query> [--pick N]        a GIF from Giphy into ./outbox/ (if turned on)
@@ -68,11 +79,34 @@ Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, 
 """
 
 
+def _clock(text: str):
+    from .when import _clock as clock
+    try:
+        return clock(text)
+    except T.TaskError as e:
+        raise CtlError(str(e)) from None
+
+
+def _length(text: str) -> int:
+    """30m, 2h, 1h30m, 90 (minutes) -> seconds."""
+    import re
+    t = text.strip().lower().replace(" ", "")
+    if t.isdigit():
+        return int(t) * 60
+    parts = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m(?:in)?)?", t)
+    if not t or not parts or not any(parts.groups()):
+        raise CtlError(f"{text!r}: a length is like 30m, 2h or 1h30m (or an end time, 16:00)")
+    seconds = int(parts.group(1) or 0) * 3600 + int(parts.group(2) or 0) * 60
+    if not 0 < seconds <= 7 * 86400:
+        raise CtlError(f"{text!r}: too long")
+    return seconds
+
+
 class AssistantCommands:
     """Registered with the control server by AssistantDomain."""
 
     help = HELP
-    errors = (T.TaskError,)
+    errors = (T.TaskError, C.CalendarError)
 
     def __init__(self, ctl, domain):
         self.ctl = ctl
@@ -115,6 +149,37 @@ class AssistantCommands:
         a.add_argument("--name", default="")
         a.add_argument("--keep", action="store_true", help="into ./inbox (to work on) instead of the reply")
         sub.add_parser("capabilities", add_help=False)
+        cal = sub.add_parser("cal", add_help=False).add_subparsers(dest="action")
+        a = cal.add_parser("list", add_help=False)
+        a.add_argument("when", nargs="*")
+        a.add_argument("--days", type=int, default=0)
+        a.add_argument("--calendar", default="")
+        a.add_argument("--search", default="")
+        a = cal.add_parser("free", add_help=False)
+        a.add_argument("day", nargs="?", default="today")
+        a.add_argument("--from", dest="from_", default="09:00")
+        a.add_argument("--to", default="21:00")
+        a.add_argument("--min", default="30m")
+        cal.add_parser("calendars", add_help=False)
+        a = cal.add_parser("add", add_help=False)
+        a.add_argument("title")
+        a.add_argument("start")
+        a.add_argument("length", nargs="?", default="")
+        a.add_argument("--calendar", default="")
+        a.add_argument("--where", default="")
+        a.add_argument("--note", default="")
+        a.add_argument("--all-day", dest="all_day", action="store_true")
+        a.add_argument("--days", type=int, default=1)
+        a = cal.add_parser("move", add_help=False)
+        a.add_argument("id")
+        a.add_argument("start")
+        a.add_argument("length", nargs="?", default="")
+        a = cal.add_parser("edit", add_help=False)
+        a.add_argument("id")
+        a.add_argument("--title")
+        a.add_argument("--where")
+        a.add_argument("--note")
+        cal.add_parser("delete", add_help=False).add_argument("id")
         a = sub.add_parser("gif", add_help=False)
         a.add_argument("query", nargs="+")
         a.add_argument("--pick", type=int, default=1)
@@ -137,6 +202,8 @@ class AssistantCommands:
             return await self.fetch(session, args.url, args.name, args.keep)
         if args.area == "gif":
             return await self.gif(session, " ".join(args.query), args.pick)
+        if args.area == "cal":
+            return await self.cal(session, args)
         if args.area == "routine":
             if args.action not in ("check", "list"):
                 raise CtlError("ov routine check (edit the routines note itself to change them)")
@@ -175,6 +242,107 @@ class AssistantCommands:
     async def task_done(self, session, args) -> str:
         t, remark = T.complete(self.vault, args.id, self.domain.today())
         return f"✓ done: {t.text}" + (f" ({remark})" if remark else "")
+
+    # ------------------------------------------------------------------ the calendar
+    async def cal(self, session, args) -> str:
+        c = self.domain.calendar
+        if not c.enabled:
+            raise CtlError("the calendar is off (calendar.enabled in the bot's config)")
+        action = args.action or "list"
+        if action == "list" and not hasattr(args, "when"):
+            args.when, args.days, args.calendar, args.search = [], 0, "", ""
+        return await getattr(self, f"cal_{action}")(c, session, args)
+
+    async def cal_calendars(self, c, session, args) -> str:
+        if not c.cals:
+            await c.sync()
+        if not c.cals:
+            raise C.CalendarError(c.error or "no calendars")
+        what = {"read": "read-only", "ask": "changes after they tap ✅", "auto": "changes on your own (with ↩️ Undo)"}
+        return "\n".join(f"{x.name}{' (primary)' if x.primary else ''}: {what[x.mode]}" for x in c.cals)
+
+    def _range(self, words: list[str], days: int):
+        today = self.domain.today()
+        text = " ".join(words).strip().lower() or "today"
+        if text in ("week", "this week"):
+            start, n = today, 7
+        elif text in ("next week",):
+            start, n = today + C.timedelta(days=7 - today.weekday()), 7
+        else:
+            start, n = parse_day(text, today), 1
+        n = days or n
+        if not 1 <= n <= 62:
+            raise CtlError("--days: 1 to 62")
+        begin = C.local(C.datetime.combine(start, C.dtime(0, 0)))
+        return begin, begin + C.timedelta(days=n)
+
+    async def cal_list(self, c, session, args) -> str:
+        start, end = self._range(args.when, args.days)
+        events = await c.between(start, end, args.calendar, args.search)
+        if not events:
+            return f"no events {start:%a %d %b}" + (f" – {end - C.timedelta(days=1):%a %d %b}"
+                                                     if (end - start).days > 1 else "")
+        today = self.domain.today()
+        lines = [e.line(today, show_cal=len(c.cals) > 1) for e in events[:150]]
+        return "\n".join(lines + ([f"(+{len(events) - 150} more)"] if len(events) > 150 else []))
+
+    async def cal_free(self, c, session, args) -> str:
+        day = parse_day(args.day, self.domain.today())
+        frm, to = (C.local(C.datetime.combine(day, _clock(x))) for x in (args.from_, args.to))
+        now = C.local(C.datetime.now()).replace(second=0, microsecond=0)
+        frm = max(frm, now) if day == now.date() else frm
+        if to <= frm:
+            return f"nothing left of {day:%a %d %b} between {args.from_} and {args.to}"
+        minimum = _length(args.min)
+        events = await c.between(frm, to)
+        slots = c.free_slots(events, frm, to, minimum)
+        busy = [e for e in c.busy(events)]
+        head = f"{day:%a %d %b} {frm:%H:%M}–{to:%H:%M}: {len(busy)} event(s)"
+        if not slots:
+            return head + f"; no free stretch of {C.duration_text(minimum)} or more"
+        return head + "; free: " + ", ".join(f"{a:%H:%M}–{b:%H:%M} ({C.duration_text((b - a).total_seconds())})"
+                                              for a, b in slots)
+
+    def _when(self, start_text: str, length: str, all_day: bool, days: int = 1):
+        if all_day:
+            start = parse_day(start_text, self.domain.today())
+            if not 1 <= days <= 60:
+                raise CtlError("--days: 1 to 60")
+            return start, start + C.timedelta(days=days)
+        try:
+            start = parse_moment(start_text)
+        except T.TaskError as e:
+            raise CtlError(f"{e} (an event's start: e.g. \"thursday 14:00\", \"tomorrow 9am\", 2026-11-03 10:00)") from None
+        start = C.local(start)
+        if not length:
+            return start, start + C.timedelta(hours=1)
+        if C.re_clock(length):
+            end = C.local(C.datetime.combine(start.date(), _clock(length)))
+            if end <= start:
+                raise CtlError(f"it would end ({length}) before it starts ({start:%H:%M})")
+            return start, end
+        return start, start + C.timedelta(seconds=_length(length))
+
+    async def cal_add(self, c, session, args) -> str:
+        start, end = self._when(args.start, args.length, args.all_day, args.days)
+        return await c.propose_add(session, args.title.strip()[:200] or "(no title)", start, end, args.all_day,
+                                   args.calendar, args.where[:300], args.note[:2000])
+
+    async def cal_move(self, c, session, args) -> str:
+        cal_id, eid = c.find(args.id)
+        ev = next((e for e in c.events if (e.cal, e.id) == (cal_id, eid)), None)
+        length = args.length or (C.duration_text((ev.ends() - ev.starts()).total_seconds())
+                                 if ev and not ev.all_day else "")
+        if ev and ev.all_day:
+            raise CtlError("an all-day event: say what to change in Google Calendar, or delete it and add it again")
+        start, end = self._when(args.start, length, False)
+        return await c.propose_change(session, args.id, start=start, end=end)
+
+    async def cal_edit(self, c, session, args) -> str:
+        return await c.propose_change(session, args.id, title=args.title, where=args.where, note=args.note)
+
+    async def cal_delete(self, c, session, args) -> str:
+        return await c.propose_delete(session, args.id)
 
     # ------------------------------------------------------------------ reminders, check-backs, focus
     def _policy(self, spec: str):
