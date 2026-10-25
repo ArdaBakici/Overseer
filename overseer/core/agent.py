@@ -863,17 +863,16 @@ class Agent:
         if not (activity.commands or activity.files):
             return
         n = len(activity.commands)
-        lines = [f"🛠 <b>{n} command(s)</b>" + (" (the last 40 here, all in commands.txt)" if n > 40 else "")]
+        lines = [f"🛠 <b>{n} command(s)</b>" + (" (the last 40)" if n > 40 else "")]
         if activity.commands:
             lines.append(_command_fold(activity.commands[-40:]))
         lines += activity.report_lines()  # the domain's remarks (e.g. heavy work on the HPC's login node)
         if activity.files:
             lines.append("✏️ local files: " + ", ".join(code(f) for f in activity.files[:20]))
-        files = [("commands.txt", "\n\n".join(activity.commands).encode())] if len(activity.commands) > 15 else []
         # As a rich message: the commands in a collapsible block, as a real code block.
         rich = [lines[0]]
         if activity.commands:
             rich.append(rich_details("Show", rich_code("\n".join(f"$ {c.strip()}" for c in activity.commands[-40:]), "bash")))
         rich += lines[2:] if activity.commands else lines[1:]
         await self.notifier.send(Outgoing("\n".join(lines), markdown="\n\n".join(rich), session_id=s.id,
-                                          job_id=s.job_id, silent=True, files=files))
+                                          job_id=s.job_id, silent=True))
