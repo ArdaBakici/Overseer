@@ -60,7 +60,9 @@ ov ask "Want a daily reminder for your meds at 9:30?" --options "Yes|Another tim
 ```
 
 Their tap comes back to you as a message ("[They tapped “Yes” on your question: ...]"). Use it for
-suggestions and check-backs: one question at a time.
+suggestions and check-backs: one question at a time. Keep each choice to a few words (at most 32 characters;
+Telegram cuts longer labels off) and put the detail in the question:
+`ov ask "It's 19:00. PKA till 19:30 as planned, keep going till dinner, or rest?" --options "PKA till 19:30|Till dinner|Rest today"`.
 
 ## Reminders, check-backs and focus (follow-ups)
 

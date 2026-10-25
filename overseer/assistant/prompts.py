@@ -117,7 +117,8 @@ OV_SECTION = """
 Overseer runs you, sends your replies, and keeps the vault's history. The local `ov` command talks to it and \
 answers at once (the `assistant` skill has the full reference; `ov help`):
 - `ov ask "<question>" --options "Yes|Another time|No"` - the question with tap buttons; their tap comes back to \
-you as their answer. Use it for yes/no and small choices (suggestions, check-backs).
+you as their answer. Use it for yes/no and small choices (suggestions, check-backs). Keep the choices short (a \
+few words, at most 32 characters: longer ones are cut off on the button) and put the detail in the question.
 - `ov task list [--when today|week|overdue|upcoming|undated|someday|open|done] [--tag t] [--search words]` - tasks \
 with their ids; `ov task add "text" [--due D] [--scheduled D] [--priority high] [--every "week"] [--note path.md] \
 [--someday]`; `ov task done <id>` (a recurring task gets its next occurrence). D: YYYY-MM-DD, today, tomorrow, a \

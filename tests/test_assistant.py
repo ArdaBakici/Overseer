@@ -807,10 +807,14 @@ async def test_ov_task_add_someday_and_ov_ask(aenv):
         assert ok and text.startswith("✓ asked"), text
         msg = aenv.notifier.sent[-1]
         assert msg.text == "❓ A daily reminder for your meds at 9:30?" and msg.session_id == s.id
-        labels = [label for label, _ in msg.buttons[0]]
-        assert labels == ["Yes", "Another time", "No"] and all(len(d) <= 64 for _, d in msg.buttons[0])
+        labels = [label for row in msg.buttons for label, _ in row]
+        assert labels == ["Yes", "Another time", "No"] and all(len(d) <= 64 for row in msg.buttons for _, d in row)
+        assert [len(row) for row in msg.buttons] == [2, 1]  # ("Another time" is too long for three in a row)
         ok, text = await aenv.ctl.handle(token, ["ask", "Which?", "--options", "only one"])
         assert not ok and "2 to 6 choices" in text
+        ok, text = await aenv.ctl.handle(token, ["ask", "Which?", "--options",
+                                                 "PKA till 19:30 as planned then stop|Rest"])
+        assert not ok and "at most 32 characters" in text and "put the detail in the question" in text
     finally:
         await aenv.ctl.stop()
     # Their tap: the message says what they chose, and the agent gets it as their answer.

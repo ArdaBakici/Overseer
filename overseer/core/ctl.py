@@ -48,7 +48,15 @@ TOKEN_ENV = "OVERSEER_CTL"  # (codex hides variables named *TOKEN*/*KEY*/*SECRET
 
 
 ASK_MAX_OPTIONS = 6
-ASK_OPTION_MAX = 40
+ASK_OPTION_MAX = 32  # (one button per row on a phone shows about this much; longer ones are cut off)
+
+
+def button_rows(options: list[str]) -> list[list[int]]:
+    """Which options share a row: as many as fit on a phone without Telegram cutting their labels off."""
+    longest = max((len(o) for o in options), default=0)
+    per_row = 3 if longest <= 10 else 2 if longest <= 16 else 1
+    idx = list(range(len(options)))
+    return [idx[i:i + per_row] for i in range(0, len(idx), per_row)]
 
 
 class CtlError(Exception):
@@ -140,7 +148,8 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
   ov react <emoji>                 react to the researcher's last message here (👍 ❤ 🔥 🎉 👏 🙏 👀 ...)
-  ov ask "<question>" [--options "Yes|No"]   a question with tap buttons; the tap comes back to you
+  ov ask "<question>" [--options "Yes|No"]   a question with tap buttons; the tap comes back to you (choices:
+                                   a few words each, at most 32 characters - the detail goes in the question)
   ov status                        this conversation: project, what will wake you
   ov history search <text> [--project p|main] [--kind conversation|...] [--since 30d] [--limit N]
   ov history show <conversation> [--last 5] [--grep text]   read a past conversation's turns
@@ -503,16 +512,16 @@ class ControlServer:
         question = question.strip()
         if not question:
             raise CtlError('ov ask "<question>" --options "Yes|Another time|No"')
-        if not 2 <= len(opts) <= ASK_MAX_OPTIONS or any(len(o) > ASK_OPTION_MAX for o in opts):
-            raise CtlError(f"--options: 2 to {ASK_MAX_OPTIONS} choices separated by |, each up to {ASK_OPTION_MAX} "
-                           'characters, e.g. "Yes|Another time|No"')
+        if not 2 <= len(opts) <= ASK_MAX_OPTIONS:
+            raise CtlError(f"--options: 2 to {ASK_MAX_OPTIONS} choices separated by |, e.g. \"Yes|Another time|No\"")
+        if long := [o for o in opts if len(o) > ASK_OPTION_MAX]:
+            raise CtlError(f"--options: each choice at most {ASK_OPTION_MAX} characters (longer ones are cut off on "
+                           f"the button): shorten {long[0]!r} - put the detail in the question")
         qid = secrets.token_hex(4)
         self.store.set(f"ask:{qid}", json.dumps({"session": session.id, "question": question[:1000],
                                                   "options": opts, "at": time.time()}))
-        buttons = [opts[i:i + 3] for i in range(0, len(opts), 3)]
-        n = iter(range(len(opts)))
         await self.notifier.send(Outgoing(f"❓ {esc(question[:1000])}", session_id=session.id, buttons=[
-            [(o, f"ask:{qid}:{next(n)}") for o in row] for row in buttons]))
+            [(opts[i], f"ask:{qid}:{i}") for i in row] for row in button_rows(opts)]))
         return "✓ asked: their tap comes back to you as a message (or they may answer in words)"
 
     async def react(self, session, emoji: str) -> str:

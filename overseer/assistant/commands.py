@@ -79,7 +79,7 @@ Projects (a lasting subject - a trip, a move, a course: its own Telegram topic, 
   ov conversation move <project|main>
 
   ov ask "<question>" [--options "Yes|Another time|No"]   a question with tap buttons; their tap comes back to
-                                   you as their answer (2-6 choices)
+                                   you as their answer (2-6 choices, a few words each: at most 32 characters)
   ov notify <text>                 send the user a message now
   ov status                        this conversation: what will wake you
   ov history search <text> [--since 30d] [--limit N]   your past conversations (and the vault's notes)
