@@ -19,6 +19,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from .config import Config
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
     from .agent import Agent, Session
 
 log = logging.getLogger(__name__)
+
+REDELIVERED = "rewake:"  # + watch id: put back after a wake-up run that didn't finish (its next delivery says so)
+
 
 class WatchError(ValueError):
     """A watch or timer the agent may not set (the message tells it why)."""
@@ -329,6 +333,7 @@ class Autopilot:
                    undo: list[tuple] | None = None, quiet: bool = False, by_user: bool = False) -> None:
         if notice:
             await self.notifier.send(Outgoing(notice, session_id=s.id, silent=quiet))
+        started = time.time()
         try:
             ok = await self.agent.handle(s, prompt, quiet=quiet, origin=kind)
         except Exception:
@@ -338,13 +343,25 @@ class Autopilot:
         if ok or self.agent.shutting_down or by_user:  # (the user's own schedule isn't the agent's to pause)
             return
         # A failed or stopped wake-up pauses this conversation's wake-ups: nothing keeps going unattended after a
-        # problem. The watches that fired are put back, so they fire again once the researcher writes here.
+        # problem. The watches that fired are put back, so they fire again once the researcher writes here - unless
+        # the run had already acted on them (it set new wake-ups: e.g. it resubmitted and watches the new job), then
+        # the same news isn't handed to it again (FB5). Put back, they come with a warning that they were delivered.
         self.store.set(f"wakeups_paused:{s.id}", "1")
-        for wid, state, due, fired in undo or []:
-            w = self.store.get_watch(wid)
-            if w:
-                w.state, w.due, w.fired = state, due, fired
-                self.store.update_watch(w)
+        fired_ids = [wid for wid, state, _, _ in undo or [] if state != "cancelled"]
+        new = [w for w in self.store.watches(s.id) if w.created >= started]
+        if new and fired_ids:
+            self.agent.add_note(s.id, f"Your wake-up run for {', '.join(f'w{i}' for i in fired_ids)} didn't finish "
+                                "(an error or a stop), but it had already set new wake-ups ("
+                                + ", ".join(f"w{w.id}" for w in new) + "), so those aren't handed to you again. "
+                                "Check that nothing was left half-done.")
+        else:
+            for wid, state, due, fired in undo or []:
+                w = self.store.get_watch(wid)
+                if w:
+                    w.state, w.due, w.fired = state, due, fired
+                    self.store.update_watch(w)
+                    if wid in fired_ids:
+                        self.store.set(f"{REDELIVERED}{wid}", str(started))
         await self.notifier.send(Outgoing(
             "⏸ <b>Wake-ups paused</b> for this conversation: that run didn't complete (see above). They resume when "
             "you write to the agent here; /auto off cancels them.", session_id=s.id))
@@ -352,6 +369,16 @@ class Autopilot:
     # ------------------------------------------------------------------ prompts
     async def _wake_prompt(self, s: Session, fired: list[tuple[WatchRecord, Any, list[str]]]) -> str:
         parts = ["[Wake-up you set up]"]
+        before = [(w, self.store.get(f"{REDELIVERED}{w.id}")) for w, _, _ in fired]
+        before = [(w, float(t)) for w, t in before if t]
+        if before:  # (handed over before, by a run that didn't finish: some of it may be done)
+            for w, _ in before:
+                self.store.unset(f"{REDELIVERED}{w.id}")
+            when = datetime.fromtimestamp(min(t for _, t in before)).strftime("%H:%M")
+            parts.append(f"[Again: {', '.join(f'w{w.id}' for w, _ in before)} came to you before, at {when}, but that "
+                         "run didn't finish (an error, a stop or a restart). Some of it may already be done: check "
+                         "first (`ov watches`, `ov job list`, `ov results`, the research log), then do only what's "
+                         "left - don't resubmit what's already running.]")
         by_kind: dict[str, list[tuple[WatchRecord, Any]]] = {}
         for w, info, _ in fired:
             if w.kind != "timer":

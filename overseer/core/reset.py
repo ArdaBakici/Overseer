@@ -14,7 +14,7 @@ from pathlib import Path
 from .config import Config
 from .store import Store
 
-PLATFORM_FLAGS = ("wakeups_paused:", "last_user_message:")
+PLATFORM_FLAGS = ("wakeups_paused:", "last_user_message:", "rewake:")
 # kv entries that belong to conversations: the main chat's / projects' current one, runs cut off by a restart,
 # notes for an agent's next turn, planner proposals, the feedback reviewer, questions asked with buttons (ov ask).
 CONVERSATION_KEYS = ("general_session", "run:", "cutoff:", "notes:", "proposal:", "proposal_id:", "feedback_reviewer",

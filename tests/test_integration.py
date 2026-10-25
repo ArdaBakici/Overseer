@@ -3805,3 +3805,38 @@ async def test_messages_wait_while_telegram_is_unreachable(env, caplog):
     tg.send_message = slow
     await n.send(Outgoing("🤖 slow"))
     assert calls == ["🤖 slow"] and n._backlog == []
+
+
+async def test_a_wake_up_isnt_handed_over_again_as_if_new(env, monkeypatch):
+    """FB5: a wake-up run that fails after doing its work (here: it watches a new job) isn't delivered again; one
+    that fails before acting is - once the researcher writes - but says it came before and may be partly done."""
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    # Fails without acting: put back, and the next delivery warns.
+    w = env.store.add_watch(WatchRecord(session_id=s.id, kind="timer", due=time.time() - 1, note="FORCE_APIERROR"))
+    await ap.check(s.id)
+    await ap.drain()
+    assert ap.paused(s.id) and env.store.get_watch(w.id).state == "active"
+    w = env.store.get_watch(w.id)
+    w.note = "compare the seeds"
+    env.store.update_watch(w)
+    await env.agent.handle(s, "hi")  # (they write: wake-ups resume, and what was put back fires)
+    await ap.drain()
+    again = claude_calls(env)[-1]["stdin"]
+    assert f"[Again: w{w.id} came to you before, at" in again and "don't resubmit" in again
+    assert "compare the seeds" in again and env.store.get_watch(w.id).state == "fired"
+    # Fails after acting (it set a new wake-up in that run): not handed over again; the agent is told.
+    w2 = env.store.add_watch(WatchRecord(session_id=s.id, kind="timer", due=time.time() - 1, note="look at 5001"))
+    real = env.agent.handle
+
+    async def acts_then_fails(sess, prompt, **kw):
+        env.store.add_watch(WatchRecord(session_id=sess.id, kind="timer", due=time.time() + 3600, note="next run"))
+        return False
+    monkeypatch.setattr(env.agent, "handle", acts_then_fails)
+    await ap.check(s.id)
+    await ap.drain()
+    monkeypatch.setattr(env.agent, "handle", real)
+    assert env.store.get_watch(w2.id).state == "fired" and not env.store.get(f"rewake:{w2.id}")
+    notes = env.agent.take_notes(s.id)
+    assert any(f"run for w{w2.id} didn't finish" in n and "aren't handed to you again" in n for n in notes)
+    await env.ctl.stop()
