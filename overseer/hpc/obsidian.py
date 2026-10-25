@@ -106,13 +106,22 @@ class VaultFolder:
     # ---- what Overseer writes: findings, results, graphs
     def sync(self) -> list[str]:
         """Write the generated notes (and copy the graphs) that changed; the paths written."""
+        return self.write(self.records())
+
+    def records(self) -> list[tuple]:
+        """What the notes are made of, from the database: [(project, findings, results)]. In the thread that owns
+        the database (SQLite refuses others): the event loop's."""
+        out = []
+        for project in [None, *(p.name for p in self.store.list_projects(include_archived=True))]:
+            findings, results = self.store.findings(project), self.store.results(project)
+            if findings or results:
+                out.append((project, findings, results))
+        return out
+
+    def write(self, records: list[tuple]) -> list[str]:
+        """The files (any thread): the notes and graphs that changed; the paths written."""
         written = []
-        projects = [p.name for p in self.store.list_projects(include_archived=True)]
-        for project in [None, *projects]:
-            findings = self.store.findings(project)
-            results = self.store.results(project)
-            if not findings and not results:
-                continue
+        for project, findings, results in records:
             d = self.project_dir(project)
             figures = self._figures(project, results, d)
             for name, text in ((FINDINGS_NOTE, self.findings_note(project, findings)),
@@ -185,7 +194,7 @@ class VaultFolder:
     async def loop(self) -> None:
         while True:
             try:
-                await asyncio.to_thread(self.sync)
+                await asyncio.to_thread(self.write, self.records())  # (reading here, writing in a thread)
             except Exception:
                 log.exception("obsidian notes")
             await asyncio.sleep(SYNC_SECONDS)

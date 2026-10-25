@@ -181,3 +181,20 @@ def test_the_i_have_adhd_style_reaches_the_hpc_agents_too(henv):
     assert "i-have-adhd" not in henv.agent.system_prompt(sid)
     henv.cfg.agent.i_have_adhd = True
     assert "## Output style: i-have-adhd (always on)" in henv.agent.system_prompt(sid)
+
+
+async def test_the_notes_loop_reads_the_database_in_its_own_thread(henv, monkeypatch):
+    """The database is read in the event loop's thread (SQLite refuses others), only the files are written in a
+    worker thread - as the bot runs it (a real thread, unlike the sync() tests above)."""
+    import asyncio
+    from overseer.hpc import obsidian
+    henv.store.add_finding(FindingRecord(project="dreamer", kind="insight", text="from the loop", created=time.time()))
+    calls = []
+
+    async def stop(seconds):
+        calls.append(seconds)
+        raise asyncio.CancelledError
+    monkeypatch.setattr(obsidian.asyncio, "sleep", stop)
+    with pytest.raises(asyncio.CancelledError):
+        await henv.domain.vault.loop()
+    assert "from the loop" in (henv.folder / "dreamer" / "Findings.md").read_text()
