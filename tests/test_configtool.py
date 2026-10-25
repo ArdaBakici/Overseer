@@ -94,3 +94,13 @@ def test_a_broken_file_says_where(tmp_path):
     p.write_text("- just\n- a list\n")
     with pytest.raises(ConfigError, match="isn't a YAML mapping"):
         load_config(p)
+
+
+def test_the_adhd_output_style_is_a_switch(tmp_path):
+    from overseer.core import adhd
+    text = adhd.section()
+    assert text.startswith("\n\n## Output style: i-have-adhd (always on)") and "### Rules" in text
+    assert "#### 1. Lead with the next action" in text and "disable-model-invocation" not in text  # (no frontmatter)
+    assert "github.com/ayghri/i-have-adhd" in text
+    lic = (adhd.SKILL.parent / "LICENSE").read_text()
+    assert "MIT License" in lic and "Ayoub Ghriss" in lic

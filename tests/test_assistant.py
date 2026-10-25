@@ -1233,3 +1233,12 @@ async def test_a_routine_runs_even_while_wake_ups_are_paused(aenv, monkeypatch):
     ap.wake(s, "agent's own", kind="wakeup")
     await ap.drain()
     assert ap.paused(s.id)  # (the agent's own wake-ups still pause on failure)
+
+
+def test_the_i_have_adhd_style_is_off_unless_turned_on(aenv):
+    sid = aenv.agent.general_session().id
+    assert "i-have-adhd" not in aenv.agent.system_prompt(sid)
+    aenv.cfg.agent.i_have_adhd = True
+    prompt = aenv.agent.system_prompt(sid)
+    assert prompt.endswith(prompt[prompt.index("## Output style: i-have-adhd (always on)"):])  # (last)
+    assert "#### 1. Lead with the next action" in prompt and "## Their calendar" not in prompt.split("i-have-adhd")[-1]

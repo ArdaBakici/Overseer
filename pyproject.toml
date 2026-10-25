@@ -29,7 +29,7 @@ include = ["overseer*"]
 [tool.setuptools.package-data]
 "overseer.hpc" = ["skills/*/SKILL.md", "dashboard.js"]
 "overseer.assistant" = ["skills/*/SKILL.md", "dashboard.js"]
-"overseer.core" = ["dashboard.html"]
+"overseer.core" = ["dashboard.html", "skills/*/SKILL.md", "skills/*/LICENSE"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

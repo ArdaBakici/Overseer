@@ -71,6 +71,7 @@ agent:
   report_commands: "off"        # summary | live | "off": the commands it ran (mostly reading notes)
   live_progress: true
   allowed_domains: []
+  i_have_adhd: false            # the i-have-adhd output style (github.com/ayghri/i-have-adhd) for its replies
   claude_code:
     model: null
     home: ./state/assistant/claude   # its own login: overseer login claude_code -c assistant.yaml

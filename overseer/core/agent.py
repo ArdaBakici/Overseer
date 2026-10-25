@@ -608,6 +608,9 @@ class Agent:
         if sess and sess.rec.role == "reviewer":
             from .feedback import SOURCE
             prompt += REVIEWER_SECTION.format(src=SOURCE)
+        if self.cfg.agent.i_have_adhd:  # (last: it shapes the replies, and says the instructions above win)
+            from . import adhd
+            prompt += adhd.section()
         return prompt
 
     def _subagent_section(self, s: Session) -> str:

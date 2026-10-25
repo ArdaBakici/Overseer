@@ -82,6 +82,9 @@ agent:
   allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)
   deny_read: []                 # extra local paths the agent may never read
   llm_status_updates: false     # one-line LLM progress summary in periodic status messages
+  # The i-have-adhd output style (github.com/ayghri/i-have-adhd) for every agent of this bot, subagents too: replies
+  # lead with the next action, number their steps, restate where things stand, no tangents or filler.
+  i_have_adhd: false
 
   claude_code:
     command: claude

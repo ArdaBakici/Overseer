@@ -314,6 +314,15 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
   - **Size:** the agent keeps it well under 200k tokens; past about 600 KB, Overseer asks it to condense the older entries.
 - **Cost:** each wake-up re-sends the conversation so far, and wake-ups are often hours apart, after the provider's prompt cache has expired. The agent is told to wake itself only when there is something to look at.
 
+**Replies shaped for ADHD** (optional). `agent.i_have_adhd: true` gives every agent of the bot (subagents and the
+feedback reviewer too) the [i-have-adhd](https://github.com/ayghri/i-have-adhd) output style: replies lead with the next
+action, number their steps, restate where things stand, give concrete time estimates and leave out tangents,
+preambles and pleasantries. In Claude Code it's a skill you'd turn on with `/i-have-adhd`; since Overseer's agents
+are reached through Telegram, it's always on here (like the skill's own always-on mode): the rules go into each
+agent's instructions, after Overseer's own, which win where they conflict. Say "stop adhd mode" to an agent to turn
+it off for that conversation. It's a per-bot setting: set it in the assistant's config too if you want it there. The
+skill's text and MIT license are in `overseer/core/skills/i-have-adhd/`.
+
 **Research notes in Obsidian** (optional). Give the bot a folder of your Obsidian vault, `obsidian.folder:
 /home/me/Vault/HPC` (create the folder first; it must be inside the vault, not the vault itself), and the research
 moves there, synced to your phone and computers:

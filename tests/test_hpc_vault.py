@@ -174,3 +174,10 @@ def test_the_assistant_sees_the_folder_but_cant_change_it(henv, tmp_path, monkey
     if ad.vault.history:
         exclude = (acfg.vault_git_dir / "info" / "exclude").read_text()
         assert "/HPC/**/figures/" in exclude
+
+
+def test_the_i_have_adhd_style_reaches_the_hpc_agents_too(henv):
+    sid = henv.agent.general_session().id
+    assert "i-have-adhd" not in henv.agent.system_prompt(sid)
+    henv.cfg.agent.i_have_adhd = True
+    assert "## Output style: i-have-adhd (always on)" in henv.agent.system_prompt(sid)

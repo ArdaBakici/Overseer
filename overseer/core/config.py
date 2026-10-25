@@ -248,6 +248,9 @@ class AgentConfig:
     # Overseer's state and well-known daemon sockets are always blocked).
     deny_read: list[str] = field(default_factory=list)
     llm_status_updates: bool = False  # one-line LLM progress summary in periodic status messages
+    # The i-have-adhd output style (github.com/ayghri/i-have-adhd) for every agent of this bot (subagents too): replies
+    # lead with the next action, number their steps, restate where things stand, skip tangents and filler.
+    i_have_adhd: bool = False
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
     autopilot: AutopilotConfig = field(default_factory=AutopilotConfig)
