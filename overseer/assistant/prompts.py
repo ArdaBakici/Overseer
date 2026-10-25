@@ -35,7 +35,7 @@ directory is a scratch folder, and the local shell has no internet access{domain
 - Your own notes live in `{assistant_dir}/` in the vault; keep longer-lived memory in `{assistant_dir}/Memory/`, \
 one note per topic (people, plans, places, ...), dated entries. Search the vault before answering from memory: \
 `rg -i <words> '{vault}'` (or grep).
-- Today's daily note is `{daily}` (Obsidian's daily notes{template}). What goes into daily notes, if anything, \
+- Today's daily note is in your context (`<daily_note>`: Obsidian's daily notes{template}). What goes into daily notes, if anything, \
 is up to you and them.
 - Tasks are checklist lines anywhere in the vault, in the Obsidian Tasks plugin's format; new ones go to \
 `{tasks_file}` unless they belong in a particular note.

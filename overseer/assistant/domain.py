@@ -199,7 +199,7 @@ class AssistantDomain(Domain):
             persona_unset="" if self.persona_set() else P.PERSONA_UNSET,
             writing_path=self._rel("My writing style.md"), personality_path=self._rel("My personality.md"),
             system_path=self._rel("System.md"), someday_path=self._rel("Someday.md"), silent=P.SILENT,
-            assistant_dir=cfg.vault.assistant_dir.strip("/") or ".", daily=self.vault.daily_note(),
+            assistant_dir=cfg.vault.assistant_dir.strip("/") or ".",
             tasks_file=self.vault.rel(self.vault.tasks_file),
             template=f", from the template `{t}`" if (t := self.vault.daily_template()) else "",
             routines_path=self.scheduler.rel, routines_state=self.scheduler.state_line(),
@@ -270,7 +270,9 @@ class AssistantDomain(Domain):
     async def now_context(self) -> str:
         """The date and time (the agent can't know them), what's due, and Syncthing's conflicts."""
         now = datetime.now()
-        lines = [f"<now>{now:%A %d %B %Y, %H:%M} {time.strftime('%Z')}</now>"]
+        # (today's things go here, not in the instructions: those are handed over again whenever they change)
+        lines = [f"<now>{now:%A %d %B %Y, %H:%M} {time.strftime('%Z')}</now>",
+                 f"<daily_note>{self.vault.daily_note()}</daily_note>"]
         if self.calendar.enabled:
             lines.append(self.calendar.context())
         try:

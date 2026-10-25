@@ -1242,3 +1242,14 @@ def test_the_i_have_adhd_style_is_off_unless_turned_on(aenv):
     prompt = aenv.agent.system_prompt(sid)
     assert prompt.endswith(prompt[prompt.index("## Output style: i-have-adhd (always on)"):])  # (last)
     assert "#### 1. Lead with the next action" in prompt and "## Their calendar" not in prompt.split("i-have-adhd")[-1]
+
+
+async def test_the_instructions_dont_change_by_themselves(aenv, monkeypatch):
+    """What's in the instructions is handed over again whenever it changes (agent.INSTRUCTIONS_KEY): nothing in them
+    may change with the day or the hour - today's daily note goes with each request instead."""
+    import overseer.assistant.vault as V
+    sid = aenv.agent.general_session().id
+    first = aenv.agent.system_prompt(sid)
+    monkeypatch.setattr(V.Vault, "daily_note", lambda self, day=None: "Daily/2099-01-01.md")
+    assert aenv.agent.system_prompt(sid) == first
+    assert "<daily_note>Daily/2099-01-01.md</daily_note>" in await aenv.domain.now_context()
