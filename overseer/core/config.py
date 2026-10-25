@@ -357,6 +357,8 @@ class Config:
             raise ConfigError(f"local.tmp_dir is too long for a unix socket path ({self.ctl_socket}); use e.g. /tmp/overseer")
         if self.agent.backend not in BACKENDS:
             raise ConfigError(f"agent.backend must be one of {', '.join(BACKENDS)}")
+        if self.agent.report_commands is False:  # (YAML reads an unquoted `off` as false)
+            self.agent.report_commands = "off"
         if self.agent.report_commands not in ("summary", "live", "off"):
             raise ConfigError("agent.report_commands must be summary, live or off")
         self.local.resolve(self.agent.claude_code.home)

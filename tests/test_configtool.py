@@ -104,3 +104,11 @@ def test_the_adhd_output_style_is_a_switch(tmp_path):
     assert "github.com/ayghri/i-have-adhd" in text
     lic = (adhd.SKILL.parent / "LICENSE").read_text()
     assert "MIT License" in lic and "Ayoub Ghriss" in lic
+
+
+def test_an_unquoted_off(tmp_path):
+    from overseer.core.config import load_config
+    p = tmp_path / "config.yaml"
+    p.write_text("ssh:\n  hostname: login.example.edu\ntelegram:\n  allowed_chat_ids: [1]\n"
+                 "agent:\n  report_commands: off\n")
+    assert load_config(p).agent.report_commands == "off"
