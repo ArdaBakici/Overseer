@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-from .config import Config, ConfigError, _build
+from .config import Config, ConfigError, _build, read_yaml
 
 KEY_RE = re.compile(r"^(\s*)([A-Za-z_][\w-]*):(.*)$")
 Path_ = tuple[str, ...]
@@ -196,9 +196,7 @@ def example_path(domain: str) -> Path:
 
 def update(config_path: Path) -> tuple[str, str | None]:
     """(the report, the new file's text or None if there's nothing to change)."""
-    raw = yaml.safe_load(config_path.read_text()) or {}
-    if not isinstance(raw, dict):
-        raise ConfigError(f"{config_path} isn't a YAML mapping")
+    raw = read_yaml(config_path)
     domain = str(raw.get("domain") or "hpc")
     example = example_path(domain)
     guide = defaults(domain)

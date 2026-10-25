@@ -81,3 +81,16 @@ def test_a_broken_file_is_refused(tmp_path):
     f.write_text("- just\n- a list\n")
     with pytest.raises(ConfigError):
         update(f)
+
+
+def test_a_broken_file_says_where(tmp_path):
+    from overseer.core.config import ConfigError, load_config
+    p = tmp_path / "assistant.yaml"
+    p.write_text("domain: assistant\nmedia:\n  fetch: true\ncalendar: {}\n  ics: {Uni: UNI_ICS_URL}\n")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "line 5" in str(e.value) and "   5 |   ics: {Uni: UNI_ICS_URL}" in str(e.value)
+    assert "under its section's line" in str(e.value)
+    p.write_text("- just\n- a list\n")
+    with pytest.raises(ConfigError, match="isn't a YAML mapping"):
+        load_config(p)

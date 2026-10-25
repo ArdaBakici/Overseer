@@ -468,9 +468,30 @@ def apply_timezone(name: str) -> None:
     time.tzset()
 
 
+def read_yaml(path: str | os.PathLike) -> dict:
+    """The file's settings - or, if it isn't valid YAML, an error saying where and what usually causes it."""
+    text = Path(path).read_text()
+    try:
+        raw = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        if mark is None:
+            raise ConfigError(f"{path} isn't valid YAML: {e}") from None
+        lines = text.split("\n")
+        n = mark.line  # (0-based)
+        shown = "\n".join(f"  {i + 1:>4} | {lines[i]}" for i in range(max(0, n - 3), min(len(lines), n + 1)))
+        hint = ""
+        if "expected <block end>" in str(e) or "mapping values are not allowed" in str(e):
+            hint = ("\nUsually the indentation: a setting indented by two spaces has to be under its section's line "
+                    "(e.g. `calendar:` with nothing after the colon), with spaces only, no tabs.")
+        raise ConfigError(f"{path} line {n + 1}: {getattr(e, 'problem', None) or e}\n{shown}{hint}") from None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path} isn't a YAML mapping (settings like `domain: assistant`)")
+    return raw
+
+
 def load_config(path: str | os.PathLike) -> Config:
-    with open(path) as fh:
-        raw = yaml.safe_load(fh) or {}
+    raw = read_yaml(path)
     cfg = _build(Config, raw, "")
     cfg.local.base_dir = str(Path(path).resolve().parent)
     cfg.validate()
