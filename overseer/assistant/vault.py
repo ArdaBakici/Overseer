@@ -128,6 +128,7 @@ class Vault:
         self.git_dir: Path = cfg.vault_git_dir
         self._lock = asyncio.Lock()
         self.history = bool(cfg.vault.history and shutil.which("git"))
+        self.extra_exclude: list[str] = []  # more for the history to leave out (e.g. the HPC bot's graphs)
 
     # ------------------------------------------------------------------ the assistant's files
     @property
@@ -254,13 +255,26 @@ class Vault:
         return proc.returncode, text
 
     async def init(self) -> None:
-        if not self.history or (self.git_dir / "HEAD").exists():
+        if not self.history:
             return
-        self.git_dir.parent.mkdir(parents=True, exist_ok=True)
-        await self._git("init", "-q")
-        (self.git_dir / "info").mkdir(exist_ok=True)
-        (self.git_dir / "info" / "exclude").write_text(EXCLUDE)
-        await self.snapshot("Vault history starts")
+        if not (self.git_dir / "HEAD").exists():
+            self.git_dir.parent.mkdir(parents=True, exist_ok=True)
+            await self._git("init", "-q")
+            (self.git_dir / "info").mkdir(exist_ok=True)
+            self._write_exclude()
+            await self.snapshot("Vault history starts")
+        else:
+            self._write_exclude()
+
+    def _write_exclude(self) -> None:
+        text = EXCLUDE + "".join(f"{p}\n" for p in self.extra_exclude)
+        f = self.git_dir / "info" / "exclude"
+        try:
+            if f.read_text() != text:
+                f.write_text(text)
+        except OSError:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text)
 
     async def snapshot(self, message: str) -> Change | None:
         """Record what changed since the last snapshot as one commit (None if nothing did)."""

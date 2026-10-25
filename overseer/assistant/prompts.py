@@ -142,6 +142,13 @@ conversation into it. `ov project list`, `ov project set <name> --about ... --di
 - `ov history search <text>` - your past conversations with the user; `ov notify <text>` - a message now.
 - `ov feedback "<what limited you>"` - feedback about Overseer itself."""
 
+BOT_FOLDERS = """
+
+## The HPC bot's notes: {folders}
+Overseer's HPC bot (it runs the user's experiments on the university cluster) keeps its notes there: a research \
+log per project, findings, results and graphs. Read them when the user asks about their research or experiments, \
+and link to them ([[Research log]], ...), but you can't change them - that folder is the HPC bot's."""
+
 CALENDAR_SECTION = """
 
 ## Their calendar

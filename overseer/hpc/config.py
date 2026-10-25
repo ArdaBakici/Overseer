@@ -89,7 +89,29 @@ class SlurmConfig:
     quota_warn_percent: int = 80
 
 
-SECTIONS = {"ssh": SSHConfig, "slurm": SlurmConfig}
+@dataclass
+class ObsidianConfig:
+    """A folder of your Obsidian vault for the HPC bot: its research logs, findings, results and graphs, one
+    subfolder per project. Its agent can read and write that folder and nothing else of the vault (the assistant,
+    if you run it, sees the whole vault but can't change this folder)."""
+
+    folder: str = ""  # e.g. /home/me/Vault/HPC - a folder inside the vault (not the vault itself); "" = off
+    max_figure_mb: int = 5  # graphs bigger than this aren't copied into the vault
+
+
+SECTIONS = {"ssh": SSHConfig, "slurm": SlurmConfig, "obsidian": ObsidianConfig}
+
+
+def vault_root(folder: Path) -> Path | None:
+    """The vault a folder is in: the nearest folder above it with Obsidian's settings (.obsidian)."""
+    for p in folder.parents:
+        if (p / ".obsidian").is_dir():
+            return p
+    return None
+
+
+def _obsidian_dir(cfg) -> Path | None:
+    return Path(cfg.obsidian.folder).expanduser().resolve() if cfg.obsidian.folder.strip() else None
 
 
 # Paths derived from the sections (all inside the allowed local folders), as cfg.<name>.
@@ -104,7 +126,14 @@ DERIVED = {
     "control_socket": lambda cfg: cfg.local.tmp("ssh", "master.sock"),
     # Lives outside ssh_dir: the agent may read this one (it holds no secrets).
     "agent_ssh_config": lambda cfg: cfg.local.tmp("agent-ssh", "config"),
+    "obsidian_dir": _obsidian_dir,
+    "obsidian_vault": lambda cfg: vault_root(_obsidian_dir(cfg)) if _obsidian_dir(cfg) else None,
 }
+
+
+def registry(cfg) -> dict:
+    """What the other bots should know about this one (state/bots/): its vault folder - the assistant keeps out."""
+    return {"vault_folder": str(cfg.obsidian_dir)} if cfg.obsidian_dir else {}
 
 
 def validate(cfg) -> None:
@@ -117,6 +146,22 @@ def validate(cfg) -> None:
         raise ConfigError(f"local.tmp_dir is too long for a unix socket path ({cfg.control_socket}); use e.g. /tmp/overseer")
     if cfg.slurm.track not in ("all", "agent"):
         raise ConfigError("slurm.track must be 'all' or 'agent'")
+    if cfg.obsidian.folder.strip():
+        raw = Path(cfg.obsidian.folder).expanduser()
+        if not raw.is_absolute():
+            raise ConfigError("obsidian.folder must be an absolute path (a folder inside your Obsidian vault)")
+        folder = raw.resolve()
+        if not folder.is_dir():
+            raise ConfigError(f"obsidian.folder {folder} doesn't exist: create it inside your vault first")
+        root = vault_root(folder)
+        if root is None:
+            raise ConfigError(f"obsidian.folder {folder} isn't inside an Obsidian vault (no .obsidian folder above "
+                              "it): give a folder inside the vault, e.g. <vault>/HPC")
+        base = Path(cfg.local.base_dir or ".").resolve()
+        if base.is_relative_to(folder) or folder.is_relative_to(base):
+            raise ConfigError("obsidian.folder can't be Overseer's own folder (or inside it)")
+        if not 1 <= cfg.obsidian.max_figure_mb <= 50:
+            raise ConfigError("obsidian.max_figure_mb: 1 to 50")
     for name, proj in cfg.projects.items():
         if not proj.dir.startswith(("/", "~")):
             raise ConfigError(f"projects.{name}.dir must be an absolute path on the HPC")

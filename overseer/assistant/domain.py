@@ -103,6 +103,8 @@ class AssistantDomain(Domain):
                 pass
 
     async def start(self, notifier, projects) -> None:
+        # The HPC bot's graphs (figures/ in its folder) stay out of the vault's history: big, and not yours to undo.
+        self.vault.extra_exclude = [f"/{self.vault.rel(p)}/**/figures/" for p in self.bot_folders()]
         try:
             await self.vault.init()  # the history starts with the vault as it is
         except Exception:
@@ -138,10 +140,20 @@ class AssistantDomain(Domain):
         return out
 
     # ------------------------------------------------------------------ the sandbox
+    def bot_folders(self) -> list[Path]:
+        """The other bots' folders in this vault (e.g. the HPC bot's research notes): read-only for the assistant."""
+        root = self.cfg.vault_dir
+        out = []
+        for b in self.cfg.local.other_bots():
+            p = Path(b.get("vault_folder") or "/nonexistent")
+            if p.is_absolute() and p != root and p.is_relative_to(root) and p.is_dir():
+                out.append(p)
+        return out
+
     def sandbox(self) -> Sandbox:
         root = self.cfg.vault_dir
-        return Sandbox(writable=[root], deny_write=[root / p for p in PROTECTED if (root / p).exists()],
-                       skills=skills())
+        return Sandbox(writable=[root], deny_write=[root / p for p in PROTECTED if (root / p).exists()]
+                       + self.bot_folders(), skills=skills())
 
     # ------------------------------------------------------------------ instructions
     def persona_name(self) -> str:
@@ -193,6 +205,8 @@ class AssistantDomain(Domain):
             routines_path=self.scheduler.rel, routines_state=self.scheduler.state_line(),
             domains=f" (except {', '.join(domains)})" if domains else "",
             web=self.agent.web_line(s.project if s else None) if self.agent else "")
+        if folders := self.bot_folders():
+            prompt += P.BOT_FOLDERS.format(folders=", ".join(f"`{self.vault.rel(p)}/`" for p in folders))
         prompt += self._flagged_section()
         if self.calendar.enabled:
             prompt += P.CALENDAR_SECTION.format(calendars=self._calendars_line(), system_path=self._rel("System.md"))

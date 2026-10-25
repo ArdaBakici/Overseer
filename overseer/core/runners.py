@@ -119,6 +119,10 @@ class Sandbox:
     """What a domain adds to the agent's sandbox (on top of the platform's own rules, below), and the skills its
     agent gets."""
     deny_read: list[Path] = field(default_factory=list)  # more local paths its commands must never read
+    # Paths only its shell commands are kept out of (the CLIs' sandboxes can deny a folder yet allow a writable one
+    # inside it; Claude Code's own file tools can't - their deny rules always win - so for those, list the folder's
+    # other entries in deny_read). E.g. the vault around the HPC bot's folder.
+    deny_read_shell: list[Path] = field(default_factory=list)
     unix_sockets: list[Path] = field(default_factory=list)  # local sockets its commands may connect to
     writable: list[Path] = field(default_factory=list)  # local folders it may write besides its scratch folder
     deny_write: list[Path] = field(default_factory=list)  # folders inside those it must not write (e.g. .obsidian)
@@ -280,12 +284,14 @@ class Runner:
         (d / ".tmp").mkdir(mode=0o700, parents=True, exist_ok=True)
         return d
 
-    def deny_read(self) -> list[str]:
-        """Local paths the agent's commands must never read (only existing ones are listed)."""
+    def deny_read(self, shell: bool = False) -> list[str]:
+        """Local paths the agent's commands must never read (only existing ones are listed); `shell`: for its shell
+        commands' sandbox (with the domain's deny_read_shell)."""
         home = Path.home()
         uid = os.getuid()
         candidates = [
-            *self.sandbox.deny_read, home / ".ssh", *self.cfg.local.secrets(),
+            *self.sandbox.deny_read, *(self.sandbox.deny_read_shell if shell else []), home / ".ssh",
+            *self.cfg.local.secrets(),
             home / ".gnupg", home / ".docker", home / ".aws", home / ".config" / "gcloud",
             Path("/var/run/docker.sock"), Path("/run/docker.sock"), Path("/run/containerd"),
             Path("/run/podman"), Path("/var/run/podman"), Path(f"/run/user/{uid}"),
@@ -470,7 +476,8 @@ class ClaudeCodeRunner(Runner):
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": [],
                 "filesystem": {"allowWrite": [str(workdir), *map(str, self.sandbox.writable)],
-                               "denyWrite": [str(p) for p in self.sandbox.deny_write], "denyRead": deny},
+                               "denyWrite": [str(p) for p in self.sandbox.deny_write],
+                               "denyRead": self.deny_read(shell=True)},
                 # Overseer's control socket, and the domain's (e.g. the SSH master that reaches the HPC). On Linux the
                 # sandbox can't tell sockets apart by path (seccomp), so it's all or none: other bots' sockets are kept
                 # out by their folders being unreadable (LocalConfig.secrets).
@@ -654,7 +661,7 @@ class CodexRunner(Runner):
                 fs[str(p)] = "write"
             for p in self.sandbox.deny_write:
                 fs[str(p)] = "read"
-        for p in self.deny_read():
+        for p in self.deny_read(shell=True):
             fs[p] = "deny"
         net: dict[str, Any] = {"enabled": network}
         if network:

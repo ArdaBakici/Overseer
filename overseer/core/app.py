@@ -42,7 +42,9 @@ def prepare_local_dirs(cfg: Config) -> None:
         if d.is_symlink() or d.stat().st_uid != os.getuid():
             raise ConfigError(f"{d} must be a real directory owned by you")
         os.chmod(d, 0o700)
-    cfg.local.register(cfg.domain)
+    from .config import domain_module
+    registry = getattr(domain_module(cfg.domain), "registry", None)  # (what the other bots should know of this one)
+    cfg.local.register(cfg.domain, registry(cfg) if registry else None)
 
 
 def domain_factory(cfg: Config):

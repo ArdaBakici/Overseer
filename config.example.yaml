@@ -118,6 +118,13 @@ digest:
   enabled: true
   time: "08:00"                 # this machine's local time
 
+# A folder of your Obsidian vault for this bot: research logs (one subfolder per project, General.md outside
+# projects), findings, results and the graphs of finished jobs, as notes. Its agent can read and write this folder and
+# nothing else of the vault. If the assistant bot uses the same vault, it can read the folder but not change it.
+obsidian:
+  folder: ""                    # e.g. /home/me/Vault/HPC (create it first; "" = off: research logs stay on the HPC)
+  max_figure_mb: 5              # graphs bigger than this aren't copied into the vault
+
 # The dashboard Mini App (/dashboard): served on this machine, reachable only on your tailnet.
 # Run `tailscale serve --bg 8765` once and put the https://….ts.net address it prints in url.
 dashboard:

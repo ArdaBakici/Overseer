@@ -307,11 +307,29 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
 - **Turning it off:** `/auto off` cancels the pending wake-ups (in that thread or topic, or as a reply: that conversation), and the agent is told. `/stop` stops a run.
 - **Limits:** check-ins and repeating timers are at least 15 minutes apart, and a repeating timer ends (after 24 hours unless the agent sets `--for`). There is no limit on the number of wake-ups. `/usage` shows what they cost.
 - **Pauses on problems:** a wake-up that fails or is `/stop`ped pauses that conversation's wake-ups until you write to it there.
-- **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder.
+- **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder (or, with an
+  Obsidian folder - below - `Research log.md` in the vault).
   - **Contents:** the current goal at the top (rewritten when the goal changes), then an entry per experiment: what changed and why, the job ids, the results, the next idea.
   - **What the agent sees:** Overseer shows it the log's beginning and latest entries when a conversation starts and at every wake-up, so it keeps the thread across long gaps and compaction.
   - **Size:** the agent keeps it well under 200k tokens; past about 600 KB, Overseer asks it to condense the older entries.
 - **Cost:** each wake-up re-sends the conversation so far, and wake-ups are often hours apart, after the provider's prompt cache has expired. The agent is told to wake itself only when there is something to look at.
+
+**Research notes in Obsidian** (optional). Give the bot a folder of your Obsidian vault, `obsidian.folder:
+/home/me/Vault/HPC` (create the folder first; it must be inside the vault, not the vault itself), and the research
+moves there, synced to your phone and computers:
+- `HPC/<project>/Research log.md`: the project's research log, written by the agent the Obsidian way (frontmatter,
+  [[links]], #tags) - you can read and edit it too. The first time, an existing `RESEARCH_LOG.md` on the HPC is
+  copied in; from then on the vault's note is the log (the HPC copy is no longer used).
+- `HPC/General.md`: the same for work outside projects.
+- `HPC/<project>/Findings.md` and `Results.md`: written by Overseer from its records and rewritten when they change
+  (a table of every result, then a section per result with its hypothesis, conclusion, metrics and graphs).
+- `HPC/<project>/figures/`: the graphs of finished jobs (the ones under their cards, up to `obsidian.max_figure_mb`),
+  embedded in Results.md; the agent can copy its own figures there too and embed them in the log.
+- **Privacy, enforced by the sandbox:** the HPC agent can read and write this folder and nothing else of the vault.
+  Its shell commands find the whole vault denied (they can't even list your notes' names), with its folder allowed
+  inside; Claude Code's own file tools get every other note and folder of the vault denied. The assistant, if it
+  shares the vault, reads the folder (so "how are my experiments going?" works) but can't change it, and its vault
+  history leaves the graphs out.
 
 **Results and findings: what each experiment showed.** Every project keeps a record of its experiments.
 - **Results:** one row per finished job.

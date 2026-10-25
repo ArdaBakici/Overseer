@@ -576,3 +576,53 @@ async def test_assistant_sandbox_end_to_end(hpc, backend, cli_name, tmp_path):
         assert "overseer: How to talk to Overseer" not in body
     finally:
         shutil.rmtree(short, ignore_errors=True)
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_hpc_vault_folder_end_to_end(hpc, backend, cli_name, tmp_path):
+    """The HPC bot's folder in the Obsidian vault (obsidian.folder): its agent reads and writes there, and can't read
+    (or write) anything else of the vault - other notes, Obsidian's settings."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    vault = tmp_path / "Vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".obsidian" / "app.json").write_text('{"secret-setting": 1}')
+    (vault / "Personal").mkdir()
+    (vault / "Personal" / "Journal.md").write_text("PRIVATE-JOURNAL\n")
+    (vault / "Ideas.md").write_text("PRIVATE-IDEAS\n")
+    (vault / "HPC" / "proj").mkdir(parents=True)
+    (vault / "HPC" / "proj" / "Research log.md").write_text("# Research log\nEARLIER-ENTRY\n")
+    cfg.obsidian.folder = str(vault / "HPC")
+    cfg.validate()
+    log = vault / "HPC" / "proj" / "Research log.md"
+    script = [
+        f"cat '{log}'; echo '- new entry' >> '{log}' && echo HPC-WRITE-OK",
+        f"mkdir -p '{vault / 'HPC' / 'proj' / 'figures'}' && cp /etc/hostname '{vault / 'HPC' / 'proj' / 'figures' / 'a.txt'}' && echo FIG-OK",
+        f"cat '{vault / 'Personal' / 'Journal.md'}' 2>&1; echo PERSONAL-DONE",
+        f"cat '{vault / 'Ideas.md'}' 2>&1; echo IDEAS-DONE",
+        f"cat '{vault / '.obsidian' / 'app.json'}' 2>&1; echo OBSIDIAN-DONE",
+        f"grep -r PRIVATE '{vault}' 2>&1 | head -3; echo GREP-DONE",
+        f"echo x > '{vault / 'new.md'}' 2>&1; echo x >> '{vault / 'Ideas.md'}' 2>&1; echo ROOTWRITE-DONE",
+    ]
+    with FakeModel(script) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+    outs = fm.outputs
+    detail = "\n\nTOOL OUTPUTS:\n" + "\n====\n".join(outs)
+    if os.environ.get("OVERSEER_E2E_VERBOSE"):
+        print(detail)
+    assert len(outs) >= len(script), detail
+    assert "EARLIER-ENTRY" in outs[0] and "HPC-WRITE-OK" in outs[0], detail
+    assert "- new entry" in log.read_text(), detail
+    assert "FIG-OK" in outs[1] and (vault / "HPC" / "proj" / "figures" / "a.txt").exists(), detail
+    for i in (2, 3, 4, 5):
+        assert "PRIVATE" not in outs[i] and "secret-setting" not in outs[i], detail
+    assert "Ideas.md" not in outs[5] and "Personal" not in outs[5], detail  # (not even the names: the vault's denied)
+    assert not (vault / "new.md").exists() and (vault / "Ideas.md").read_text() == "PRIVATE-IDEAS\n", detail

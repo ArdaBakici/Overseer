@@ -46,8 +46,29 @@ def skills() -> dict[str, str]:
 
 
 def hpc_sandbox(cfg) -> Sandbox:
-    """The HPC is reached through the unix socket of Overseer's SSH master; its key folder stays unreadable."""
-    return Sandbox(deny_read=[cfg.ssh_dir], unix_sockets=[cfg.control_socket], skills=skills())
+    """The HPC is reached through the unix socket of Overseer's SSH master; its key folder stays unreadable. With a
+    vault folder (obsidian.folder): that folder is writable, and the rest of the vault unreadable - for its shell
+    commands the whole vault is denied with the folder allowed inside it; Claude Code's file tools get every other
+    entry of the vault denied instead (their deny rules can't make an exception)."""
+    folder, root = cfg.obsidian_dir, cfg.obsidian_vault
+    vault = vault_denials(root, folder) if folder and root else []
+    return Sandbox(deny_read=[cfg.ssh_dir, *vault], deny_read_shell=[root] if folder and root else [],
+                   unix_sockets=[cfg.control_socket], skills=skills(), writable=[folder] if folder else [])
+
+
+def vault_denials(root: Path, folder: Path) -> list[Path]:
+    """What of the vault the agent must not read: everything but the way down to its folder - at each level, every
+    other entry (the vault's other notes and folders, .obsidian, Syncthing's files). Listed again before each run, so
+    new notes are covered."""
+    out = []
+    at = root
+    for part in folder.relative_to(root).parts:
+        try:
+            out += [p for p in at.iterdir() if p.name != part]
+        except OSError:
+            pass
+        at = at / part
+    return sorted(out)
 
 
 def make_domain(cfg, store, notifier) -> HpcDomain:
@@ -77,6 +98,8 @@ class HpcDomain(Domain):
         self._monitor = None
         self.jobs = None  # watches.JobWatches, once the wake-up engine exists
         self._dashboard = None  # dashboard.HpcDashboard, made on first use
+        from .obsidian import VaultFolder
+        self.vault = VaultFolder(self) if cfg.obsidian_dir else None  # its folder in the Obsidian vault, if set
 
     @property
     def monitor(self):
@@ -91,6 +114,15 @@ class HpcDomain(Domain):
 
     def check_project_dir(self, path: str) -> str:
         return check_dir(path)
+
+    async def check(self) -> list[tuple[str, bool, str]]:
+        if not self.vault:
+            return [("obsidian", True, "off (obsidian.folder)")]
+        root = self.cfg.obsidian_vault
+        import os
+        ok = os.access(self.vault.root, os.W_OK)
+        return [("obsidian", ok, f"{self.vault.root} in the vault {root} - research logs, findings, results, graphs"
+                 + ("" if ok else " · not writable by this user"))]
 
     async def project_created(self, notifier, name: str) -> None:
         if hasattr(notifier, "ensure_jobs_topics"):
@@ -177,7 +209,10 @@ class HpcDomain(Domain):
         self.monitor = Monitor(self.cfg, self.hpc, self.store, self.notifier, reporter)
 
     def services(self) -> list[tuple[str, object]]:
-        return [("monitor", self.monitor.run_forever())] if self.monitor else []
+        out = [("monitor", self.monitor.run_forever())] if self.monitor else []
+        if self.vault:
+            out.append(("obsidian", self.vault.loop()))  # findings, results and graphs into the vault
+        return out
 
     async def start(self, notifier, projects) -> None:
         if hasattr(notifier, "ensure_jobs_topics"):
@@ -206,14 +241,18 @@ class HpcDomain(Domain):
             prompt += P.OV_SECTION.format(min_gap=human_interval(cfg.agent.autopilot.min_checkin_minutes * 60),
                                           repeat=human_interval(cfg.agent.autopilot.repeat_hours * 3600))
         prompt += self.storage_section() + P.PYTHON_SECTION
+        if self.vault:
+            prompt += P.OBSIDIAN_SECTION.format(folder=self.vault.root)
         proj = self.store.get_project(s.project) if s else None
         if proj:
             worker = bool(s and s.rec.is_worker)
             context = f"\n\nAbout this project, from the researcher:\n{proj.context.strip()}" if proj.context.strip() else ""
-            log_path = f"{proj.dir.rstrip('/')}/{P.LOG_FILE}"
+            log_path = self.vault.log_path(proj.name) if self.vault else f"{proj.dir.rstrip('/')}/{P.LOG_FILE}"
             prompt += P.PROJECT_SECTION.format(name=proj.name, dir=proj.dir, context=context,
                                                notes=f"{proj.dir.rstrip('/')}/{P.NOTES_FILE}",
                                                log_rule=(P.WORKER_LOG_RULE if worker else P.LOG_RULE).format(log=log_path))
+        elif self.vault and not (s and s.rec.is_worker):
+            prompt += P.GENERAL_LOG_RULE.format(log=self.vault.log_path(None))
         return prompt
 
     def _quota_rows(self) -> list:
@@ -243,6 +282,8 @@ class HpcDomain(Domain):
         parts = []
         if fresh and s.project:  # a new CLI session: give it the project's notes
             parts.append(await self.project_notes(s.project))
+        elif fresh and self.vault:  # (outside projects: the general research log)
+            parts.append(await self.research_log(None))
         if fresh and s.job_id:
             parts.append(await self.job_context(s.job_id))
         if fresh:  # the project's findings and latest results
@@ -251,7 +292,7 @@ class HpcDomain(Domain):
         return [p for p in parts if p]
 
     async def wake_context(self, s: Session) -> list[str]:
-        parts = [await self.research_log(s.project)] if s.project else []
+        parts = [await self.research_log(s.project)] if s.project or self.vault else []
         return parts + [results_context(self.store, s.project, s.id)]
 
     def remote_path(self, path: str) -> str:
@@ -273,8 +314,11 @@ class HpcDomain(Domain):
             notes = f"<project_notes path='{path}'>\n{notes[:12000].strip()}\n</project_notes>"
         return notes + "\n\n" + await self.research_log(project)
 
-    async def research_log(self, project: str) -> str:
-        """The project's research log for the agent: its beginning (the goal) and its latest entries."""
+    async def research_log(self, project: str | None) -> str:
+        """The project's research log for the agent: its beginning (the goal) and its latest entries. In the vault if
+        the bot has a folder there (also for work outside projects), else in the project's folder on the HPC."""
+        if self.vault:
+            return await self.vault.research_log(project)
         proj = self.store.get_project(project)
         if not proj or not proj.dir:
             return ""

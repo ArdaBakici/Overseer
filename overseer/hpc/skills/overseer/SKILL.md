@@ -313,7 +313,10 @@ mode needs to be switched on.
 If a wake-up fails, the conversation's wake-ups pause until the researcher writes. They can also cancel
 them all (`/auto off`). You're told when they cancel something.
 
-Research log (`RESEARCH_LOG.md` in the project folder; in planner mode only the planner writes it):
+Research log (in planner mode only the planner writes it): `RESEARCH_LOG.md` in the project folder on the HPC - or,
+when Overseer has a folder in the researcher's Obsidian vault, `<that folder>/<project>/Research log.md` on this
+machine (your instructions give the path; there `General.md` is the log outside projects, and `Findings.md`,
+`Results.md` and `figures/` are written by Overseer):
 - **Structure:** the current goal at the top, then one entry per experiment or wake-up.
 - **Goal changes:** rewrite the goal, keeping a one-line note of the old one.
 - **Size:** keep it compact, well under 200k tokens (~800 KB). When it grows long, condense the old

@@ -147,6 +147,27 @@ Overseer shows you its beginning and latest entries when a conversation starts a
 compact, well under 200k tokens (~800 KB): when it grows long, condense the old entries into a short summary \
 section at the top - the findings (`ov finding`) keep what must never be lost."""
 
+GENERAL_LOG_RULE = """
+
+Research log outside projects: `{log}`. Whenever you run experiments outside a project, add an entry - what you \
+changed and why, the job ids, the key results, the next idea. Overseer shows you its beginning and latest entries \
+when a conversation starts and when you are woken. Keep it compact; condense old entries into a summary at the top."""
+
+OBSIDIAN_SECTION = """
+
+## Your folder in the researcher's Obsidian vault: `{folder}`
+The researcher keeps their notes in Obsidian; this folder of the vault is yours, on this machine (not the HPC), \
+synced to their phone and computers. The rest of the vault is private: you can't read it.
+- Research logs live here: `General.md` for work outside projects, `<project>/Research log.md` for each project.
+- `<project>/Findings.md` and `<project>/Results.md` are written by Overseer from `ov finding` / `ov result`, with \
+the graphs of finished jobs in `<project>/figures/` - read them, don't edit them (your edits would be overwritten).
+- Write notes the Obsidian way: YAML frontmatter at the top (project, status, updated), [[wikilinks]] between \
+notes (e.g. [[Results]], [[Findings]], a job's section: [[Results#<job id> <name>]]), #tags.
+- Figures: copy one from the HPC into `<project>/figures/` (`scp hpc:<path> '{folder}/<project>/figures/'`; PNG or \
+SVG, a few MB at most) and embed it in the log with `![[name.png]]`.
+- Edit the notes with your file tools (Edit/Write); other notes of your own here are fine (an idea, a paper), \
+kept tidy."""
+
 WORKER_LOG_RULE = """Research log: `{log}` is written by your planner only - don't edit it (read it if useful). Your \
 detailed notes go in your own NOTES.md (below); your planner records the results from your report."""
 

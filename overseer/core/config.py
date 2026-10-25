@@ -112,9 +112,10 @@ class LocalConfig:
                 out.append(info)
         return out
 
-    def register(self, domain: str) -> None:
-        """Note this bot's folders, so the other bots' agents are kept out of them. Its folders must not lie inside
-        another bot's (or hold one): an agent can't be kept out of a folder its own is in."""
+    def register(self, domain: str, extra: dict | None = None) -> None:
+        """Note this bot's folders, so the other bots' agents are kept out of them (and what else the domain wants the
+        other bots to know: `extra`, e.g. the HPC bot's vault folder). Its folders must not lie inside another bot's
+        (or hold one): an agent can't be kept out of a folder its own is in."""
         state, tmp = self._resolve(self.state_dir), self._resolve(self.tmp_dir)
         shared = self.bots_dir.parent  # ./state: the HPC bot's, and the other bots' folders below it are fine
         mine = [tmp] + ([state] if state != shared else [])
@@ -126,8 +127,8 @@ class LocalConfig:
                                       f"{p}: give each bot folders of its own")
         self.bots_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         name = hashlib.sha1(str(tmp).encode()).hexdigest()[:12]
-        (self.bots_dir / f"{name}.json").write_text(json.dumps({"domain": domain, "state": str(state),
-                                                                 "tmp": str(tmp)}))
+        (self.bots_dir / f"{name}.json").write_text(json.dumps({**(extra or {}), "domain": domain,
+                                                                 "state": str(state), "tmp": str(tmp)}))
 
     def secrets(self) -> list[Path]:
         """What no agent of any of Overseer's bots may read: every bot's state (./state and the bots' folders below
