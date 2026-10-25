@@ -68,7 +68,7 @@ agent:
   enabled: true
   backend: claude_code
   timeout_minutes: 30
-  report_commands: "off"        # summary | live | "off": the commands it ran (mostly reading notes)
+  report_commands: summary      # summary (after each request, all in commands.txt when long) | live | "off"
   live_progress: true
   allowed_domains: []
   i_have_adhd: false            # the i-have-adhd output style (github.com/ayghri/i-have-adhd) for its replies
