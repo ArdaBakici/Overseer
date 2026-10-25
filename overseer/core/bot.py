@@ -75,6 +75,9 @@ def _preview(rec: dict, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+NEW_TOPIC_GAP = 3  # a message this close to its topic's id is the topic's first: Telegram made the topic for it
+
+
 def _thread_error(e: Exception) -> bool:
     text = str(e).lower()
     return "thread" in text or "topic" in text
@@ -600,13 +603,35 @@ class TelegramNotifier:
             if not self.general_thread(chat_id):
                 await self._create_general(chat_id)
 
+    def was_general(self, chat_id: int, thread: int | None) -> bool:
+        """A topic that was the general one before (Overseer made a new one since)."""
+        return bool(thread) and thread in json.loads(self.store.get(f"general_topic_old:{chat_id}") or "[]")
+
+    def adopt_general(self, chat_id: int, thread: int) -> None:
+        """This topic is the general one (again): the one before it is remembered."""
+        old = self.general_thread(chat_id)
+        if old and old != thread:
+            hist = [t for t in json.loads(self.store.get(f"general_topic_old:{chat_id}") or "[]") if t != thread]
+            self.store.set(f"general_topic_old:{chat_id}", json.dumps((hist + [old])[-20:]))
+        self.store.set(f"general_topic:{chat_id}", str(thread))
+
+    async def topic_exists(self, chat_id: int, thread: int) -> bool:
+        """Whether a topic is still there (a chat action in it: harmless, gone in seconds)."""
+        try:
+            await self.app.bot.send_chat_action(chat_id, ChatAction.TYPING, message_thread_id=thread)
+            return True
+        except BadRequest as e:
+            return not _thread_error(e)
+        except Exception:
+            return True  # (can't tell: don't replace it)
+
     async def _create_general(self, chat_id: int) -> int | None:
         try:
             topic = await self.app.bot.create_forum_topic(chat_id, name="general")
         except Exception:
             log.warning("could not create the general topic", exc_info=True)
             return None
-        self.store.set(f"general_topic:{chat_id}", str(topic.message_thread_id))
+        self.adopt_general(chat_id, topic.message_thread_id)
         try:
             await self.app.bot.send_message(
                 chat_id, "💬 <b>general</b> - for anything that isn't about a project: questions, quick runs, your "
@@ -705,7 +730,12 @@ class TelegramNotifier:
                         if not (thread and _thread_error(e2)):
                             raise
                 # The topic was deleted (or Telegram lost it): make a new one - at most once an hour, so an
-                # outage on Telegram's side can't spawn a topic per message - else use the main chat.
+                # outage on Telegram's side can't spawn a topic per message - else use the main chat. Unless it's
+                # still there (the error was about something else): then it's kept, and the message goes without it.
+                if thread and await self.topic_exists(chat_id, thread):
+                    log.warning("sending to topic %s failed (%s) but the topic exists: kept", thread, e)
+                    await self._deliver_any(chat_id, None, f"📁 <b>{esc(proj.name)}</b> · " if proj else "", msg)
+                    continue
                 key = ("\0jobs:" if msg.jobs else "") + (proj.name if proj else "\0general")
                 log.warning("topic %s unavailable (%s)", proj.name if proj else "general", e)
                 if time.time() - self._recreated.get(key, 0) > 3600:
@@ -918,6 +948,7 @@ class Bot:
         self._tasks: set[asyncio.Task] = set()
         self._net_errors = (0.0, 0)  # (when the last one was logged, how many since)
         self._pending: dict[tuple[int, int | None], str] = {}  # new thread -> its first message, until a project is picked
+        self._pending_general: dict[tuple[int, int], str] = {}  # an unknown topic's message, until it's made general
         self._pending_files: dict[tuple[int, int | None], list[tuple[str, Path]]] = {}  # ...and the files sent with it
         self._uploads: dict[tuple[int, int | None], dict] = {}  # files received, not yet given to the agent
         self.digest = None  # digest.Digest (the morning digest), set by the app
@@ -981,12 +1012,15 @@ class Bot:
         add(MessageHandler(~allowed, self.on_stranger))
 
     # ------------------------------------------------------------------ helpers
-    async def reply(self, update: Update, text: str) -> None:
-        for chunk in split_message(text):
+    async def reply(self, update: Update, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> None:
+        chunks = split_message(text)
+        for i, chunk in enumerate(chunks):
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row]
+                                           for row in buttons]) if buttons and i == len(chunks) - 1 else None
             try:
-                await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+                await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML, reply_markup=markup)
             except BadRequest:
-                await update.effective_message.reply_text(strip_html(chunk))
+                await update.effective_message.reply_text(strip_html(chunk), reply_markup=markup)
 
     def _thread(self, update: Update | None) -> int | None:
         msg = update.effective_message if update else None
@@ -1007,8 +1041,15 @@ class Bot:
 
     def _is_general(self, update: Update | None) -> bool:
         thread = self._thread(update)
-        gen = self.notifier.general_thread(update.effective_chat.id) if hasattr(self.notifier, "general_thread") else None
-        return bool(thread) and thread == gen
+        chat_id = update.effective_chat.id
+        gen = self.notifier.general_thread(chat_id) if hasattr(self.notifier, "general_thread") else None
+        if bool(thread) and thread == gen:
+            return True
+        if hasattr(self.notifier, "was_general") and self.notifier.was_general(chat_id, thread):
+            self.notifier.adopt_general(chat_id, thread)  # (written in the general topic of before: it's general again)
+            log.info("topic %s is the general topic again", thread)
+            return True
+        return False
 
     def _own_topic(self, update: Update) -> bool:
         """One of the topics Overseer made for itself (not a conversation's): general, feedback, a jobs topic."""
@@ -1058,6 +1099,15 @@ class Bot:
                   else "")
         notice = ("✋ Messages outside the topics don't go to the agent. Write in a project's topic, or in 💬 general "
                   "for anything else." + (f" ({len(files)} file(s) not sent.)" if files else "") + quoted)
+        msg = update.effective_message
+        if thread and msg is not None and (getattr(msg, "message_id", 0) or 0) - thread > NEW_TOPIC_GAP:
+            # An existing topic Overseer doesn't know (e.g. the general topic, if it lost track of it): never
+            # deleted. It can become the general topic, and the message goes to the agent.
+            self._pending_general[(chat_id, thread)] = text
+            await self.reply(update, "✋ This topic isn't one of Overseer's (any more), so messages here don't reach "
+                                     "the agent. If it's your general topic, make it the general one again:"
+                                     + quoted, buttons=[[("💬 Make this the general topic", f"gen:{thread}")]])
+            return
         if thread:  # the topic Telegram made for the message: removed, so the chat keeps only Overseer's topics
             try:
                 await self.app.bot.delete_forum_topic(chat_id, thread)
@@ -1784,6 +1834,12 @@ class Bot:
                     await self._edit(q, result)
             elif action == "noop":
                 pass
+            elif action == "gen" and arg.isdigit() and hasattr(self.notifier, "adopt_general"):
+                self.notifier.adopt_general(chat.id, int(arg))  # 💬 Make this the general topic
+                await self._edit(q, "✓ This is the 💬 general topic now: what isn't about a project goes here.")
+                text = self._pending_general.pop((chat.id, int(arg)), "")
+                if text.strip():
+                    self._spawn(self._run_agent(chat.id, self.agent.general_session(), text))
             elif action == "ask":  # a question the agent asked (ov ask): the tap is the researcher's answer
                 await self._answer_ask(q, chat.id, arg)
             elif action == "fb" and getattr(self.agent, "feedback", None):  # 👀 Noted / ✅ Fixed / ✖ Won't fix

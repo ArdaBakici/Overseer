@@ -1300,12 +1300,13 @@ def make_projects(env):
 PICKERS = []  # (text, buttons) the bot replied with directly
 
 
-def topic_update(text, thread=None, reply_to=None):
+def topic_update(text, thread=None, reply_to=None, message_id=None):
     async def reply_text(text, reply_markup=None, **kw):
         rows = reply_markup.inline_keyboard if reply_markup else []
         PICKERS.append((text, [(b.text, b.callback_data) for row in rows for b in row]))
     msg = NS(text=text, reply_to_message=NS(message_id=reply_to) if reply_to else None,
-             message_thread_id=thread, is_topic_message=thread is not None, reply_text=reply_text)
+             message_thread_id=thread, is_topic_message=thread is not None, reply_text=reply_text,
+             **({"message_id": message_id} if message_id else {}))
     return NS(effective_message=msg, effective_chat=NS(id=1))
 
 
@@ -1430,6 +1431,12 @@ class FakeTelegram:
         if kw.get("reply_parameters"):
             self.replies = (self.replies or {}) | {len(self.sent): kw["reply_parameters"].message_id}
         return NS(message_id=len(self.sent))
+
+    async def send_chat_action(self, chat_id, action, message_thread_id=None, **kw):
+        from telegram.error import BadRequest
+        if message_thread_id in self.dead_threads:
+            raise BadRequest("Message thread not found")
+        return True
 
     replies: dict = None  # message number -> the message it replies to
     edits: list = None  # (chat_id, message_id, text)
@@ -3872,3 +3879,66 @@ def test_changed_instructions_are_handed_to_a_resumed_conversation(env):
     env.store.unset(INSTRUCTIONS_KEY + s.id)
     update = a._instructions_update(s, sysp2, "cli-1")[1]
     assert "You are X." in update and "## Project" in update
+
+
+
+async def test_an_existing_topic_is_never_deleted_and_general_finds_its_way_back(env, monkeypatch):
+    """A message in an existing topic Overseer doesn't know (here: the general topic, after Overseer made another
+    one) isn't refused by deleting the topic: an older general topic is general again, and an unknown one can be
+    made the general topic with a button - the message then goes to the agent."""
+    from telegram.error import BadRequest
+    from overseer.core.bot import Bot, TelegramNotifier
+    tg = FakeTelegram()
+    deleted = []
+
+    async def delete_forum_topic(chat_id, message_thread_id):
+        deleted.append(message_thread_id)
+    tg.delete_forum_topic = delete_forum_topic
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store)
+    await notifier.detect_topics()
+    await notifier.ensure_general_topic()
+    old = notifier.general_thread(1)
+    bot = Bot(env.cfg, app=NS(bot=tg), store=env.store, agent=env.agent, notifier=notifier,
+              projects=make_projects(env))
+    started = []
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        started.append((session.id, text))
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+
+    async def drain():
+        for t in list(bot._tasks):
+            await t
+    # Overseer made a new general topic meanwhile (a send failed): writing in the old one still works, and makes
+    # it the general one again.
+    await notifier._create_general(1)
+    assert notifier.general_thread(1) != old
+    await bot.on_text(topic_update("add renew mac", thread=old, message_id=old + 500), None)
+    await drain()
+    assert started == [(env.agent.general_session().id, "add renew mac")] and notifier.general_thread(1) == old
+    assert not deleted
+    # An existing topic it never knew: not deleted; a button makes it the general topic, and the message goes on.
+    PICKERS.clear()
+    await bot.on_text(topic_update("hello there", thread=777, message_id=4000), None)
+    await drain()
+    assert not deleted and len(started) == 1
+    text, buttons = PICKERS[-1]
+    assert "isn't one of Overseer's" in text and buttons == [("💬 Make this the general topic", "gen:777")]
+    q = FakeQuery("gen:777")
+    await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
+    await drain()
+    assert notifier.general_thread(1) == 777 and "general topic now" in q.edits[-1][0]
+    assert started[-1] == (env.agent.general_session().id, "hello there")
+    # A topic Telegram made for a message written in "All" is still removed.
+    await bot.on_text(topic_update("in All", thread=901, message_id=902), None)
+    assert deleted == [901]
+    # Before replacing a topic after a failed send, Overseer checks it's really gone.
+    async def action_ok(chat_id, action, message_thread_id=None):
+        return True
+    tg.send_chat_action = action_ok
+    assert await notifier.topic_exists(1, 777)
+
+    async def action_gone(chat_id, action, message_thread_id=None):
+        raise BadRequest("Message thread not found")
+    tg.send_chat_action = action_gone
+    assert not await notifier.topic_exists(1, 777)
