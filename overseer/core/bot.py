@@ -1379,9 +1379,34 @@ class Bot:
             text, files = "\n\n".join([*up["captions"], text]), up["files"]
         await self._route(update, text, files)
 
+    def _from_all(self, update: Update) -> bool:
+        """Written in Telegram's "All" view: no topic, or the one Telegram just made for this message (its first)."""
+        thread, msg = self._thread(update), update.effective_message
+        gap = NEW_TOPIC_GAP + (10 if getattr(msg, "media_group_id", None) else 0)  # (an album: all its pictures)
+        return not thread or (getattr(msg, "message_id", 0) or 0) - thread <= gap
+
+    async def _all_to_general(self, update: Update, text: str, files: list[tuple[str, Path]]) -> None:
+        """A message from "All" goes to the general conversation: the topic Telegram made for it is removed (so the
+        chat keeps only Overseer's topics) and the message is shown in 💬 general, where the reply comes."""
+        chat_id, thread = update.effective_chat.id, self._thread(update)
+        if thread:
+            try:
+                await self.app.bot.delete_forum_topic(chat_id, thread)
+            except Exception:
+                log.debug("could not delete topic %s", thread, exc_info=True)
+        shown = esc(text[:3000]) if text and text.strip() else ""
+        names = ", ".join(esc(n) for n, _ in files)
+        await self.notifier.send(Outgoing(
+            "✉️ <i>From “All”:</i>" + (f"\n{shown}" if shown else "") + (f"\n📎 {names}" if names else ""),
+            session_id=self.agent.general_session().id, silent=True))
+
     async def _route(self, update: Update, text: str, files: list[tuple[str, Path]]) -> None:
         if self._outside_topics(update):
-            await self._refuse_outside_topics(update, text, files)
+            if not self._from_all(update):  # an existing topic Overseer doesn't know
+                await self._refuse_outside_topics(update, text, files)
+                return
+            await self._all_to_general(update, text, files)
+            self._spawn(self._run_agent(update.effective_chat.id, self.agent.general_session(), text, files))
             return
         session = self._replied_session(update) or self._here(update)
         if session is None:  # a thread the user just started
@@ -1425,7 +1450,7 @@ class Bot:
         the next message (a picture without a caption, then a few words about it); after UPLOAD_WAIT without one,
         on its own. An album is one message."""
         msg = update.effective_message
-        if self._outside_topics(update):
+        if self._outside_topics(update) and not self._from_all(update):  # (from "All": general's, below)
             await self._refuse_outside_topics(update, msg.caption or "", [])
             return
         if msg.photo:

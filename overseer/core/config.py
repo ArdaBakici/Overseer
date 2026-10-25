@@ -162,8 +162,8 @@ class TelegramConfig:
     # a topic per project, ... - Overseer makes them; null = whatever the bot's mode in @BotFather is, true = topics
     # (warns if the bot's topic mode is off), false = one conversation in the plain chat, even if it's on.
     topics: bool | None = None
-    # With topics: a message written outside them (Telegram's "All" view) starts a new conversation of its own.
-    # Off: it's refused, with a note to write in a project's topic or in "general".
+    # With topics: a message written outside them (Telegram's "All" view) goes to the general conversation; true: it
+    # starts a new conversation of its own.
     new_threads: bool = False
 
     @property

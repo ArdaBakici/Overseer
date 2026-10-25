@@ -70,7 +70,7 @@ telegram:
   rich_messages: true           # Telegram's native rich messages for agent replies (tables, formulas, plots inline)
   streaming: true               # live progress as a streaming draft with a Stop button
   topics: null                  # null: topics if the bot has threaded mode on in @BotFather; true / false: on / off
-  new_threads: false            # true: a message outside the topics ("All") starts a conversation of its own
+  new_threads: false            # a message outside the topics ("All") goes to general; true: it starts a conversation of its own
 
 agent:
   enabled: true

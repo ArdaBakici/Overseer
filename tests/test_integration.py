@@ -2957,9 +2957,10 @@ async def test_a_symlinked_inbox_is_not_followed(env, tmp_path):
     assert (workdir / "inbox" / "x.png").read_bytes() == b"data"
 
 
-async def test_messages_outside_the_topics_are_refused(env, monkeypatch):
-    """With new threads off (the default), a message written in "All" reaches no agent: the topic Telegram made for
-    it is deleted and a note in "general" says where to write. Jobs topics talk to their project's agent."""
+async def test_messages_outside_the_topics_go_to_general(env, monkeypatch):
+    """With new threads off (the default), a message written in "All" goes to the general conversation: the topic
+    Telegram made for it is deleted, and the message is shown in "general", where the reply comes. Jobs topics talk
+    to their project's agent."""
     from overseer.core.bot import Bot, TelegramNotifier
     tg = FakeTelegram()
     deleted = []
@@ -2986,35 +2987,41 @@ async def test_messages_outside_the_topics_are_refused(env, monkeypatch):
         for t in list(bot._tasks):
             await t
 
-    # Telegram made a topic of its own for the message: deleted, and the note (with the text) is in "general".
-    await bot.on_text(topic_update("why is seed 1 at zero?", thread=901), None)
+    main = env.agent.general_session().id
+    # Telegram made a topic of its own for the message: deleted; the message is shown in "general" and goes to
+    # the general conversation.
+    await bot.on_text(topic_update("why is seed 1 at zero?", thread=901, message_id=902), None)
     await drain()
-    assert not started and deleted == [901]
+    assert started == [(main, "why is seed 1 at zero?")] and deleted == [901]
     gen = notifier.general_thread(1)
     note = [t for _, th, t in tg.sent if th == gen][-1]
-    assert "outside the topics" in note and "why is seed 1 at zero?" in note, note
-    # No topic at all: also refused.
+    assert "From “All”" in note and "why is seed 1 at zero?" in note, note
+    # No topic at all: the same.
     await bot.on_text(topic_update("hello"), None)
     await drain()
-    assert not started and "outside the topics" in tg.sent[-1][2]
-    # A picture sent there: refused before it's downloaded.
-    await bot.on_file(file_update(30, photo=b"x", caption="look", thread=902), None)
-    assert deleted[-1] == 902 and not bot._uploads
+    assert started[-1] == (main, "hello")
+    # A picture sent there: downloaded, and it goes to general too.
+    monkeypatch.setattr("overseer.core.bot.ALBUM_WAIT", 0.01)  # (with a caption: sent after this)
+    await bot.on_file(file_update(904, photo=b"x", caption="look", thread=903), None)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        await drain()
+    assert started[-1] == (main, "look") and deleted[-1] == 903
 
     # Topics still work: general, a project's topic, and its jobs topic.
     await bot.on_text(topic_update("quota?", thread=gen), None)
     await bot.on_text(topic_update("dreamer status", thread=projects.get("dreamer").thread_map["1"]), None)
     await bot.on_text(topic_update("how is the sweep?", thread=notifier.jobs_thread(1, "dreamer")), None)
     await drain()
-    sessions = [env.agent.get(sid).project for sid, _ in started]
-    assert [t for _, t in started] == ["quota?", "dreamer status", "how is the sweep?"]
+    sessions = [env.agent.get(sid).project for sid, _ in started[-3:]]
+    assert [t for _, t in started[-3:]] == ["quota?", "dreamer status", "how is the sweep?"]
     assert sessions == [None, "dreamer", "dreamer"]
 
     # Turned on: a new thread is a conversation of its own again.
     env.cfg.telegram.new_threads = True
-    await bot.on_text(topic_update("a new idea", thread=903), None)
+    await bot.on_text(topic_update("a new idea", thread=905), None)
     await drain()
-    assert any("Which project" in t for t, _ in PICKERS[-1:]) and 903 not in deleted
+    assert any("Which project" in t for t, _ in PICKERS[-1:]) and 905 not in deleted
 
 
 # ----------------------------------------------------------------------------- runs cut off by a restart

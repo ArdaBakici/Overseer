@@ -59,10 +59,10 @@ telegram:
   rich_messages: true
   streaming: true
   # Topics, like the HPC bot: Overseer makes them - "general" for everyday talk, one per project (a trip, a move,
-  # ...: you with /project new, or the assistant itself) - and nothing is written outside them (Telegram's "All").
+  # ...: you with /project new, or the assistant itself). A message written outside them (Telegram's "All") goes to general.
   # Needs threaded mode for this bot in @BotFather. false: one conversation in a plain chat (/new starts afresh).
   topics: false
-  new_threads: false            # with topics: true lets a message in "All" start a conversation (a topic) of its own
+  new_threads: false            # true: a message in "All" starts a conversation (a topic) of its own instead
 
 agent:
   enabled: true

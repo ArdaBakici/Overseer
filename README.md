@@ -221,7 +221,7 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
 - **Fallback:** if Telegram ever rejects the formatting, the message is resent as plain text.
 
-**Writing outside the topics ("All") is blocked by default.** Such a message reaches no agent. Telegram makes a topic of its own for it, which Overseer deletes, and a note in 💬 general says to write in a project's topic or in general, quoting your message so you can paste it there. Files sent there are refused the same way. Each 📊 jobs topic talks to its project's agent. Set `telegram.new_threads: true` to have such messages start conversations of their own, as below.
+**Writing outside the topics ("All") goes to 💬 general.** Telegram makes a topic of its own for such a message; Overseer deletes it, shows your message in 💬 general ("From “All”"), and the general conversation answers there. Files sent there go the same way. Each 📊 jobs topic talks to its project's agent. A topic Overseer doesn't know is never deleted: it offers to make it the general topic. Set `telegram.new_threads: true` to have messages in "All" start conversations of their own instead, as below.
 
 **Threads: each one is a conversation** (with `telegram.new_threads: true`). With topics enabled, the chat with the bot works like an AI chat app:
 - **New thread:** a message from the ✏️ composer starts a new thread, which is its own conversation. If you have projects, Overseer asks which one it's about (📁 dreamer / 📁 chem / 💬 no project) and renames the thread, e.g. "dreamer · plot the reward curves". Starting the message with `dreamer: …` skips the question.
@@ -552,7 +552,7 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
 - **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
   @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
   subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
-  `ov project new`, optionally with a notes folder in the vault). Writing in "All" is refused, as for the HPC
+  `ov project new`, optionally with a notes folder in the vault). Writing in "All" goes to 💬 general, as for the HPC
   bot. With `topics: false` (the example's default) it's one plain chat.
 - **Media and reactions.** `.gif` files in a reply play as animations and videos as videos. Its shell has no
   internet, so `ov fetch <url>` has Overseer download a picture, GIF or video for it: public addresses only (never

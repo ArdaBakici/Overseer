@@ -566,16 +566,17 @@ async def drain(bot):
 
 async def test_with_topics_the_assistant_works_like_the_hpc_bot(aenv, monkeypatch):
     """telegram.topics: true - Overseer makes the topics ("general", one per project, made by you or the
-    assistant), and nothing written outside them ("All") reaches the agent."""
+    assistant), and what's written outside them ("All") goes to the general conversation."""
     from test_integration import topic_update
     t = topic_bot(aenv, monkeypatch, use_topics=True)
     assert await t.notifier.detect_topics()
     await t.notifier.ensure_general_topic()
     gen = t.notifier.general_thread(1)
-    # A message in "All" (Telegram made a topic for it): refused, that topic deleted.
+    # A message in "All" (Telegram made a topic for it): to general, that topic deleted.
     await t.bot.on_text(topic_update("what's on today?", thread=901), None)
     await drain(t.bot)
-    assert not t.started and t.deleted == [901] and "outside the topics" in t.tg.sent[-1][2]
+    assert t.started == [(aenv.agent.general_session().id, "what's on today?")] and t.deleted == [901]
+    assert any("From “All”" in text for _, th, text in t.tg.sent if th == gen)
     # In "general": the everyday conversation.
     await t.bot.on_text(topic_update("what's on today?", thread=gen), None)
     await drain(t.bot)
