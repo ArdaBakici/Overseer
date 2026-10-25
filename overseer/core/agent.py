@@ -9,6 +9,7 @@ resuming the CLI's session, reporting the commands it ran, the files it sends, a
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -104,6 +105,47 @@ CONTINUE_PROMPT = (
     "[Overseer was restarted while you were working on the request below, and your run was cut off partway. "
     "Some of it may already be done: check before redoing anything (files you changed, jobs you submitted - "
     "`ov job list`, `squeue`), then finish it.]\n\n")
+
+
+# What a conversation's CLI session knows of its instructions (the system prompt): Claude Code and Codex keep the
+# instructions a session began with and ignore new ones when it's resumed, so Overseer hands over what changed.
+INSTRUCTIONS_KEY = "instructions:"  # + conversation id: {"cli", "base", "seen"} - section -> hash
+
+
+def prompt_sections(prompt: str) -> dict[str, str]:
+    """The instructions by section ("## ..." headings; what comes before the first: "(start)")."""
+    out: dict[str, str] = {}
+    title, lines = "(start)", []
+    for line in prompt.split("\n"):
+        if line.startswith("## "):
+            if "\n".join(lines).strip():
+                out[_unique(out, title)] = "\n".join(lines).strip()
+            title, lines = line.strip(), [line]
+        else:
+            lines.append(line)
+    if "\n".join(lines).strip():
+        out[_unique(out, title)] = "\n".join(lines).strip()
+    return out
+
+
+def _unique(d: dict, key: str) -> str:
+    n, k = 2, key
+    while k in d:
+        k, n = f"{key} ({n})", n + 1
+    return k
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha1(text.encode()).hexdigest()[:16]
+
+
+INSTRUCTIONS_UPDATE = """<instructions_update>
+Your instructions (the system prompt) changed since this conversation began - e.g. the researcher changed a setting \
+or a note they're made from. The sections below replace their earlier versions (new ones are added); sections not \
+shown are unchanged. Follow them from now on.{removed}
+
+{sections}
+</instructions_update>"""
 
 
 def _size(n: int) -> str:
@@ -480,6 +522,46 @@ class Agent:
         self.store.set(f"notes:{sid}", "[]")
         return json.loads(raw)
 
+    # ------------------------------------------------------------------ instructions of a resumed conversation
+    def _instructions_update(self, s: Session, system: str, resume: str | None) -> tuple[dict, str]:
+        """(what the CLI session will know after this turn, the update to hand over: "" if none). A new CLI session
+        gets the instructions itself; a resumed one keeps those it began with, so what changed goes with the request."""
+        sections = prompt_sections(system)
+        now = {k: _hash(v) for k, v in sections.items()}
+        try:
+            rec = json.loads(self.store.get(INSTRUCTIONS_KEY + s.id) or "null")
+        except ValueError:
+            rec = None
+        if resume is None:
+            return {"base": now, "seen": now}, ""
+        if not rec or rec.get("cli") != resume:  # (from before Overseer kept track: what it began with is unknown)
+            rec = {"base": {}, "seen": {}}
+        seen = rec.get("seen") or {}
+        changed = [k for k in sections if seen.get(k) != now[k]]
+        removed = [k for k in seen if k not in now and k != "(start)"]
+        known = {"base": rec.get("base") or {}, "seen": now}
+        if not changed and not removed:
+            return known, ""
+        gone = (f"\nNo longer part of your instructions: {'; '.join(removed)}." if removed else "")
+        return known, INSTRUCTIONS_UPDATE.format(removed=gone, sections="\n\n".join(sections[k] for k in changed))
+
+    def _instructions_known(self, s: Session, known: dict, cli: str | None, compacted: bool = False) -> None:
+        """After a turn: what its CLI session now knows. A compaction keeps the instructions it began with but may
+        drop what was handed over since, so that is handed over again."""
+        if not cli:
+            return
+        seen = known["base"] if compacted else known["seen"]
+        self.store.set(INSTRUCTIONS_KEY + s.id, json.dumps({"cli": cli, "base": known["base"], "seen": seen}))
+
+    def _instructions_compacted(self, s: Session) -> None:
+        try:
+            rec = json.loads(self.store.get(INSTRUCTIONS_KEY + s.id) or "null")
+        except ValueError:
+            return
+        if rec:
+            rec["seen"], rec["cli"] = rec.get("base") or {}, s.rec.cli_session_id
+            self.store.set(INSTRUCTIONS_KEY + s.id, json.dumps(rec))
+
     async def compact(self, s: Session, focus: str = "") -> bool:
         """Compact the conversation now (the researcher's /compact): the CLI summarises its older turns."""
         backend = self.session_backend(s)
@@ -517,6 +599,7 @@ class Agent:
             if res.session_id and res.session_id != s.rec.cli_session_id:
                 s.rec.cli_session_id = res.session_id
                 self.store.upsert_session(s.rec)
+            self._instructions_compacted(s)
             s.origin = "compact"
             self._record_usage(s, backend, res)
             s.origin = "user"
@@ -740,6 +823,10 @@ class Agent:
         notes = self.take_notes(s.id)
         if notes:  # things that happened since the agent last ran (e.g. the researcher declined a request)
             parts.append("<overseer_notes>\n" + "\n".join(f"- {n}" for n in notes) + "\n</overseer_notes>")
+        system = self.system_prompt(s.id)
+        known, update = self._instructions_update(s, system, resume)
+        if update:
+            parts.append(update)
         parts.append(user_text)
         prompt = "\n\n".join(parts)
 
@@ -773,8 +860,7 @@ class Agent:
             progress.start()
         try:
             state = await self.domain.before_run(s)
-            res = await runner.run(prompt, system=self.system_prompt(s.id), session_id=resume, key=s.id,
-                                   activity=activity)
+            res = await runner.run(prompt, system=system, session_id=resume, key=s.id, activity=activity)
         except asyncio.CancelledError:
             transcript.write({"kind": "end", "status": "stopped"})
             raise
@@ -790,6 +876,7 @@ class Agent:
                 await progress.close()
             await self._report_activity(s, activity, buffer)
         note = await self.domain.after_run(s, activity, state, res.text)  # e.g. the notes it changed, ↩️ Undo
+        self._instructions_known(s, known, res.session_id or resume, compacted=bool(res.compactions))
         if res.session_id:
             s.rec.backend, s.rec.cli_session_id = backend, res.session_id
             self.store.upsert_session(s.rec)

@@ -3840,3 +3840,35 @@ async def test_a_wake_up_isnt_handed_over_again_as_if_new(env, monkeypatch):
     notes = env.agent.take_notes(s.id)
     assert any(f"run for w{w2.id} didn't finish" in n and "aren't handed to you again" in n for n in notes)
     await env.ctl.stop()
+
+
+def test_changed_instructions_are_handed_to_a_resumed_conversation(env):
+    """The CLIs keep a resumed conversation's first instructions: what changed goes with the next request, once."""
+    from overseer.core.agent import INSTRUCTIONS_KEY, prompt_sections
+    assert list(prompt_sections("You are X.\n\n## A\none\n\n## B\ntwo\n## A\nagain")) == ["(start)", "## A", "## B",
+                                                                                           "## A (2)"]
+    a = env.agent
+    s = a.general_session()
+    sysp = "You are X.\n\n## Rules\nbe brief\n\n## Project\nnone"
+    known, update = a._instructions_update(s, sysp, None)  # a new CLI session: it gets them itself
+    assert update == ""
+    a._instructions_known(s, known, "cli-1")
+    known, update = a._instructions_update(s, sysp, "cli-1")
+    assert update == ""  # unchanged
+    sysp2 = sysp.replace("be brief", "be very brief") + "\n\n## Output style\nadhd"
+    known, update = a._instructions_update(s, sysp2, "cli-1")
+    assert "<instructions_update>" in update and "## Rules\nbe very brief" in update and "## Output style" in update
+    assert "## Project" not in update and "You are X." not in update
+    a._instructions_known(s, known, "cli-1")
+    assert a._instructions_update(s, sysp2, "cli-1")[1] == ""  # (handed over once)
+    # A section that went away is named.
+    known, update = a._instructions_update(s, sysp, "cli-1")
+    assert "No longer part of your instructions: ## Output style" in update
+    a._instructions_known(s, known, "cli-1")
+    # A compaction may drop what was handed over: everything changed since the start goes again.
+    a._instructions_known(s, a._instructions_update(s, sysp2, "cli-1")[0], "cli-1", compacted=True)
+    assert "## Output style" in a._instructions_update(s, sysp2, "cli-1")[1]
+    # A conversation from before Overseer kept track: all of it, once.
+    env.store.unset(INSTRUCTIONS_KEY + s.id)
+    update = a._instructions_update(s, sysp2, "cli-1")[1]
+    assert "You are X." in update and "## Project" in update

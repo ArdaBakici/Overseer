@@ -626,3 +626,36 @@ async def test_hpc_vault_folder_end_to_end(hpc, backend, cli_name, tmp_path):
         assert "PRIVATE" not in outs[i] and "secret-setting" not in outs[i], detail
     assert "Ideas.md" not in outs[5] and "Personal" not in outs[5], detail  # (not even the names: the vault's denied)
     assert not (vault / "new.md").exists() and (vault / "Ideas.md").read_text() == "PRIVATE-IDEAS\n", detail
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_new_instructions_reach_a_resumed_conversation(hpc, backend, cli_name):
+    """Both CLIs keep the instructions a conversation began with when it's resumed (a new --append-system-prompt /
+    developer_instructions is ignored), so a setting that changes them (e.g. agent.i_have_adhd) would never reach an
+    ongoing conversation: Overseer hands over the sections that changed, once."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    with FakeModel([]) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        await asyncio.wait_for(agent.handle(s, "FIRST-REQUEST"), 240)
+        assert s.rec.cli_session_id
+        await asyncio.wait_for(agent.handle(s, "SECOND-REQUEST"), 240)  # (unchanged: nothing handed over)
+        cfg.agent.i_have_adhd = True
+        await asyncio.wait_for(agent.handle(s, "THIRD-REQUEST"), 240)
+        await asyncio.wait_for(agent.handle(s, "FOURTH-REQUEST"), 240)
+
+    def request(marker):  # (the first request with it: the one made for that turn)
+        bodies = [json.dumps(r["body"]) for r in fm.requests if marker in json.dumps(r["body"])]
+        return bodies[0] if bodies else ""
+    second, third, fourth = request("SECOND-REQUEST"), request("THIRD-REQUEST"), request("FOURTH-REQUEST")
+    assert second and third and fourth and "FIRST-REQUEST" in fourth  # (resumed: the same conversation)
+    assert "instructions_update" not in second and "i-have-adhd (always on)" not in second
+    assert "<instructions_update>" in third and "i-have-adhd (always on)" in third, "not handed over"
+    assert fourth.count("<instructions_update>") == 1  # (once: not again with every request)
