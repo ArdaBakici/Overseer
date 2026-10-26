@@ -1,0 +1,148 @@
+# Overseer configuration. Copy to config.yaml and edit.
+# Secrets never go in this file. Put them in .env next to it (see .env.example; chmod 600):
+#   TELEGRAM_BOT_TOKEN                       - from @BotFather
+#   ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN - only if you don't use `overseer login claude_code`
+#   OPENAI_API_KEY / CODEX_API_KEY           - only if you don't use `overseer login codex`
+
+# Which bot this is: hpc (Overseer: SLURM jobs on the cluster). Each domain runs as its own bot and process, with
+# its own config file, state folder and secrets.
+domain: hpc
+
+local:
+  # On THIS machine, Overseer and the agent only write inside these folders.
+  # Relative paths are relative to the folder containing this config file (Overseer's folder).
+  allowed_roots: [".", "/tmp"]
+  state_dir: ./state        # DB, audit log, SSH key/config, the CLIs' logins and sessions
+  tmp_dir: /tmp/overseer    # SSH connection socket + the agent's scratch directories (keep the path short)
+  env_file: .env            # secrets (TELEGRAM_BOT_TOKEN, API keys); the agent can't read it
+  timezone: ""              # e.g. Europe/Istanbul; "" = this machine's time zone
+
+ssh:
+  # Overseer uses its OWN key, ssh config and known_hosts in ./state/ssh - never ~/.ssh.
+  # Create them with:  overseer ssh setup      (or: overseer ssh setup --import ~/.ssh/id_ed25519)
+  host: hpc                 # the name the agent uses: `ssh hpc '...'`
+  hostname: login.cluster.edu
+  user: your-netid
+  port: 22
+  proxy_jump: null          # e.g. your-netid@gateway.cluster.edu (uses the same key)
+  extra_options: {}         # extra ssh_config options for the host, e.g. {Compression: "yes"}
+
+slurm:
+  poll_interval: 60             # seconds
+  status_interval_minutes: 10   # how often a running job's live card is refreshed (silently) and alerts checked
+  plot_interval_minutes: 60     # how often a running job's graphs (the agent's ov plots command) are refreshed
+  track: all                    # "all" of your jobs, or only the ones the agent submitted ("agent")
+  notify_queued: true
+  log_tail_lines: 12            # lines of the (training) log shown in status messages
+  gpu_stats: false              # GPU use in the hourly status (srun --overlap nvidia-smi); the 📊 Status button always shows it
+  # Idle GPUs: a running job whose GPUs all stay at most idle_gpu_percent busy this long gets a 💤 on its card,
+  # you're told, and the agent watching it is woken. 0 = off.
+  idle_gpu_minutes: 30
+  idle_gpu_percent: 5
+  idle_gpu_sample_minutes: 10   # how often running GPU jobs are sampled (a short srun --overlap step)
+  ignore_name_globs: ["interactive", "sys/dashboard*", "ood-*"]
+  # Where the agent runs anything heavier than a quick command (scripts, plots, data processing):
+  # `hpc-run -- <command>` runs it on a compute node. A shared worker job keeps a node for a while
+  # so commands start right away; it ends itself after idle_minutes unused.
+  compute:
+    partition: compute
+    cpus: 8
+    mem: 32G
+    worker_hours: 8
+    idle_minutes: 45
+    wait_minutes: 15            # give up if no node is free after this long
+    gpu_partition: nvidia       # for hpc-run --gpu
+    gpu_gres: "gpu:1"
+    sbatch_args: []             # e.g. ["--account=myproject"]
+    login_cpu_seconds: 120      # guardrail: CPU seconds for commands run directly on the login node (0 = off)
+    login_warn_seconds: 120     # flag commands that ran this long on the login node
+  setup: ""                     # only if SLURM isn't found: what you'd run first, e.g. "module load slurm"
+  # Disk quota (space and number of files): its limits go into the agent's instructions, and past the
+  # threshold you and the agent are warned. "" = don't check.
+  quota_command: myquota
+  quota_check_hours: 24          # and once at startup
+  quota_warn_percent: 80
+
+telegram:
+  token_env: TELEGRAM_BOT_TOKEN
+  # Your chat id(s). The agent has full access to your HPC account, so only list chats you control.
+  allowed_chat_ids: [123456789]
+  rich_messages: true           # Telegram's native rich messages for agent replies (tables, formulas, plots inline)
+  streaming: true               # live progress as a streaming draft with a Stop button
+  topics: null                  # null: topics if the bot has threaded mode on in @BotFather; true / false: on / off
+  new_threads: false            # a message outside the topics ("All") goes to general; true: it starts a conversation of its own
+  general: topic                # the general conversation: a 💬 general topic, or "all": Telegram's "All" view itself
+
+agent:
+  enabled: true
+  backend: claude_code          # claude_code | codex  (switch any time from Telegram: /backend codex)
+  timeout_minutes: 60           # max length of one agent run (/stop ends it earlier)
+  auto_update: true             # `claude update` / `codex update` once a day while nothing runs (/update: now)
+  report_commands: summary      # summary (after each request) | live (every few seconds) | off
+  live_progress: true           # a self-updating "⏳ working" message: latest reasoning, running command
+  allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)
+  deny_read: []                 # extra local paths the agent may never read
+  llm_status_updates: false     # one-line LLM progress summary in periodic status messages
+  # The i-have-adhd output style (github.com/ayghri/i-have-adhd) for every agent of this bot, subagents too: replies
+  # lead with the next action, number their steps, restate where things stand, no tangents or filler.
+  i_have_adhd: false
+
+  claude_code:
+    command: claude
+    model: null                 # e.g. opus, sonnet; null = Claude Code's default (also: /model in Telegram)
+    effort: null                # low | medium | high | xhigh | max (also: /effort in Telegram)
+    home: ./state/claude        # CLAUDE_CONFIG_DIR for Overseer's runs. Log in: overseer login claude_code
+    # pass_env: [ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, HTTPS_PROXY, ...]
+    extra_settings: {}          # merged into Claude Code settings (sandbox settings can't be loosened)
+
+  codex:
+    command: codex
+    model: null                 # e.g. gpt-5.5-codex; null = codex default
+    reasoning_effort: null      # minimal | low | medium | high | xhigh (also: /effort in Telegram)
+    home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex (device code)
+    # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
+    web_search: live            # the model's own web search (OpenAI's side): live | cached | disabled
+    extra_config: []            # extra `-c key=value` overrides
+
+  # Wake-ups: the agent watches jobs (ov watch) and sets timers (ov wake) on its own, no approval needed.
+  autopilot:
+    min_checkin_minutes: 15     # check-ins on running jobs and repeating timers: at least this far apart
+    repeat_hours: 24            # a repeating timer stops after this, unless the agent sets --for
+  # Planner mode (off unless you turn it on with /subagents on, or approve an agent's plan): the conversation plans
+  # on a strong model and delegates to subagents on cheaper ones, each in its own thread.
+  subagents:
+    max_running: 3              # subagents running at once; more are queued
+    planner: {claude_code: claude-opus-5-5, codex: gpt-6-astra}
+    workers:                    # models subagents may use; the first is the default
+      claude_code: [claude-sonnet-5-5]
+      codex: [gpt-6.1-sol, gpt-6-luna]
+
+# The morning digest, in the general topic: jobs, GPU time, results, what the agents did, tokens. /digest: now.
+digest:
+  enabled: true
+  time: "08:00"                 # this machine's local time
+
+# A folder of your Obsidian vault for this bot: research logs (one subfolder per project, General.md outside
+# projects), findings, results and the graphs of finished jobs, as notes. Its agent can read and write this folder and
+# nothing else of the vault. If the assistant bot uses the same vault, it can read the folder but not change it.
+obsidian:
+  folder: ""                    # e.g. /home/me/Vault/HPC (create it first; "" = off: research logs stay on the HPC)
+  max_figure_mb: 5              # graphs bigger than this aren't copied into the vault
+
+# The dashboard Mini App (/dashboard): served on this machine, reachable only on your tailnet.
+# Run `tailscale serve --bg 8765` once and put the https://….ts.net address it prints in url.
+dashboard:
+  enabled: false
+  port: 8765
+  url: ""                       # e.g. https://homelab.tail1234.ts.net
+
+# Projects: each gets its own Telegram topic, conversations, jobs, notes (OVERSEER.md in its folder) and agent
+# settings. You can also create them from Telegram: /project new <name> <dir> [what it's about].
+# Topics in the chat with the bot need its topic mode ("threaded mode"), switched on in @BotFather.
+projects: {}
+#  dreamer:
+#    dir: /scratch/netid/rf-dreamer          # jobs running under this folder are reported in the project's topic
+#    context: "DreamerV3 benchmarks on crafter/minigrid. venv: methods/dreamerv3/venv. a100 or h100."
+#    backend: null                           # unset = copied from the main chat when the project is created
+#    model: null
+#    effort: null

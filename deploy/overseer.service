@@ -1,0 +1,27 @@
+# systemd user service. Install:
+#   mkdir -p ~/.config/systemd/user && cp deploy/overseer.service ~/.config/systemd/user/
+#   # secrets go in ~/Overseer/.env (see .env.example, chmod 600) - Overseer loads it itself
+#   systemctl --user daemon-reload && systemctl --user enable --now overseer
+#   loginctl enable-linger $USER    # keep running when you're logged out
+[Unit]
+Description=Overseer - SLURM job monitor and Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Overseer
+# Overseer only writes inside local.allowed_roots (its own folder and /tmp).
+Environment=PYTHONDONTWRITEBYTECODE=1
+# `uv sync` (or pip install -e .) creates .venv; running its python directly avoids uv re-syncing on every start.
+ExecStart=%h/Overseer/.venv/bin/python -m overseer run -c %h/Overseer/config.yaml
+Restart=on-failure
+RestartSec=30
+# Stop signals go to Overseer only: it stops the agent runs in progress itself and offers them again (▶️ Continue)
+# at the next start. With the default (control-group), the agent CLIs would be killed first and their runs reported
+# as failed. Anything left is killed after TimeoutStopSec.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
