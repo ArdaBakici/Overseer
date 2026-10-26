@@ -221,7 +221,7 @@ Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · 
   - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
 - **Fallback:** if Telegram ever rejects the formatting, the message is resent as plain text.
 
-**Writing outside the topics ("All") is blocked by default.** Such a message reaches no agent. Telegram makes a topic of its own for it, which Overseer deletes, and a note in 💬 general says to write in a project's topic or in general, quoting your message so you can paste it there. Files sent there are refused the same way. Each 📊 jobs topic talks to its project's agent. Set `telegram.new_threads: true` to have such messages start conversations of their own, as below.
+**Writing outside the topics ("All") goes to 💬 general.** Telegram makes a topic of its own for such a message; Overseer deletes it, shows your message in 💬 general ("From “All”"), and the general conversation answers there. Files sent there go the same way. Each 📊 jobs topic talks to its project's agent. A topic Overseer doesn't know is never deleted: it offers to make it the general topic. Set `telegram.new_threads: true` to have messages in "All" start conversations of their own instead, as below.
 
 **Threads: each one is a conversation** (with `telegram.new_threads: true`). With topics enabled, the chat with the bot works like an AI chat app:
 - **New thread:** a message from the ✏️ composer starts a new thread, which is its own conversation. If you have projects, Overseer asks which one it's about (📁 dreamer / 📁 chem / 💬 no project) and renames the thread, e.g. "dreamer · plot the reward curves". Starting the message with `dreamer: …` skips the question.
@@ -254,7 +254,7 @@ Each project gets a topic in your chat with the bot, so the main chat stays uncl
 
 **The "general" topic: anything that isn't about a project.** With topics on, Overseer also creates a 💬 general topic. Use it for questions like "how much quota do I have left?" or "which partitions have free GPUs?". It is the main chat's conversation, so `/new`, `/ask`, `/auto` and `/stop` there act on the main conversation. Jobs that belong to no project are reported there too, and if the topic is deleted, Overseer makes a new one.
 
-Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `/health` shows whether it's on. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
+Topics in private chats need the bot's topic mode ("threaded mode"), which you switch on in @BotFather. `telegram.topics` decides whether Overseer uses them: `null` (the default) follows the bot's mode, `true` uses them (and warns at startup if the mode is off), `false` keeps one conversation in a plain chat even if the mode is on. `/health` shows whether topics are on, and why not. Without it, project messages still work, labelled `📁 project ·` in the main chat. If a project's topic gets deleted, Overseer creates a new one, or falls back to the labelled main-chat message.
 
 **Job cards and the jobs topics.** Job news lives apart from your conversations, so the agent's replies don't get buried:
 - **Where:** with topics on, each project has a "📊 dreamer · jobs" topic, and one "📊 jobs" topic holds the jobs that belong to no project.
@@ -307,11 +307,38 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
 - **Turning it off:** `/auto off` cancels the pending wake-ups (in that thread or topic, or as a reply: that conversation), and the agent is told. `/stop` stops a run.
 - **Limits:** check-ins and repeating timers are at least 15 minutes apart, and a repeating timer ends (after 24 hours unless the agent sets `--for`). There is no limit on the number of wake-ups. `/usage` shows what they cost.
 - **Pauses on problems:** a wake-up that fails or is `/stop`ped pauses that conversation's wake-ups until you write to it there.
-- **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder.
+- **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder (or, with an
+  Obsidian folder - below - `Research log.md` in the vault).
   - **Contents:** the current goal at the top (rewritten when the goal changes), then an entry per experiment: what changed and why, the job ids, the results, the next idea.
   - **What the agent sees:** Overseer shows it the log's beginning and latest entries when a conversation starts and at every wake-up, so it keeps the thread across long gaps and compaction.
   - **Size:** the agent keeps it well under 200k tokens; past about 600 KB, Overseer asks it to condense the older entries.
 - **Cost:** each wake-up re-sends the conversation so far, and wake-ups are often hours apart, after the provider's prompt cache has expired. The agent is told to wake itself only when there is something to look at.
+
+**Replies shaped for ADHD** (optional). `agent.i_have_adhd: true` gives every agent of the bot (subagents and the
+feedback reviewer too) the [i-have-adhd](https://github.com/ayghri/i-have-adhd) output style: replies lead with the next
+action, number their steps, restate where things stand, give concrete time estimates and leave out tangents,
+preambles and pleasantries. In Claude Code it's a skill you'd turn on with `/i-have-adhd`; since Overseer's agents
+are reached through Telegram, it's always on here (like the skill's own always-on mode): the rules go into each
+agent's instructions, after Overseer's own, which win where they conflict. Say "stop adhd mode" to an agent to turn
+it off for that conversation. It's a per-bot setting: set it in the assistant's config too if you want it there. The
+skill's text and MIT license are in `overseer/core/skills/i-have-adhd/`.
+
+**Research notes in Obsidian** (optional). Give the bot a folder of your Obsidian vault, `obsidian.folder:
+/home/me/Vault/HPC` (create the folder first; it must be inside the vault, not the vault itself), and the research
+moves there, synced to your phone and computers:
+- `HPC/<project>/Research log.md`: the project's research log, written by the agent the Obsidian way (frontmatter,
+  [[links]], #tags) - you can read and edit it too. The first time, an existing `RESEARCH_LOG.md` on the HPC is
+  copied in; from then on the vault's note is the log (the HPC copy is no longer used).
+- `HPC/General.md`: the same for work outside projects.
+- `HPC/<project>/Findings.md` and `Results.md`: written by Overseer from its records and rewritten when they change
+  (a table of every result, then a section per result with its hypothesis, conclusion, metrics and graphs).
+- `HPC/<project>/figures/`: the graphs of finished jobs (the ones under their cards, up to `obsidian.max_figure_mb`),
+  embedded in Results.md; the agent can copy its own figures there too and embed them in the log.
+- **Privacy, enforced by the sandbox:** the HPC agent can read and write this folder and nothing else of the vault.
+  Its shell commands find the whole vault denied (they can't even list your notes' names), with its folder allowed
+  inside; Claude Code's own file tools get every other note and folder of the vault denied. The assistant, if it
+  shares the vault, reads the folder (so "how are my experiments going?" works) but can't change it, and its vault
+  history leaves the graphs out.
 
 **Results and findings: what each experiment showed.** Every project keeps a record of its experiments.
 - **Results:** one row per finished job.
@@ -442,7 +469,128 @@ overseer.example.com {
 
 `tls internal` (Caddy's own CA) only works where you install Caddy's root certificate: iOS (and enable full trust) and desktops yes, Android most likely not, since apps there ignore user-installed CAs.
 
+## The personal assistant: a second bot
+
+The same platform runs a second, separate bot: a daily assistant whose memory is your **Obsidian vault**. It runs
+from Overseer's folder next to the HPC bot, as its own process with its own Telegram bot, config, state and
+logins, and it can't reach anything of the HPC bot's.
+
+```bash
+cp assistant.example.yaml assistant.yaml        # set vault.path and your chat id
+echo 'ASSISTANT_BOT_TOKEN=123456789:...' >> .env  # a second bot from @BotFather (telegram.token_env names it)
+overseer login claude_code -c assistant.yaml    # its own login (./state/assistant/claude)
+overseer check -c assistant.yaml
+overseer run -c assistant.yaml                  # e.g. a second systemd service
+```
+
+- **The vault is its memory.** Point `vault.path` at the folder Syncthing keeps in sync on the homelab. The agent
+  reads and edits notes there with real commands (`rg`, editing files): your daily note, notes it keeps in
+  `Assistant/Memory/`, anything you ask about. It follows Obsidian's conventions ([[links]], #tags) and never
+  writes `.obsidian/` (Obsidian's settings) or Syncthing's own files: the sandbox refuses it.
+- **Personality: yours to give.** On its first run it just says hi and asks you who it should be - a name, how
+  to talk and behave - and writes that into `Assistant/Persona.md` (edit it in Obsidian, or ask it to change).
+  `Assistant/About me.md` is what it knows about you; it adds lasting facts there and tells you. Both go into its
+  instructions on every reply. `/persona` shows it. It also keeps two notes about you for other AI agents:
+  `Assistant/My writing style.md` (informal and formal, written so another model can imitate you) and
+  `Assistant/My personality.md`.
+- **↩️ Undo.** Overseer keeps a history of the vault in a git repository in the bot's state folder, outside the
+  vault (so nothing extra is synced and the agent can't touch it). Before each reply it records your edits since,
+  after it the reply's changes; a reply that changed notes lists them with a ↩️ Undo button, which reverts exactly
+  those changes and keeps yours (if you edited the same lines since, it says so and changes nothing). `/undo`
+  lists recent changes, `/vault` shows the history and Syncthing's conflict copies.
+- **Tasks** are the Obsidian Tasks plugin's checklist lines, anywhere in the vault (`- [ ] Call the bank 📅
+  2026-10-20 ⏫ #home`, with 🔁 recurrences). `/tasks [today|week|#tag|words]` lists them with ✅ buttons,
+  `/task <text>` adds one; the agent uses `ov task list|add|done`. Completing a recurring task adds its next
+  occurrence, like the plugin. New tasks go to `Assistant/Tasks.md` unless it belongs in a particular note.
+- **It builds the system with you.** Nothing is set up in advance: you just talk to it, and it suggests one thing at
+  a time when it notices a pattern ("a daily reminder for that at 9:30?"), with tap buttons (`ov ask`). How it
+  organizes your things is its own note, `Assistant/System.md`, which it keeps up to date. Its tools:
+  - **Routines** in `Assistant/Routines.md`, added with your agreement: a `do:` routine wakes the assistant at its
+    time (it may decide there's nothing worth saying and stay silent); a `say:` one ("Meds 💊") just sends its
+    message. You change them by asking ("move it to 22:00", "pause it until I'm back").
+  - **Reminders** fire once, with ✅ Done · 💤 Later · ⏭ Skip; ones you want to come back until answered get a
+    follow-up policy (the note's `# Follow-ups`, e.g. "again after 10m, up to 5 more times").
+  - **Check-backs**: when it thinks one would help ("I'll send it by 3"), it asks first, then checks in at 3
+    ("how did it go?" ✅ · 💤 · 🧱 Stuck - which brings it in to help).
+  - **Someday list**: things to do sometime ("learn to draw") are tasks tagged `#someday` in `Assistant/Someday.md`;
+    it brings one up now and then on a day that looks light - its judgement, not Overseer's.
+  - **Focus sessions**: "let's do 25 minutes on the intro" - one quiet countdown message, then a ping.
+  - `/remind` and `/reminders` still exist as shortcuts.
+- **Your calendars** (optional): Google Calendar, and read-only calendars from iCal links. The assistant sees
+  today's and tomorrow's events in every request and looks
+  further with `ov cal`. It plans around them: it checks free time before suggesting when to do something, it
+  reads a packed day as "smaller and fewer suggestions" and a light one as room for a bigger task or a someday
+  item, and it can offer to block time for a task. It changes events only where you allow it: in calendars under
+  `calendar.ask` you get a card (✅ Add / ✖ No) and nothing happens until you tap; in ones under `calendar.auto`
+  it's done at once and the notice has ↩️ Undo. It never invites anyone and leaves events with other people alone.
+  `calendar.event_reminders: 10` adds a reminder 10 minutes before each timed event.
+
+  **Planning with the calendar** (time-blocking, a day or week laid out, re-planning) isn't a fixed method: the
+  assistant has tools and works out with you what helps, keeping what works in `Assistant/System.md`. It can send
+  several changes as **one proposal** (one card, ✅ Apply all / ✖ No - answer in words to adjust it; one ↩️ Undo
+  for all of it; refused before it reaches you if it overlaps busy events), **label** its own events and **link**
+  them to Obsidian tasks, and tie **actions to events**: "when the intro block ends, ask me if it's done" (✅ ticks
+  the task off) or "10 minutes before the exam, wake up and help me get ready". Actions follow an event when you
+  move it in Google Calendar, go when it's deleted, and work on any event, iCal ones included. The Google login stays with
+  Overseer (in the bot's state folder, which agents can't read); the agent only uses `ov cal`. Set up:
+  1. In [Google Cloud](https://console.cloud.google.com): a project, enable the **Google Calendar API**; the
+     **OAuth consent screen**: External, add yourself as a test user, then **publish** it (left in "Testing",
+     Google drops the login after 7 days; unverified is fine for just you); **Credentials → OAuth client ID →
+     Desktop app**.
+  2. Its id and secret into `.env`: `GOOGLE_CLIENT_ID=...` and `GOOGLE_CLIENT_SECRET=...`.
+  3. `uv run overseer login google -c assistant.yaml`: open the link on any device, allow access; the browser then
+     fails to load a `127.0.0.1` page - copy that page's address back into the terminal. It lists your calendars
+     and what the assistant may do with each.
+  4. `calendar.enabled: true` (and `ask` / `auto` as you like), restart the bot. `overseer check` shows it.
+
+  **iCal links** are read-only calendars it sees and plans around but never changes: a university timetable, a
+  calendar someone shared, Outlook's or Apple's "publish calendar" link, a holidays feed. List them under
+  `calendar.ics` by name; the value is the link (`https://` or `webcal://`), or - since such links usually work
+  like a password - the name of a variable in `.env` holding it: `ics: {Uni: UNI_ICS_URL}` and
+  `UNI_ICS_URL=https://...` in `.env`. Overseer fetches each one every `ics_minutes` (30) and works out repeating
+  events, their exceptions and time zones itself. They work without Google too (`enabled: false`).
+- **Topics** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in @BotFather.
+  Everyday talk stays in Telegram's "All" view itself (`telegram.general: all`, the example's choice): no general
+  topic. Overseer makes one topic per project, a lasting subject such as a trip or a move (`/project new japan Trip
+  in April`, or the assistant creates one with `ov project new`, optionally with a notes folder in the vault), plus
+  🛠 feedback and 🌐 web. In @BotFather (your bot → Bot Settings → Threaded mode), turn off users creating topics:
+  otherwise Telegram turns each message you write in "All" into a topic of its own (Overseer then moves it into
+  "All" and tells you once at startup). Switching to `all` deletes a 💬 general topic of before; the conversation
+  itself carries on in "All". `general: topic` keeps a 💬 general topic, as the HPC bot does. With `topics: false`
+  (the example's default) it's one plain chat.
+- **Media and reactions.** `.gif` files in a reply play as animations and videos as videos. Its shell has no
+  internet, so `ov fetch <url>` has Overseer download a picture, GIF or video for it: public addresses only (never
+  this machine, the LAN or the tailnet; the address is checked and pinned, redirects too), recognised by its
+  bytes, up to `media.max_mb`; each download is noted in a 🌐 web topic. `ov gif <query>` searches Giphy, if
+  you give it a key (`media.giphy_key_env`). `ov react 🎉` reacts to your last message instead of replying.
+  Image tools (Pillow, ffmpeg, ImageMagick) work in its sandbox if they're installed on the homelab;
+  `ov capabilities` tells it what it can send and do.
+- **Notes it always keeps in mind**: besides Persona and About me, any note with frontmatter `assistant: always`
+  (e.g. a writing style it maintains for you); `assistant: index` lists one by name and description.
+- **Its time zone** is `local.timezone` (e.g. Asia/Dubai), whatever the homelab's is; reminders confirm the exact
+  moment (`Thu 2026-10-22 10:00 (+04:00, tomorrow)`).
+- **Starting over.** `uv run overseer reset -c assistant.yaml` (with the bot stopped) lists and wipes its
+  flags: pending reminders and check-ins, the day logs, the first-hello flag, wake-ups it set itself, paused
+  wake-ups. Then it asks whether to forget the conversations too: their records, transcripts and search index,
+  and the agent CLIs' own sessions - without them it can't resume or search old chats. Your notes, projects,
+  settings and logins stay either way (`--yes` answers only the first question). For a completely fresh start,
+  also delete the `Assistant/` folder in the vault: it then says hi and asks for a personality again.
+- **Every morning**: today's events, today's tasks and the overdue ones, today's reminders, what changed in the vault. Its
+  **dashboard** (its own port, on your tailnet like the HPC bot's) has Today, Tasks and Changes tabs. `/search`
+  also searches the vault's notes.
+- **Kept apart from the HPC bot.** On Linux the sandbox can't filter unix sockets by path, so each bot notes its
+  folders in `./state/bots/` and every bot's agent is denied the others' state and tmp folders (the HPC bot's SSH
+  connection socket is in its tmp folder), all of `./state`, and every `.env*` file. Its folders must be its own
+  (`./state/assistant`, `/tmp/overseer-assistant`), and the vault must be outside Overseer's folder.
+  The end-to-end test runs both bots side by side with the real CLIs and checks this.
+
 ## Configuration notes
+
+- **Updating an old config file**: `uv run overseer config` (or `-c assistant.yaml`) lists what you changed from
+  the defaults, the settings that are new since your file (with the example's suggestion), and the ones no longer
+  used; and writes `config.yaml.new`: the current example, comments and all, with your values in it. Settings
+  you never set keep their default, so it means exactly what your file did (that's checked before it's written).
+  Your file isn't touched: look the new one over, then `mv config.yaml.new config.yaml`.
 
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
@@ -466,26 +614,71 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 ```
 
 - `tests/test_integration.py` covers the monitor, agent sessions, job detection, the runners' sandbox settings and the bot. It uses fake SLURM (`tests/fake_slurm/`) and fake CLIs (`tests/fake_cli/`).
+- `tests/test_assistant.py` covers the assistant: tasks, reminders, the vault's history and undo, its config and sandbox, a whole turn.
 - `tests/test_e2e.py` runs the real Claude Code and Codex against a scripted model (`tests/fake_model_server.py`) and a local sshd. It is skipped unless sshd, bubblewrap, socat and the CLIs are available.
+
+### Architecture: a platform and its domains
+
+Overseer is a platform (`overseer/core`) with domains plugged into it (`overseer/hpc`, the SLURM jobs;
+`overseer/assistant`, the personal assistant). The platform
+runs agent conversations from Telegram: the Claude Code / Codex runners and their sandbox, the Telegram layer,
+the agent's control command, wake-ups, transcripts and search, usage, the digest and the dashboard. A domain adds
+what is its own through the hooks in `core/domain.py`: the agent's instructions and context, its sandbox additions
+and skills, what it watches in the agent's commands, its watch kinds, `ov` commands, Telegram commands and buttons,
+digest sections, dashboard tabs and searchable records. `config.yaml`'s `domain:` picks it (`hpc` by default), and
+its own config sections (`ssh`, `slurm`) live in `overseer/<domain>/config.py`.
+
+Each domain runs as its own process and Telegram bot, with its own config, state folder and secrets
+(`overseer run -c <its config>`). The platform never imports a domain's code (a test enforces it): it loads the
+domain by name.
+
+**The platform (`overseer/core`)**
 
 | module | role |
 |---|---|
-| `config.py` | config schema, `.env` loading; keeps local writes inside `local.allowed_roots` |
-| `sshlink.py` | Overseer's own key/config/known_hosts, the master connection, the agent's ssh wrappers |
-| `ssh.py`, `hpc.py` | Overseer's own read-only queries (squeue/sacct/scontrol, log tails) |
-| `monitor.py`, `slurm.py`, `diagnose.py` | polling → queued/started/status/final-report messages |
-| `runners.py` | Claude Code / Codex: sandbox settings, scrubbed env, event parsing, job detection |
-| `agent.py` | conversations, backend switching, command reports, "agent submitted job" tracking |
+| `domain.py` | the Domain interface: every hook a domain can fill, with neutral defaults |
+| `app.py` | one bot: the platform wired around its domain (`overseer run`) |
+| `config.py` | config schema, the domain's sections, `.env` loading; keeps local writes inside `local.allowed_roots` |
+| `runners.py` | Claude Code / Codex: sandbox settings (plus the domain's), scrubbed env, event parsing |
+| `agent.py` | conversations, backend switching, command reports, the domain's hooks around each run |
 | `live.py` | transcripts, the self-updating progress message, `overseer watch` |
-| `autopilot.py` | watches and timers that wake conversations, check-ins, pausing after a failed wake-up |
-| `metrics.py` | what matters in a job (`ov metrics`): critical/important metrics, progress, the extraction command, alerts |
-| `usage.py` | `/usage`: tokens and cost per day, by origin, backend and conversation |
-| `cluster.py` | `ov cluster`, `/cluster`, queued cards' estimated start: free GPUs/CPUs per partition, SLURM's start estimates, fairshare |
-| `dashboard.py`, `dashboard.html`, `dashboard.js` | the Mini App: a small read-only HTTP server (Telegram initData auth) and its page |
-| `search.py` | `ov history`, `/search`: a full-text index (SQLite FTS5, `state/search.db`) of transcripts, results, findings and jobs |
-| `digest.py` | the morning digest (and `/digest`): jobs, GPU time, results, agents, tokens |
-| `projects.py` | projects from config and Telegram, folder matching for jobs |
-| `ctl.py` | `ov`: the agent's requests to Overseer over a unix socket (jobs, projects, watches and timers, notifications); installs the `overseer` skill |
-| `compute.py` | `hpc-run` and the shared compute worker, the agent's ssh wrapper with the login-node CPU limit |
-| `richtext.py` | Markdown → Telegram HTML (fallback) and Rich Markdown, tag-safe message splitting, collapsible sections |
-| `bot.py` | Telegram commands, buttons, message → conversation routing |
+| `autopilot.py` | timers and the domain's watch kinds that wake conversations, pausing after a failed wake-up |
+| `ctl.py` | the agent's control command over a unix socket (projects, wake-ups, feedback, skills, subagents, history), plus the domain's commands |
+| `bot.py` | Telegram: the platform's commands and buttons, message → conversation routing, the domain's commands |
+| `subagents.py`, `feedback.py`, `addons.py` | planner mode; agents' feedback about Overseer; skills as addons |
+| `search.py` | `/search`, `ov history`: a full-text index (SQLite FTS5) of transcripts and the domain's records |
+| `digest.py` | the morning digest: the domain's sections, the agents, tokens, what waits for you |
+| `dashboard.py`, `dashboard.html` | the Mini App's server (Telegram initData auth) and page; the domain gives its tabs |
+| `usage.py`, `projects.py`, `store.py`, `notify.py`, `richtext.py` | `/usage`; projects; the database; messages; Markdown → Telegram |
+
+**The HPC domain (`overseer/hpc`)**
+
+| module | role |
+|---|---|
+| `domain.py` | HpcDomain: the hooks, filled in for SLURM jobs on the cluster |
+| `config.py` | the `ssh` and `slurm` sections and the paths derived from them |
+| `prompts.py` | the agent's instructions for the HPC |
+| `activity.py` | jobs the agent submits (sbatch), cancels (scancel), heavy work on the login node |
+| `sshlink.py`, `ssh.py`, `remote.py` | Overseer's own key/config/known_hosts, the master connection, the agent's ssh wrappers; Overseer's read-only queries |
+| `monitor.py`, `slurm.py`, `diagnose.py` | polling → live job cards, final reports, alerts, idle GPUs |
+| `watches.py` | job watches (`ov watch`), check-ins, alert and idle-GPU wake-ups |
+| `commands.py`, `telegram.py` | the HPC's `ov` commands; its Telegram commands and job-card buttons |
+| `metrics.py`, `plots.py`, `results.py` | what matters in a job, its graphs, results and findings |
+| `compute.py`, `cluster.py`, `quota.py` | `hpc-run` and the compute worker; `ov cluster`; disk quota |
+| `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | the HPC's digest sections, dashboard tabs and searchable records |
+
+**The assistant domain (`overseer/assistant`)**
+
+| module | role |
+|---|---|
+| `domain.py` | AssistantDomain: the vault-writing sandbox, persona and context, the vault's history around each reply (↩️ Undo) |
+| `config.py` | the `vault` section; its own state, tmp folders and token required |
+| `prompts.py`, `skills/assistant/SKILL.md` | the agent's instructions and its skill |
+| `vault.py` | the vault: its own notes (persona, about me, writing style, personality), daily notes, Syncthing conflicts, the history (git outside the vault) and undo |
+| `tasks.py`, `when.py` | Obsidian Tasks: parsing, selecting, adding, completing, recurrences; days and times as people write them |
+| `routines.py`, `scheduler.py` | Routines.md: parsing, times, follow-up policies; running them, the first hello |
+| `media.py` | `ov fetch` (public addresses only, media only, size-limited) and Giphy search; `ov capabilities` |
+| `reminders.py` | follow-ups: reminders, `say:` routines, check-backs on commitments, focus sessions (with follow-up policies) |
+| `calendar.py` | Google Calendar and iCal links: the login, reading events (every few minutes, two weeks ahead), free time, changes behind ✅ cards or with ↩️ Undo, reminders before events |
+| `commands.py`, `telegram.py` | `ov task`, `ov remind`, `ov cal`; /tasks, /task, /remind, /reminders, /undo, /vault, /persona and their buttons |
+| `digest.py`, `dashboard.py`, `dashboard.js`, `search.py` | its digest sections, dashboard tabs and the notes in search |

@@ -12,6 +12,9 @@ dependencies = [
     "markdown-it-py>=3",
     "python-telegram-bot>=21.0",
     "PyYAML>=6.0",
+    "httpx>=0.27",
+    "icalendar>=6",
+    "recurring-ical-events>=3",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +27,9 @@ overseer = "overseer.__main__:main"
 include = ["overseer*"]
 
 [tool.setuptools.package-data]
-overseer = ["skills/*/SKILL.md", "dashboard.html", "dashboard.js"]
+"overseer.hpc" = ["skills/*/SKILL.md", "dashboard.js"]
+"overseer.assistant" = ["skills/*/SKILL.md", "dashboard.js"]
+"overseer.core" = ["dashboard.html", "skills/*/SKILL.md", "skills/*/LICENSE"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

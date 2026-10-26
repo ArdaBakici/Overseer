@@ -4,6 +4,10 @@
 #   ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN - only if you don't use `overseer login claude_code`
 #   OPENAI_API_KEY / CODEX_API_KEY           - only if you don't use `overseer login codex`
 
+# Which bot this is: hpc (Overseer: SLURM jobs on the cluster). Each domain runs as its own bot and process, with
+# its own config file, state folder and secrets.
+domain: hpc
+
 local:
   # On THIS machine, Overseer and the agent only write inside these folders.
   # Relative paths are relative to the folder containing this config file (Overseer's folder).
@@ -11,6 +15,7 @@ local:
   state_dir: ./state        # DB, audit log, SSH key/config, the CLIs' logins and sessions
   tmp_dir: /tmp/overseer    # SSH connection socket + the agent's scratch directories (keep the path short)
   env_file: .env            # secrets (TELEGRAM_BOT_TOKEN, API keys); the agent can't read it
+  timezone: ""              # e.g. Europe/Istanbul; "" = this machine's time zone
 
 ssh:
   # Overseer uses its OWN key, ssh config and known_hosts in ./state/ssh - never ~/.ssh.
@@ -64,7 +69,9 @@ telegram:
   allowed_chat_ids: [123456789]
   rich_messages: true           # Telegram's native rich messages for agent replies (tables, formulas, plots inline)
   streaming: true               # live progress as a streaming draft with a Stop button
-  new_threads: false            # true: a message outside the topics ("All") starts a conversation of its own
+  topics: null                  # null: topics if the bot has threaded mode on in @BotFather; true / false: on / off
+  new_threads: false            # a message outside the topics ("All") goes to general; true: it starts a conversation of its own
+  general: topic                # the general conversation: a 💬 general topic, or "all": Telegram's "All" view itself
 
 agent:
   enabled: true
@@ -76,6 +83,9 @@ agent:
   allowed_domains: []           # internet hosts the agent's LOCAL shell may reach (HPC access needs none)
   deny_read: []                 # extra local paths the agent may never read
   llm_status_updates: false     # one-line LLM progress summary in periodic status messages
+  # The i-have-adhd output style (github.com/ayghri/i-have-adhd) for every agent of this bot, subagents too: replies
+  # lead with the next action, number their steps, restate where things stand, no tangents or filler.
+  i_have_adhd: false
 
   claude_code:
     command: claude
@@ -111,6 +121,13 @@ agent:
 digest:
   enabled: true
   time: "08:00"                 # this machine's local time
+
+# A folder of your Obsidian vault for this bot: research logs (one subfolder per project, General.md outside
+# projects), findings, results and the graphs of finished jobs, as notes. Its agent can read and write this folder and
+# nothing else of the vault. If the assistant bot uses the same vault, it can read the folder but not change it.
+obsidian:
+  folder: ""                    # e.g. /home/me/Vault/HPC (create it first; "" = off: research logs stay on the HPC)
+  max_figure_mb: 5              # graphs bigger than this aren't copied into the vault
 
 # The dashboard Mini App (/dashboard): served on this machine, reachable only on your tailnet.
 # Run `tailscale serve --bg 8765` once and put the https://….ts.net address it prints in url.

@@ -1,0 +1,96 @@
+# The personal assistant: a second bot, run from Overseer's folder next to the HPC bot. Copy to assistant.yaml,
+# edit, then:  overseer login claude_code -c assistant.yaml   and   overseer run -c assistant.yaml
+# Its memory is your Obsidian vault (kept in sync with your devices by Syncthing): it reads and writes notes there,
+# keeps a history of every change (outside the vault) and lets you undo each reply's changes.
+#
+# Secrets never go in this file. Its bot token goes in .env (the same file as the HPC bot's, or its own: env_file):
+#   ASSISTANT_BOT_TOKEN=123456789:...        - a second bot from @BotFather
+
+domain: assistant
+
+local:
+  allowed_roots: [".", "/tmp"]
+  # Its own folders (required): the HPC bot's (./state, /tmp/overseer) hold its SSH key and connection. Anywhere
+  # inside allowed_roots works; neither bot's agent can read the other's.
+  state_dir: ./state/assistant  # its DB, the vault's history (vault.git), its CLIs' logins and sessions
+  tmp_dir: /tmp/overseer-assistant
+  env_file: .env
+  timezone: Asia/Dubai          # the time zone you live in: its times, reminders, routines ("" = this machine's)
+
+# The Obsidian vault: the folder Syncthing keeps in sync on this machine. The agent may write it (except .obsidian/
+# and Syncthing's own files); it must be outside Overseer's folder.
+vault:
+  path: /home/you/Vault
+  assistant_dir: Assistant      # the assistant's own notes in the vault: Persona.md, About me.md, Memory/
+  tasks_file: ""                # where new tasks go; "" = Assistant/Tasks.md (tasks are read from the whole vault)
+  daily_folder: null            # daily notes; null = Obsidian's own setting (.obsidian/daily-notes.json)
+  daily_format: null            # e.g. YYYY-MM-DD; null = Obsidian's setting
+  history: true                 # record every change (git, in state_dir/vault.git) and offer ↩️ Undo
+
+# Pictures, GIFs and videos from the internet (its shell has none: Overseer downloads them - public addresses only,
+# media only - and notes each one in a 🌐 web topic).
+media:
+  fetch: true                   # ov fetch <url>
+  max_mb: 20
+  giphy_key_env: ""             # ov gif <query>: the .env variable with your Giphy API key, e.g. GIPHY_API_KEY; "" = off
+  giphy_rating: pg-13
+
+# Your calendars: the assistant sees your events and plans around them. Google Calendar: it changes events only in the
+# calendars listed under ask (after you tap ✅) or auto (at once, with ↩️ Undo), never ones with other people invited.
+# Set up: a Google Cloud project with the Calendar API, an OAuth client of type "Desktop app" (its id and secret in
+# .env), then: uv run overseer login google -c assistant.yaml
+calendar:
+  enabled: false                # Google Calendar
+  client_id_env: GOOGLE_CLIENT_ID
+  client_secret_env: GOOGLE_CLIENT_SECRET
+  read: []                      # calendars it sees, by name or id; [] = all of yours
+  ask: [primary]                # it may add/change events here after you tap ✅ (primary = your main calendar)
+  auto: []                      # ... and here at once (you see each change, with ↩️ Undo)
+  # Read-only calendars from iCal links (a timetable, a shared or published calendar): name: link, or the name of a
+  # variable in .env holding it (such links work like a password), e.g. {Uni: UNI_ICS_URL}. Works without Google too.
+  ics: {}
+  ics_minutes: 30               # how often each link is fetched again
+  event_reminders: 0            # a reminder this many minutes before each timed event; 0 = off
+  sync_minutes: 5
+
+telegram:
+  token_env: ASSISTANT_BOT_TOKEN  # the name of the variable in .env (not the token itself)
+  allowed_chat_ids: [123456789]
+  rich_messages: true
+  streaming: true
+  # Topics: one per project (a trip, a move, ...: you with /project new, or the assistant itself), plus 🛠 feedback
+  # and 🌐 web. Needs threaded mode for this bot in @BotFather. false: one conversation in a plain chat (/new starts
+  # afresh).
+  topics: false
+  # Where everyday talk lives with topics: "all" - Telegram's "All" view itself (in @BotFather, turn off users
+  # creating topics for the bot, or each message in "All" becomes a topic of its own); "topic" - a 💬 general topic.
+  general: all
+  new_threads: false            # true: a message in "All" starts a conversation (a topic) of its own instead
+
+agent:
+  enabled: true
+  backend: claude_code
+  timeout_minutes: 30
+  report_commands: summary      # summary (a list after each request) | live | "off": the commands it ran
+  live_progress: true
+  allowed_domains: []
+  i_have_adhd: false            # the i-have-adhd output style (github.com/ayghri/i-have-adhd) for its replies
+  claude_code:
+    model: null
+    home: ./state/assistant/claude   # its own login: overseer login claude_code -c assistant.yaml
+  codex:
+    model: null
+    home: ./state/assistant/codex
+
+digest:
+  enabled: true
+  time: "07:30"                 # today's tasks and reminders, what changed in the vault
+
+# The dashboard Mini App (/dashboard): today, tasks, the vault's changes. Its own port; on your tailnet only, e.g.
+#   tailscale serve --bg --https=8443 http://127.0.0.1:8766   ->   url: https://homelab.tail1234.ts.net:8443
+dashboard:
+  enabled: false
+  port: 8766
+  url: ""
+
+projects: {}

@@ -12,7 +12,14 @@ prog = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
 
 
-def load():
+def load():  # (a test may be rewriting it right now: read it again)
+    import time
+    for _ in range(50):
+        try:
+            with open(STATE) as fh:
+                return json.load(fh)
+        except ValueError:
+            time.sleep(0.02)
     with open(STATE) as fh:
         return json.load(fh)
 

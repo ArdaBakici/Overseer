@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Overseer</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: var(--tg-theme-bg-color, #fcfcfb);
+    --bg-2: var(--tg-theme-secondary-bg-color, #f1f0ec);
+    --text: var(--tg-theme-text-color, #0b0b0b);
+    --muted: var(--tg-theme-hint-color, #6b6a66);
+    --link: var(--tg-theme-link-color, #2a78d6);
+    --accent: var(--tg-theme-button-color, #2a78d6);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --line: color-mix(in srgb, var(--text) 12%, transparent);
+    --grid: color-mix(in srgb, var(--text) 8%, transparent);
+    /* job states (status palette: always shown with an icon, failures also hatched) */
+    --running: #2a78d6;
+    --good: #0ca30c;
+    --critical: #d03b3b;
+    --serious: #ec835a;
+    --pending: #a8a69f;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: var(--tg-theme-bg-color, #1a1a19);
+    --bg-2: var(--tg-theme-secondary-bg-color, #242422);
+    --text: var(--tg-theme-text-color, #f0efec);
+    --muted: var(--tg-theme-hint-color, #a3a29a);
+    --running: #3987e5;
+    --pending: #6b6a66;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: var(--tg-theme-bg-color, #1a1a19);
+      --bg-2: var(--tg-theme-secondary-bg-color, #242422);
+      --text: var(--tg-theme-text-color, #f0efec);
+      --muted: var(--tg-theme-hint-color, #a3a29a);
+      --running: #3987e5;
+      --pending: #6b6a66;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { padding: 0 16px 32px; overflow-x: hidden; }
+  header { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 12px 0 8px;
+    border-bottom: 1px solid var(--line); }
+  nav { display: flex; gap: 4px; overflow-x: auto; }
+  nav button { flex: 1 0 auto; border: 0; border-radius: 8px; padding: 8px 12px; font: inherit; font-weight: 600;
+    background: var(--bg-2); color: var(--text); }
+  nav button[aria-selected="true"] { background: var(--accent); color: var(--accent-text); }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
+  select, input[type="search"] { font: inherit; color: var(--text); background: var(--bg-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 8px; min-width: 0; }
+  input[type="search"] { flex: 1 1 140px; }
+  .chip { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 999px;
+    padding: 4px 10px; font: inherit; font-size: 13px; }
+  .chip[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .empty, .error { padding: 24px 0; text-align: center; color: var(--muted); }
+  .error { color: var(--critical); }
+  details.job { border-bottom: 1px solid var(--line); padding: 10px 0; }
+  details.job summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: auto 1fr auto; gap: 8px;
+    align-items: baseline; }
+  details.job summary::-webkit-details-marker { display: none; }
+  .jid { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .badge { font-size: 12px; padding: 1px 6px; border-radius: 6px; background: var(--bg-2); color: var(--muted); }
+  .card { white-space: pre-wrap; margin: 8px 0; font-size: 14px; }
+  pre { white-space: pre-wrap; word-break: break-word; background: var(--bg-2); padding: 8px; border-radius: 8px;
+    font-size: 12px; max-height: 50vh; overflow: auto; }
+  .carousel { margin: 8px 0; }
+  .carousel img { width: 100%; border-radius: 8px; background: #fff; }
+  .carousel .nav { display: flex; justify-content: center; gap: 12px; align-items: center; margin-top: 4px; }
+  button.plain { border: 1px solid var(--line); background: var(--bg-2); color: var(--text); border-radius: 8px;
+    padding: 4px 12px; font: inherit; }
+  .table-wrap { overflow-x: auto; margin: 0 -16px; padding: 0 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--bg); cursor: pointer; user-select: none; font-weight: 600; }
+  th[aria-sort="ascending"]::after { content: " ▲"; font-size: 10px; }
+  th[aria-sort="descending"]::after { content: " ▼"; font-size: 10px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.wrap { white-space: normal; min-width: 180px; }
+  tr.more td { white-space: normal; color: var(--muted); }
+  tr.more .detail { position: sticky; left: 0; max-width: calc(100vw - 32px); }
+  td.wrap { max-width: 320px; }
+  .finding { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; margin: 8px 0; }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; background: var(--c); vertical-align: -1px; }
+  #tl svg { display: block; width: 100%; }
+  #tl text { fill: var(--text); font-size: 12px; }
+  #tl .axis text { fill: var(--muted); font-size: 11px; }
+  #tl .grid line { stroke: var(--grid); }
+  #tl rect.bar { cursor: pointer; }
+  #tip { position: fixed; z-index: 10; pointer-events: none; background: var(--bg-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; max-width: 260px; display: none;
+    box-shadow: 0 4px 16px rgba(0,0,0,.15); }
+</style>
+</head>
+<body>
+<header>
+  <nav role="tablist"></nav>
+</header>
+<main id="main"><div class="empty">Loading…</div></main>
+<div id="tip" role="tooltip"></div>
+<script src="/app.js"></script>
+</body>
+</html>

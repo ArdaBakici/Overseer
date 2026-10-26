@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 config.yaml
+assistant.yaml
 *.db
 *.db-journal
 audit.log

@@ -27,13 +27,14 @@ from pathlib import Path
 import pytest
 
 from fake_model_server import FakeModel
-from overseer.agent import Agent
-from overseer.config import Config
-from overseer.hpc import HPC
-from overseer.runners import _toml
-from overseer.ssh import SSHRunner
-from overseer.sshlink import setup_key, write_configs
-from overseer.store import Store
+from overseer.core.agent import Agent
+from overseer.hpc.domain import HpcDomain
+from overseer.core.config import Config
+from overseer.hpc.remote import HPC
+from overseer.core.runners import _toml
+from overseer.hpc.ssh import SSHRunner
+from overseer.hpc.sshlink import setup_key, write_configs
+from overseer.core.store import Store
 
 FAKE_SLURM = Path(__file__).parent / "fake_slurm"
 SSHD = shutil.which("sshd") or ("/usr/sbin/sshd" if os.path.exists("/usr/sbin/sshd") else None)
@@ -207,22 +208,22 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
     write_configs(cfg)
     (app / ".env").write_text("TELEGRAM_BOT_TOKEN=999:super-secret-token\n")
     (app / ".env").chmod(0o600)
-    from overseer import live
+    from overseer.core import live
     monkeypatch.setattr(live, "PROGRESS_SECONDS", 0.2)
     with FakeModel(script, think=True) as fm:
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
-        from overseer.ctl import ControlServer
-        from overseer.projects import Projects
-        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
+        from overseer.core.ctl import ControlServer
+        from overseer.core.projects import Projects
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes)
         await ctl.start()
         s = agent.general_session()
         # The wake-up instructions must reach the model through each CLI's own mechanism.
-        from overseer.autopilot import Autopilot
-        autopilot = Autopilot(cfg, store, agent, notes, agent.hpc)
+        from overseer.core.autopilot import Autopilot
+        autopilot = Autopilot(cfg, store, agent, notes)
         try:
             await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
         finally:
@@ -325,7 +326,7 @@ async def test_compaction_end_to_end(hpc, backend, cli_name):
             cfg.agent.codex.extra_config.append("model_auto_compact_token_limit=20000")
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         s = agent.general_session()
         await asyncio.wait_for(agent.handle(s, "Run the checks."), 180)
@@ -369,7 +370,7 @@ async def test_only_tools_that_work_within_a_turn(hpc, backend, cli_name):
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         await asyncio.wait_for(agent.handle(agent.general_session(), "Run the checks."), 180)
         main = next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"]))
@@ -410,15 +411,15 @@ async def test_planner_mode_end_to_end(hpc, planner, worker, worker_model, plann
             configure_backend(cfg, b, clis[b], fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(planner)
-        from overseer.autopilot import Autopilot
-        from overseer.ctl import ControlServer
-        from overseer.projects import Projects
-        from overseer.subagents import Subagents
-        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes, agent.hpc)
+        from overseer.core.autopilot import Autopilot
+        from overseer.core.ctl import ControlServer
+        from overseer.core.projects import Projects
+        from overseer.core.subagents import Subagents
+        ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes)
         await ctl.start()
-        Autopilot(cfg, store, agent, notes, agent.hpc)
+        Autopilot(cfg, store, agent, notes)
         subs = Subagents(cfg, store, agent, notes)
         s = agent.general_session()
         try:
@@ -461,13 +462,13 @@ async def test_installed_skills_reach_the_cli(hpc, backend, cli_name):
     if not cli:
         pytest.skip(f"{cli_name} not installed")
     cfg, remote, state, app = hpc
-    from overseer.addons import Addons
-    from overseer.store import SkillRecord
+    from overseer.core.addons import Addons
+    from overseer.core.store import SkillRecord
     with FakeModel(["echo hi"]) as fm:
         configure_backend(cfg, backend, cli, fm)
         store = Store(cfg.local.db_path)
         notes = Notes()
-        agent = Agent(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup))
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
         agent.set_backend(backend)
         Addons(store, agent, notes)
         text = ("---\nname: cluster-long-jobs\ndescription: How to run jobs longer than 24 h on this cluster "
@@ -476,3 +477,185 @@ async def test_installed_skills_reach_the_cli(hpc, backend, cli_name):
         await asyncio.wait_for(agent.handle(agent.general_session(), "Run the checks."), 120)
         body = json.dumps(next(r["body"] for r in fm.requests if "Run the checks." in json.dumps(r["body"])))
         assert "cluster-long-jobs" in body and "jobs longer than 24 h on this cluster" in body, body[:3000]
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_assistant_sandbox_end_to_end(hpc, backend, cli_name, tmp_path):
+    """The assistant bot next to the HPC bot, on the same machine: its agent writes the vault (not Obsidian's
+    settings), uses `ov`, and can't reach anything of the HPC bot's - its SSH master connection, key or folders."""
+    from overseer.assistant.domain import AssistantDomain
+    from overseer.core.ctl import ControlServer
+    from overseer.core.projects import Projects
+    from overseer.hpc.sshlink import ensure_master
+
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    hcfg, remote, state, app = hpc
+    hcfg.local.register("hpc")  # the HPC bot ran from this folder: its folders are noted
+    await ensure_master(hcfg)  # ...and its SSH connection to the HPC is open
+    sock = hcfg.control_socket
+    assert sock.exists()
+    vault = tmp_path / "Vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".obsidian" / "app.json").write_text("{}")
+    (vault / "Journal.md").write_text("# Journal\n")
+    short = tempfile.mkdtemp(prefix="ova-", dir="/tmp")
+    cfg = Config(domain="assistant")
+    cfg.local.base_dir = str(app)
+    cfg.local.state_dir = "./state/assistant"
+    cfg.local.tmp_dir = short
+    cfg.telegram.token_env = "ASSISTANT_BOT_TOKEN"
+    cfg.telegram.allowed_chat_ids = [1]
+    cfg.vault.path = str(vault)
+    cfg.agent.timeout_minutes = 3
+    cfg.validate()
+    for d in (cfg.local.state(), cfg.local.tmp()):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg.local.register("assistant")
+    (app / ".env").write_text("ASSISTANT_BOT_TOKEN=999:assistant-secret\n")
+    probe = f"import socket; s = socket.socket(socket.AF_UNIX); s.connect({str(sock)!r}); print('MASTER-CONNECTED')"
+    script = [
+        f"echo '- written by the agent' >> {vault / 'Journal.md'} && echo VAULT-WRITE-OK",
+        f"echo hacked > {vault / '.obsidian' / 'app.json'} 2>&1; cat {vault / '.obsidian' / 'app.json'}; echo OBSIDIAN-DONE",
+        f"python3 -c \"{probe}\" 2>&1 | tail -1; echo MASTER-DONE",
+        f"ssh -S {sock} -O check hpc 2>&1; ssh -S {sock} hpc 'echo REMOTE-REACHED' 2>&1 | tail -1; echo SSH-DONE",
+        f"ls {Path(hcfg.local.tmp_dir)} 2>&1; echo HPCTMP-DONE",
+        f"cat {hcfg.ssh_key} 2>&1 | head -c 60; echo; echo KEY-DONE",
+        f"cat {app / '.env'} 2>&1; echo ENV-DONE",
+        f"touch {app / 'assistant-was-here'} 2>&1; echo APPWRITE-DONE",
+        "ov task add 'E2E task' --due tomorrow",
+        "cat .agents/skills/assistant/SKILL.md 2>&1 | head -2; echo SKILL-DONE",
+        "ov commit 2h 'send the e2e report' && ov focus 25m 'first paragraph' && ov followup list",
+        f"printf '# Routines\\n## Meds\\n- when: every day 09:30\\n- say: Meds\\n' > '{vault / 'Assistant' / 'Routines.md'}'"
+        " && ov routine check",
+        "ov fetch http://127.0.0.1:8765/api/today; ov capabilities | head -3; ov history day | head -2",
+    ]
+    try:
+        with FakeModel(script) as fm:
+            configure_backend(cfg, backend, cli, fm)
+            store = Store(cfg.local.db_path)
+            notes = Notes()
+            domain = AssistantDomain(cfg, store, notes)
+            domain.prepare()
+            agent = Agent(cfg, store, notes, domain)
+            agent.set_backend(backend)
+            ctl = ControlServer(cfg, agent, Projects(cfg, store, agent), notes)
+            await ctl.start()
+            s = agent.general_session()
+            try:
+                await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+            finally:
+                await ctl.stop()
+        outs = fm.outputs
+        detail = f"\n\nTELEGRAM:\n{notes.texts()}\n\nTOOL OUTPUTS:\n" + "\n====\n".join(outs)
+        if os.environ.get("OVERSEER_E2E_VERBOSE"):
+            print(detail)
+        assert len(outs) >= len(script), detail
+        assert "VAULT-WRITE-OK" in outs[0] and "written by the agent" in (vault / "Journal.md").read_text(), detail
+        assert (vault / ".obsidian" / "app.json").read_text() == "{}", detail       # Obsidian's settings: refused
+        assert "MASTER-CONNECTED" not in outs[2] and "MASTER-DONE" in outs[2], detail  # the HPC's SSH master: no
+        assert "REMOTE-REACHED" not in outs[3] and "SSH-DONE" in outs[3], detail
+        assert "master.sock" not in outs[4] and "agent-ssh" not in outs[4], detail  # the HPC bot's tmp folder
+        assert "PRIVATE KEY" not in outs[5] and "KEY-DONE" in outs[5], detail
+        assert "assistant-secret" not in outs[6] and "ENV-DONE" in outs[6], detail
+        assert not (app / "assistant-was-here").exists(), detail
+        assert "✓ added to Assistant/Tasks.md: E2E task 📅" in outs[8], detail
+        assert "E2E task" in (vault / "Assistant" / "Tasks.md").read_text()
+        if backend == "codex":
+            assert "name: assistant" in outs[9], detail
+        assert "✓ r" in outs[10] and "focus until" in outs[10] and "send the e2e report" in outs[10], detail
+        assert "✓ Meds (say): every day 09:30" in outs[11], detail
+        assert "private address" in outs[12] and "What you can send" in outs[12], detail
+        reply = notes.sent[-1]
+        assert reply.buttons and reply.buttons[0][0][0] == "↩️ Undo", detail
+        assert "Journal.md" in reply.text and "Assistant/Tasks.md" in reply.text, detail
+        body = json.dumps([r["body"] for r in fm.requests if r["body"].get("tools")][0])
+        assert "a personal assistant" in body and "You are Overseer's agent" not in body
+        assert "assistant: How to work as the user's personal assistant" in body  # its skill, not the HPC's
+        assert "overseer: How to talk to Overseer" not in body
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_hpc_vault_folder_end_to_end(hpc, backend, cli_name, tmp_path):
+    """The HPC bot's folder in the Obsidian vault (obsidian.folder): its agent reads and writes there, and can't read
+    (or write) anything else of the vault - other notes, Obsidian's settings."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    vault = tmp_path / "Vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".obsidian" / "app.json").write_text('{"secret-setting": 1}')
+    (vault / "Personal").mkdir()
+    (vault / "Personal" / "Journal.md").write_text("PRIVATE-JOURNAL\n")
+    (vault / "Ideas.md").write_text("PRIVATE-IDEAS\n")
+    (vault / "HPC" / "proj").mkdir(parents=True)
+    (vault / "HPC" / "proj" / "Research log.md").write_text("# Research log\nEARLIER-ENTRY\n")
+    cfg.obsidian.folder = str(vault / "HPC")
+    cfg.validate()
+    log = vault / "HPC" / "proj" / "Research log.md"
+    script = [
+        f"cat '{log}'; echo '- new entry' >> '{log}' && echo HPC-WRITE-OK",
+        f"mkdir -p '{vault / 'HPC' / 'proj' / 'figures'}' && cp /etc/hostname '{vault / 'HPC' / 'proj' / 'figures' / 'a.txt'}' && echo FIG-OK",
+        f"cat '{vault / 'Personal' / 'Journal.md'}' 2>&1; echo PERSONAL-DONE",
+        f"cat '{vault / 'Ideas.md'}' 2>&1; echo IDEAS-DONE",
+        f"cat '{vault / '.obsidian' / 'app.json'}' 2>&1; echo OBSIDIAN-DONE",
+        f"grep -r PRIVATE '{vault}' 2>&1 | head -3; echo GREP-DONE",
+        f"echo x > '{vault / 'new.md'}' 2>&1; echo x >> '{vault / 'Ideas.md'}' 2>&1; echo ROOTWRITE-DONE",
+    ]
+    with FakeModel(script) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        await asyncio.wait_for(agent.handle(s, "Run the checks."), 240)
+    outs = fm.outputs
+    detail = "\n\nTOOL OUTPUTS:\n" + "\n====\n".join(outs)
+    if os.environ.get("OVERSEER_E2E_VERBOSE"):
+        print(detail)
+    assert len(outs) >= len(script), detail
+    assert "EARLIER-ENTRY" in outs[0] and "HPC-WRITE-OK" in outs[0], detail
+    assert "- new entry" in log.read_text(), detail
+    assert "FIG-OK" in outs[1] and (vault / "HPC" / "proj" / "figures" / "a.txt").exists(), detail
+    for i in (2, 3, 4, 5):
+        assert "PRIVATE" not in outs[i] and "secret-setting" not in outs[i], detail
+    assert "Ideas.md" not in outs[5] and "Personal" not in outs[5], detail  # (not even the names: the vault's denied)
+    assert not (vault / "new.md").exists() and (vault / "Ideas.md").read_text() == "PRIVATE-IDEAS\n", detail
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_new_instructions_reach_a_resumed_conversation(hpc, backend, cli_name):
+    """Both CLIs keep the instructions a conversation began with when it's resumed (a new --append-system-prompt /
+    developer_instructions is ignored), so a setting that changes them (e.g. agent.i_have_adhd) would never reach an
+    ongoing conversation: Overseer hands over the sections that changed, once."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    with FakeModel([]) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        await asyncio.wait_for(agent.handle(s, "FIRST-REQUEST"), 240)
+        assert s.rec.cli_session_id
+        await asyncio.wait_for(agent.handle(s, "SECOND-REQUEST"), 240)  # (unchanged: nothing handed over)
+        cfg.agent.i_have_adhd = True
+        await asyncio.wait_for(agent.handle(s, "THIRD-REQUEST"), 240)
+        await asyncio.wait_for(agent.handle(s, "FOURTH-REQUEST"), 240)
+
+    def request(marker):  # (the first request with it: the one made for that turn)
+        bodies = [json.dumps(r["body"]) for r in fm.requests if marker in json.dumps(r["body"])]
+        return bodies[0] if bodies else ""
+    second, third, fourth = request("SECOND-REQUEST"), request("THIRD-REQUEST"), request("FOURTH-REQUEST")
+    assert second and third and fourth and "FIRST-REQUEST" in fourth  # (resumed: the same conversation)
+    assert "instructions_update" not in second and "i-have-adhd (always on)" not in second
+    assert "<instructions_update>" in third and "i-have-adhd (always on)" in third, "not handed over"
+    assert fourth.count("<instructions_update>") == 1  # (once: not again with every request)
