@@ -165,6 +165,11 @@ class TelegramConfig:
     # With topics: a message written outside them (Telegram's "All" view) goes to the general conversation; true: it
     # starts a new conversation of its own.
     new_threads: bool = False
+    # With topics, where the general conversation (everything that's about no project) lives: "topic" - a 💬 general
+    # topic Overseer makes; "all" - Telegram's "All" view itself (no general topic; projects, 🛠 feedback and
+    # 🌐 web keep theirs). For "all", turn off users creating topics for the bot in @BotFather, or every message
+    # written in "All" becomes a topic of its own.
+    general: str = "topic"
 
     @property
     def token(self) -> str:
@@ -359,6 +364,8 @@ class Config:
             raise ConfigError(f"agent.backend must be one of {', '.join(BACKENDS)}")
         if self.agent.report_commands is False:  # (YAML reads an unquoted `off` as false)
             self.agent.report_commands = "off"
+        if self.telegram.general not in ("topic", "all"):
+            raise ConfigError("telegram.general must be topic or all")
         if self.agent.report_commands not in ("summary", "live", "off"):
             raise ConfigError("agent.report_commands must be summary, live or off")
         self.local.resolve(self.agent.claude_code.home)

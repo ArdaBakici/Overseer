@@ -3949,3 +3949,60 @@ async def test_an_existing_topic_is_never_deleted_and_general_finds_its_way_back
         raise BadRequest("Message thread not found")
     tg.send_chat_action = action_gone
     assert not await notifier.topic_exists(1, 777)
+
+
+async def test_general_in_all(env, monkeypatch):
+    """telegram.general: all (the assistant's choice) - the general conversation is Telegram's "All" itself: no
+    general topic (an earlier one is deleted), messages there go to the agent as they are, and what's general is
+    sent there; projects and the side topics keep their topics."""
+    from overseer.core.bot import Bot, TelegramNotifier
+    env.cfg.telegram.general = "all"
+    env.cfg.validate()
+    tg = FakeTelegram()
+    deleted = []
+
+    async def delete_forum_topic(chat_id, message_thread_id):
+        deleted.append(message_thread_id)
+    tg.delete_forum_topic = delete_forum_topic
+    env.store.set("general_topic:1", "77")  # (the general topic of before)
+    notifier = TelegramNotifier(NS(bot=tg), [1], env.store, general_in_all=True)
+    assert await notifier.detect_topics()
+    await notifier.ensure_general_topic()
+    assert deleted == [77] and not env.store.get("general_topic:1") and notifier.general_thread(1) is None
+    assert not [c for c in tg.created if c[1] == "general"]
+    projects = make_projects(env)
+    projects.create("japan", "/scratch/me/japan")
+    await notifier.ensure_topic("japan")
+    await notifier.ensure_feedback_topic()
+    assert notifier.feedback_thread(1)  # (🛠 feedback: still a topic of its own)
+    bot = Bot(env.cfg, app=NS(bot=tg), store=env.store, agent=env.agent, notifier=notifier, projects=projects)
+    started = []
+
+    async def fake_run_agent(chat_id, session, text, files=None):
+        started.append((session.id, text))
+    monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
+
+    async def drain():
+        for t in list(bot._tasks):
+            await t
+    main = env.agent.general_session().id
+    # Written in "All": the general conversation, nothing deleted or echoed.
+    n = len(tg.sent)
+    await bot.on_text(topic_update("add renew mac before 2pm"), None)
+    await drain()
+    assert started == [(main, "add renew mac before 2pm")] and len(tg.sent) == n and deleted == [77]
+    # Its replies (and everything general) go to "All".
+    await notifier.send(Outgoing("🤖 added", session_id=main))
+    assert tg.sent[-1] == (1, None, "🤖 added")
+    # A project's topic is still its own.
+    await bot.on_text(topic_update("flights?", thread=projects.get("japan").thread_map["1"]), None)
+    await drain()
+    assert env.agent.get(started[-1][0]).project == "japan"
+    # If users may still create topics, a message in "All" arrives as a topic of its own: moved into "All".
+    await bot.on_text(topic_update("hello", thread=950, message_id=951), None)
+    await drain()
+    assert started[-1] == (main, "hello") and deleted[-1] == 950
+    assert any(th is None and "From “All”" in t for _, th, t in tg.sent)
+    env.cfg.telegram.general = "everywhere"
+    with pytest.raises(ConfigError, match="telegram.general"):
+        env.cfg.validate()

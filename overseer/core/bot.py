@@ -88,7 +88,7 @@ class TelegramNotifier:
     in private chats enabled); otherwise they are labelled with the project's name."""
 
     def __init__(self, app: Application, chat_ids: list[int], store: Store, rich: bool = True,
-                 streaming: bool = True, use_topics: bool | None = None):
+                 streaming: bool = True, use_topics: bool | None = None, general_in_all: bool = False):
         self.app = app
         self.chat_ids = chat_ids
         self.store = store
@@ -97,6 +97,8 @@ class TelegramNotifier:
         self.use_topics = use_topics  # telegram.topics: None = the bot's own mode (@BotFather)
         self.topics = False  # set by detect_topics()
         self.topic_mode = False  # the bot's mode in @BotFather
+        self.general_in_all = general_in_all  # telegram.general: all - the general conversation is "All" itself
+        self.users_create_topics = False  # @BotFather: users may make topics (then a message in "All" becomes one)
         self._drafts: dict[int, str | None] = {}  # live draft id -> conversation
         self._recreated: dict[str, float] = {}  # project -> when its topic was last recreated
         # Messages Telegram couldn't be reached for (the network was down): sent once it can be, oldest first.
@@ -110,6 +112,7 @@ class TelegramNotifier:
         try:
             me = await self.app.bot.get_me()
             self.topic_mode = bool(getattr(me, "has_topics_enabled", False))
+            self.users_create_topics = bool(getattr(me, "allows_users_to_create_topics", False))
         except Exception:
             log.warning("could not check whether the bot has topics enabled", exc_info=True)
         if self.use_topics and not self.topic_mode:
@@ -592,12 +595,27 @@ class TelegramNotifier:
         return None
 
     def general_thread(self, chat_id: int) -> int | None:
-        """The "general" topic: everything that belongs to no project."""
+        """The "general" topic: everything that belongs to no project (None: "All" itself, telegram.general)."""
+        if self.general_in_all:
+            return None
         v = self.store.get(f"general_topic:{chat_id}")
         return int(v) if v else None
 
     async def ensure_general_topic(self) -> None:
         if not self.topics:
+            return
+        if self.general_in_all:  # "All" is the general conversation: a general topic of before goes
+            for chat_id in self.chat_ids:
+                old = [*json.loads(self.store.get(f"general_topic_old:{chat_id}") or "[]"),
+                       *([int(v)] if (v := self.store.get(f"general_topic:{chat_id}")) else [])]
+                for thread in old:
+                    try:
+                        await self.app.bot.delete_forum_topic(chat_id, thread)
+                        log.info("general topic %s deleted: the general conversation is in \"All\" now", thread)
+                    except Exception:
+                        log.info("could not delete the old general topic %s", thread, exc_info=True)
+                self.store.unset(f"general_topic:{chat_id}")
+                self.store.unset(f"general_topic_old:{chat_id}")
             return
         for chat_id in self.chat_ids:
             if not self.general_thread(chat_id):
@@ -1086,6 +1104,8 @@ class Bot:
         makes the message a topic of its own (one nobody assigned yet) or sends it with no topic at all."""
         if self.cfg.telegram.new_threads or not getattr(self.notifier, "topics", False):
             return False
+        if getattr(self.notifier, "general_in_all", False) and not self._thread(update):
+            return False  # ("All" is the general conversation)
         if self._replied_session(update):  # a reply to one of Overseer's messages: that conversation
             return False
         thread = self._thread(update)

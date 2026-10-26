@@ -13,6 +13,7 @@ import logging
 import os
 
 from .config import Config, ConfigError
+from .notify import Outgoing
 
 log = logging.getLogger("overseer")
 
@@ -20,6 +21,10 @@ TG_CONNECT_TIMEOUT = 15
 TG_READ_TIMEOUT = 60
 TG_WRITE_TIMEOUT = 30
 TG_MEDIA_WRITE_TIMEOUT = 120  # (uploading a picture, GIF, video or file)
+USERS_TOPICS_NOTE = ("⚠️ The general conversation is in “All” (telegram.general: all), but this bot lets you create "
+                     "topics, so Telegram turns each message you write in “All” into a topic of its own. Overseer "
+                     "moves those into “All” for now; for a clean chat, turn that off in @BotFather: your bot → Bot "
+                     "Settings → Threaded mode → users can't create topics.")
 
 CORE_MENU = [
     ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
@@ -73,6 +78,8 @@ def build(cfg: Config):
     async def post_init(app: Application) -> None:
         if await notifier.detect_topics():  # a topic per project, and "general", in the chat with the bot
             await notifier.ensure_general_topic()
+            if notifier.general_in_all and notifier.users_create_topics:
+                await notifier.send(Outgoing(USERS_TOPICS_NOTE, silent=True))
             for proj in projects.active():
                 await notifier.ensure_topic(proj.name)
             await domain.start(notifier, projects)  # the domain's topics (e.g. the HPC's jobs topics)
@@ -125,7 +132,8 @@ def build(cfg: Config):
         .build()
     )
     notifier = TelegramNotifier(app, cfg.telegram.allowed_chat_ids, store, rich=cfg.telegram.rich_messages,
-                                streaming=cfg.telegram.streaming, use_topics=cfg.telegram.topics)
+                                streaming=cfg.telegram.streaming, use_topics=cfg.telegram.topics,
+                                general_in_all=cfg.telegram.general == "all")
     domain = domain_factory(cfg)(cfg, store, notifier)  # this bot: the HPC (Overseer), ...
     domain.prepare()  # e.g. the HPC's ssh configs and the agent's ssh wrappers
     agent = Agent(cfg, store, notifier, domain)

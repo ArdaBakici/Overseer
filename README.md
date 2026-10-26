@@ -549,11 +549,15 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   like a password - the name of a variable in `.env` holding it: `ics: {Uni: UNI_ICS_URL}` and
   `UNI_ICS_URL=https://...` in `.env`. Overseer fetches each one every `ics_minutes` (30) and works out repeating
   events, their exceptions and time zones itself. They work without Google too (`enabled: false`).
-- **Topics, like the HPC bot** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in
-  @BotFather. Overseer then makes the topics: 💬 general for everyday talk, and one per project, a lasting
-  subject such as a trip or a move (`/project new japan Trip in April`, or the assistant creates one with
-  `ov project new`, optionally with a notes folder in the vault). Writing in "All" goes to 💬 general, as for the HPC
-  bot. With `topics: false` (the example's default) it's one plain chat.
+- **Topics** (optional): set `telegram.topics: true` and switch on threaded mode for the bot in @BotFather.
+  Everyday talk stays in Telegram's "All" view itself (`telegram.general: all`, the example's choice): no general
+  topic. Overseer makes one topic per project, a lasting subject such as a trip or a move (`/project new japan Trip
+  in April`, or the assistant creates one with `ov project new`, optionally with a notes folder in the vault), plus
+  🛠 feedback and 🌐 web. In @BotFather (your bot → Bot Settings → Threaded mode), turn off users creating topics:
+  otherwise Telegram turns each message you write in "All" into a topic of its own (Overseer then moves it into
+  "All" and tells you once at startup). Switching to `all` deletes a 💬 general topic of before; the conversation
+  itself carries on in "All". `general: topic` keeps a 💬 general topic, as the HPC bot does. With `topics: false`
+  (the example's default) it's one plain chat.
 - **Media and reactions.** `.gif` files in a reply play as animations and videos as videos. Its shell has no
   internet, so `ov fetch <url>` has Overseer download a picture, GIF or video for it: public addresses only (never
   this machine, the LAN or the tailnet; the address is checked and pinned, redirects too), recognised by its

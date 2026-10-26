@@ -71,6 +71,7 @@ telegram:
   streaming: true               # live progress as a streaming draft with a Stop button
   topics: null                  # null: topics if the bot has threaded mode on in @BotFather; true / false: on / off
   new_threads: false            # a message outside the topics ("All") goes to general; true: it starts a conversation of its own
+  general: topic                # the general conversation: a 💬 general topic, or "all": Telegram's "All" view itself
 
 agent:
   enabled: true
