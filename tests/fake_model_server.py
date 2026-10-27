@@ -9,6 +9,8 @@ the CLI's shell tool with the next command; once all commands ran it answers
 With `think=True` each tool call is preceded by a reasoning summary ("THOUGHT <n>") and a
 short message ("NOTE <n>"), like real models' thinking and progress updates.
 All tool outputs the CLI sends back are recorded in `.outputs` (in order).
+`.fail_next = n`: the next n requests that offer tools fail like the account is out of usage (the Anthropic API's
+"credit balance is too low", the OpenAI API's usage_limit_reached).
 """
 
 import json
@@ -33,6 +35,7 @@ class FakeModel:
         self.input_tokens = input_tokens
         self.requests = []
         self.outputs: list[str] = []
+        self.fail_next = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -80,6 +83,14 @@ class FakeModel:
                 fake.requests.append({"path": path, "body": body})
                 if path.endswith("/count_tokens"):
                     return self._json({"input_tokens": 10})
+                if fake.fail_next and body.get("tools"):
+                    fake.fail_next -= 1
+                    if path.endswith("/messages"):
+                        return self._json({"type": "error", "error": {
+                            "type": "invalid_request_error", "message": "Your credit balance is too low to access the "
+                            "Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}, 400)
+                    return self._json({"error": {"type": "usage_limit_reached", "message": "The usage limit has been "
+                                                 "reached", "plan_type": "plus", "resets_in_seconds": 5400}}, 429)
                 if path.endswith("/messages"):
                     events = fake.anthropic(body)
                 elif path.endswith("/responses"):

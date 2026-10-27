@@ -3,7 +3,8 @@
     overseer ssh setup [--import KEY]   (the HPC bot) create Overseer's own SSH key/config in the Overseer folder
     overseer ssh connect                open the SSH connection interactively (for 2FA clusters)
     overseer ssh test                   check the connection works
-    overseer login claude_code|codex    log the agent CLI in (stored in the state dir)
+    overseer login claude_code|codex    log the agent CLI in (stored in the state dir); with several accounts
+                                        (agent.<cli>.accounts): --account <name>, each in turn
     overseer login google               (the assistant) connect your Google Calendar
     overseer sessions                   list agent conversations
     overseer open [conversation]        open a conversation in Claude Code / Codex (default: latest)
@@ -79,16 +80,21 @@ async def check(cfg: Config) -> int:
             if not shutil.which(cmd):
                 print(f"[skip] {backend}: {cmd!r} not installed")
                 continue
-            try:
-                reply = await asyncio.wait_for(
-                    runner.text(system="You are a connectivity check.", prompt="Reply with exactly: OK"), 120)
-                report(f"{backend} model call", "OK" in reply, reply[:200])
-            except asyncio.TimeoutError:
-                report(f"{backend} model call", False,
-                       f"no answer within 2 minutes (not logged in?)\n  (log in with: overseer login {backend} -c <config>)")
-            except Exception as e:
-                report(f"{backend} model call", False,
-                       f"{e}\n  (log in with: overseer login {backend} -c <config>)")
+            accounts = agent.accounts.names(backend)
+            for account in accounts:  # (each login: the runner reads the home at each run)
+                runner.c.home = agent.accounts.homes[backend][account]
+                name = f"{backend} ({account}) model call" if len(accounts) > 1 else f"{backend} model call"
+                login_hint = f"overseer login {backend}" + (f" --account {account}" if len(accounts) > 1 else "")
+                try:
+                    reply = await asyncio.wait_for(
+                        runner.text(system="You are a connectivity check.", prompt="Reply with exactly: OK"), 120)
+                    report(name, "OK" in reply, reply[:200])
+                except asyncio.TimeoutError:
+                    report(name, False, f"no answer within 2 minutes (not logged in?)\n  (log in with: {login_hint} "
+                                        "-c <config>)")
+                except Exception as e:
+                    report(name, False, f"{e}\n  (log in with: {login_hint} -c <config>)")
+            agent.accounts.apply(backend)
         print(f"active agent backend: {agent.backend}")
     return 0 if ok else 1
 
@@ -160,7 +166,7 @@ def ssh_command(cfg: Config, action: str, import_from: str | None) -> int:
     return 2
 
 
-def login(cfg: Config, backend: str, extra: list[str]) -> int:
+def login(cfg: Config, backend: str, extra: list[str], account: str | None = None) -> int:
     from .core.runners import make_runner
 
     if backend == "google":
@@ -174,6 +180,18 @@ def login(cfg: Config, backend: str, extra: list[str]) -> int:
     if backend not in BACKENDS:
         print(f"usage: overseer login {'|'.join(BACKENDS)}", file=sys.stderr)
         return 2
+    from .core.config import accounts_of
+
+    accounts = accounts_of(getattr(cfg.agent, backend))
+    if account is None and len(accounts) > 1:
+        print(f"{backend} has several accounts: log each in with --account <name> ({', '.join(accounts)})",
+              file=sys.stderr)
+        return 2
+    if account is not None and account not in accounts:
+        print(f"{backend} has no account {account!r} in the config (agent.{backend}.accounts: "
+              f"{', '.join(accounts)})", file=sys.stderr)
+        return 2
+    getattr(cfg.agent, backend).home = accounts[account or next(iter(accounts))]
     prepare_local_dirs(cfg)
     runner = make_runner(cfg, backend)
     argv, env = runner.login_command(extra)
@@ -243,6 +261,9 @@ def open_command(cfg: Config, target: str | None) -> int:
         domain = domain_factory(cfg)(cfg, Store(cfg.local.db_path), None)
         domain.prepare()
         sandbox = domain.sandbox()
+    from .core.accounts import Accounts, carry_session
+    accounts = Accounts(cfg, Store(cfg.local.db_path))  # (the account the bot uses now, with the session in it)
+    carry_session(rec.backend, rec.cli_session_id, accounts.all_homes(rec.backend), accounts.home(rec.backend))
     runner = make_runner(cfg, rec.backend, sandbox)  # the bot's sandbox, exactly
     argv, env, cwd = runner.interactive_command(rec.cli_session_id, rec.id)
     # The bot runs the CLIs without a terminal (TERM=dumb, NO_COLOR); here they get the user's terminal.
@@ -374,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--import", dest="import_key", help="ssh setup: copy this existing private key instead of generating one")
     ap.add_argument("--full", action="store_true", help="watch: show complete command output")
     ap.add_argument("--yes", action="store_true", help="reset: don't ask")
+    ap.add_argument("--account", help="login: which of the CLI's accounts (agent.<cli>.accounts)")
     ap.add_argument("-v", "--verbose", action="store_true")
     argv = list(sys.argv[1:] if argv is None else argv)
     extra: list[str] = []
@@ -395,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             return asyncio.run(check(cfg))
         if args.command == "login":
-            return login(cfg, args.target or cfg.agent.backend, extra)
+            return login(cfg, args.target or cfg.agent.backend, extra, args.account)
         if args.command == "ssh":
             return ssh_command(cfg, args.target or "", args.import_key)
         if args.command == "sessions":

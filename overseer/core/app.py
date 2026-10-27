@@ -28,7 +28,8 @@ USERS_TOPICS_NOTE = ("⚠️ The general conversation is in “All” (telegram.
 
 CORE_MENU = [
     ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
-    ("backend", "show/switch claude_code or codex"), ("model", "show/set the agent's model"),
+    ("backend", "show/switch claude_code or codex"), ("account", "the CLIs' logins: show/switch"),
+    ("model", "show/set the agent's model"),
     ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),
     ("compact", "compact the conversation (free context)"), ("update", "update Claude Code and Codex"),
     ("auto", "wake-ups: list, off, or a goal to work on alone"), ("usage", "tokens and cost used today"),

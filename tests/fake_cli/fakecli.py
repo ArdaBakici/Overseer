@@ -6,6 +6,10 @@ the agent runs `ssh hpc ...sbatch...`, sbatch answers with a job id, then a fina
 A prompt containing FORCE_SLEEP makes it hang (for /stop tests); FORCE_FAIL (or a file $FAKE_CLI_LOG.fail) makes it exit with an error;
 FORCE_SLOW pauses between events (to watch the live progress).
 
+Accounts: a CLI home (CLAUDE_CONFIG_DIR / CODEX_HOME) listed in the file $FAKE_CLI_LOG.limited is out of usage (the
+run fails like the real CLIs' usage limits). Sessions are kept in the home like the real CLIs; with a file
+$FAKE_CLI_LOG.strict, resuming a session that isn't in the home fails like theirs.
+
 Working alone over many runs (fake claude, for prompts with FAKE_LOOP, and wake-ups and check-ins):
 every run submits a new job id and watches it with `ov watch`, like a real agent. Markers in the
 prompt (the first message, or job logs quoted in a wake-up's report) steer it: FAKE_DONE (stop),
@@ -53,6 +57,31 @@ if args == ["update"]:
         open(version_file, "w").write(VERSIONS[prog][1])
         print(f"Successfully updated from {current} to {VERSIONS[prog][1]}")
     sys.exit(0)
+
+CLI_HOME = os.environ.get("CLAUDE_CONFIG_DIR" if prog == "claude" else "CODEX_HOME", "")
+STRICT = os.path.exists(os.environ["FAKE_CLI_LOG"] + ".strict")
+
+
+def limited():
+    path = os.environ["FAKE_CLI_LOG"] + ".limited"
+    return bool(CLI_HOME) and os.path.exists(path) and CLI_HOME in open(path).read().split("\n")
+
+
+def claude_session_file(sid):
+    return os.path.join(CLI_HOME, "projects", re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()), f"{sid}.jsonl")
+
+
+if prog == "claude" and limited():
+    sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-opus-5-5"})
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": True,
+          "result": "You've hit your limit · resets 3pm (UTC)"})
+    sys.exit(1)
+if prog == "codex" and limited() and "exec" in args:
+    emit({"type": "thread.started", "thread_id": args[-2] if "resume" in args else str(uuid.uuid4())})
+    emit({"type": "turn.failed", "error": {"message": "You've hit your usage limit. Upgrade to Pro "
+                                                      "(https://chatgpt.com/explore/pro), or try again in 2 hours 5 minutes."}})
+    sys.exit(1)
 
 if prog == "claude" and "FORCE_APIERROR" in stdin:  # an API error, reported as the run's result
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
@@ -188,6 +217,13 @@ if prog == "claude":
               "compact_metadata": {"trigger": "manual", "pre_tokens": 150000, "post_tokens": 3000}})
         emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False, "result": ""})
         sys.exit(0)
+    if STRICT and "--resume" in args and not os.path.exists(claude_session_file(sid)):
+        emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
+              "result": f"No conversation found with session ID: {sid}"})
+        sys.exit(1)
+    os.makedirs(os.path.dirname(claude_session_file(sid)), exist_ok=True)
+    with open(claude_session_file(sid), "a") as fh:
+        fh.write(json.dumps({"type": "user", "message": stdin[-2000:]}) + "\n")
     emit({"type": "system", "subtype": "init", "session_id": sid, "model": model})
     if "FAKE_COMPACT" in stdin:  # the context filled up: Claude Code compacted it on its own
         emit({"type": "system", "subtype": "status", "status": "compacting", "session_id": sid})
@@ -264,6 +300,9 @@ if prog == "codex":
         open(out_file, "w").write("OK report")
         emit({"type": "turn.completed"})
         sys.exit(0)
+    if STRICT and resumed and not os.path.exists(codex_rollout(tid)):
+        emit({"type": "error", "message": f"thread/resume failed: no rollout found for thread id {tid}"})
+        sys.exit(1)
     emit({"type": "thread.started", "thread_id": tid})
     # Session log, like codex's own: the model and effort are only recorded here.
     model = args[args.index("-m") + 1] if "-m" in args else "gpt-fake-default"

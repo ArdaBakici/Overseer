@@ -15,7 +15,8 @@ Overseer is a Telegram bot for your SLURM jobs. It runs on your homelab and watc
 - **Fixing.** Tap **🔧 Ask agent to fix**, reply to any job message, or just chat. The agent investigates with real commands (`ssh hpc 'sacct …'`, logs, code, quota, modules), edits, and runs `sbatch`.
   - **Visibility:** while it works, one message updates itself with its latest reasoning and the command it is running. Afterwards you see every command it ran, and you get a message the moment it submits a job.
   - **Follow-up:** that job is then monitored like any other, and replying to its report continues the same conversation.
-- **Switching agents.** Change between Claude Code and Codex at any time with `/backend`.
+- **Switching agents.** Change between Claude Code and Codex at any time with `/backend`; a conversation keeps its history (what was said and done is handed over).
+- **Several accounts.** Give each CLI more than one login (e.g. a personal and a work subscription) and switch with `/account`. When one runs out of usage, the bot moves on by itself and runs the request again there: first the CLI's other accounts, then the other CLI ([below](#several-accounts-per-cli)).
 - **Projects.** Each project (e.g. dreamer, chemistry) gets its own Telegram topic, conversations, jobs, agent settings and notes. A "general" topic holds everything that isn't about a project.
 - **The agent talks to Overseer.** With its `ov` command it registers the jobs it submits, creates projects and moves or stops tracking jobs when you ask it to.
 - **Rich messages.** Agent replies are formatted (bold, lists, code, tables), logs and command lists fold away, and the agent can send plots it makes on the HPC.
@@ -153,6 +154,7 @@ Both logins work on a headless server.
 - **Codex:** `overseer login codex` uses Codex's device-code flow. It prints a URL and a code; open the URL on any device and enter the code. To use an API key instead, run `printenv OPENAI_API_KEY | overseer login codex -- --with-api-key`.
 - **Claude Code:** `overseer login claude_code` prints a URL to open elsewhere and asks you to paste back the code. Alternatively, `overseer login claude_code -- setup-token` prints a long-lived token, which you then export as `CLAUDE_CODE_OAUTH_TOKEN`.
 - **Other flags:** anything after `--` is passed to the CLI's login command in place of these defaults.
+- **Several accounts:** list them in the config (`agent.claude_code.accounts`, below) and log each in: `overseer login claude_code --account work`.
 
 **Clusters with 2FA/Duo.** Run `overseer ssh connect` once. It opens the master connection interactively so you can approve the login, and the connection then stays up (`ControlPersist`). If the network drops, run it again; the bot tells you when it can't reach the HPC.
 
@@ -178,7 +180,8 @@ To keep it running, use `deploy/overseer.service` (a systemd user unit; instruct
 | **📈 Plot** button | the job's graphs now, from the agent's plotting command (no model involved); without one, the agent writes one and registers it |
 | **📊 Status** / **📜 Log** buttons | Status (on a job's card): refreshes the card now; `/job <id>` shows the card's content plus the last lines of the log. Log: the log itself. If the job's output names its own log file (e.g. `output: …/train_<jobid>.log`), Overseer follows that file instead of SLURM's stdout, for status, final reports and check-ins too |
 | `/fix <id> [instructions]`, `/ask <text>`, `/new` | agent |
-| `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one with a fresh session |
+| `/backend [claude_code\|codex]` | show both agents with their model and effort, or switch the active one; conversations continue on the new one, with what was said and done so far handed over |
+| `/account [name]` | the CLIs' logins: which one is in use, which are out of usage and until when; switch with a button, `/account work` or `/account codex default` (below) |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
 | *(while the agent works)* | a live ⏳ preview that updates every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. Its **Stop** button stops the run. It's a Telegram streaming draft, which vanishes when the answer arrives; where drafts aren't available (`telegram.streaming: false`, group chats) it's a message that is edited in place and then removed |
 | `/stop` | stop the agent's current run (kills the whole process group) |
@@ -583,6 +586,30 @@ overseer run -c assistant.yaml                  # e.g. a second systemd service
   connection socket is in its tmp folder), all of `./state`, and every `.env*` file. Its folders must be its own
   (`./state/assistant`, `/tmp/overseer-assistant`), and the vault must be outside Overseer's folder.
   The end-to-end test runs both bots side by side with the real CLIs and checks this.
+
+## Several accounts per CLI
+
+Each CLI can have several logins, e.g. a personal and a work Claude subscription. Each gets a folder of its own:
+
+```yaml
+agent:
+  claude_code:
+    accounts:                   # the first one is used at first
+      personal: ./state/claude
+      work: ./state/claude-work
+  codex:
+    accounts:
+      default: ./state/codex
+```
+
+Log each one in: `uv run overseer login claude_code --account work` (`overseer check` tests every account).
+
+- **One account per CLI is in use, for the whole bot.** `/account` lists them (▶ the one in use, ⏸ out of usage until when) and switches with a button or `/account <name>`. The choice is kept across restarts.
+- **Out of usage.** When a run hits the account's usage limit (a subscription's 5-hour or weekly limit, or an API key out of credit), Overseer marks the account out until it resets (when the CLI says; otherwise an hour) and moves the whole bot on: to the CLI's next account that isn't out, then to the other CLI. You get a 🔄 message, and the interrupted request runs again there; the agent is told to check what was already done before redoing anything. After 3 switches in a row, or once every account is out, it stops and keeps the request for **▶️ Continue**.
+- **It doesn't switch back by itself.** When the account resets, the bot stays where it is until you switch (`/account`, or `/backend` after a move to the other CLI).
+- **Conversations keep their history.** Moving between accounts of a CLI, the conversation's session is copied into the new account's folder and resumed there, so nothing is lost. Moving to the other CLI (a failover or `/backend`), the new agent starts with what was said and done so far: the latest turns in full, older ones a line each, from Overseer's own transcripts.
+- `/usage` splits tokens and cost by account, and a reply's footer names the account when a CLI has several.
+- The accounts' folders hold logins: like `./state`, the agents can never read them, wherever you put them.
 
 ## Configuration notes
 

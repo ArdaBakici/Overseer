@@ -92,6 +92,11 @@ agent:
     model: null                 # e.g. opus, sonnet; null = Claude Code's default (also: /model in Telegram)
     effort: null                # low | medium | high | xhigh | max (also: /effort in Telegram)
     home: ./state/claude        # CLAUDE_CONFIG_DIR for Overseer's runs. Log in: overseer login claude_code
+    # Several logins (e.g. a personal and a work subscription), each in its own folder; `home` is then unused.
+    # The first is used at first; /account switches, and one out of usage makes the bot move on by itself.
+    # Log each in: overseer login claude_code --account <name>
+    # accounts: {personal: ./state/claude, work: ./state/claude-work}
+    accounts: {}
     # pass_env: [ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, HTTPS_PROXY, ...]
     extra_settings: {}          # merged into Claude Code settings (sandbox settings can't be loosened)
 
@@ -100,6 +105,7 @@ agent:
     model: null                 # e.g. gpt-5.5-codex; null = codex default
     reasoning_effort: null      # minimal | low | medium | high | xhigh (also: /effort in Telegram)
     home: ./state/codex         # CODEX_HOME for Overseer's runs. Log in: overseer login codex (device code)
+    accounts: {}                # several logins, like claude_code's
     # pass_env: [OPENAI_API_KEY, CODEX_API_KEY, HTTPS_PROXY, ...]
     web_search: live            # the model's own web search (OpenAI's side): live | cached | disabled
     extra_config: []            # extra `-c key=value` overrides

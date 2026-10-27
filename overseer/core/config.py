@@ -191,6 +191,9 @@ class ClaudeCodeConfig:
     # CLAUDE_CONFIG_DIR (login, sessions, settings) for Overseer's runs. Log in once with:
     #   overseer login claude_code
     home: str = "./state/claude"
+    # Several logins (e.g. a personal and a work subscription): name -> its own CLAUDE_CONFIG_DIR, the first one in
+    # use at first (then /account). `home` is then unused. Log each in: overseer login claude_code --account <name>
+    accounts: dict[str, str] = field(default_factory=dict)
     # Environment variables passed through (everything else, e.g. the Telegram token, is stripped).
     pass_env: list[str] = field(default_factory=lambda: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", *PROXY_ENV])
     # Merged into the settings Overseer passes with --settings (sandbox keys can't be loosened).
@@ -204,10 +207,16 @@ class CodexConfig:
     reasoning_effort: str | None = None  # low | medium | high | xhigh
     # CODEX_HOME for Overseer's runs. Log in once with: overseer login codex
     home: str = "./state/codex"
+    accounts: dict[str, str] = field(default_factory=dict)  # several logins, as agent.claude_code.accounts
     pass_env: list[str] = field(default_factory=lambda: ["OPENAI_API_KEY", "CODEX_API_KEY", *PROXY_ENV])
     # The model's own web search (runs on OpenAI's side): live, cached (OpenAI's index only) or disabled.
     web_search: str = "live"
     extra_config: list[str] = field(default_factory=list)  # extra `-c key=value` overrides
+
+
+def accounts_of(c: "ClaudeCodeConfig | CodexConfig") -> dict[str, str]:
+    """A CLI's logins: name -> its home (agent.<cli>.accounts; none = its one home, as "default")."""
+    return {str(k): v for k, v in c.accounts.items()} if c.accounts else {"default": c.home}
 
 
 @dataclass
@@ -368,8 +377,19 @@ class Config:
             raise ConfigError("telegram.general must be topic or all")
         if self.agent.report_commands not in ("summary", "live", "off"):
             raise ConfigError("agent.report_commands must be summary, live or off")
-        self.local.resolve(self.agent.claude_code.home)
-        self.local.resolve(self.agent.codex.home)
+        for b in BACKENDS:
+            c = getattr(self.agent, b)
+            if not isinstance(c.accounts, dict):
+                raise ConfigError(f"agent.{b}.accounts: name: folder, e.g. {{personal: ./state/{b}-personal}}")
+            for name, home in accounts_of(c).items():
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", str(name)):
+                    raise ConfigError(f"agent.{b}.accounts: {name!r} - a short name of letters, digits, - and _")
+                if not isinstance(home, str) or not home.strip():
+                    raise ConfigError(f"agent.{b}.accounts.{name}: the folder of its login, e.g. ./state/{b}-{name}")
+                self.local.resolve(home)
+            homes = [self.local._resolve(h) for h in accounts_of(c).values()]
+            if len(set(homes)) != len(homes):
+                raise ConfigError(f"agent.{b}.accounts: each account needs its own folder")
         ws = self.agent.codex.web_search  # true/false in older config files
         self.agent.codex.web_search = {True: "live", False: "disabled"}.get(ws, ws) if isinstance(ws, bool) else ws
         if self.agent.codex.web_search not in ("live", "cached", "disabled"):

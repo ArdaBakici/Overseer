@@ -659,3 +659,35 @@ async def test_new_instructions_reach_a_resumed_conversation(hpc, backend, cli_n
     assert "instructions_update" not in second and "i-have-adhd (always on)" not in second
     assert "<instructions_update>" in third and "i-have-adhd (always on)" in third, "not handed over"
     assert fourth.count("<instructions_update>") == 1  # (once: not again with every request)
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_out_of_usage_continues_in_the_next_account(hpc, backend, cli_name):
+    """The real CLIs: an account's usage limit (the API's own error) is recognised; the request runs again on the
+    CLI's next account, where the conversation goes on - its session copied into that account's home."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    getattr(cfg.agent, backend).accounts = {"first": f"./state/{backend}-first", "second": f"./state/{backend}-second"}
+    cfg.validate()
+    with FakeModel([]) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        assert await asyncio.wait_for(agent.handle(s, "FIRST-REQUEST"), 240)
+        sid = s.rec.cli_session_id
+        first, second = (cfg.local.resolve(f"./state/{backend}-{n}") for n in ("first", "second"))
+        fm.fail_next = 1  # the first account is out of usage now
+        assert await asyncio.wait_for(agent.handle(s, "SECOND-REQUEST"), 240), notes.texts()
+
+    assert agent.accounts.active(backend) == "second" and agent.accounts.out_until(backend, "first")
+    assert "🔄" in notes.texts(), notes.texts()
+    bodies = [json.dumps(r["body"]) for r in fm.requests if "SECOND-REQUEST" in json.dumps(r["body"])]
+    assert "FIRST-REQUEST" in bodies[-1], "the conversation didn't go on in the second account"
+    assert s.rec.cli_session_id == sid  # (the same CLI session, resumed from the second account's home)
+    from overseer.core.accounts import session_files
+    assert session_files(backend, first, sid) and session_files(backend, second, sid)

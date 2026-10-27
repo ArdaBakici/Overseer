@@ -31,7 +31,7 @@ Shortcuts, if you want them:
 /remind &lt;when&gt; &lt;text&gt; — e.g. /remind tomorrow 9am call the bank · /remind 2h stretch · /reminders — pending ones
 /undo — undo a recent change of the assistant's · /vault — the vault: recent changes, sync conflicts
 /persona — how the assistant behaves (a note in your vault: edit it there, or ask the assistant)
-/new — a fresh conversation · /stop — stop the current reply · /backend · /model · /effort
+/new — a fresh conversation · /stop — stop the current reply · /backend · /account · /model · /effort
 /auto &lt;goal&gt; — let it work on something on its own (it wakes itself) · /auto off
 /digest · /search &lt;text&gt; · /dashboard · /usage · /health
 /project — projects (each gets its own topic) · /feedback · /skills"""

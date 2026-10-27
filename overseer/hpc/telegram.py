@@ -26,6 +26,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /ask &lt;text&gt; — talk to the agent (or just send a message)
 /new — start a fresh agent conversation
 /backend [claude_code|codex] — show or switch the agent
+/account [name] — the CLIs' logins (several per CLI): show or switch
 /model [name|default] — show or set the active agent's model
 /effort [level|default] — show or set the active agent's effort
 /stop — stop the agent's current run

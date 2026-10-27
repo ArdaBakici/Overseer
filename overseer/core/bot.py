@@ -50,10 +50,13 @@ UPLOAD_WAIT = 30
 ALBUM_WAIT = 2
 MAX_DOWNLOAD = 20 * 1024 * 1024  # the largest file the Bot API lets bots download
 
+ACCOUNT_CLI = {"claude_code": "Claude", "codex": "Codex"}  # (short, for buttons)
+
 HELP = """<b>Overseer</b>
 
 /ask &lt;text&gt; — talk to the agent (or just send a message) · /new — a fresh conversation
 /backend [claude_code|codex] · /model [name|default] · /effort [level|default] — the agent
+/account [name] — the CLIs' logins: which is in use, which are out of usage; switch
 /stop — stop the agent's current run · /compact [focus] — compact the conversation
 /update — update Claude Code and Codex now
 /auto &lt;goal&gt; — ask the agent to work on it on its own · /auto — pending wake-ups · /auto off — cancel them
@@ -1005,6 +1008,7 @@ class Bot:
         add(CommandHandler("ask", self.cmd_ask, filters=allowed))
         add(CommandHandler("new", self.cmd_new, filters=allowed))
         add(CommandHandler("backend", self.cmd_backend, filters=allowed))
+        add(CommandHandler(["account", "accounts"], self.cmd_account, filters=allowed))
         add(CommandHandler("model", self.cmd_model, filters=allowed))
         add(CommandHandler("effort", self.cmd_effort, filters=allowed))
         add(CommandHandler("compact", self.cmd_compact, filters=allowed))
@@ -1207,7 +1211,11 @@ class Bot:
         lines = []
         for b in BACKENDS:
             mark = "▶️" if b == self.agent.backend_of(scope) else "▫️"
-            lines.append(f"{mark} {esc(self.agent.describe(b, scope))}")
+            acc = f" · account {self.agent.accounts.active(b)}" if self.agent.accounts.several(b) else ""
+            lines.append(f"{mark} {esc(self.agent.describe(b, scope) + acc)}")
+        if self.agent.accounts.forced:
+            lines.append(f"(For now every conversation runs on {code(self.agent.accounts.forced)}: the other ran out "
+                         "of usage. /backend or /account switches back.)")
         return "\n".join(lines)
 
     async def cmd_backend(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1223,8 +1231,41 @@ class Bot:
             await self.reply(update, f"⛔ {esc(e)}")
             return
         await self.reply(update, f"Agent in {self._where(scope)} is now {code(self.agent.backend_of(scope))}. Its "
-                                 "conversations continue with a fresh session on this backend (the job context is "
-                                 "re-sent).\n\n" + self._agents_summary(scope))
+                                 "conversations continue on this backend, with what was said and done so far handed "
+                                 "over.\n\n" + self._agents_summary(scope))
+
+    def _accounts_view(self) -> tuple[str, list[list[tuple[str, str]]]]:
+        acc = self.agent.accounts
+        rows = [[(("▶ " if n == acc.active(b) and self.agent.backend == b else "")
+                  + f"{ACCOUNT_CLI[b]} · {n}" + (" ⏸" if acc.out_until(b, n) else ""), f"acct:{b}:{n}")
+                 for n in acc.names(b)] for b in BACKENDS]
+        several = any(acc.several(b) for b in BACKENDS)
+        hint = ("Switch with a button, or /account &lt;name&gt; (/account codex &lt;name&gt; if both CLIs have it). "
+                "When one runs out of usage the bot moves on by itself: the CLI's next account, then the other CLI."
+                if several else "One login per CLI: add more with <code>agent.claude_code.accounts</code> / "
+                "<code>agent.codex.accounts</code> in the config (then <code>overseer login &lt;cli&gt; --account "
+                "&lt;name&gt;</code>).")
+        return f"<b>Accounts</b>\n{acc.describe()}\n\n{hint}", rows
+
+    async def cmd_account(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not ctx.args:
+            text, rows = self._accounts_view()
+            await self.reply(update, text, buttons=rows)
+            return
+        found = self.agent.accounts.find(" ".join(ctx.args))
+        if len(found) != 1:
+            text, rows = self._accounts_view()
+            why = "Which one? Both CLIs have it." if found else f"No account {code(' '.join(ctx.args))}."
+            await self.reply(update, f"⛔ {why}\n\n{text}", buttons=rows)
+            return
+        await self.reply(update, self._use_account(*found[0]))
+
+    def _use_account(self, backend: str, name: str) -> str:
+        self.agent.use_account(backend, name)
+        busy = len(self.agent.running_sessions())
+        return (f"✅ The bot runs on <b>{esc(self.agent.accounts.label(backend, name))}</b> now: every conversation "
+                f"carries on there, its history with it." + (f" ({busy} run(s) in progress finish where they started.)"
+                                                              if busy else ""))
 
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         scope = self._scope(update)
@@ -1857,6 +1898,12 @@ class Bot:
         try:
             if self.ext and await self.ext.on_button(update, q, chat.id, action, arg):  # the domain's (job cards)
                 pass
+            elif action == "acct":  # /account's buttons
+                backend, _, name = arg.partition(":")
+                if backend in BACKENDS and name in self.agent.accounts.names(backend):
+                    text = self._use_account(backend, name)
+                    view, rows = self._accounts_view()
+                    await self._edit(q, f"{text}\n\n{view}", rows)
             elif action in ("rerun", "rerunx"):  # a run cut off by a restart: ▶️ Continue / ✖ Dismiss
                 rec = self.agent.pop_cut_off_run(arg)
                 session = self.agent.get(rec.get("session")) if rec else None
