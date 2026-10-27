@@ -32,7 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import Config
+from .accounts import LIMIT_ANSWER_RE, usage_limit
+from .config import Config, accounts_of
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,20 @@ CODEX_DISABLED_FEATURES = [
 
 class AgentRunError(RuntimeError):
     pass
+
+
+class UsageLimitError(AgentRunError):
+    """The account ran out of usage (its plan's limit, or the API key's credit): `until` when it resets, if said."""
+
+    def __init__(self, message: str, until: float | None = None):
+        super().__init__(message)
+        self.until = until
+
+
+def _check_limit(message: str) -> None:
+    hit, until = usage_limit(message)
+    if hit:
+        raise UsageLimitError(message, until)
 
 
 @dataclass
@@ -299,6 +314,9 @@ class Runner:
         if os.environ.get("SSH_AUTH_SOCK"):
             candidates.append(Path(os.environ["SSH_AUTH_SOCK"]).parent)
         candidates += [Path(p).expanduser() for p in self.cfg.agent.deny_read]
+        # Every login of the CLIs (accounts kept outside the state dir too)
+        candidates += [self.cfg.local._resolve(h) for b in ("claude_code", "codex")
+                       for h in accounts_of(getattr(self.cfg.agent, b)).values()]
         # Real paths only: the sandboxes can't mask a path through a symlinked dir (e.g. /var/run -> /run),
         # and both names of the same socket must collapse into one entry.
         paths = []
@@ -567,7 +585,11 @@ class ClaudeCodeRunner(Runner):
 
         stderr = await self._exec(argv, {**self.env(workdir), **activity.env}, workdir, prompt[:MAX_PROMPT], on_event)
         if result.is_error:  # e.g. an API error: Claude Code reports it as the result, not as an answer
-            raise AgentRunError("claude: " + (result.text or stderr.strip() or "the run failed")[-1500:])
+            message = "claude: " + (result.text or stderr.strip() or "the run failed")[-1500:]
+            _check_limit(message)
+            raise AgentRunError(message)
+        if result.text and len(result.text) < 400 and LIMIT_ANSWER_RE.match(result.text):
+            _check_limit("claude: " + result.text)  # (the limit, reported as if it were the answer)
         if not result.text:
             result.text = texts[-1] if texts else ""
         if stderr and not result.text:
@@ -759,8 +781,11 @@ class CodexRunner(Runner):
         text = out_file.read_text().strip() if out_file.exists() else ""
         out_file.unlink(missing_ok=True)
         result.text = text or (messages[-1] if messages else "")
+        if errors:  # out of usage part-way through a turn: not an answer, even with some text before it
+            _check_limit("codex: " + "; ".join(e for e in errors if e)[-1500:])
         if not result.text and (errors or stderr):
             detail = "; ".join(e for e in errors if e) or "\n".join(stderr.strip().splitlines()[-15:])
+            _check_limit("codex: " + detail[-1500:] + "\n" + stderr[-1500:])
             raise AgentRunError("codex: " + detail[-1500:])
         if not ephemeral and result.session_id:
             await self._fill_actual_settings(result)

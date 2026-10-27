@@ -21,12 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .accounts import NAMES as CLI_NAMES, Accounts, carry_session, handover, when
 from .config import BACKENDS, Config
 from .ctl import TOKEN_ENV
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import SILENT, Notifier, Outgoing, code, esc, pre
-from .runners import Activity, AgentRunError, Runner, make_runner
+from .runners import Activity, AgentRunError, Runner, UsageLimitError, make_runner
 from .store import SessionRecord, Store
 
 if TYPE_CHECKING:
@@ -105,6 +106,12 @@ CONTINUE_PROMPT = (
     "[Overseer was restarted while you were working on the request below, and your run was cut off partway. "
     "Some of it may already be done: check before redoing anything (files you changed, jobs you submitted - "
     "`ov job list`, `squeue`), then finish it.]\n\n")
+# Out of usage part-way through a run: it runs again on the next account (at most this many times in a row).
+MAX_FAILOVERS = 3
+RERUN_PROMPT = (
+    "[Overseer: the previous attempt at the request below stopped part-way - {why} - and it runs again now{where}. "
+    "Some of it may already be done: check before redoing anything (files you changed, commands or jobs you "
+    "started), then finish it.]\n\n")
 
 
 # What a conversation's CLI session knows of its instructions (the system prompt): Claude Code and Codex keep the
@@ -276,6 +283,8 @@ class Session:
     origin: str = "user"  # what started the current turn: user | wakeup | checkin | subagent
     last_reply: str = ""  # the agent's last answer (a subagent's report)
     last_status: str = ""  # how its last run ended: done | error | stopped
+    ran_on: tuple[str, str] = ("", "")  # the CLI and account of its current (or last) run
+    switched: str = ""  # why its next run is on another CLI (said in the handover): set by a failover
 
     @property
     def id(self) -> str:
@@ -306,6 +315,7 @@ class Agent:
         self.shutting_down = False  # Overseer is stopping: runs cut off now are offered again at the next start
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
+        self.accounts = Accounts(cfg, store)  # the CLIs' logins: the one in use, those out of usage
 
     # ------------------------------------------------------------------ backend, model, effort
     # Stored per scope: the main chat ("backend", "model:<backend>", ...) and each project
@@ -345,6 +355,10 @@ class Agent:
         return self.backend_of(None)
 
     def backend_of(self, project: str | None) -> str:
+        return self.accounts.forced or self.own_backend_of(project)
+
+    def own_backend_of(self, project: str | None) -> str:
+        """Its own setting (/backend), whatever a failover to the other CLI made the whole bot use for now."""
         b = self._setting("backend", project) or self.cfg.agent.backend
         return b if b in BACKENDS else self.cfg.agent.backend
 
@@ -352,6 +366,13 @@ class Agent:
         if name not in BACKENDS:
             raise ValueError(f"backend must be one of {', '.join(BACKENDS)}")
         self._set_setting("backend", name, project)
+        self.accounts.force(None)  # (the researcher chose: a failover's choice is over)
+
+    def use_account(self, backend: str, name: str) -> None:
+        """/account: run on this login of this CLI from now on (the whole bot)."""
+        self.accounts.switch(backend, name)
+        self.accounts.clear_out(backend, name)  # (they know best: it may be back before its estimated reset)
+        self.accounts.force(None if backend == self.own_backend_of(None) else backend)
 
     def runner(self, backend: str | None = None, project: str | None = None) -> Runner:
         b = backend or self.backend_of(project)
@@ -382,13 +403,18 @@ class Agent:
         return [m for m in (v or "").split(",") if m] or list(self.cfg.agent.subagents.workers.get(backend, []))
 
     def session_backend(self, s: Session) -> str:
+        if self.accounts.forced:  # (the other CLI is out of usage: everything runs here for now)
+            return self.accounts.forced
         b = s.rec.agent_backend
         return b if b in BACKENDS else self.backend_of(s.project)
 
     def session_runner(self, s: Session) -> Runner:
         b = self.session_backend(s)
         if s.rec.is_worker:
-            model, effort = s.rec.model or None, self.cfg.agent.subagents.worker_effort
+            model = s.rec.model or None
+            if s.rec.agent_backend in BACKENDS and b != s.rec.agent_backend:  # (its model is the other CLI's)
+                model = (self.worker_models(b, s.project) or [None])[0]
+            effort = self.cfg.agent.subagents.worker_effort
         elif s.rec.role == "reviewer" or self.planner_on(s):  # the feedback reviewer plans too
             model, effort = self.planner_model(b, s.project), self._setting(f"effort:{b}", s.project)
         else:
@@ -449,17 +475,19 @@ class Agent:
             res.usage_is_total = False  # a new conversation: its total is this request's usage
         # else: resumed from before Overseer kept totals - the footer says it's the conversation's total
 
-    def _record_usage(self, s: Session, backend: str, res) -> None:
+    def _record_usage(self, s: Session, backend: str, res, account: str = "") -> None:
         """Tokens and cost of this run, for /usage (a codex total Overseer can't split yet isn't counted)."""
         if res.usage_is_total:
             return
         self.store.add_usage(session_id=s.id, project=s.project, backend=backend, model=res.model, origin=s.origin,
                              input=res.input_tokens, cached=res.cached_tokens, output=res.output_tokens,
-                             cost=res.cost_usd)
+                             cost=res.cost_usd, account=account)
 
-    def footer(self, backend: str, res, project: str | None = None, runner: Runner | None = None) -> str:
+    def footer(self, backend: str, res, project: str | None = None, runner: Runner | None = None,
+               account: str = "") -> str:
         r = runner or self.runner(backend, project)
-        parts = [backend, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
+        name = f"{backend} ({account})" if account and self.accounts.several(backend) else backend
+        parts = [name, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
         tokens = res.input_tokens + res.output_tokens
         if tokens:
             cached = f" ({_human(res.cached_tokens)} cached)" if res.cached_tokens else ""
@@ -575,6 +603,13 @@ class Agent:
             return False
         runner = self.session_runner(s)
         async with s.lock:
+            resume, _ = self._resume(s, backend)
+            if not resume:
+                await self.notifier.send(Outgoing(f"🗜 Nothing to compact: this conversation's {esc(backend)} session "
+                                                  "isn't in the account in use (its next run starts a new one).",
+                                                  session_id=s.id, job_id=s.job_id))
+                return False
+            account = self.accounts.active(backend)
             s.task = asyncio.current_task()
             transcript = Transcript(self.cfg, s.id)
             transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
@@ -601,7 +636,7 @@ class Agent:
                 self.store.upsert_session(s.rec)
             self._instructions_compacted(s)
             s.origin = "compact"
-            self._record_usage(s, backend, res)
+            self._record_usage(s, backend, res, account)
             s.origin = "user"
             c = res.compactions[-1]
             tokens = (f": {_human(c['pre_tokens'])} → {_human(c['post_tokens'])} tokens"
@@ -733,8 +768,8 @@ class Agent:
                     user_text = f"{user_text}\n\n{uploads_note(items, self.session_backend(s))}".strip()
                 self._run_update(run, text=user_text, files=[], started=time.time())
                 s.last_status = "running"
-                await self._turn(s, user_text, quiet)
-                ok, s.last_status = True, "done"
+                ok = await self._turn_on_any_account(s, user_text, quiet)
+                s.last_status = "done" if ok else "error"
             except asyncio.CancelledError:
                 if self.shutting_down:  # not stopped by the researcher: offered again at the next start
                     raise
@@ -759,6 +794,77 @@ class Agent:
         if self.subagents and s.rec.is_worker:  # done, waiting for its jobs, failed or stopped: its planner hears
             self.subagents.turn_ended(s)
         return ok
+
+    async def _turn_on_any_account(self, s: Session, user_text: str, quiet: bool) -> bool:
+        """The turn; if the account runs out of usage, again on the next one (the CLI's next account, then the other
+        CLI), up to MAX_FAILOVERS times. False if it stopped there (the researcher can ▶️ Continue it later)."""
+        text = user_text
+        for attempt in range(MAX_FAILOVERS + 1):
+            try:
+                await self._turn(s, text, quiet)
+                return True
+            except UsageLimitError as e:
+                place = await self._fail_over(s, e)
+                if place is None or attempt == MAX_FAILOVERS:
+                    await self._out_of_usage(s, user_text, everywhere=place is None)
+                    s.last_reply = str(e)[:1500]
+                    return False
+                backend, account = s.ran_on
+                text = RERUN_PROMPT.format(why=f"{self.accounts.label(backend, account)} ran out of usage",
+                                           where=f", on {place}") + user_text
+        return False
+
+    async def _fail_over(self, s: Session, e: UsageLimitError) -> str | None:
+        """The account the run was on is out of usage: mark it out, and move the whole bot on (the CLI's next account
+        that isn't out, then the other CLI). Where the run goes now, or None if every account is out."""
+        backend, account = s.ran_on
+        until = self.accounts.mark_out(backend, account, e.until)
+        log.warning("%s account %s is out of usage until %s: %s", backend, account, when(until), str(e)[:300])
+        now = self.session_backend(s)
+        if (now, self.accounts.active(now)) != (backend, account) and not self.accounts.out_until(
+                now, self.accounts.active(now)):
+            return self.accounts.label(now)  # (another run already moved the bot on)
+        nxt = self.accounts.next_after_limit(backend, account)
+        if not nxt:
+            return None
+        b, name = nxt
+        self.accounts.switch(b, name)
+        out = f"{esc(self.accounts.label(backend, account))} is out of usage until {esc(when(until))}"
+        if b == backend:
+            text = (f"🔄 {out}. The bot uses {esc(CLI_NAMES[b])}'s <b>{esc(name)}</b> account now (the conversations "
+                    "carry on there); this request runs again on it. /account switches.")
+        else:
+            self.accounts.force(b)
+            s.switched = f"{CLI_NAMES[backend]} ran out of usage"
+            text = (f"🔄 {out}" + (" (and its other accounts too)" if self.accounts.several(backend) else "")
+                    + f". Every conversation runs on <b>{esc(self.accounts.label(b))}</b> now, with what was said so "
+                    "far handed over; this request runs again there. /account or /backend switches back.")
+        await self.notifier.send(Outgoing(text, session_id=s.id, job_id=s.job_id))
+        return self.accounts.label(b)
+
+    async def _out_of_usage(self, s: Session, text: str, everywhere: bool) -> None:
+        """Stopped by usage limits: kept for the researcher's ▶️ Continue."""
+        rid = uuid.uuid4().hex[:10]
+        backend, account = s.ran_on
+        self.store.set(CUT_OFF_KEY + rid, json.dumps({
+            "session": s.id, "text": text[:RUN_TEXT_MAX], "origin": s.origin, "started": time.time(),
+            "at": time.time(), "files": [],
+            "prefix": RERUN_PROMPT.format(why="every account it tried was out of usage", where="")}))
+        if everywhere:
+            outs = []
+            for b in BACKENDS:
+                items = [f"{n} until {when(t)}" if self.accounts.several(b) else f"until {when(t)}"
+                         for n in self.accounts.names(b) if (t := self.accounts.out_until(b, n))]
+                if items:
+                    outs.append(f"{CLI_NAMES[b]} " + ", ".join(items))
+            head = "⏸ <b>Every account is out of usage</b>: " + esc("; ".join(outs)) + "."
+        else:
+            head = (f"⏸ <b>Usage limits on {MAX_FAILOVERS + 1} accounts in a row</b> (the last: "
+                    f"{esc(self.accounts.label(backend, account))}): stopped here.")
+        await self.notifier.send(Outgoing(
+            f"{head} The request is kept: ▶️ Continue runs it again (on {esc(self.accounts.label(self.session_backend(s)))}"
+            "; /account picks another).", session_id=s.id, job_id=s.job_id,
+            buttons=[[("▶️ Continue", f"rerun:{rid}"), ("✖ Dismiss", f"rerunx:{rid}")]]))
 
     async def _run_failed(self, s: Session, e: AgentRunError) -> None:
         hint = ("\nOverseer can update it: /update (it also updates the CLIs once a day on its own)."
@@ -813,13 +919,44 @@ class Agent:
         files = [(name, Path(p)) for name, p in rec.get("files") or [] if Path(p).is_file()]
         if not rec.get("started"):  # it was waiting its turn: simply run it now
             return rec.get("text", ""), files
-        return (CONTINUE_PROMPT + rec.get("text", "")), files
+        return (rec.get("prefix", CONTINUE_PROMPT) + rec.get("text", "")), files
+
+    def _resume(self, s: Session, backend: str) -> tuple[str | None, str]:
+        """How a run of this conversation continues: (the CLI session to resume, or None for a new one; what to tell
+        a new one about the conversation so far). Its session is copied into the account in use if it was left in
+        another; a conversation that was with the other CLI starts with a summary of it (`handover`)."""
+        sid = s.rec.cli_session_id
+        if not sid:
+            return None, ""
+        if s.rec.backend == backend:
+            homes = self.accounts.all_homes(backend)
+            if len(homes) == 1:
+                return sid, ""
+            try:
+                if carry_session(backend, sid, homes, self.accounts.home(backend)):
+                    return sid, ""
+            except OSError:
+                log.warning("could not copy %s's %s session into %s", s.id, backend,
+                            self.accounts.home(backend), exc_info=True)
+            reason = s.switched or "its session couldn't be moved to the account in use"
+            before = f"{CLI_NAMES[backend]}, on another account"
+        elif s.rec.backend in BACKENDS:
+            reason = s.switched or f"the researcher switched this conversation to {CLI_NAMES[backend]}"
+            before = CLI_NAMES[s.rec.backend]
+        else:
+            return None, ""
+        return None, handover(self.cfg, s.id, before, reason)
 
     async def _turn(self, s: Session, user_text: str, quiet: bool = False) -> None:
         backend = self.session_backend(s)
         runner = self.session_runner(s)
-        resume = s.rec.cli_session_id if s.rec.backend == backend else None
+        account = self.accounts.active(backend)
+        s.ran_on = (backend, account)
+        resume, history = self._resume(s, backend)
+        s.switched = ""
         parts = await self.domain.context(s, fresh=resume is None)  # (a new CLI session knows nothing yet)
+        if history:
+            parts.append(history)
         notes = self.take_notes(s.id)
         if notes:  # things that happened since the agent last ran (e.g. the researcher declined a request)
             parts.append("<overseer_notes>\n" + "\n".join(f"- {n}" for n in notes) + "\n</overseer_notes>")
@@ -839,7 +976,8 @@ class Agent:
                 log.warning("could not install the approved skills for %s", s.id, exc_info=True)
         transcript = Transcript(self.cfg, s.id)
         transcript.write({"kind": "turn", "backend": backend, "model": runner.model, "effort": runner.effort,
-                          "text": user_text, **({"project": s.project} if s.project else {})})
+                          "text": user_text, **({"project": s.project} if s.project else {}),
+                          **({"account": account} if self.accounts.several(backend) else {})})
         progress = Progress(self.notifier, backend, s.id, s.job_id) if self.cfg.agent.live_progress else None
         activity, live, buffer = self._activity(s)
 
@@ -885,9 +1023,9 @@ class Agent:
         if res.effort:
             self.store.set(f"last_effort:{backend}", res.effort)
         self._usage_delta(backend, res, resumed=resume is not None)
-        footer = self.footer(backend, res, s.project, runner)
+        footer = self.footer(backend, res, s.project, runner, account)
         s.last_reply = res.text or ""
-        self._record_usage(s, backend, res)
+        self._record_usage(s, backend, res, account)
         text, autopilot_line = res.text, ""
         if self.autopilot:
             autopilot_line = self.autopilot.after_turn(s, activity)

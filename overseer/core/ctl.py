@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .accounts import all_homes
 from .config import Config
 from .notify import Outgoing, code, esc
 from .autopilot import WatchError, human_interval, parse_duration
@@ -676,4 +677,5 @@ def write_skills(cfg: Config, skills: dict[str, str]) -> None:
     Codex has the model read a skill's file with a command, and its sandbox can't read Overseer's state
     dir: its copy goes into each scratch dir, as .agents/skills (CodexRunner)."""
     for name, text in skills.items():
-        install_skill(cfg.local.resolve(cfg.agent.claude_code.home) / "skills", name, text)
+        for home in all_homes(cfg, "claude_code"):  # (every account's)
+            install_skill(home / "skills", name, text)

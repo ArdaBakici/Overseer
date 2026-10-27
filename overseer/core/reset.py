@@ -11,6 +11,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from .accounts import all_homes
 from .config import Config
 from .store import Store
 
@@ -40,9 +41,10 @@ def conversation_files(cfg: Config) -> list[Path]:
     """The files that hold conversations (only those that exist)."""
     candidates = [cfg.local.state("transcripts"), cfg.local.state("search.db"),
                   cfg.local.state("search.db-wal"), cfg.local.state("search.db-shm"), cfg.local.tmp("agents")]
-    claude = cfg.local.resolve(cfg.agent.claude_code.home)
-    codex = cfg.local.resolve(cfg.agent.codex.home)
-    candidates += [claude / n for n in CLAUDE_SESSION_FILES] + [codex / n for n in CODEX_SESSION_FILES]
+    for claude in all_homes(cfg, "claude_code"):  # (every account's)
+        candidates += [claude / n for n in CLAUDE_SESSION_FILES]
+    for codex in all_homes(cfg, "codex"):
+        candidates += [codex / n for n in CODEX_SESSION_FILES]
     return [p for p in candidates if p.exists() or p.is_symlink()]
 
 

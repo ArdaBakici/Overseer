@@ -141,6 +141,7 @@ ADDED_COLUMNS = [
     ("sessions", "finished", "REAL DEFAULT 0"),
     ("sessions", "delivered", "INTEGER DEFAULT 0"),
     ("metric_specs", "plot", "TEXT DEFAULT ''"),
+    ("usage", "account", "TEXT DEFAULT ''"),  # the CLI's login it ran on (agent.<cli>.accounts)
 ]
 
 
@@ -557,11 +558,12 @@ class Store:
 
     # ---------------------------------------------------------------- token usage
     def add_usage(self, *, session_id: str, project: str | None, backend: str, model: str | None, origin: str,
-                  input: int, cached: int, output: int, cost: float | None) -> None:
+                  input: int, cached: int, output: int, cost: float | None, account: str = "") -> None:
         now = time.time()
-        self.db.execute("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        self.db.execute("INSERT INTO usage (ts, day, session_id, project, backend, model, origin, input, cached, "
+                        "output, cost, account) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (now, time.strftime("%Y-%m-%d", time.localtime(now)), session_id, project, backend, model or "",
-                         origin, input, cached, output, cost))
+                         origin, input, cached, output, cost, account))
         self.db.commit()
 
     def usage_rows(self, since: float, until: float | None = None) -> list[sqlite3.Row]:

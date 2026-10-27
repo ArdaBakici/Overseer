@@ -60,6 +60,15 @@ def usage_report(store: Store, period: str = "today") -> str:
             f"{esc(b)} {_n(sum(x['input'] + x['output'] for x in rs))}"
             + (f" ${sum(x['cost'] or 0 for x in rs):.2f}" if any(x["cost"] is not None for x in rs) else "")
             for b, rs in backends.items()))
+    accounts: dict[str, list] = {}
+    for r in rows:
+        if r["account"]:  # (recorded when the CLI has several accounts)
+            accounts.setdefault(f"{r['backend']} {r['account']}", []).append(r)
+    if len(accounts) > 1:
+        lines.append("by account: " + " · ".join(
+            f"{esc(a)} {_n(sum(x['input'] + x['output'] for x in rs))}"
+            + (f" ${sum(x['cost'] or 0 for x in rs):.2f}" if any(x["cost"] is not None for x in rs) else "")
+            for a, rs in accounts.items()))
     workers = {sid for sid in {r["session_id"] for r in rows} if (s := store.get_session(sid)) and s.is_worker}
     if workers:  # planner mode: what the subagents cost, apart from your conversations (and their planners)
         def part(rs: list) -> str:

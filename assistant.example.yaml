@@ -78,6 +78,8 @@ agent:
   claude_code:
     model: null
     home: ./state/assistant/claude   # its own login: overseer login claude_code -c assistant.yaml
+    # Several logins, each in a folder of its own (not the HPC bot's): see config.example.yaml
+    # accounts: {personal: ./state/assistant/claude, work: ./state/assistant/claude-work}
   codex:
     model: null
     home: ./state/assistant/codex
