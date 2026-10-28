@@ -54,28 +54,28 @@ tailnet only), and a second bot, a **personal assistant** whose memory is your O
 ## Getting started
 
 You need a Linux machine that stays on, an SSH login to a SLURM cluster, Telegram, and a Claude or ChatGPT
-subscription (or an API key). The **[setup guide](docs/setup.md)** walks through it step by step. In short:
+subscription (or an API key). Get Overseer, then let the setup walk you through the rest:
 
 ```bash
-# packages, uv and the agent CLIs (either or both)
-sudo apt install openssh-client bubblewrap socat git
-curl -LsSf https://astral.sh/uv/install.sh | sh
-npm install -g @anthropic-ai/claude-code @openai/codex
-
-# Overseer
+curl -LsSf https://astral.sh/uv/install.sh | sh            # uv: Python and Overseer's dependencies
 git clone https://github.com/ArdaBakici/Overseer ~/Overseer && cd ~/Overseer
 uv sync
-cp config.example.yaml config.yaml        # set ssh.hostname, ssh.user, telegram.allowed_chat_ids
-cp .env.example .env && chmod 600 .env    # TELEGRAM_BOT_TOKEN from @BotFather
-
-uv run overseer ssh setup                 # Overseer's own SSH key: add it to the cluster, then
-uv run overseer ssh test
-uv run overseer login claude_code         # and/or: overseer login codex
-uv run overseer check                     # everything [ok]?
-uv run overseer run
+uv run overseer setup
 ```
 
-To keep it running across reboots, use the systemd service in `deploy/` ([setup step 8](docs/setup.md#8-keep-it-running-with-systemd)).
+The setup runs in the terminal, step by step. It does the following:
+- installs what's missing (the agents' sandbox, Node.js, Claude Code / Codex);
+- checks your Telegram bot's token and finds your chat id when you message the bot;
+- creates Overseer's own SSH key and adds it to the cluster, then lists the cluster's partitions to pick from;
+- logs the agents in, checks everything, and starts the bot in the background.
+
+Run it again any time to change something. The [setup guide](docs/setup.md) explains each step, and how to do it
+by hand.
+
+```bash
+uv run overseer tui        # watch the bots live: jobs, what the agents are doing, wake-ups, usage, the log
+uv run overseer stop       # (and start, restart, status) - the bot runs in the background, restarted after a crash
+```
 
 ## Everyday use
 
@@ -100,8 +100,8 @@ The **[guide](docs/guide.md)** explains every command and feature in detail.
 
 | | |
 |---|---|
-| [docs/setup.md](docs/setup.md) | **Setting up**, step by step, with troubleshooting |
-| [docs/guide.md](docs/guide.md) | **Using it:** commands, job cards, projects, working on its own, results, planner mode, accounts, configuration |
+| [docs/setup.md](docs/setup.md) | **Setting up**: `overseer setup`, or each step by hand; troubleshooting |
+| [docs/guide.md](docs/guide.md) | **Using it:** commands, job cards, projects, working on its own, results, planner mode, accounts, the terminal monitor, configuration |
 | [docs/security.md](docs/security.md) | What the agent can and can't do, the sandbox, your SSH key |
 | [docs/assistant.md](docs/assistant.md) | The personal assistant bot: Obsidian, tasks, reminders, calendars |
 | [docs/development.md](docs/development.md) | Running the tests, the architecture |

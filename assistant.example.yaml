@@ -16,6 +16,7 @@ local:
   tmp_dir: /tmp/overseer-assistant
   env_file: .env
   timezone: Asia/Dubai          # the time zone you live in: its times, reminders, routines ("" = this machine's)
+  restart_on_crash: true        # overseer start / the TUI: started again after a crash (false: it is not)
 
 # The Obsidian vault: the folder Syncthing keeps in sync on this machine. The agent may write it (except .obsidian/
 # and Syncthing's own files); it must be outside Overseer's folder.

@@ -4,7 +4,7 @@ The full guide to the HPC bot, once it's [set up](setup.md). For a quick overvie
 what the agent may and may not do, [security.md](security.md); for the personal assistant bot,
 [assistant.md](assistant.md).
 
-**Contents:** [Commands](#commands) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
+**Contents:** [Commands](#commands) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
 
 ## Commands
 
@@ -403,6 +403,29 @@ uv run overseer open chat-b920aa      # or a specific one (a unique prefix is en
 
 Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's session ID, saved as soon as a run starts), so they survive restarts. A job the agent submits stays linked to the conversation that submitted it.
 
+## The terminal monitor (overseer tui)
+
+`uv run overseer tui` shows every bot of this Overseer folder (the HPC bot and the assistant, if you have both) live in
+the terminal - over `ssh` from your laptop or phone too. Pick a bot on the left; its tabs (1-6) are:
+
+| tab | |
+|---|---|
+| **Overview** | running or stopped, since when, whether it's watched (restarted after a crash, and how often today); Telegram reachable; SSH and the last poll (HPC) or the vault and calendar (assistant); the agent runs in progress, with their CLI, account and how long they've run; the accounts in use and out of usage |
+| **Jobs** (HPC) or **Today** (assistant) | the jobs with their state, project and the agent's 🤖 - select one for its card; the assistant's day: reminders, routines and events, tasks due, what waits for you |
+| **Agents** | the conversations, the running ones first (▶); select one to follow it live, like `overseer watch`: its reasoning, commands with their output, the reply |
+| **Wake-ups** | the pending watches and timers, and when they fire |
+| **Usage** | tokens and cost today, in 7 and 30 days: by CLI, by account, and what for (your messages, wake-ups, ...) |
+| **Log** | the bot's log (`state/logs/overseer.log`), warnings in yellow and errors in red |
+
+- **Read-only:** it only reads the bots' files (their database opened read-only). It never touches a conversation,
+  sends nothing to Telegram and runs nothing on the HPC, so it's safe to leave open.
+- **Starting and stopping:** its only actions are `s` start, `x` stop and `r` restart of the selected bot, in the
+  background - closing the monitor leaves the bots running. Stopping a bot that's working asks first (its runs are
+  offered again with ▶️ Continue at the next start). The same from the command line: `overseer start | stop | restart
+  | status [-c assistant.yaml]` ([setup](setup.md#8-keep-it-running)).
+- **How it knows:** a running bot rewrites `state/status.json` every few seconds; the monitor shows a bot whose file
+  stops changing as not responding.
+
 ## Restarts don't lose the agent's work
 
 Stopping Overseer (Ctrl-C, `systemctl --user restart overseer`, a crash, a reboot) also stops the agent runs in progress. Their CLIs die with Overseer, even if it's killed, so nothing carries on unseen. At the next start each conversation that was cut off gets a notice:
@@ -418,6 +441,7 @@ Stopping Overseer (Ctrl-C, `systemctl --user restart overseer`, a crash, a reboo
   you never set keep their default, so it means exactly what your file did (that's checked before it's written).
   Your file isn't touched: look the new one over, then `mv config.yaml.new config.yaml`.
 
+- `local.restart_on_crash` (true): a bot started with `overseer start` (or the monitor) is started again after a crash; false: it isn't.
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).

@@ -3,6 +3,13 @@
 This guide takes you from nothing to a running bot: you chat with it on Telegram, it watches your SLURM jobs, and an
 AI agent (Claude Code or Codex) can fix and resubmit them for you. It takes about 20-30 minutes.
 
+> **The easy way:** after [step 2](#2-get-overseer) (getting Overseer), run `uv run overseer setup`. It walks you
+> through the rest in the terminal: it installs what's missing, checks your bot's token, finds your chat id by itself
+> (you just message the bot), sets up the SSH key and adds it to the cluster, lists the cluster's partitions to pick
+> from, logs the agents in, runs the check and starts the bot in the background. Each step shows what's already done,
+> so you can run it again any time to change something. For the personal assistant: `uv run overseer setup -c
+> assistant.yaml`. The manual steps below do the same by hand.
+
 **Contents:**
 1. [What you need](#what-you-need)
 2. [Install the system packages and the agent CLIs](#1-install-the-system-packages-and-the-agent-clis)
@@ -12,7 +19,7 @@ AI agent (Claude Code or Codex) can fix and resubmit them for you. It takes abou
 6. [Connect to the HPC](#5-connect-to-the-hpc)
 7. [Log the agents in](#6-log-the-agents-in)
 8. [Check and start it](#7-check-and-start-it)
-9. [Keep it running with systemd](#8-keep-it-running-with-systemd)
+9. [Keep it running](#8-keep-it-running)
 10. [Optional extras](#optional-extras)
 11. [Troubleshooting](#troubleshooting)
 12. [Updating Overseer](#updating-overseer)
@@ -176,23 +183,46 @@ uv run overseer check
 ```
 
 This checks SSH and SLURM, the Telegram token, and makes a real test call to each installed agent. Every line should
-say `[ok]` (an agent you didn't install shows `[skip]`). Then start the bot:
+say `[ok]` (an agent you didn't install shows `[skip]`). Then start the bot in the background:
 
 ```bash
-uv run overseer run
+uv run overseer start
 ```
 
 Send it a message on Telegram, e.g. *"which of my jobs are running?"* or *"how much quota do I have left?"*. Within
-a minute it also posts a card for each of your running jobs. Press Ctrl-C to stop it.
+a minute it also posts a card for each of your running jobs. Watch it with `uv run overseer tui`
+([the monitor](guide.md#the-terminal-monitor-overseer-tui)); `uv run overseer run` runs it in the terminal instead
+(Ctrl-C stops it).
 
 **First things to try:**
 - `/project new myproj /scratch/me/myproj What this project is about`: a topic of its own for a project.
 - Reply to a failed job's card, or tap **🔧 Ask agent to fix**.
 - `/help` lists every command; the [guide](guide.md) explains them.
 
-## 8. Keep it running with systemd
+## 8. Keep it running
 
-To start Overseer at boot and restart it if it crashes, install the user service in `deploy/overseer.service`:
+`uv run overseer start` runs the bot in the background: closing the terminal or logging out doesn't stop it.
+
+```bash
+uv run overseer status                # running? since when? restarted after a crash?
+uv run overseer stop                  # a clean stop (runs in progress are offered again at the next start)
+uv run overseer restart               # after changing config.yaml
+uv run overseer tui                   # watch it live; s / x / r start, stop and restart it there too
+```
+
+- **After a crash it starts again by itself**: a small watcher process runs it, and starts it again after a pause
+  (30 s, longer if it keeps crashing). It doesn't restart a bot you stopped, nor one that can't start (e.g. a config
+  error). `local.restart_on_crash: false` turns this off; the monitor shows whether a bot is watched.
+- **Only one copy runs**: starting a bot that is already running (from here, the monitor or a terminal) is refused.
+- **Its log** is in `state/logs/overseer.log` (the monitor's Log tab).
+- **Logging out:** on systems that end a user's processes at logout (`KillUserProcesses=yes`), `overseer start` and the
+  monitor tell you; `loginctl enable-linger $USER` keeps the bot running.
+- **After a reboot** it stays off until you start it again. To start it at boot, use systemd instead:
+
+### Or: systemd, to start at boot
+
+To start Overseer at boot and restart it if it crashes, install the user service in `deploy/overseer.service`
+(instead of `overseer start`):
 
 ```bash
 mkdir -p ~/.config/systemd/user

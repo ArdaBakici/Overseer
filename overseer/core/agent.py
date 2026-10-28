@@ -285,6 +285,7 @@ class Session:
     last_status: str = ""  # how its last run ended: done | error | stopped
     ran_on: tuple[str, str] = ("", "")  # the CLI and account of its current (or last) run
     switched: str = ""  # why its next run is on another CLI (said in the handover): set by a failover
+    started: float = 0  # when its current run started (the TUI shows it)
 
     @property
     def id(self) -> str:
@@ -760,6 +761,7 @@ class Agent:
                 return False
             s.task = asyncio.current_task()
             s.origin = origin
+            s.started = time.time()
             if origin == "user" and self.autopilot:
                 self.autopilot.user_turn(s)
             try:

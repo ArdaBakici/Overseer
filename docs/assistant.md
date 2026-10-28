@@ -23,8 +23,10 @@ uv run overseer run -c assistant.yaml
 
 4. **Optional:** your calendars ([below](#your-calendars-optional)) and topics ([below](#topics-media-and-the-rest)).
 
-To keep it running, copy `deploy/overseer.service` to `overseer-assistant.service` and change `config.yaml` to
-`assistant.yaml` in its `ExecStart` line ([setup step 8](setup.md#8-keep-it-running-with-systemd)).
+Start it in the background with `uv run overseer start -c assistant.yaml` (`stop`, `status`, `restart` likewise), or
+from the monitor (`uv run overseer tui`), which shows both bots. With systemd instead: copy `deploy/overseer.service`
+to `overseer-assistant.service` and change `config.yaml` to `assistant.yaml` in its `ExecStart` line
+([setup step 8](setup.md#8-keep-it-running)). The easy way to set it up: `uv run overseer setup -c assistant.yaml`.
 
 ## What it does
 

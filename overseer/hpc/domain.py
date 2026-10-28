@@ -153,6 +153,33 @@ class HpcDomain(Domain):
             self._dashboard = HpcDashboard(self)
         return await self._dashboard.route(parts, query)
 
+    # ------------------------------------------------------------------ the TUI
+    async def status(self) -> dict:
+        from .dashboard import HpcDashboard
+        from .slurm import STATE_EMOJI
+        from .sshlink import master_alive
+
+        m = self.monitor
+        poll = (f"{int(time.time() - m.last_ok)} s ago" if m and m.last_ok else "not yet")
+        lines = [["SSH", "up" if await master_alive(self.cfg) else "down (reopens at the next poll)", None],
+                 ["last poll", poll + (f" - {m.last_error[:200]}" if m and m.last_error else ""),
+                  bool(m and m.last_ok and not m.last_error and time.time() - m.last_ok < 5 * self.cfg.slurm.poll_interval)],
+                 ["HPC", f"{self.hpc.user or self.cfg.ssh.user}@{self.cfg.ssh.hostname}", None]]
+        w = getattr(m, "worker", None)
+        if w:
+            lines.append(["compute worker", f"job {w.job_id}: {w.state} ({w.reason}) · {w.elapsed} of {w.time_limit}",
+                          None])
+        overview = (self._dashboard or HpcDashboard(self)).overview()
+        rows, details = [], []
+        for j in overview["jobs"][:80]:
+            ended = j["ended"] or 0
+            rows.append([f"{STATE_EMOJI.get(j['state'], '•')} {j['state']}", j["id"], j["name"], j["project"],
+                         "🤖" if j["agent"] else "", (j["start"] if j["state"] == "PENDING" else "")
+                         or time.strftime("%d %b %H:%M", time.localtime(ended or j["seen"] or 0))])
+            details.append(j["card"] or j["report"] or "(no card yet)")
+        return {"lines": lines, "tables": [{"title": "Jobs", "rows": rows, "details": details,
+                                            "columns": ["state", "job", "name", "project", "agent", "since / ended"]}]}
+
     # ------------------------------------------------------------------ the morning digest
     async def digest_sections(self, since: float, now: float) -> list[str]:
         from .digest import HpcDigest

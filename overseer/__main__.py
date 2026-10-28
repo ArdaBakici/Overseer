@@ -17,7 +17,12 @@
     overseer reset [--yes]              wipe the bot's flags: its wake-ups, paused wake-ups, and the domain's own
                                         (the assistant's reminders, day logs, set-up flag); then asks whether to
                                         forget its conversations too. The bot must be stopped
-    overseer run                        start the bot
+    overseer run                        start the bot (in this terminal)
+    overseer start | stop | restart     run the bot in the background (it outlives the terminal; restarted after
+                                        a crash unless local.restart_on_crash: false) / stop it / both
+    overseer status                     is it running (and watched), since when, its restarts
+    overseer tui                        watch every bot of this folder live (read-only); start and stop them
+    overseer setup                      set a bot up step by step (the HPC bot, or -c assistant.yaml)
 All take -c/--config (default: config.yaml).
 """
 
@@ -280,6 +285,37 @@ def open_command(cfg: Config, target: str | None) -> int:
     return subprocess.call(argv, env=env, cwd=str(cwd))
 
 
+def daemon_command(cfg: Config, command: str) -> int:
+    import time
+
+    from .core import daemon
+
+    if command == "supervise":
+        return daemon.supervise(cfg)
+    if command == "status":
+        st = daemon.state(cfg.local.state())
+        if not st.running:
+            print("not running" + (f" (the watcher: {st.supervisor.get('state')})" if st.watched else ""))
+            return 1
+        hb = daemon.read_json(cfg.local.state("status.json"))
+        since = f", up {_ago(hb['started']).removesuffix(' ago')}" if hb.get("started") else ""
+        watched = (f"; watched (restarted after a crash: {st.restarts_since(time.time() - 86400)} in the last day)"
+                   if st.watched else "; not watched (local.restart_on_crash is off, or started by hand)")
+        print(f"running, pid {st.pid}{since}{watched}")
+        return 0
+    if command in ("stop", "restart"):
+        ok, msg = daemon.stop(cfg)
+        print(msg)
+        if command == "stop":
+            return 0 if ok else 1
+    ok, msg = daemon.start(cfg)
+    print(msg)
+    note = daemon.linger_note()
+    if ok and note:
+        print(f"note: {note}")
+    return 0 if ok else 1
+
+
 def config_command(path: str) -> int:
     """`overseer config`: the report, and <file>.new to look over and move into place."""
     from pathlib import Path
@@ -387,7 +423,8 @@ async def update_command(cfg: Config) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset",
-                                           "config"])
+                                           "config", "start", "stop", "restart", "status", "tui", "setup",
+                                           "supervise"])
     ap.add_argument("target", nargs="?",
                     help="login: claude_code|codex|google; ssh: setup|connect|test; open: conversation (default: latest); "
                          "watch: conversation (default: all)")
@@ -408,6 +445,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.command == "config":  # (before loading it: an old file may not load any more)
         return config_command(args.config)
+    if args.command == "setup":  # (there may be no config yet)
+        from .tui.setup import run_setup
+        return run_setup(args.config)
+    if args.command == "tui":
+        from .tui.monitor import run_monitor
+        return run_monitor(args.config)
     try:
         cfg = load_config(args.config)
     except (OSError, ConfigError) as e:
@@ -431,6 +474,15 @@ def main(argv: list[str] | None = None) -> int:
             return reset_command(cfg, args.yes)
         if args.command == "update":
             return asyncio.run(update_command(cfg))
+        if args.command in ("start", "stop", "restart", "status", "supervise"):
+            return daemon_command(cfg, args.command)
+        from .core import daemon
+        try:
+            daemon.acquire_lock(cfg.local.state())  # (held while it runs: a second copy refuses to start)
+        except daemon.AlreadyRunning as e:
+            print(e, file=sys.stderr)
+            return daemon.EXIT_RUNNING
+        daemon.log_to_file(cfg.local.state())
         app = build(cfg)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
