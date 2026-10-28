@@ -74,7 +74,7 @@ by hand.
 
 ```bash
 uv run overseer tui        # watch the bots live: jobs, what the agents are doing, wake-ups, usage, the log
-uv run overseer stop       # (and start, restart, status) - the bot runs in the background, restarted after a crash
+uv run overseer stop       # (and start, restart, status) - the bot runs in the background
 ```
 
 ## Everyday use

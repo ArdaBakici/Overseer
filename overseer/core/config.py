@@ -51,9 +51,10 @@ class LocalConfig:
     # The time zone this bot thinks in - its times, reminders, routines, digest - and the agent's `date`, if not this
     # machine's: e.g. Asia/Dubai. "" = this machine's.
     timezone: str = ""
-    # `overseer start` (and the TUI) run the bot in the background, watched: restarted after a crash (not after a
-    # stop, nor when it can't start, e.g. a config error). false: it stays down until you start it again.
-    restart_on_crash: bool = True
+    # `overseer start` (and the TUI) run the bot in the background. true: watched, and started again after a crash (not
+    # after a stop, nor when it can't start, e.g. a config error). false (the default): it stays down until you start
+    # it again.
+    restart_on_crash: bool = False
     # Set by load_config to the config file's folder; relative paths resolve against it.
     base_dir: str = ""
 

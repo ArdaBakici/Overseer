@@ -203,7 +203,7 @@ class Monitor(App):
                 n = sum(1 for t in h.supervisor.get("restarts", []) if t > time.time() - 86400)
                 parts.append("↻ watched: restarted after a crash" + (f" ({n}× in the last day)" if n else ""))
             else:
-                parts.append("not watched (no restart after a crash)")
+                parts.append("not restarted after a crash (local.restart_on_crash: true turns it on)")
             if h.stale:
                 parts.append("⚠ no heartbeat for over a minute")
             style = "bold yellow" if h.stale else "bold green"

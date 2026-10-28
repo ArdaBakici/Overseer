@@ -122,7 +122,11 @@ def test_the_status_command(bot_cfg, monkeypatch, capsys):
     assert daemon_command(bot_cfg, "start") == 0
     assert daemon_command(bot_cfg, "status") == 0
     out = capsys.readouterr().out
-    assert "running, pid" in out and "watched (restarted after a crash: 0 in the last day)" in out
+    assert "running, pid" in out and "not restarted after a crash (local.restart_on_crash: true" in out
+    assert daemon_command(bot_cfg, "stop") == 0
+    bot_cfg.local.restart_on_crash = True  # (opted in)
+    assert daemon_command(bot_cfg, "start") == 0 and daemon_command(bot_cfg, "status") == 0
+    assert "watched (restarted after a crash: 0 in the last day)" in capsys.readouterr().out
     assert daemon_command(bot_cfg, "stop") == 0
 
 
@@ -187,9 +191,15 @@ def test_health_of_a_bot(bot_cfg, monkeypatch):
     h = D.health(bot)
     assert not h.running and h.label == "○ stopped"
     fake(monkeypatch, "run")
+    assert bot_cfg.local.restart_on_crash is False  # (not in its config: off)
     daemon.start(bot_cfg)
     h = D.health(bot)
-    assert h.running and h.watched and h.stale  # (the stand-in writes no heartbeat)
+    assert h.running and not h.watched and h.stale  # (the stand-in writes no heartbeat)
+    daemon.stop(bot_cfg)
+    bot_cfg.local.restart_on_crash = True  # opted in: watched
+    daemon.start(bot_cfg)
+    h = D.health(bot)
+    assert h.running and h.watched
     daemon.stop(bot_cfg)
 
 
@@ -303,7 +313,7 @@ async def test_the_setup_wizard_writes_a_working_config(tmp_path):
     cfg = load_config(cfgp)
     assert (cfg.ssh.hostname, cfg.ssh.user, cfg.telegram.allowed_chat_ids, cfg.local.timezone) == (
         "login.hpc.example", "ab123", [4242], "Asia/Dubai")
-    assert cfg.local.restart_on_crash is True and not list(tmp_path.glob("config.yaml.bak-*"))
+    assert cfg.local.restart_on_crash is False and not list(tmp_path.glob("config.yaml.bak-*"))  # (opt-in)
 
 
 def test_overseer_run_refuses_a_second_copy(bot_cfg):

@@ -589,7 +589,7 @@ class Setup(App):
             yield Static("Research notes in Obsidian (optional): a folder inside your vault, e.g. "
                          "/home/me/Vault/HPC", classes="hint")
             yield Input(placeholder="leave empty to keep the research logs on the HPC", id="obsidian")
-        yield Checkbox("Restart the bot by itself if it crashes", True, id="restart")
+        yield Checkbox("Restart the bot by itself if it crashes", False, id="restart")
         yield Checkbox("ADHD-friendly replies (lead with the next action, numbered steps, no tangents)", False,
                        id="adhd")
         yield Button("Save", id="save-prefs", variant="primary")
@@ -606,7 +606,7 @@ class Setup(App):
             o = self.query_one("#obsidian", Input)
             if not o.value and self.draft.get("obsidian.folder"):
                 o.value = str(self.draft.get("obsidian.folder"))
-        self.query_one("#restart", Checkbox).value = self.draft.get("local.restart_on_crash", True) is not False
+        self.query_one("#restart", Checkbox).value = bool(self.draft.get("local.restart_on_crash", False))
         self.query_one("#adhd", Checkbox).value = bool(self.draft.get("agent.i_have_adhd", False))
 
     def status_prefs(self) -> str:

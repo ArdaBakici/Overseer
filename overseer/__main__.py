@@ -19,7 +19,7 @@
                                         forget its conversations too. The bot must be stopped
     overseer run                        start the bot (in this terminal)
     overseer start | stop | restart     run the bot in the background (it outlives the terminal; restarted after
-                                        a crash unless local.restart_on_crash: false) / stop it / both
+                                        a crash with local.restart_on_crash: true) / stop it / both
     overseer status                     is it running (and watched), since when, its restarts
     overseer tui                        watch every bot of this folder live (read-only); start and stop them
     overseer setup                      set a bot up step by step (the HPC bot, or -c assistant.yaml)
@@ -300,7 +300,7 @@ def daemon_command(cfg: Config, command: str) -> int:
         hb = daemon.read_json(cfg.local.state("status.json"))
         since = f", up {_ago(hb['started']).removesuffix(' ago')}" if hb.get("started") else ""
         watched = (f"; watched (restarted after a crash: {st.restarts_since(time.time() - 86400)} in the last day)"
-                   if st.watched else "; not watched (local.restart_on_crash is off, or started by hand)")
+                   if st.watched else "; not restarted after a crash (local.restart_on_crash: true turns it on)")
         print(f"running, pid {st.pid}{since}{watched}")
         return 0
     if command in ("stop", "restart"):

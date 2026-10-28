@@ -1,8 +1,8 @@
 """Running a bot in the background: `overseer start | stop | restart | status` (and the TUI's keys).
 
     overseer start      the bot runs on, detached from the terminal (closing it, or logging out, doesn't stop it).
-                        With local.restart_on_crash (the default) a small watcher process runs it and starts it
-                        again after a crash; never after a stop, nor when it can't start (a config error).
+                        With local.restart_on_crash: true (off by default) a small watcher process runs it and starts
+                        it again after a crash; never after a stop, nor when it can't start (a config error).
     overseer stop       a clean stop (like Ctrl-C): runs in progress are offered again at the next start.
 
 Only one copy of a bot runs at a time, however it was started (here, in tmux, by systemd): `overseer run` takes a lock

@@ -410,7 +410,7 @@ the terminal - over `ssh` from your laptop or phone too. Pick a bot on the left;
 
 | tab | |
 |---|---|
-| **Overview** | running or stopped, since when, whether it's watched (restarted after a crash, and how often today); Telegram reachable; SSH and the last poll (HPC) or the vault and calendar (assistant); the agent runs in progress, with their CLI, account and how long they've run; the accounts in use and out of usage |
+| **Overview** | running or stopped, since when, whether it's watched (restarted after a crash with `local.restart_on_crash: true`, and how often today); Telegram reachable; SSH and the last poll (HPC) or the vault and calendar (assistant); the agent runs in progress, with their CLI, account and how long they've run; the accounts in use and out of usage |
 | **Jobs** (HPC) or **Today** (assistant) | the jobs with their state, project and the agent's 🤖 - select one for its card; the assistant's day: reminders, routines and events, tasks due, what waits for you |
 | **Agents** | the conversations, the running ones first (▶); select one to follow it live, like `overseer watch`: its reasoning, commands with their output, the reply |
 | **Wake-ups** | the pending watches and timers, and when they fire |
@@ -441,7 +441,7 @@ Stopping Overseer (Ctrl-C, `systemctl --user restart overseer`, a crash, a reboo
   you never set keep their default, so it means exactly what your file did (that's checked before it's written).
   Your file isn't touched: look the new one over, then `mv config.yaml.new config.yaml`.
 
-- `local.restart_on_crash` (true): a bot started with `overseer start` (or the monitor) is started again after a crash; false: it isn't.
+- `local.restart_on_crash` (false): true has a bot started with `overseer start` (or the monitor) started again after a crash.
 - `slurm.poll_interval` (default 60 s) sets how often jobs are checked. `slurm.track: agent` reports only on jobs the agent submitted.
 - `agent.report_commands`: `summary` (default) sends one message per request, `live` batches commands every 5 s while the agent works, and `off` sends nothing.
 - `agent.live_progress: false` turns off the self-updating ⏳ message (the transcript for `overseer watch` is always written).

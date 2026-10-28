@@ -210,9 +210,10 @@ uv run overseer restart               # after changing config.yaml
 uv run overseer tui                   # watch it live; s / x / r start, stop and restart it there too
 ```
 
-- **After a crash it starts again by itself**: a small watcher process runs it, and starts it again after a pause
-  (30 s, longer if it keeps crashing). It doesn't restart a bot you stopped, nor one that can't start (e.g. a config
-  error). `local.restart_on_crash: false` turns this off; the monitor shows whether a bot is watched.
+- **Restart after a crash (off by default)**: with `local.restart_on_crash: true` in the config, a small watcher
+  process runs the bot and starts it again after a crash, after a pause (30 s, longer if it keeps crashing). It
+  doesn't restart a bot you stopped, nor one that can't start (e.g. a config error). The monitor shows whether a
+  bot is watched, and how often it was restarted.
 - **Only one copy runs**: starting a bot that is already running (from here, the monitor or a terminal) is refused.
 - **Its log** is in `state/logs/overseer.log` (the monitor's Log tab).
 - **Logging out:** on systems that end a user's processes at logout (`KillUserProcesses=yes`), `overseer start` and the
