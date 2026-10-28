@@ -1321,7 +1321,7 @@ class Bot:
         "1. <code>dashboard: {enabled: true}</code> - Overseer serves it on this machine (127.0.0.1:8765).\n"
         "2. On the homelab: <code>tailscale serve --bg 8765</code>. It prints an https://….ts.net address, reachable "
         "only on your tailnet (not the internet: that would be <i>funnel</i>). Put it in <code>dashboard.url</code>. "
-        "(Or any HTTPS reverse proxy to 127.0.0.1:8765, e.g. Caddy: see the README.)\n"
+        "(Or any HTTPS reverse proxy to 127.0.0.1:8765, e.g. Caddy: see docs/setup.md.)\n"
         "Then /dashboard opens it, from any of your devices with Tailscale on.")
 
     async def cmd_dashboard(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

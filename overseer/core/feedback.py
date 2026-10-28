@@ -25,7 +25,7 @@ from .store import FeedbackRecord, SessionRecord, Store
 KINDS = {"limitation": "🧱", "bug": "🐞", "idea": "💡"}
 STATUS = {"open": "", "noted": "👀 noted", "fixed": "✅ fixed", "wontfix": "✖ won't fix"}
 PER_DAY = 3  # new items per conversation per day (+1s are unlimited)
-SOURCE = Path(__file__).resolve().parent.parent.parent  # Overseer's source (README, overseer/, tests/)
+SOURCE = Path(__file__).resolve().parent.parent.parent  # Overseer's source (README, docs/, overseer/, tests/)
 REVIEWER_KEY = "feedback_reviewer"
 
 REVIEW_PROMPT = """[Feedback review]{focus}
@@ -40,7 +40,7 @@ Agents reported these about Overseer (open ones, most +1s first):
    the risks. Put it in ./outbox/DESIGN-{date}.md - it's sent to the researcher with your reply.
 3. When a change is clear and contained, also write it as a patch: copy the source - only the code, not its state or
    secrets - into your scratch folder (`mkdir -p a b && cp -r {src}/overseer {src}/tests {src}/README.md
-   {src}/pyproject.toml a/ && cp -r a/. b/`), edit the copy in b/, and save `diff -ruN a b` as
+   {src}/docs {src}/pyproject.toml a/ && cp -r a/. b/`), edit the copy in b/, and save `diff -ruN a b` as
    ./outbox/<short-name>.patch (ready for `git apply -p1`). Run its tests if you can (`cd b && python -m pytest -q
    tests/test_integration.py`).
 4. When an item is really missing know-how (how to do something on this cluster or with these tools) rather than a
