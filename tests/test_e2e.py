@@ -256,7 +256,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         assert "HOME=/" in outs[8] and "U=" in outs[8] and "requires approval" not in outs[8], detail
         assert "SCP-DONE" in outs[9], detail
         # Known gap: Codex's sandbox doesn't isolate the machine's localhost (Claude Code's does). If this
-        # starts failing for codex, Codex closed it: update the README's sandbox table.
+        # starts failing for codex, Codex closed it: update the sandbox table in docs/security.md.
         assert ("LOOPBACK-OPEN" if backend == "codex" else "LOOPBACK-CLOSED") in outs[10], detail
         st = json.loads(state.read_text())
         workers = [j for j, v in st["jobs"].items() if v["name"] == "overseer-worker"]
