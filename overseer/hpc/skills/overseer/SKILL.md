@@ -33,8 +33,11 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
   2 FAILED"); each task has its own log. Watching an array wakes you when all its tasks have ended, with
   each task's state and log path and the end of each log (failed tasks first). Its card and check-ins show the
   running task's log; `ov job show <id>` gives the tasks' log pattern (%a = the task id).
-- `hpc-run`'s shared worker job (`overseer-worker`) is not one of your jobs. Don't register or watch
-  it: `hpc-run` starts, reuses and ends it (`hpc-run --stop` ends it early).
+- `hpc-run`'s jobs - its shared worker (`overseer-worker`) and the nodes of their own it asks for with
+  `--cpus/--mem/--time/--gpu` (`overseer-run-...`) - are not your jobs. Don't register or watch them:
+  `hpc-run` starts and ends them (`hpc-run --status` lists them, `hpc-run --stop` ends the worker early).
+  A node of its own may wait in the queue: `hpc-run` says so (the job, its state and reason) every minute,
+  and cancels the request after `slurm.compute.wait_minutes` - for work that can wait, use `sbatch`.
 
 ## Past work: `ov history`
 
@@ -373,7 +376,7 @@ ov propose plan.json
 ov spawn cosine "brief..." [--model claude-sonnet-5-5] [--backend codex]   # start a subagent (or queue it)
 ov agents                     # your subagents and their state
 ov agent show cosine          # its task and report
-ov agent send cosine "also try warmup 1k"   # it works on that and reports again
+ov agent send cosine "also try warmup 1k"   # while it works: it reads it at its next step; else it works on it and reports again
 ov agent stop cosine
 ov planner off                # the goal is reached: back to normal mode
 ```

@@ -163,6 +163,8 @@ class Search:
         kind = ev.get("kind")
         if kind == "turn" and ev.get("text"):
             return "request", ev["text"]
+        if kind == "steer" and ev.get("text"):  # (written while the agent worked)
+            return "request", ev["text"].split("\n", 1)[-1]
         if kind == "end" and ev.get("status") == "done" and ev.get("text"):
             return "reply", ev["text"]
         if kind == "message" and ev.get("text"):
@@ -238,6 +240,8 @@ class Search:
                     turns[-1]["commands"].append(ev.get("command", ""))
                 elif turns and kind == "message":
                     turns[-1]["notes"].append(ev.get("text", ""))
+                elif turns and kind == "steer":  # (the researcher wrote while it worked)
+                    turns[-1]["request"] += "\n\n(while it worked) " + ev.get("text", "").split("\n", 1)[-1]
         if grep:
             words = [w.lower() for w in re.findall(r"\w+", grep)]
             keep = set()

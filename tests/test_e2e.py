@@ -264,7 +264,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         assert f"ON-COMPUTE {remote / 'proj'} Agg" in outs[11] and "started a compute worker" in outs[11], detail
         assert "AGAIN" in outs[12] and "started a compute worker" not in outs[12], detail
         assert [a for a in st["steps"] if f"--jobid={workers[0]}" in a and "--overlap" in a], st["steps"]
-        assert f"worker: {workers[0]} RUNNING" in outs[13], detail
+        assert f"shared worker: {workers[0]} overseer-worker RUNNING" in outs[13], detail
         assert "EXIT=152" in outs[14] and "login node's CPU limit" in outs[14], detail
         assert "✓ job 5001 (" in outs[15] and "tracked in this conversation (already was)" in outs[15], detail
         assert "✓ project e2eproj created (~/e2eproj)" in outs[16], detail
@@ -691,3 +691,37 @@ async def test_out_of_usage_continues_in_the_next_account(hpc, backend, cli_name
     assert s.rec.cli_session_id == sid  # (the same CLI session, resumed from the second account's home)
     from overseer.core.accounts import session_files
     assert session_files(backend, first, sid) and session_files(backend, second, sid)
+
+
+@pytest.mark.parametrize("backend,cli_name", [("claude_code", "claude"), ("codex", "codex")])
+async def test_a_message_sent_mid_run_reaches_the_agent(hpc, backend, cli_name):
+    """The real CLIs, steered: while the agent's command runs, the researcher writes; the agent has it at its next
+    step - in the same request (one turn, one reply)."""
+    cli = find_cli(cli_name)
+    if not cli:
+        pytest.skip(f"{cli_name} not installed")
+    cfg, remote, state, app = hpc
+    with FakeModel(["sleep 6", "echo AFTER"]) as fm:
+        configure_backend(cfg, backend, cli, fm)
+        store = Store(cfg.local.db_path)
+        notes = Notes()
+        agent = Agent(cfg, store, notes, HpcDomain(cfg, store, notes, HPC(SSHRunner(cfg), cfg.slurm.setup)))
+        agent.set_backend(backend)
+        s = agent.general_session()
+        run = asyncio.create_task(agent.handle(s, "FIRST-REQUEST"))
+        for _ in range(1200):  # (until the model has asked for its first command: `sleep 6` runs now)
+            if s.steering and any(r["body"].get("tools") for r in fm.requests):
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(2)
+        assert await agent.steer(s, "STEER-MESSAGE use lr 1e-4"), "the run didn't take the message"
+        assert await asyncio.wait_for(run, 240), notes.texts()
+
+    with_steer = [i for i, r in enumerate(fm.requests) if "STEER-MESSAGE" in json.dumps(r["body"])]
+    assert with_steer and with_steer[0] >= 1, "the message never reached the model (or not mid-run)"
+    assert any("AFTER" in o for o in fm.outputs)  # (it went on with its work)
+    replies = [m for m in notes.sent if m.text.startswith("🤖")]
+    assert len(replies) == 1, notes.texts()  # one request, one reply
+    path = cfg.local.state("transcripts") / f"{s.id}.jsonl"
+    events = [json.loads(x) for x in path.read_text().splitlines()]
+    assert sum(e["kind"] == "turn" for e in events) == 1 and any(e["kind"] == "steer" for e in events)

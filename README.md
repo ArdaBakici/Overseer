@@ -80,13 +80,15 @@ uv run overseer stop       # (and start, restart, status) - the bot runs in the 
 ## Everyday use
 
 Just talk to it: *"which of my jobs are running?"*, *"why did 18746955 fail?"*, *"plot the reward for seeds 0-2"*.
-Reply to a job's message to talk about that job.
+Reply to a job's message to talk about that job. You can write while it works too: *"actually use lr 1e-4"* goes into
+its run, and it takes it into account at its next step (`/after <text>` waits until it's done instead).
 
 | Command | |
 |---|---|
 | **🔧 Ask agent to fix** | on a failed job's card: the agent investigates, fixes and resubmits |
 | `/jobs`, `/job <id>`, `/log <id>` | your jobs, one job's card, a log tail |
 | `/ask <text>`, `/new`, `/stop` | talk to the agent, start a fresh conversation, stop its run |
+| `/after <text>` | a message for once the agent has finished what it's working on |
 | `/auto <goal>` | let the agent work on a goal on its own; `/auto off` cancels its wake-ups |
 | `/project new <name> <dir> [about]` | a project with its own topic |
 | `/results`, `/findings` | what each experiment showed |

@@ -24,7 +24,7 @@ from ..core.runners import Sandbox
 from ..core.store import JobRecord
 from . import prompts as P
 from .activity import JobActivity
-from .compute import WORKER_NAME
+from .compute import is_helper
 from .quota import Quota, limits_line, over
 from .results import context as results_context
 from .slurm import array_parent
@@ -431,7 +431,7 @@ class HpcDomain(Domain):
             return
         try:
             new = await self.hpc.submitted_since(since, int((time.monotonic() - started) / 60) + 3,
-                                                 skip_names=(WORKER_NAME,))  # hpc-run's worker isn't a job of yours
+                                                 skip=is_helper)  # hpc-run's jobs aren't jobs of yours
         except Exception:
             log.debug("could not ask SLURM for new jobs", exc_info=True)
             return

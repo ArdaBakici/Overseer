@@ -10,6 +10,7 @@ import time
 from importlib import resources
 
 from ..core.dashboard import JOB_ID, json_answer
+from .compute import is_helper
 from .slurm import gpus_from_tres
 
 
@@ -57,9 +58,9 @@ class HpcDashboard:
 
     # ------------------------------------------------------------------ data
     def overview(self) -> dict:
-        active = [r for r in self.store.active_jobs() if r.name != "overseer-worker"]
+        active = [r for r in self.store.active_jobs() if not is_helper(r.name)]
         seen = {r.job_id for r in active}
-        recent = [r for r in self.store.recent_jobs(80) if r.job_id not in seen and r.name != "overseer-worker"]
+        recent = [r for r in self.store.recent_jobs(80) if r.job_id not in seen and not is_helper(r.name)]
         jobs = []
         for r in active + recent:
             try:
@@ -110,7 +111,7 @@ class HpcDashboard:
         tracked = {r.job_id: r for r in self.store.recent_jobs(2000)}
         jobs = []
         for j in rows:
-            if j.name == "overseer-worker" or not j.start_time[:1].isdigit():
+            if is_helper(j.name) or not j.start_time[:1].isdigit():
                 continue  # (never started: nothing to draw)
             rec = tracked.get(j.job_id)
             jobs.append({"id": j.job_id, "name": j.name, "state": j.state, "start": j.start_time,

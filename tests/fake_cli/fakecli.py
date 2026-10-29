@@ -15,6 +15,11 @@ every run submits a new job id and watches it with `ov watch`, like a real agent
 prompt (the first message, or job logs quoted in a wake-up's report) steer it: FAKE_DONE (stop),
 FAKE_HELP (ask), FAKE_NOJOB (submit nothing), FAKE_TWO (two jobs), FAKE_NOWATCH (submit without
 watching), FAKE_EVERY (watch with check-ins); in a check-in, FAKE_DIVERGE makes it scancel and resubmit.
+
+Messages sent while it works (steering): claude reads streaming input (--input-format stream-json) and acknowledges each
+message it takes (--replay-user-messages); codex runs through `codex app-server` and takes `turn/steer`. With
+FAKE_STEER in the request, either waits up to 5 s after its command for such a message, and its answer ends with
+"STEERED: <message>". A message after the answer gets an answer of its own ("LATE: <message>").
 """
 import re
 import json
@@ -23,17 +28,93 @@ import sys
 import time
 import uuid
 
+import select
+
 prog = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
-stdin = "" if sys.stdin.isatty() or args[:1] == ["app-server"] else sys.stdin.read()  # (app-server: a conversation)
-with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
-    fh.write(json.dumps({"prog": prog, "argv": args, "env": dict(os.environ), "stdin": stdin, "cwd": os.getcwd()}) + "\n")
+
+
+class Lines:
+    """stdin, a line at a time, with a timeout (while the run goes on, more may come: steering)."""
+    def __init__(self):
+        self.buf = b""
+        self.eof = False
+
+    def get(self, timeout=None):
+        """The next line (str), or None: nothing within `timeout` s (None: wait), or the end of the input."""
+        end = None if timeout is None else time.time() + timeout
+        while b"\n" not in self.buf and not self.eof:
+            left = None if end is None else max(0.0, end - time.time())
+            if not select.select([0], [], [], left)[0]:
+                return None
+            data = os.read(0, 65536)
+            if not data:
+                self.eof = True
+            self.buf += data
+        if b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            return line.decode()
+        return None
+
+
+LINES = Lines()
+STREAM = prog == "claude" and "stream-json" in args[args.index("--input-format") + 1:args.index("--input-format") + 2] \
+    if "--input-format" in args else False
+REPLAY = "--replay-user-messages" in args
+STEERED = []  # messages taken while it worked
+
+
+def user_text(line):
+    content = json.loads(line)["message"]["content"]
+    return content if isinstance(content, str) else "".join(b.get("text", "") for b in content)
+
+
+def log_call(text):
+    with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
+        fh.write(json.dumps({"prog": prog, "argv": args, "env": dict(os.environ), "stdin": text,
+                             "cwd": os.getcwd()}) + "\n")
+
+
+if STREAM:  # (claude with streaming input: the request is the first message)
+    stdin = user_text(LINES.get())
+elif sys.stdin.isatty() or args[:1] == ["app-server"]:  # (app-server: a conversation - logged per turn)
+    stdin = ""
+else:
+    stdin = sys.stdin.read()
+if args[:1] != ["app-server"]:
+    log_call(stdin)
+
+
+def take_steer(line):
+    text = user_text(line)
+    STEERED.append(text)
+    if REPLAY:
+        print(json.dumps({"type": "user", "isReplay": True, "message": {"role": "user", "content": text}}), flush=True)
 
 
 def emit(ev):
+    if STREAM and ev.get("type") == "result" and not ev.get("is_error"):
+        while (line := LINES.get(0)) is not None:  # (sent while it worked: taken before it answers)
+            take_steer(line)
+        if STEERED and ev.get("result"):
+            ev = {**ev, "result": ev["result"] + "\nSTEERED: " + " | ".join(STEERED)}
     print(json.dumps(ev), flush=True)
     if "FORCE_SLOW" in stdin:
         time.sleep(0.3)
+    if STREAM and ev.get("type") == "result":  # the input stays open: each later message is a turn of its own
+        while (line := LINES.get()) is not None:
+            if REPLAY:
+                print(json.dumps({"type": "user", "isReplay": True,
+                                  "message": {"role": "user", "content": user_text(line)}}), flush=True)
+            print(json.dumps({**ev, "result": "LATE: " + user_text(line)}), flush=True)
+
+
+def wait_steer(seconds=5):
+    """FAKE_STEER: give a message sent while it works time to come (it's taken at this step)."""
+    if STREAM and "FAKE_STEER" in stdin:
+        line = LINES.get(seconds)
+        if line is not None:
+            take_steer(line)
 
 
 if "login" in args:
@@ -235,6 +316,7 @@ if prog == "claude":
         {"type": "text", "text": "Checking the job."},
         {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ssh hpc 'cd ~/proj && sbatch train.sh'"}},
         {"type": "tool_use", "id": "t2", "name": "Write", "input": {"file_path": "/tmp/x/notes.md", "content": "x"}}]}})
+    wait_steer()
     if "FORCE_BLOCK" in stdin:
         emit({"type": "user", "session_id": sid, "message": {"content": [
             {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "This command requires approval"}]}})
@@ -266,25 +348,112 @@ def codex_compacted(tid):
         fh.write(json.dumps({"type": "compacted", "payload": {"message": "summary of the earlier turns"}}) + "\n")
 
 
-if prog == "codex" and args[:1] == ["app-server"]:  # JSON-RPC over stdio: only what /compact uses
-    for line in sys.stdin:
+def codex_model():
+    for i, a in enumerate(args):
+        if a == "-m" or (a == "-c" and args[i + 1].startswith("model=")):
+            return args[i + 1].split("=", 1)[1].strip('"') if a == "-c" else args[i + 1]
+    return "gpt-fake-default"
+
+
+def codex_effort():
+    return next((a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort=")), None)
+
+
+if prog == "codex" and args[:1] == ["app-server"]:  # JSON-RPC over stdio: Overseer's runs (and /compact)
+    def out(msg):
+        print(json.dumps(msg), flush=True)
+
+    def note(method, params):
+        out({"method": method, "params": params})
+        if "FORCE_SLOW" in stdin:
+            time.sleep(0.3)
+
+    def turn_item(kind, item, started=False):
+        if started:
+            note("item/started", {"item": {**item, "type": kind}})
+        note("item/completed", {"item": {**item, "type": kind}})
+
+    tid, active = None, None
+    while (line := LINES.get()) is not None:
         msg = json.loads(line)
-        if msg.get("method") != "thread/compact/start":
-            if "id" in msg:
-                print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
-            continue
-        tid = msg["params"]["threadId"]
-        if not os.path.exists(codex_rollout(tid)):
-            print(json.dumps({"id": msg["id"], "error": {"message": f"no rollout found for thread id {tid}"}}), flush=True)
-            continue
-        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
-        codex_compacted(tid)
-        item = {"type": "contextCompaction", "id": "c1"}
-        print(json.dumps({"method": "item/completed", "params": {"threadId": tid, "turnId": "t1", "item": item}}),
-              flush=True)
-        print(json.dumps({"method": "turn/completed", "params": {"threadId": tid, "turn": {"id": "t1",
-                                                                                           "status": "completed"}}}),
-              flush=True)
+        m, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+        if m == "thread/compact/start":
+            log_call("")
+            tid = params["threadId"]
+            if not os.path.exists(codex_rollout(tid)):
+                out({"id": rid, "error": {"message": f"no rollout found for thread id {tid}"}})
+                continue
+            out({"id": rid, "result": {}})
+            codex_compacted(tid)
+            note("item/completed", {"threadId": tid, "turnId": "t1", "item": {"type": "contextCompaction", "id": "c1"}})
+            note("turn/completed", {"threadId": tid, "turn": {"id": "t1", "status": "completed"}})
+        elif m == "thread/start":
+            tid = str(uuid.uuid4())
+            out({"id": rid, "result": {"thread": {"id": tid}, "model": codex_model(), "reasoningEffort": codex_effort()}})
+        elif m == "thread/resume":
+            tid = params["threadId"]
+            if STRICT and not os.path.exists(codex_rollout(tid)):
+                out({"id": rid, "error": {"message": f"thread/resume failed: no rollout found for thread id {tid}"}})
+                continue
+            out({"id": rid, "result": {"thread": {"id": tid}, "model": codex_model(), "reasoningEffort": codex_effort()}})
+        elif m == "turn/steer":
+            if active and params.get("expectedTurnId") == active:
+                STEERED.append(params["input"][0]["text"])
+                out({"id": rid, "result": {"turnId": active}})
+            else:
+                out({"id": rid, "error": {"code": -32600, "message": "no active turn to steer"}})
+        elif m == "turn/start":
+            stdin = params["input"][0]["text"]
+            log_call(stdin)
+            turn = active = str(uuid.uuid4())
+            out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
+            if limited():
+                note("error", {"threadId": tid, "turnId": turn, "willRetry": False, "error": {
+                    "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), or "
+                               "try again in 2 hours 5 minutes.", "codexErrorInfo": "usageLimitExceeded"}})
+                note("turn/completed", {"threadId": tid, "turn": {"id": turn, "status": "failed", "error": {
+                    "message": "You've hit your usage limit."}}})
+                active = None
+                continue
+            if "FORCE_SLEEP" in stdin:
+                time.sleep(60)
+            if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):
+                print("boom: model unavailable", file=sys.stderr)
+                sys.exit(3)
+            with open(codex_rollout(tid), "a") as fh:  # (its session log: the model and effort are recorded here)
+                fh.write(json.dumps({"type": "turn_context", "payload": {"model": codex_model(), "collaboration_mode": {
+                    "mode": "default", "settings": {"model": codex_model(), "reasoning_effort": codex_effort()}}}}) + "\n")
+            if "FAKE_COMPACT" in stdin:  # the context filled up: codex compacted it
+                codex_compacted(tid)
+                turn_item("contextCompaction", {"id": "c0"})
+            cmd = "/bin/bash -lc 'ssh hpc sbatch --parsable ~/proj/train.sh'"
+            turn_item("reasoning", {"id": "i0", "summary": ["The batch size is probably too big for the GPU."],
+                                    "content": []})
+            turn_item("agentMessage", {"id": "i0b", "text": "Checking the job."})
+            note("item/started", {"item": {"id": "i1", "type": "commandExecution", "command": cmd,
+                                           "status": "inProgress"}})
+            if "FAKE_STEER" in stdin:  # (a message sent while it works comes now: turn/steer)
+                end = time.time() + 5
+                while not STEERED and time.time() < end and (line := LINES.get(max(0.0, end - time.time()))):
+                    msg = json.loads(line)
+                    if msg.get("method") == "turn/steer" and msg["params"].get("expectedTurnId") == active:
+                        STEERED.append(msg["params"]["input"][0]["text"])
+                        out({"id": msg["id"], "result": {"turnId": active}})
+            note("item/completed", {"item": {"id": "i1", "type": "commandExecution", "command": cmd,
+                                             "aggregatedOutput": "4343\n", "exitCode": 0, "status": "completed"}})
+            turn_item("fileChange", {"id": "i2", "changes": [{"path": "/tmp/x/a.py", "kind": "update"}]})
+            final = "Resubmitted as job 4343." + ("\nSTEERED: " + " | ".join(STEERED) if STEERED else "")
+            turn_item("agentMessage", {"id": "i3", "text": final})
+            counter = os.environ["FAKE_CLI_LOG"] + f".{tid}.runs"  # usage: the thread's running total
+            runs = (int(open(counter).read()) if os.path.exists(counter) else 0) + 1
+            open(counter, "w").write(str(runs))
+            note("thread/tokenUsage/updated", {"threadId": tid, "turnId": turn, "tokenUsage": {
+                "total": {"inputTokens": 5000 * runs, "cachedInputTokens": 1000 * runs, "outputTokens": 700 * runs},
+                "last": {}}})
+            active = None
+            note("turn/completed", {"threadId": tid, "turn": {"id": turn, "status": "completed"}})
+        elif rid is not None:
+            out({"id": rid, "result": {}})
     sys.exit(0)
 
 if prog == "codex" and args[:2] == ["debug", "models"]:

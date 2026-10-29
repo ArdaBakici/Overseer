@@ -4,7 +4,7 @@ The full guide to the HPC bot, once it's [set up](setup.md). For a quick overvie
 what the agent may and may not do, [security.md](security.md); for the personal assistant bot,
 [assistant.md](assistant.md).
 
-**Contents:** [Commands](#commands) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
+**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
 
 ## Commands
 
@@ -22,6 +22,8 @@ what the agent may and may not do, [security.md](security.md); for the personal 
 | `/account [name]` | the CLIs' logins: which one is in use, which are out of usage and until when; switch with a button, `/account work` or `/account codex default` ([more](#several-accounts-per-cli)) |
 | `/model [name\|default]`, `/effort [level\|default]` | show or set the active agent's model and effort without restarting (`default` goes back to `config.yaml`). Claude Code accepts low, medium, high, xhigh and max; Codex accepts minimal, low, medium, high and xhigh |
 | *(while the agent works)* | a live ⏳ preview that updates every 5 s: elapsed time, number of commands, the agent's latest reasoning summaries (💭) and notes (💬), and the command running right now. Its **Stop** button stops the run. It's a Telegram streaming draft, which vanishes when the answer arrives; where drafts aren't available (`telegram.streaming: false`, group chats) it's a message that is edited in place and then removed |
+| *(writing while the agent works)* | your message goes into its run: it reads it at its next step and takes it into account ([more](#writing-while-the-agent-works)) |
+| `/after <text>` | a message for once the agent has finished what it's working on (not into the run) |
 | `/stop` | stop the agent's current run (kills the whole process group) |
 | `/update` | update Claude Code and Codex now, with their own updaters; `/health` shows their versions. Overseer also does it once a day while no agent run is in progress (`agent.auto_update`), and tells you when a version changed. On the homelab: `uv run overseer update` |
 | `/compact [focus]` | compact the conversation now ([more](#long-conversations-context-compaction)). As a reply to a message, it applies to that conversation |
@@ -165,6 +167,23 @@ With topics enabled, the chat with the bot works like an AI chat app:
   - **Safety:** Overseer only sends regular files from the outbox. Symlinks and hard links are refused, so the agent can't get Overseer to send something its sandbox can't read.
 - **Fallback:** if Telegram ever rejects the formatting, the message is resent as plain text.
 
+## Writing while the agent works
+
+You don't have to wait for the agent to finish. Write in the conversation while it works - "actually use lr 1e-4",
+"skip seed 3", "also plot the loss" - and the message goes into its run: it reads it at its next step (after the
+command running now, or at once if it's thinking) and carries on with it in mind. You get "📨 Sent to the agent while
+it works", the live ⏳ preview shows when it got it, and its one reply covers both.
+
+- **Both CLIs:** Claude Code takes it through its streaming input, Codex through its app server (`turn/steer`).
+- **Pictures and files** go into its `inbox/` with the message, as usual.
+- **Too late for the run** (it was writing its final answer): the message isn't lost - it's the next request, right
+  after, said to have come while it was finishing.
+- **Stopped first** (`/stop`, a failure): you're told which message didn't reach it, so you can send it again.
+- **`/after <text>`** waits instead: the message is a request of its own once the run is done.
+- **Wake-ups and check-ins** take your messages the same way while they run; so does a subagent, when you write in its
+  thread or its planner sends it something (`ov agent send`).
+- `overseer watch`, the monitor, `ov history` and handovers show these messages as part of the request.
+
 ## Working on its own: watches and wake-ups
 
 The agent only runs when you write to it, or when something it set up wakes it. It needs no approval:
@@ -224,11 +243,16 @@ The agent has `hpc-run`, which runs a command on a compute node and returns its 
 hpc-run --dir /scratch/me/rf-dreamer -- python plot_rewards.py      # on the shared worker node
 hpc-run --cpus 32 --mem 128G --time 120 -- python preprocess.py    # on a node of its own
 hpc-run --gpu -- python eval.py                                    # on a GPU node of its own
-hpc-run --status | --stop                                          # the shared worker
+hpc-run --status                                                   # the shared worker, and runs on nodes of their own
+hpc-run --stop                                                     # end the shared worker
 ```
 - **Shared worker:** the first `hpc-run` submits a small job (`overseer-worker`) on the compute partition that just holds a node (8 cores, 32 GB, 8 h by default). Later commands run inside it as job steps (`srun --jobid … --overlap`), so they start at once instead of queueing.
   - **Ending:** it ends itself after 45 minutes unused, before clusters cancel idle jobs.
   - **Not reported:** it isn't announced as a job; `/health` shows it.
+- **A node of its own** (`--cpus`, `--mem`, `--time`, `--gpu`): a job named `overseer-run-…`, which may have to wait in
+  the queue. `hpc-run` says so at once (the job, its state and SLURM's reason), again every minute, and when it gets the
+  node. If none comes within `slurm.compute.wait_minutes` (15), it cancels the request and suggests `sbatch` instead.
+  Like the worker, these jobs are never reported or registered as yours.
 - **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display.
 - **Instructions:** the agent is told to use `hpc-run` for anything that computes (scripts, plots, data processing, tests) and `sbatch` for real runs. The 📈 Plot button asks for plots made this way.
 - **Guardrail:** commands the agent runs directly on the login node get 120 CPU seconds (`ulimit -t`, set by its `ssh` wrapper). A heavy script there is stopped with a message pointing to `hpc-run`.

@@ -43,7 +43,7 @@ class ComputeConfig:
     mem: str = "32G"
     worker_hours: float = 8  # time limit of the worker job
     idle_minutes: int = 45  # the worker ends itself after this long unused (clusters cancel idle jobs too)
-    wait_minutes: int = 15  # how long hpc-run waits for a node before giving up
+    wait_minutes: float = 15  # how long hpc-run waits for a node before giving up
     gpu_partition: str = "nvidia"  # for `hpc-run --gpu`
     gpu_gres: str = "gpu:1"
     sbatch_args: list[str] = field(default_factory=list)  # extra flags for every allocation, e.g. ["--account=x"]

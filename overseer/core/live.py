@@ -99,6 +99,8 @@ class Progress:
             self.steps.append(("💭", ev["text"]))
         elif kind == "message":
             self.steps.append(("💬", ev["text"]))
+        elif kind == "steer":
+            self.steps.append(("📨", "your message reached the agent: " + _unnote(ev.get("text", ""))))
         elif kind == "tool":
             self.steps.append(("🔧", f"{ev.get('name')} {ev.get('detail') or ''}".strip()))
         elif kind == "file":
@@ -199,6 +201,8 @@ def render_event(ev: dict[str, Any], st: Style, *, full: bool = False, output_li
         return [st("💭 " + _indent(ev.get("text", ""), 3), "2;3")]
     if kind == "message":
         return ["💬 " + _indent(ev.get("text", ""), 3)]
+    if kind == "steer":
+        return [st("📨 (sent while it worked) ", "1;36") + _indent(_unnote(ev.get("text", "")), 3)]
     if kind == "command":
         return [st("$ " + _indent(ev.get("command", ""), 2), "1;33")]
     if kind == "output":
@@ -239,6 +243,11 @@ def render_event(ev: dict[str, Any], st: Style, *, full: bool = False, output_li
             out.append(st(f"── {clock} · ⚠️ {ev.get('text') or 'failed'}", "31"))
         return out
     return []
+
+
+def _unnote(text: str) -> str:
+    """A steered message without Overseer's note to the agent."""
+    return text.split("\n", 1)[1] if text.startswith("[") and "\n" in text else text
 
 
 def _indent(text: str, n: int) -> str:
