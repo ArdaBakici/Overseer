@@ -16,11 +16,13 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
 from textual.widgets import (Button, Checkbox, ContentSwitcher, Footer, Header, Input, Label, ListItem, ListView,
                              RichLog, Select, Static)
 
 from ..core import daemon
 from . import steps as S
+from .monitor import Help, QuietScreen, for_slow_links
 
 PLACEHOLDERS = {"ssh.hostname": "login.cluster.edu", "ssh.user": "your-netid"}
 EXAMPLE_CHAT = 123456789
@@ -74,6 +76,7 @@ class Setup(App):
 
     def __init__(self, config: Path):
         super().__init__()
+        for_slow_links(self)
         self.config = config.resolve()
         self.base = self.config.parent
         self.new = not self.config.exists()  # (then its values are the example's until you save yours)
@@ -90,6 +93,9 @@ class Setup(App):
         self.check_ok: bool | None = None
         self.partitions: list[S.Partition] = []
         self._enter = False  # (the step changed by key: focus its first field once it shows)
+
+    def get_default_screen(self) -> Screen:
+        return QuietScreen(id="_default")
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
@@ -149,7 +155,6 @@ class Setup(App):
             self.query_one("#steps", ListView).focus()
 
     def action_help(self) -> None:
-        from .monitor import Help
         if len(self.screen_stack) == 1:
             self.push_screen(Help(KEYS))
 

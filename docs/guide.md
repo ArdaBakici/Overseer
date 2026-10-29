@@ -467,6 +467,20 @@ the terminal - over `ssh` from your laptop or phone too. Pick a bot on the left;
 The list keeps its place as the bot's data refreshes (the cursor stays on its job or conversation), and new
 transcript or log lines are added without moving what you're reading.
 
+**Over a slow connection.** The monitor sends the terminal only what changed: nothing while you just watch, a few
+hundred bytes per key in a list, and a repaint of the pane on a tab switch (50-60 KB raw for a 150x45 window).
+Over ssh it also turns Textual's animations off. Those bytes are escape codes repeated row after row, so the
+connection itself matters most:
+
+- **Compress the ssh connection:** `ssh -C homelab`, or `Compression yes` for that host in `~/.ssh/config`. The
+  monitor's output shrinks about 25 times (a tab switch: ~60 KB to ~3 KB). This is the one to do.
+- **Or use [mosh](https://mosh.org)** (`mosh homelab`, with `mosh-server` installed there) on a slow, lossy or mobile
+  link: it sends only the screen's latest state, skipping what's already out of date, and the session survives a
+  dropped connection or a sleeping laptop. It needs UDP ports 60000-61000 open to the homelab (over a tailnet they
+  are).
+- `f` stops following a busy transcript or log (each new line scrolls, and so repaints, the whole pane), and a smaller
+  window has less to repaint.
+
 The setup (`overseer setup`) works the same way: `Ctrl+N` / `Ctrl+B` go to the next / previous step and into its
 first field, `Tab` moves between fields, `Enter` in a field saves the step, `Esc` goes back to the list of steps, and
 `F1` shows the keys.

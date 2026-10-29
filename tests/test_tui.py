@@ -351,7 +351,7 @@ def test_overseer_alone_opens_the_tui(tmp_path, monkeypatch):
 async def test_the_monitor_from_the_keyboard(env, monkeypatch):  # noqa: F811
     from textual.widgets import DataTable, Input, RichLog
 
-    from overseer.tui.monitor import Details, Help, Monitor
+    from overseer.tui.monitor import TABS, Details, Help, Monitor
     env.set_jobs(**{"77": {"name": "train", "state": "RUNNING", "workdir": str(env.home / "proj")},
                     "78": {"name": "evaluate", "state": "PENDING", "workdir": str(env.home / "proj")}})
     await env.monitor.poll(first=True)
@@ -413,6 +413,15 @@ async def test_the_monitor_from_the_keyboard(env, monkeypatch):  # noqa: F811
         await press("right")  # (no tab moves under the help)
         await press("escape")
         assert not isinstance(app.screen, Help) and app.tab == "agents"
+        await press("2")
+        app._forget()  # (the jobs are being redrawn as you leave: you still leave)
+        app.refresh_all()
+        await press("4")
+        assert app.tab == "wakeups"
+        for a in TABS:  # from every tab, every other one (no tab keeps the focus)
+            for b in TABS:
+                await press(str(TABS.index(a) + 1), str(TABS.index(b) + 1))
+                assert app.tab == b, (a, b)
         await press("q")
     assert not app.is_running
 
