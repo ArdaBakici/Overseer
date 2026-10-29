@@ -346,3 +346,104 @@ def test_overseer_alone_opens_the_tui(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, "run_monitor", lambda config="config.yaml": opened.append(config) or 0)
     assert main.main([]) == 0 and opened == ["config.yaml"]
     assert main.main(["-c", str(tmp_path / "assistant.yaml")]) == 0 and opened[-1] == str(tmp_path / "assistant.yaml")
+
+
+async def test_the_monitor_from_the_keyboard(env, monkeypatch):  # noqa: F811
+    from textual.widgets import DataTable, Input, RichLog
+
+    from overseer.tui.monitor import Details, Help, Monitor
+    env.set_jobs(**{"77": {"name": "train", "state": "RUNNING", "workdir": str(env.home / "proj")},
+                    "78": {"name": "evaluate", "state": "PENDING", "workdir": str(env.home / "proj")}})
+    await env.monitor.poll(first=True)
+    assert await env.agent.handle(env.agent.general_session(), "how are my jobs?")
+    env.cfg.source = str(env.tmp / "app" / "config.yaml")
+    hb = Heartbeat(env.cfg, env.agent, env.notifier, env.agent.domain)
+    await hb.write()
+    monkeypatch.setattr(D, "discover", lambda base: [D.Bot(Path(env.cfg.source), env.cfg)])
+    app = Monitor(env.tmp / "app")
+    async with app.run_test(size=(150, 45)) as pilot:
+        async def press(*keys):
+            await pilot.press(*keys)
+            await pilot.pause(0.2)
+
+        await pilot.pause()
+        await press("right")  # the arrows go through the tabs, and the tab's list has the keys at once
+        assert app.tab == "domain" and app.focused.id == "dt0"
+        await press("left", "left")
+        assert app.tab == "log" and app.focused.id == "log-body"
+        await press("2")
+        dt = app.query_one("#dt0", DataTable)
+        everything = dt.row_count
+        assert everything >= 2 and app.focused is dt
+        await press("down")
+        picked = dt.get_row_at(1)
+        app._forget()  # (the next refresh rebuilds the tables: the cursor stays on its job)
+        app.refresh_all()
+        await pilot.pause(0.3)
+        dt = app.query_one("#dt0", DataTable)
+        assert dt.cursor_row == 1 and dt.get_row_at(1) == picked and app.focused is dt
+
+        await press("enter")  # a job's whole card
+        assert isinstance(app.screen, Details) and picked[1] in str(app.screen.title_text)
+        await press("escape")
+        assert not isinstance(app.screen, Details) and app.tab == "domain"
+
+        await press("slash", *"evaluate")  # the filter (its letters are typed, not keys: no q to quit)
+        assert app.query_one("#filter", Input).value == "evaluate"
+        rows = [app.query_one("#dt0", DataTable).get_row_at(i) for i in range(app.query_one("#dt0").row_count)]
+        assert len(rows) == 1 and "evaluate" in " ".join(rows[0])
+        await press("enter")  # kept, and back in the list
+        assert not app.query_one("#filter").has_class("shown") and app.focused.id == "dt0"
+        assert app.query_one("#dt0", DataTable).row_count == 1
+        await press("escape")  # cleared
+        assert app.query_one("#dt0", DataTable).row_count == everything and not app.filters.get("domain")
+
+        await press("3")
+        assert app.focused.id == "conversations"
+        await press("enter")
+        assert app.focused.id == "transcript"
+        assert "how are my jobs?" in "\n".join(str(x) for x in app.query_one("#transcript", RichLog).lines)
+        await press("escape")
+        assert app.focused.id == "conversations"
+
+        await press("f")
+        assert not app.follow and not app.query_one("#transcript", RichLog).auto_scroll
+        await press("question_mark")
+        assert isinstance(app.screen, Help)
+        await press("right")  # (no tab moves under the help)
+        await press("escape")
+        assert not isinstance(app.screen, Help) and app.tab == "agents"
+        await press("q")
+    assert not app.is_running
+
+
+async def test_the_setup_wizard_from_the_keyboard(tmp_path):
+    from textual.widgets import ContentSwitcher
+
+    from overseer.tui.monitor import Help
+    from overseer.tui.setup import Setup
+    cfgp = tmp_path / "config.yaml"
+    app = Setup(cfgp)
+    async with app.run_test(size=(150, 48)) as pilot:
+        async def press(*keys):
+            await pilot.press(*keys)
+            await pilot.pause(0.2)
+
+        await pilot.pause()
+        assert app.focused.id == "steps"
+        await press("down", "down", "enter")  # look at a step, then go into it
+        assert app.query_one("#panes", ContentSwitcher).current == "telegram" and app.focused.id == "token"
+        await press("ctrl+n")  # the next step, in its first field
+        assert app.query_one("#panes", ContentSwitcher).current == "hpc" and app.focused.id == "hostname"
+        await press(*"login.hpc.example", "tab", *"ab123", "enter")  # Enter saves the step
+        await press("ctrl+b")
+        assert app.query_one("#panes", ContentSwitcher).current == "telegram"
+        await press("tab", "tab", *"4242", "enter")
+        await press("escape")
+        assert app.focused.id == "steps"
+        await press("f1")
+        assert isinstance(app.screen, Help)
+        await press("escape")
+        assert not isinstance(app.screen, Help)
+    cfg = load_config(cfgp)
+    assert (cfg.ssh.hostname, cfg.ssh.user, cfg.telegram.allowed_chat_ids) == ("login.hpc.example", "ab123", [4242])

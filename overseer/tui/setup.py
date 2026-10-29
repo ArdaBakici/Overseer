@@ -26,6 +26,26 @@ PLACEHOLDERS = {"ssh.hostname": "login.cluster.edu", "ssh.user": "your-netid"}
 EXAMPLE_CHAT = 123456789
 ICON = {"ok": "✅", "warn": "⚠️ ", "todo": "⬜"}
 
+KEYS = [  # the help screen (F1)
+    ("Steps", [
+        ("Ctrl+N  Ctrl+B", "the next / previous step (and into its first field)"),
+        ("↑ ↓  then Enter", "in the list of steps: look at one, then go into it"),
+        ("Esc", "back to the list of steps"),
+    ]),
+    ("In a step", [
+        ("Tab  Shift+Tab", "the next / previous field or button"),
+        ("Enter", "in a field: save the step (its main button); on a button: press it"),
+        ("Space", "tick a checkbox"),
+    ]),
+    ("", [("F1", "this help"), ("Ctrl+Q", "quit (what you saved is kept)")]),
+]
+# Enter in a field presses its step's main button
+SUBMIT = {"token": "save-token", "chat-id": "save-chat", "hostname": "save-hpc", "user": "save-hpc",
+          "proxy": "save-hpc", "port": "save-hpc", "import-key": "import", "gres": "save-cluster",
+          "quota": "save-cluster", "account": "save-cluster", "vault-path": "save-vault",
+          "claude-accounts": "save-agents", "codex-accounts": "save-agents", "tz": "save-prefs",
+          "digest": "save-prefs", "obsidian": "save-prefs"}
+
 HPC_STEPS = [("welcome", "Welcome"), ("prereq", "Install what's needed"), ("telegram", "Telegram bot"),
              ("hpc", "Connect to the HPC"), ("cluster", "Cluster settings"), ("agents", "AI agents"),
              ("prefs", "Preferences"), ("check", "Check everything"), ("start", "Start the bot")]
@@ -48,7 +68,9 @@ class Setup(App):
     .title { text-style: bold; margin-bottom: 1; }
     #out { height: 12; border-top: solid $primary-background; }
     """
-    BINDINGS = [Binding("ctrl+n", "next", "next step"), Binding("ctrl+q", "quit", "quit")]
+    BINDINGS = [Binding("ctrl+n", "next(1)", "next step"), Binding("ctrl+b", "next(-1)", "previous step"),
+                Binding("escape", "steps", show=False), Binding("f1", "help", "keys"),
+                Binding("ctrl+q", "quit", "quit")]
 
     def __init__(self, config: Path):
         super().__init__()
@@ -67,6 +89,7 @@ class Setup(App):
         self.ssh_ok = False
         self.check_ok: bool | None = None
         self.partitions: list[S.Partition] = []
+        self._enter = False  # (the step changed by key: focus its first field once it shows)
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
@@ -83,8 +106,9 @@ class Setup(App):
 
     def on_mount(self) -> None:
         what = "the personal assistant" if self.draft.domain == "assistant" else "the HPC bot"
-        self.sub_title = f"{what} · {self.config.name}"
+        self.sub_title = f"{what} · {self.config.name} · F1 keys"
         self.refresh_steps()
+        self.query_one("#steps", ListView).focus()
 
     def say(self, text: str, style: str = "") -> None:
         self.query_one("#out", RichLog).write(Text(text, style=style))
@@ -100,10 +124,40 @@ class Setup(App):
             sid = event.item.id[2:]
             self.query_one("#panes", ContentSwitcher).current = sid
             getattr(self, f"show_{sid}", lambda: None)()
+            if self._enter:  # (Ctrl+N / Ctrl+B: into the step)
+                self._enter = False
+                self.call_after_refresh(self._into_pane)
 
-    def action_next(self) -> None:
+    def action_next(self, step: int = 1) -> None:
         lv = self.query_one("#steps", ListView)
-        lv.index = min((lv.index or 0) + 1, len(self.steps) - 1)
+        index = max(0, min((lv.index or 0) + step, len(self.steps) - 1))
+        if index == lv.index:
+            self._into_pane()
+        else:
+            self._enter = True
+            lv.index = index
+
+    @on(ListView.Selected, "#steps")
+    def _into_pane(self) -> None:
+        """Into the step: its first field (or button)."""
+        pane = self.query_one(f"#{self.query_one('#panes', ContentSwitcher).current}")
+        first = next((w for w in pane.query("Input, Select, Checkbox, Button") if w.focusable), None)
+        (first or pane).focus()
+
+    def action_steps(self) -> None:
+        if len(self.screen_stack) == 1:
+            self.query_one("#steps", ListView).focus()
+
+    def action_help(self) -> None:
+        from .monitor import Help
+        if len(self.screen_stack) == 1:
+            self.push_screen(Help(KEYS))
+
+    @on(Input.Submitted)
+    def submitted(self, event: Input.Submitted) -> None:
+        button = SUBMIT.get(event.input.id or "")
+        if button:
+            self.query_one(f"#{button}", Button).press()
 
     def save(self) -> bool:
         backup = self.draft.save()

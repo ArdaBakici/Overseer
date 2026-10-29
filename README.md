@@ -73,7 +73,7 @@ Run it again any time to change something. The [setup guide](docs/setup.md) expl
 by hand.
 
 ```bash
-uv run overseer            # the TUI: watch the bots live - jobs, what the agents are doing, wake-ups, usage, the log
+uv run overseer            # the TUI: watch the bots live - jobs, what the agents are doing, wake-ups, usage, the log (? keys)
 uv run overseer stop       # (and start, restart, status) - the bot runs in the background
 ```
 

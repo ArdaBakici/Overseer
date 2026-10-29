@@ -450,6 +450,27 @@ the terminal - over `ssh` from your laptop or phone too. Pick a bot on the left;
 - **How it knows:** a running bot rewrites `state/status.json` every few seconds; the monitor shows a bot whose file
   stops changing as not responding.
 
+**Keys.** It's all keyboard; `?` shows the keys in the monitor itself.
+
+| key | |
+|---|---|
+| `←` `→`, `1`-`6` | the previous / next tab, or straight to one; the tab's list takes the keys at once |
+| `[` `]` | the previous / next bot |
+| `↑` `↓` (or `j` `k`), `PgUp` `PgDn`, `g` `G` | move in the list or scroll; the top / the end |
+| `Tab`, `Shift+Tab` | the next / previous pane: the bots, the list, the transcript |
+| `Enter` | a job's (or task's) whole card; on a conversation, into its transcript |
+| `Esc` | back: closes the card, clears the filter, from the transcript to the conversations |
+| `/` | filter the tab's rows (jobs, conversations, wake-ups, log lines) by words; `Enter` keeps it, `Esc` clears it |
+| `f` | follow the transcript and log as they grow, or stay where you are to read |
+| `s` `x` `r`, `q` | start, stop, restart the bot; quit (the bots keep running) |
+
+The list keeps its place as the bot's data refreshes (the cursor stays on its job or conversation), and new
+transcript or log lines are added without moving what you're reading.
+
+The setup (`overseer setup`) works the same way: `Ctrl+N` / `Ctrl+B` go to the next / previous step and into its
+first field, `Tab` moves between fields, `Enter` in a field saves the step, `Esc` goes back to the list of steps, and
+`F1` shows the keys.
+
 ## Restarts don't lose the agent's work
 
 Stopping Overseer (Ctrl-C, `systemctl --user restart overseer`, a crash, a reboot) also stops the agent runs in progress. Their CLIs die with Overseer, even if it's killed, so nothing carries on unseen. At the next start each conversation that was cut off gets a notice:
