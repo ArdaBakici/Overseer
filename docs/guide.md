@@ -429,7 +429,7 @@ Conversations are stored in `./state` (Overseer's conversation ↔ the CLI's ses
 
 ## The terminal monitor (overseer tui)
 
-`uv run overseer tui` shows every bot of this Overseer folder (the HPC bot and the assistant, if you have both) live in
+`uv run overseer` (or `uv run overseer tui`) shows every bot of this Overseer folder (the HPC bot and the assistant, if you have both) live in
 the terminal - over `ssh` from your laptop or phone too. Pick a bot on the left; its tabs (1-6) are:
 
 | tab | |

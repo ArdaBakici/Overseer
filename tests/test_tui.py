@@ -337,3 +337,12 @@ async def test_the_assistant_shows_its_day(aenv):  # noqa: F811
     assert titles == ["Today", "Tasks", "Waiting for you"]
     assert any("call the bank" in r[2] for r in st["tables"][1]["rows"])
     assert st["lines"][0][0] == "vault" and st["lines"][0][2] is True
+
+
+def test_overseer_alone_opens_the_tui(tmp_path, monkeypatch):
+    import overseer.__main__ as main
+    from overseer.tui import monitor
+    opened = []
+    monkeypatch.setattr(monitor, "run_monitor", lambda config="config.yaml": opened.append(config) or 0)
+    assert main.main([]) == 0 and opened == ["config.yaml"]
+    assert main.main(["-c", str(tmp_path / "assistant.yaml")]) == 0 and opened[-1] == str(tmp_path / "assistant.yaml")

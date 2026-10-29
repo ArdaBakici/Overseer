@@ -190,7 +190,7 @@ uv run overseer start
 ```
 
 Send it a message on Telegram, e.g. *"which of my jobs are running?"* or *"how much quota do I have left?"*. Within
-a minute it also posts a card for each of your running jobs. Watch it with `uv run overseer tui`
+a minute it also posts a card for each of your running jobs. Watch it with `uv run overseer` (the TUI)
 ([the monitor](guide.md#the-terminal-monitor-overseer-tui)); `uv run overseer run` runs it in the terminal instead
 (Ctrl-C stops it).
 
@@ -207,7 +207,7 @@ a minute it also posts a card for each of your running jobs. Watch it with `uv r
 uv run overseer status                # running? since when? restarted after a crash?
 uv run overseer stop                  # a clean stop (runs in progress are offered again at the next start)
 uv run overseer restart               # after changing config.yaml
-uv run overseer tui                   # watch it live; s / x / r start, stop and restart it there too
+uv run overseer                       # the TUI: watch it live; s / x / r start, stop and restart it there too
 ```
 
 - **Restart after a crash (off by default)**: with `local.restart_on_crash: true` in the config, a small watcher

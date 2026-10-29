@@ -21,7 +21,8 @@
     overseer start | stop | restart     run the bot in the background (it outlives the terminal; restarted after
                                         a crash with local.restart_on_crash: true) / stop it / both
     overseer status                     is it running (and watched), since when, its restarts
-    overseer tui                        watch every bot of this folder live (read-only); start and stop them
+    overseer  (or: overseer tui)        watch every bot of this folder live (read-only); start and stop them
+                                        (with nothing set up yet: the setup)
     overseer setup                      set a bot up step by step (the HPC bot, or -c assistant.yaml)
 All take -c/--config (default: config.yaml).
 """
@@ -422,9 +423,9 @@ async def update_command(cfg: Config) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="overseer", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset",
-                                           "config", "start", "stop", "restart", "status", "tui", "setup",
-                                           "supervise"])
+    ap.add_argument("command", nargs="?", default="tui",  # (none: the TUI)
+                    choices=["run", "check", "login", "ssh", "sessions", "open", "watch", "update", "reset",
+                             "config", "start", "stop", "restart", "status", "tui", "setup", "supervise"])
     ap.add_argument("target", nargs="?",
                     help="login: claude_code|codex|google; ssh: setup|connect|test; open: conversation (default: latest); "
                          "watch: conversation (default: all)")
