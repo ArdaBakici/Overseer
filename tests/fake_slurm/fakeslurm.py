@@ -47,7 +47,9 @@ FIELDS = {"%i": lambda jid, j: jid, "%T": lambda jid, j: j["state"], "%j": lambd
           "%r": lambda jid, j: j.get("reason", "None"), "%M": lambda jid, j: j.get("elapsed", "0:10"),
           "%l": lambda jid, j: j.get("time_limit", "1:00:00"), "%N": lambda jid, j: j.get("nodelist", "n1")}
 
-if prog == "squeue" and "|" not in (opt("-o") or "|"):  # filtered queries with a simple format (hpc-run)
+import re as _re
+_tokens = _re.findall(r"%\w", opt("-o") or "")
+if prog == "squeue" and "--start" not in args and _tokens and all(t in FIELDS for t in _tokens):  # (hpc-run's)
     name, states, sel = opt("-n"), (opt("-t") or "PENDING,RUNNING").split(","), opt("-j")
     for jid, j in jobs.items():
         if j["state"] in states and (not name or j["name"] == name) and (not sel or jid == sel):
@@ -142,10 +144,33 @@ elif prog == "srun":
         sys.exit(0)
     if "bash" not in args:
         sys.exit(1)
+    if opt("-J"):  # hpc-run --cpus/--mem/--time/--gpu: an allocation of its own, queued for st["srun_wait"] s
+        import time
+        st["next_id"] += 1
+        jid = str(st["next_id"])
+        wait = float(st.get("srun_wait", 0))
+        jobs[jid] = {"name": opt("-J"), "state": "PENDING" if wait else "RUNNING", "reason": "Priority",
+                     "nodelist": "cn015"}
+        save(st)
+        end = time.time() + wait
+        while time.time() < end:
+            time.sleep(0.2)
+            if load()["jobs"][jid]["state"] == "CANCELLED":
+                print(f"srun: error: Job allocation {jid} has been revoked", file=sys.stderr)
+                sys.exit(1)
+        st = load()
+        st["jobs"][jid]["state"] = "RUNNING"
+        save(st)
+        jobs = st["jobs"]
     st.setdefault("steps", []).append(args)  # hpc-run: run the command here, as if on the node
     save(st)
     import subprocess
-    sys.exit(subprocess.call(args[args.index("bash"):]))
+    rc = subprocess.call(args[args.index("bash"):])
+    if opt("-J"):
+        st = load()
+        st["jobs"][jid]["state"] = "COMPLETED"
+        save(st)
+    sys.exit(rc)
 elif prog == "scancel":
     name = opt("-n")
     for jid in ([j for j, v in jobs.items() if v["name"] == name] if name else [args[0]]):

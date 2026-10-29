@@ -224,11 +224,16 @@ The agent has `hpc-run`, which runs a command on a compute node and returns its 
 hpc-run --dir /scratch/me/rf-dreamer -- python plot_rewards.py      # on the shared worker node
 hpc-run --cpus 32 --mem 128G --time 120 -- python preprocess.py    # on a node of its own
 hpc-run --gpu -- python eval.py                                    # on a GPU node of its own
-hpc-run --status | --stop                                          # the shared worker
+hpc-run --status                                                   # the shared worker, and runs on nodes of their own
+hpc-run --stop                                                     # end the shared worker
 ```
 - **Shared worker:** the first `hpc-run` submits a small job (`overseer-worker`) on the compute partition that just holds a node (8 cores, 32 GB, 8 h by default). Later commands run inside it as job steps (`srun --jobid … --overlap`), so they start at once instead of queueing.
   - **Ending:** it ends itself after 45 minutes unused, before clusters cancel idle jobs.
   - **Not reported:** it isn't announced as a job; `/health` shows it.
+- **A node of its own** (`--cpus`, `--mem`, `--time`, `--gpu`): a job named `overseer-run-…`, which may have to wait in
+  the queue. `hpc-run` says so at once (the job, its state and SLURM's reason), again every minute, and when it gets the
+  node. If none comes within `slurm.compute.wait_minutes` (15), it cancels the request and suggests `sbatch` instead.
+  Like the worker, these jobs are never reported or registered as yours.
 - **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display.
 - **Instructions:** the agent is told to use `hpc-run` for anything that computes (scripts, plots, data processing, tests) and `sbatch` for real runs. The 📈 Plot button asks for plots made this way.
 - **Guardrail:** commands the agent runs directly on the login node get 120 CPU seconds (`ulimit -t`, set by its `ssh` wrapper). A heavy script there is stopped with a message pointing to `hpc-run`.

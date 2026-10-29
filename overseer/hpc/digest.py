@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 from ..core.digest import _clip
 from ..core.notify import code, esc
+from .compute import is_helper
 from .slurm import STATE_EMOJI, SUCCESS_STATES, gpus_from_tres
 
 log = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ class HpcDigest:
 
     def _jobs(self, since: float) -> str:
         ended = [r for r in self.store.jobs_ended_since(since) if not r.ignored]
-        active = [r for r in self.store.active_jobs() if r.name != "overseer-worker"]
+        active = [r for r in self.store.active_jobs() if not is_helper(r.name)]
         running = [r for r in active if r.state == "RUNNING"]
         queued = [r for r in active if r.state == "PENDING"]
         ok = [r for r in ended if r.state in SUCCESS_STATES]

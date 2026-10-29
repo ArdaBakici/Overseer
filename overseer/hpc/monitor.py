@@ -10,7 +10,7 @@ import logging
 import shutil
 import time
 
-from .compute import WORKER_NAME
+from .compute import WORKER_NAME, is_helper
 from ..core.config import Config
 from .diagnose import (Reporter, all_metrics, extract_traceback, find_issues, find_log_paths, rank_metrics,
                        tqdm_cleanup)
@@ -129,8 +129,8 @@ class Monitor:
 
     # ------------------------------------------------------------------ polling
     def _ignored(self, job: Job, rec: JobRecord | None) -> bool:
-        if job.name == WORKER_NAME:  # hpc-run's compute worker: shown in /health, not reported as a job
-            if job.state == "RUNNING" or self.worker is None:
+        if is_helper(job.name):  # hpc-run's jobs (its compute worker: shown in /health): not reported as jobs
+            if job.name == WORKER_NAME and (job.state == "RUNNING" or self.worker is None):
                 self.worker = job
             return True
         if rec and rec.ignored:  # deleted from Overseer (ov job delete)
@@ -195,7 +195,7 @@ class Monitor:
         for rec in self.store.active_jobs():
             if rec.job_id in live_by_id:
                 continue
-            if rec.name == WORKER_NAME:  # hpc-run's worker, registered by mistake: never reported
+            if is_helper(rec.name):  # hpc-run's job, registered by mistake: never reported
                 rec.ended_at, rec.ignored = time.time(), 1
                 self.store.upsert_job(rec)
                 continue
@@ -506,7 +506,7 @@ class Monitor:
 
     def _maybe_sample_gpus(self, rec: JobRecord, job: Job) -> None:
         c = self.cfg.slurm
-        if c.idle_gpu_minutes <= 0 or rec.name == WORKER_NAME or rec.job_id in self._sampling:
+        if c.idle_gpu_minutes <= 0 or is_helper(rec.name) or rec.job_id in self._sampling:
             return
         if not has_gpus(job, rec.info_dict.get("TRES", "")):
             return
@@ -613,7 +613,7 @@ class Monitor:
             return
         last = self.notifier.last_message_ids(finished.job_id)  # {chat: id of its card or graphs, the lowest down}
         running = sorted((r for r in self.store.active_jobs() if r.project == finished.project
-                          and r.job_id != finished.job_id and r.name != WORKER_NAME), key=lambda r: r.first_seen)
+                          and r.job_id != finished.job_id and not is_helper(r.name)), key=lambda r: r.first_seen)
         for r in running:
             refs = self.store.card_refs(r.job_id)
             if any(chat in last and mid < last[chat] for chat, mid in refs.items()):
@@ -683,7 +683,7 @@ class Monitor:
         try:
             context, card, failed = await self.final_report(rec, final)
         except (SSHError, OSError) as e:
-            if rec.name != WORKER_NAME:
+            if not is_helper(rec.name):
                 record_job(self.store, rec, final, {})
             failed = not (final.state in SUCCESS_STATES and final.exit_code.startswith("0"))
             card = (f"{STATE_EMOJI.get(final.state, '🏁')} <b>{esc(rec.job_id)}</b> {esc(rec.name)} · {esc(final.state)}"
@@ -724,7 +724,7 @@ class Monitor:
         tb = "" if success else extract_traceback(combined)
         metrics = view["values"]
         critical, important, _ = metric_lines(view["spec"], metrics, view["auto"])
-        if rec.name != WORKER_NAME:  # its row in the project's results (the agent adds what it means)
+        if not is_helper(rec.name):  # its row in the project's results (the agent adds what it means)
             record_job(self.store, rec, final, snapshot(view["spec"], metrics))
 
         tasks = final.extra.get("tasks")

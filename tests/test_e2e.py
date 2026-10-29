@@ -264,7 +264,7 @@ async def test_agent_end_to_end(hpc, backend, cli_name, monkeypatch):
         assert f"ON-COMPUTE {remote / 'proj'} Agg" in outs[11] and "started a compute worker" in outs[11], detail
         assert "AGAIN" in outs[12] and "started a compute worker" not in outs[12], detail
         assert [a for a in st["steps"] if f"--jobid={workers[0]}" in a and "--overlap" in a], st["steps"]
-        assert f"worker: {workers[0]} RUNNING" in outs[13], detail
+        assert f"shared worker: {workers[0]} overseer-worker RUNNING" in outs[13], detail
         assert "EXIT=152" in outs[14] and "login node's CPU limit" in outs[14], detail
         assert "✓ job 5001 (" in outs[15] and "tracked in this conversation (already was)" in outs[15], detail
         assert "✓ project e2eproj created (~/e2eproj)" in outs[16], detail

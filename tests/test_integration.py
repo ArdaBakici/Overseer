@@ -2128,9 +2128,15 @@ async def test_hpc_run_worker_is_never_a_job(env):
     token = ctl.open(s.id)
     env.set_jobs(**{"18747467": {"name": "overseer-worker", "state": "PENDING"}})
     ok, text = await ctl.handle(token, ["job", "add", "18747467"])
-    assert "✗ job 18747467 is hpc-run's shared compute worker" in text and env.store.get_job("18747467") is None
+    assert "✗ job 18747467 is hpc-run's own" in text and env.store.get_job("18747467") is None
     ok, text = await ctl.handle(token, ["watch", "18747467"])
-    assert not ok and "shared compute worker" in text
+    assert not ok and "hpc-run's own" in text
+    # Its runs on a node of their own too (FB7: one was mistaken for a job named "bash").
+    env.set_jobs(**{"18988143": {"name": "overseer-run-1793200000-4242", "state": "PENDING"}})
+    ok, text = await ctl.handle(token, ["job", "add", "18988143"])
+    assert "✗ job 18988143 is hpc-run's own" in text and env.store.get_job("18988143") is None
+    await env.monitor.poll()
+    assert env.store.get_job("18988143") is None
 
     # Registered anyway (an older Overseer, or by hand): when it's cancelled, nothing is reported.
     env.store.upsert_job(JobRecord(job_id="18747467", name="overseer-worker", state="PENDING", by_agent=1,
@@ -2140,6 +2146,65 @@ async def test_hpc_run_worker_is_never_a_job(env):
     await env.monitor.poll()
     assert len(env.notifier.sent) == n, env.notifier.texts()
     assert env.store.get_job("18747467").ignored
+
+
+def hpc_run_tool(env, tmp_path, **compute):
+    """The agent's hpc-run, talking to the fake SLURM here (its ssh runs the remote command locally)."""
+    import subprocess
+    from overseer.hpc.compute import write_agent_tools
+    from overseer.hpc.sshlink import _write
+    for k, v in compute.items():
+        setattr(env.cfg.slurm.compute, k, v)
+    fake = tmp_path / "real-ssh"
+    fake.write_text("#!/bin/sh\nfor last; do :; done\nexec bash -c \"$last\"\n")
+    fake.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    write_agent_tools(env.cfg, bin_dir, str(fake), _write)
+
+    def run(*args, timeout=60):
+        return subprocess.run([str(bin_dir / "hpc-run"), *args], capture_output=True, text=True, timeout=timeout)
+    return run
+
+
+def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
+    """FB7: `hpc-run --cpus/--mem/--time` waited in the queue without a word (srun --quiet), its allocation was named
+    "bash", and `hpc-run --status` said "no worker running". Now: it names the job and why it waits, gets the node or
+    gives up after compute.wait_minutes (cancelling the request), and --status lists it."""
+    import threading
+    run = hpc_run_tool(env, tmp_path, wait_minutes=0.1)  # (6 s here)
+    # A node right away: just the output.
+    p = run("--cpus", "1", "--mem", "8G", "--time", "15", "--", "echo", "REPORT")
+    assert p.returncode == 0 and p.stdout.strip() == "REPORT" and "waiting" not in p.stderr, p.stderr
+    job = next(j for j in env.slurm()["jobs"].values() if j["name"].startswith("overseer-run-"))
+    assert job["state"] == "COMPLETED"
+    # Queued for a while: it says so (the job, its state and why), then runs.
+    st = env.slurm()
+    st["srun_wait"] = 4
+    (tmp_path / "slurm.json").write_text(json.dumps(st))
+    status = {}
+
+    def look():  # (while it waits: --status lists it)
+        time.sleep(1)
+        status["out"] = run("--status").stdout
+    t = threading.Thread(target=look)
+    t.start()
+    p = run("--cpus", "1", "--mem", "8G", "--time", "15", "--", "echo", "LATE")
+    t.join()
+    assert p.returncode == 0 and p.stdout.strip() == "LATE"
+    assert "[hpc-run] asked SLURM for a node of its own (compute, 1 CPU(s), 8G, 15 min): job" in p.stderr
+    assert "is PENDING (Priority); waiting up to 0.1 min" in p.stderr and "got a node" in p.stderr, p.stderr
+    assert "run on a node of its own:" in status["out"] and "overseer-run-" in status["out"], status
+    assert "shared worker: none running" in status["out"]
+    # Queued for longer than the wait: the request is cancelled, and it says what to do instead.
+    st = env.slurm()
+    st["srun_wait"] = 60
+    (tmp_path / "slurm.json").write_text(json.dumps(st))
+    p = run("--cpus", "1", "--", "echo", "NEVER", timeout=40)
+    assert p.returncode == 75 and "NEVER" not in p.stdout
+    assert "no node within 0.1 min" in p.stderr and "the request is cancelled" in p.stderr and "sbatch" in p.stderr
+    pending = [j for j in env.slurm()["jobs"].values() if j["name"].startswith("overseer-run-") and
+               j["state"] in ("PENDING", "RUNNING")]
+    assert pending == []  # (nothing left in the queue)
 
 
 async def test_disk_quota(env, monkeypatch, tmp_path):

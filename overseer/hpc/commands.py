@@ -14,7 +14,7 @@ from ..core.ctl import CtlError
 from ..core.notify import code, esc
 from ..core.store import MetricSpec
 from . import results as R
-from .compute import WORKER_NAME
+from .compute import is_helper
 from .metrics import SpecError, check_progress, parse_alert
 from .results import ResultError
 from .slurm import TERMINAL_STATES, array_parent
@@ -350,9 +350,9 @@ class HpcCommands:
             except CtlError as e:
                 out.append(f"✗ {e}")
                 continue
-            if name == WORKER_NAME:
-                out.append(f"✗ job {jid} is hpc-run's shared compute worker, not one of your jobs: don't register or "
-                           "watch it (hpc-run starts, reuses and ends it)")
+            if is_helper(name):
+                out.append(f"✗ job {jid} is hpc-run's own (its compute worker, or a run's node), not one of your jobs: "
+                           "don't register or watch it (hpc-run starts and ends it)")
                 continue
             rec = self.store.get_job(jid)
             alive = bool(state) and state.split()[0] not in TERMINAL_STATES
@@ -613,16 +613,14 @@ class HpcCommands:
         ids = list(dict.fromkeys(array_parent(x) for x in args.ids))  # a job array is watched by its id
         for jid in ids:
             rec = self.store.get_job(jid)
-            if rec and rec.name == WORKER_NAME:
-                raise CtlError(f"job {jid} is hpc-run's shared compute worker, not one of your jobs: there's nothing "
-                               "to watch")
+            if rec and is_helper(rec.name):
+                raise CtlError(f"job {jid} is hpc-run's own, not one of your jobs: there's nothing to watch")
             if rec and rec.ended_at and not rec.ignored and rec.state != "UNKNOWN":
                 raise CtlError(f"job {jid} has already ended ({rec.state}): look at it now (ov job show {jid})")
             if not rec or rec.ignored or rec.ended_at:  # not tracked (yet), or its end wasn't confirmed: ask SLURM
                 name, state, _ = await self._verify(jid)
-                if name == WORKER_NAME:
-                    raise CtlError(f"job {jid} is hpc-run's shared compute worker, not one of your jobs: there's "
-                                   "nothing to watch")
+                if is_helper(name):
+                    raise CtlError(f"job {jid} is hpc-run's own, not one of your jobs: there's nothing to watch")
                 if state and state.split()[0] in TERMINAL_STATES:
                     raise CtlError(f"job {jid} has already ended ({state}): look at it now")
                 await self.job_add(session, argparse.Namespace(ids=[jid]))
