@@ -27,7 +27,7 @@ from .ctl import TOKEN_ENV
 from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import SILENT, Notifier, Outgoing, code, esc, pre
-from .runners import Activity, AgentRunError, Runner, UsageLimitError, make_runner
+from .runners import Activity, AgentRunError, Runner, Steering, UsageLimitError, make_runner
 from .store import SessionRecord, Store
 
 if TYPE_CHECKING:
@@ -106,6 +106,15 @@ CONTINUE_PROMPT = (
     "[Overseer was restarted while you were working on the request below, and your run was cut off partway. "
     "Some of it may already be done: check before redoing anything (files you changed, jobs you submitted - "
     "`ov job list`, `squeue`), then finish it.]\n\n")
+# A message sent while the agent works goes into its run (Agent.steer): it reads it at its next step.
+STEER_NOTE = {"user": "[The researcher, while you work - take this into account from here on:]\n",
+              "planner": "[Message from your planner while you work - take it into account from here on:]\n"}
+LATE_NOTE = "[Sent while you were finishing your last reply:]\n"
+
+
+def unnote(message: str) -> str:
+    """A steered message without its note (what was written)."""
+    return message.split("\n", 1)[1] if message.startswith("[") and "\n" in message else message
 # Out of usage part-way through a run: it runs again on the next account (at most this many times in a row).
 MAX_FAILOVERS = 3
 RERUN_PROMPT = (
@@ -285,6 +294,8 @@ class Session:
     last_status: str = ""  # how its last run ended: done | error | stopped
     ran_on: tuple[str, str] = ("", "")  # the CLI and account of its current (or last) run
     switched: str = ""  # why its next run is on another CLI (said in the handover): set by a failover
+    steering: Steering | None = None  # its run in progress takes messages (steer)
+    leftover: list[str] = field(default_factory=list)  # messages sent while it worked that it didn't take
 
     @property
     def id(self) -> str:
@@ -769,6 +780,9 @@ class Agent:
                 self._run_update(run, text=user_text, files=[], started=time.time())
                 s.last_status = "running"
                 ok = await self._turn_on_any_account(s, user_text, quiet)
+                while ok and s.leftover:  # (sent while it worked, too late for that run: their own request now)
+                    late, s.leftover = s.leftover, []
+                    ok = await self._turn_on_any_account(s, LATE_NOTE + "\n\n".join(map(unnote, late)), quiet)
                 s.last_status = "done" if ok else "error"
             except asyncio.CancelledError:
                 if self.shutting_down:  # not stopped by the researcher: offered again at the next start
@@ -788,12 +802,32 @@ class Agent:
             finally:
                 s.task = None
                 s.origin = "user"
+                if s.leftover and not self.shutting_down:  # (it stopped or failed before reading them)
+                    lost, s.leftover = s.leftover, []
+                    await self.notifier.send(Outgoing(
+                        "📨 What you sent while it worked didn't reach the agent before the run ended: send it again "
+                        "if it still applies.<blockquote expandable>" + esc("\n\n".join(map(unnote, lost))[:1500])
+                        + "</blockquote>",
+                        session_id=s.id, job_id=s.job_id))
         self.store.unset(RUN_KEY + run)  # (not reached when the run is cut off by Overseer stopping)
         if self.autopilot:
             self.autopilot.turn_ended(s)
         if self.subagents and s.rec.is_worker:  # done, waiting for its jobs, failed or stopped: its planner hears
             self.subagents.turn_ended(s)
         return ok
+
+    async def steer(self, s: Session, text: str, files: list[tuple[str, Path]] | None = None,
+                    by: str = "user") -> bool:
+        """A message for the run in progress (the researcher wrote while the agent worked, or its planner): into the
+        running turn - the agent reads it at its next step. False if the run can't take it (none in progress, or it's
+        ending): then it's a request of its own, after this one."""
+        st = s.steering
+        if st is None or st.closed or not self.is_running(s):
+            return False
+        if files:  # (into its inbox now: the run is going on)
+            items = deliver_uploads(self.session_runner(s).workdir(s.id), files)
+            text = f"{text}\n\n{uploads_note(items, self.session_backend(s))}".strip()
+        return await st.send(STEER_NOTE.get(by, STEER_NOTE["user"]) + text)
 
     async def _turn_on_any_account(self, s: Session, user_text: str, quiet: bool) -> bool:
         """The turn; if the account runs out of usage, again on the next one (the CLI's next account, then the other
@@ -996,9 +1030,11 @@ class Agent:
             activity.env = {TOKEN_ENV: token}
         if progress:
             progress.start()
+        steering = s.steering = Steering()  # (messages sent while it works go into this run)
         try:
             state = await self.domain.before_run(s)
-            res = await runner.run(prompt, system=system, session_id=resume, key=s.id, activity=activity)
+            res = await runner.run(prompt, system=system, session_id=resume, key=s.id, activity=activity,
+                                   steering=steering)
         except asyncio.CancelledError:
             transcript.write({"kind": "end", "status": "stopped"})
             raise
@@ -1006,6 +1042,9 @@ class Agent:
             transcript.write({"kind": "end", "status": "error", "text": str(e)[:2000]})
             raise
         finally:
+            steering.close()
+            s.steering = None
+            s.leftover += steering.untaken()
             if token:
                 self.ctl.close(token)
             if live:

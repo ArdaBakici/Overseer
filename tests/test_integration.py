@@ -547,7 +547,7 @@ async def test_model_effort_and_footer(env):
     env.agent.set_model("gpt-x")
     await env.agent.handle(s, "go")
     argv = env.cli_log()[-1]["argv"]
-    assert argv[argv.index("-m") + 1] == "gpt-x" and 'model_reasoning_effort="minimal"' in argv
+    assert argv[0] == "app-server" and 'model="gpt-x"' in argv and 'model_reasoning_effort="minimal"' in argv
     assert "<i>codex · gpt-x · effort minimal · 5.7k tokens (1.0k cached)</i>" in env.notifier.sent[-1].text  # no cost
 
     # codex reports the conversation's running total; the footer shows this request's share.
@@ -561,7 +561,7 @@ async def test_model_effort_and_footer(env):
     env.agent.set_effort("default")
     await env.agent.handle(s, "go")
     argv = env.cli_log()[-1]["argv"]
-    assert "-m" not in argv and not any(a.startswith("model_reasoning_effort") for a in argv)
+    assert not any(a.startswith(("model=", "model_reasoning_effort")) for a in argv)
     # Nothing configured: the model and effort codex actually used come from its session log
     # and its model catalog.
     assert "codex · gpt-fake-default · effort medium (model default)" in env.notifier.sent[-1].text
@@ -838,7 +838,7 @@ async def test_bot_routing_and_commands(env, monkeypatch):
               notifier=env.notifier)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
 
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
@@ -1539,7 +1539,7 @@ async def test_project_commands(env, monkeypatch):
     async def reply(update, text):
         replies.append(text)
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
 
     monkeypatch.setattr(bot, "reply", reply)
@@ -1646,7 +1646,7 @@ async def test_plot_button(env, monkeypatch):
               notifier=env.notifier)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
 
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
@@ -1728,7 +1728,7 @@ async def test_threads_are_conversations(env, monkeypatch):
               notifier=notifier, projects=projects)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
 
@@ -1969,7 +1969,7 @@ async def test_general_topic(env, monkeypatch):
               notifier=notifier)
     started, replies = [], []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
 
     async def reply(update, text):
@@ -2954,7 +2954,7 @@ async def test_files_sent_to_the_agent(env, monkeypatch):
               notifier=env.notifier)
     started, replies = [], []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text, [n for n, _ in files or []], files))
 
     async def reply(update, text):
@@ -3044,7 +3044,7 @@ async def test_messages_outside_the_topics_go_to_general(env, monkeypatch):
               notifier=notifier, projects=projects)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
 
@@ -3121,7 +3121,7 @@ async def test_runs_cut_off_by_a_restart_are_offered_again(env, monkeypatch):
               notifier=env.notifier)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
     await bot.offer_cut_off_runs()
@@ -3974,7 +3974,7 @@ async def test_an_existing_topic_is_never_deleted_and_general_finds_its_way_back
               projects=make_projects(env))
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
 
@@ -4043,7 +4043,7 @@ async def test_general_in_all(env, monkeypatch):
     bot = Bot(env.cfg, app=NS(bot=tg), store=env.store, agent=env.agent, notifier=notifier, projects=projects)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
 

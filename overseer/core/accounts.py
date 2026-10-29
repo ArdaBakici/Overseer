@@ -327,6 +327,8 @@ def read_turns(path: Path) -> list[dict]:
                 turns[-1]["reply"] = ev.get("text", "") or ""
             elif kind == "command":
                 turns[-1]["commands"].append(ev.get("command", ""))
+            elif kind == "steer":  # (the researcher wrote while it worked)
+                turns[-1]["request"] += "\n\n(while it worked) " + ev.get("text", "").split("\n", 1)[-1]
             elif kind == "file" and ev.get("path"):
                 turns[-1]["files"].append(ev["path"])
     return turns

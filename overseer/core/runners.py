@@ -129,6 +129,54 @@ class RunResult:
     compactions: list[dict[str, Any]] = field(default_factory=list)
 
 
+class Steering:
+    """Messages for a run in progress - the researcher (or a planner) wrote while the agent worked. The runner hands
+    them to the running turn, and marks the ones the agent took (it reads them at its next step). send() is False once
+    the run can't take any more; untaken() are the ones it ended without: they're the next request."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.queued: list[str] = []  # not handed to the CLI yet (it wasn't ready)
+        self.given: list[str] = []  # handed to the CLI, not taken yet
+        self.taken: list[str] = []
+        self.instant = False  # the CLI takes a message as it's handed over (codex's turn/steer): no separate ack
+        self._deliver: Callable[[str], Any] | None = None
+
+    async def send(self, text: str) -> bool:
+        if self.closed:
+            return False
+        if self._deliver is None:
+            self.queued.append(text)  # (handed over as soon as the CLI is ready)
+            return True
+        if not await self._deliver(text):
+            return False
+        (self.taken if self.instant else self.given).append(text)
+        return True
+
+    async def ready(self, deliver: Callable[[str], Any]) -> None:
+        """The runner can take messages now: deliver(text) -> handed over."""
+        self._deliver = deliver
+        while self.queued and not self.closed:
+            text = self.queued[0]
+            if not await deliver(text):
+                break
+            self.queued.pop(0)
+            (self.taken if self.instant else self.given).append(text)
+
+    def took(self, text: str) -> bool:
+        if text in self.given:
+            self.given.remove(text)
+            self.taken.append(text)
+            return True
+        return False
+
+    def untaken(self) -> list[str]:
+        return self.queued + self.given
+
+    def close(self) -> None:
+        self.closed = True
+
+
 @dataclass
 class Sandbox:
     """What a domain adds to the agent's sandbox (on top of the platform's own rules, below), and the skills its
@@ -197,6 +245,10 @@ class Activity:
 
     def session(self, session_id: str) -> None:
         self._emit("session", id=session_id)
+
+    def steered(self, text: str) -> None:
+        """A message sent while it worked reached the agent (it reads it at its next step)."""
+        self._emit("steer", text=text)
 
     def compacting(self) -> None:
         self._emit("compacting")
@@ -346,6 +398,17 @@ class Runner:
     # ------------------------------------------------------------------ process handling
     async def _exec(self, argv: list[str], env: dict[str, str], cwd: Path, stdin: str,
                     on_event: Callable[[dict[str, Any]], None]) -> str:
+        """Run the CLI with `stdin` as its input, each JSON line of its output to on_event: its stderr if it failed."""
+        async def talk(send, close, events):
+            await send(stdin)
+            close()
+            async for event in events:
+                _handle(on_event, event)
+        return await self._converse(argv, env, cwd, talk)
+
+    async def _converse(self, argv: list[str], env: dict[str, str], cwd: Path, talk) -> str:
+        """Run the CLI and talk to it: talk(send(text), close(), events) writes to its stdin and reads its JSON output
+        lines until it's done. Its stderr if it failed; the run's timeout, /stop and Overseer stopping kill it."""
         if not shutil.which(argv[0], path=env.get("PATH")):
             raise AgentRunError(f"{argv[0]!r} not found on PATH; install it or set agent.{self.name}.command")
         proc = await asyncio.create_subprocess_exec(
@@ -357,10 +420,21 @@ class Runner:
         _RUNNING.add(proc.pid)
         err_task = asyncio.create_task(proc.stderr.read())
 
-        async def pump():
-            proc.stdin.write(stdin.encode())
-            await proc.stdin.drain()
-            proc.stdin.close()
+        async def send(text: str) -> bool:
+            if proc.stdin.is_closing():
+                return False
+            try:
+                proc.stdin.write(text.encode())
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+            return True
+
+        def close() -> None:
+            if not proc.stdin.is_closing():
+                proc.stdin.close()
+
+        async def events():
             async for raw in proc.stdout:
                 line = raw.decode(errors="replace").strip()
                 if not line:
@@ -370,10 +444,13 @@ class Runner:
                 except json.JSONDecodeError:
                     log.debug("%s: %s", self.name, line[:500])
                     continue
-                try:
-                    on_event(event)
-                except Exception:
-                    log.exception("event handler failed")
+                yield event
+
+        async def pump():
+            try:
+                await talk(send, close, events())
+            finally:
+                close()
             await proc.wait()
 
         def kill():
@@ -388,7 +465,7 @@ class Runner:
             kill()
             await proc.wait()
             raise AgentRunError(f"{self.name} did not finish within {self.timeout // 60} minutes; stopped it")
-        except asyncio.CancelledError:
+        except BaseException:  # (cancelled: /stop, Overseer stopping; or the conversation went wrong)
             kill()
             await proc.wait()
             raise
@@ -405,7 +482,8 @@ class Runner:
 
     # ------------------------------------------------------------------ API
     async def run(self, prompt: str, *, system: str, session_id: str | None, key: str,
-                  activity: Activity) -> RunResult:
+                  activity: Activity, steering: Steering | None = None) -> RunResult:
+        """One request. With `steering`, messages sent while it works go into the running turn."""
         raise NotImplementedError
 
     async def text(self, *, system: str, prompt: str) -> str:
@@ -525,7 +603,7 @@ class ClaudeCodeRunner(Runner):
         return argv
 
     async def run(self, prompt: str, *, system: str, session_id: str | None, key: str,
-                  activity: Activity) -> RunResult:
+                  activity: Activity, steering: Steering | None = None) -> RunResult:
         workdir = self.workdir(key)
         argv = self._common(workdir) + ["--output-format", "stream-json", "--verbose", "--append-system-prompt", system]
         if session_id:
@@ -580,10 +658,19 @@ class ClaudeCodeRunner(Runner):
             elif t == "result":
                 result.is_error = bool(ev.get("is_error"))
                 if ev.get("result"):
-                    result.text = str(ev["result"])
+                    answers.append(str(ev["result"]))
+                    result.text = "\n\n".join(dict.fromkeys(answers))  # (a steered message may have made more turns)
+                # (its totals are the whole process's - every turn of this run so far)
+                result.input_tokens = result.cached_tokens = result.output_tokens = 0
                 _claude_usage(ev, result)
 
-        stderr = await self._exec(argv, {**self.env(workdir), **activity.env}, workdir, prompt[:MAX_PROMPT], on_event)
+        answers: list[str] = []
+        env = {**self.env(workdir), **activity.env}
+        if steering is None:
+            stderr = await self._exec(argv, env, workdir, prompt[:MAX_PROMPT], on_event)
+        else:
+            stderr = await self._converse(argv + ["--input-format", "stream-json", "--replay-user-messages"], env,
+                                          workdir, self._steered_talk(prompt, steering, activity, on_event, result))
         if result.is_error:  # e.g. an API error: Claude Code reports it as the result, not as an answer
             message = "claude: " + (result.text or stderr.strip() or "the run failed")[-1500:]
             _check_limit(message)
@@ -595,6 +682,33 @@ class ClaudeCodeRunner(Runner):
         if stderr and not result.text:
             raise AgentRunError("claude: " + "\n".join(stderr.strip().splitlines()[-15:])[-1500:])
         return result
+
+    def _steered_talk(self, prompt: str, steering: Steering, activity: Activity, on_event, result: RunResult):
+        """Claude Code with streaming input: the request, then the messages sent while it works - it takes them at its
+        next step, and says so (--replay-user-messages). Its input is closed once a turn has ended with every
+        message taken; a message it hadn't taken by then gets a turn of its own first."""
+        def line(text: str) -> str:
+            return json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
+
+        async def talk(send, close, events):
+            async def deliver(text: str) -> bool:
+                return not steering.closed and await send(line(text))
+
+            await send(line(prompt[:MAX_PROMPT]))
+            await steering.ready(deliver)
+            async for ev in events:
+                if ev.get("type") == "user" and ev.get("isReplay"):
+                    content = (ev.get("message") or {}).get("content")
+                    text = content if isinstance(content, str) else "".join(
+                        b.get("text", "") for b in content or [] if isinstance(b, dict))
+                    if steering.took(text):
+                        activity.steered(text)
+                    continue
+                _handle(on_event, ev)
+                if ev.get("type") == "result" and (not steering.untaken() or result.is_error):
+                    steering.close()  # (what comes from now on is the next request)
+                    close()
+        return talk
 
     async def compact(self, *, session_id: str, key: str, system: str, activity: Activity, focus: str = "") -> RunResult:
         """Compact the conversation now: Claude Code's own /compact, in the same session."""
@@ -939,9 +1053,157 @@ class CodexRunner(Runner):
             result.effort = f"{default} (model default)" if default else None
 
     async def run(self, prompt: str, *, system: str, session_id: str | None, key: str,
-                  activity: Activity) -> RunResult:
-        return await self._run(prompt, system=system, session_id=session_id, key=key, activity=activity,
-                               writable=True, network=True, ephemeral=False)
+                  activity: Activity, steering: Steering | None = None) -> RunResult:
+        if steering is None:
+            return await self._run(prompt, system=system, session_id=session_id, key=key, activity=activity,
+                                   writable=True, network=True, ephemeral=False)
+        return await self._app_run(prompt, system=system, session_id=session_id, key=key, activity=activity,
+                                   steering=steering)
+
+    async def _app_run(self, prompt: str, *, system: str, session_id: str | None, key: str, activity: Activity,
+                       steering: Steering) -> RunResult:
+        """A request through codex's app server (JSON-RPC over stdio) rather than `codex exec`: the same thread,
+        sandbox and settings, and messages sent while it works go into the running turn (turn/steer)."""
+        workdir = self.workdir(key)
+        if self.sandbox.skills:
+            from .addons import write_skills
+            write_skills(workdir, (".agents", "skills"), self.sandbox.skills, prune=False)
+        argv = [self.c.command, "app-server"]
+        for o in self.overrides(workdir, system=system, writable=True, network=True):
+            argv += ["-c", o]
+        if self.model:  # (last, and in thread/start: like exec's -m, it wins over the config's model)
+            argv += ["-c", f"model={_toml(self.model)}"]
+        # codex reports the thread's running token total, not this run's; the caller subtracts the last one
+        result = RunResult(text="", session_id=session_id, model=self.model, effort=self.effort, usage_is_total=True)
+        messages: list[str] = []
+        errors: list[str] = []
+        done = asyncio.Event()
+        turn: dict[str, str] = {}
+
+        def notified(method: str, params: dict[str, Any]) -> None:
+            item = params.get("item") or {}
+            kind = item.get("type")
+            if method == "item/started" and kind == "commandExecution":
+                activity.command(item.get("command", ""))
+            elif method == "item/completed":
+                if kind == "commandExecution":
+                    activity.output(item.get("command", ""), item.get("aggregatedOutput") or "", item.get("exitCode"))
+                elif kind == "fileChange":
+                    for ch in item.get("changes") or []:
+                        activity.file(ch.get("path", ""))
+                elif kind == "agentMessage":
+                    messages.append(item.get("text", ""))
+                    activity.message(item.get("text", ""))
+                elif kind == "reasoning":
+                    activity.thought("\n".join(str(x) for x in item.get("summary") or []))
+                elif kind == "webSearch":
+                    activity.tool("web_search", item.get("query", ""))
+                elif kind == "mcpToolCall":
+                    activity.tool(f"{item.get('server', '')}.{item.get('tool', '')}".strip("."))
+                elif kind == "contextCompaction":
+                    info = {"trigger": "auto", "pre_tokens": None, "post_tokens": None}
+                    result.compactions.append(info)
+                    activity.compacted(info)
+            elif method == "thread/tokenUsage/updated":
+                total = (params.get("tokenUsage") or {}).get("total") or {}
+                result.input_tokens = int(total.get("inputTokens") or 0)  # includes the cached part
+                result.cached_tokens = int(total.get("cachedInputTokens") or 0)
+                result.output_tokens = int(total.get("outputTokens") or 0)
+            elif method == "error" and not params.get("willRetry"):
+                err = params.get("error") or {}
+                errors.append(f"{err.get('message', '')} {json.dumps(err.get('codexErrorInfo') or '')}".strip())
+            elif method == "turn/completed" and (params.get("turn") or {}).get("id") == turn.get("id"):
+                t = params["turn"]
+                if t.get("status") not in (None, "completed"):
+                    err = t.get("error") or {}
+                    errors.append(err.get("message") or f"the turn {t.get('status')}")
+                done.set()
+
+        async def talk(send, close, events):
+            replies: dict[int, asyncio.Future] = {}
+            ids = iter(range(1, 1_000_000))
+
+            async def read():
+                async for msg in events:
+                    if "id" in msg and "method" not in msg:
+                        fut = replies.pop(msg["id"], None)
+                        if fut and not fut.done():
+                            fut.set_result(msg)
+                    elif "id" in msg:  # a request of codex's: approvals are off, so this shouldn't come - decline
+                        answer = ({"decision": "decline"} if msg["method"].lower().endswith("approval")
+                                  else None)
+                        await send(json.dumps({"id": msg["id"], **({"result": answer} if answer else
+                                              {"error": {"code": -32601, "message": "not supported by Overseer"}})})
+                                   + "\n")
+                    else:
+                        try:
+                            notified(msg.get("method", ""), msg.get("params") or {})
+                        except Exception:
+                            log.exception("codex app-server notification")
+                for fut in replies.values():  # (it ended: nothing more will be answered)
+                    if not fut.done():
+                        fut.set_exception(AgentRunError("codex app-server stopped"))
+                done.set()
+
+            async def call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                i = next(ids)
+                replies[i] = asyncio.get_running_loop().create_future()
+                if not await send(json.dumps({"id": i, "method": method, "params": params}) + "\n"):
+                    raise AgentRunError("codex app-server stopped")
+                msg = await replies[i]
+                if msg.get("error"):
+                    err = msg["error"]
+                    raise AgentRunError("codex: " + str(err.get("message") if isinstance(err, dict) else err)[:800])
+                return msg.get("result") or {}
+
+            reader = asyncio.create_task(read())
+            try:
+                await call("initialize", {"clientInfo": {"name": "overseer", "version": "1"}})
+                await send(json.dumps({"method": "initialized"}) + "\n")
+                which = {"cwd": str(workdir), **({"model": self.model} if self.model else {})}
+                if session_id:
+                    started = await call("thread/resume", {"threadId": session_id, **which})
+                else:
+                    started = await call("thread/start", which)
+                result.session_id = (started.get("thread") or {}).get("id") or session_id
+                result.model = started.get("model") or result.model
+                result.effort = started.get("reasoningEffort") or result.effort
+                if result.session_id:
+                    activity.session(result.session_id)
+                t = await call("turn/start", {"threadId": result.session_id,
+                                              "input": [{"type": "text", "text": prompt[:MAX_PROMPT]}]})
+                turn["id"] = (t.get("turn") or {}).get("id", "")
+
+                async def deliver(text: str) -> bool:
+                    if steering.closed or done.is_set():
+                        return False
+                    try:
+                        await call("turn/steer", {"threadId": result.session_id, "expectedTurnId": turn["id"],
+                                                  "input": [{"type": "text", "text": text}]})
+                    except AgentRunError:  # (the turn had just ended: it's the next request)
+                        return False
+                    activity.steered(text)  # (the turn has it)
+                    return True
+
+                steering.instant = True
+                await steering.ready(deliver)
+                await done.wait()
+            finally:
+                steering.close()
+                close()
+                await reader
+
+        stderr = await self._converse(argv, {**self.env(workdir), **activity.env}, workdir, talk)
+        result.text = messages[-1] if messages else ""
+        if result.session_id and not result.effort:
+            await self._fill_actual_settings(result)  # (the model's own default effort, from its session log)
+        if errors:  # out of usage part-way through a turn: not an answer, even with some text before it
+            _check_limit("codex: " + "; ".join(e for e in errors if e)[-1500:])
+        if not result.text and (errors or stderr):
+            detail = "; ".join(e for e in errors if e) or "\n".join(stderr.strip().splitlines()[-15:])
+            _check_limit("codex: " + detail[-1500:] + "\n" + stderr[-1500:])
+            raise AgentRunError("codex: " + detail[-1500:])
+        return result
 
     async def text(self, *, system: str, prompt: str) -> str:
         res = await self._run(f"{system}\n\n<input>\n{prompt[-MAX_PROMPT:]}\n</input>", system=None, session_id=None,
@@ -961,6 +1223,14 @@ class CodexRunner(Runner):
         for o in self.overrides(workdir, system=None, writable=True, network=True):
             argv += ["-c", o]
         return argv + [session_id], self.env(workdir), workdir
+
+
+def _handle(on_event: Callable[[dict[str, Any]], None], event: dict[str, Any]) -> None:
+    """One of the CLI's events (a handler that fails is logged: the run goes on)."""
+    try:
+        on_event(event)
+    except Exception:
+        log.exception("event handler failed")
 
 
 def _tool_detail(inp: dict[str, Any]) -> str:

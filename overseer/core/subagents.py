@@ -255,16 +255,20 @@ class Subagents:
             await self._ended(w)
         self.pump()
 
-    async def send(self, w, text: str) -> None:
-        """A message from the planner: the subagent works on it (and reports again when done)."""
+    async def send(self, w, text: str) -> bool:
+        """A message from the planner: the subagent works on it (and reports again when done). While it's working, it
+        goes into its run (it reads it at its next step): True then."""
+        if await self.agent.steer(w, text, by="planner"):
+            return True
         if w.rec.state == "queued":
             w.rec.task += f"\n\nAlso, from your planner: {text}"
             self.store.upsert_session(w.rec)
-            return
+            return False
         if w.rec.state in ENDED:
             w.rec.state, w.rec.started = "running", time.time()
             self.store.upsert_session(w.rec)
         self._spawn_task(self.agent.handle(w, f"[Message from your planner]\n{text}", origin="subagent"))
+        return False
 
     def find(self, planner, name: str):
         for r in self.store.subagents(parent=planner.id):
