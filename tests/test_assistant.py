@@ -529,7 +529,8 @@ def test_the_assistant_bot_loads_from_its_config_file(tmp_path, monkeypatch):
         assert not {"jobs", "fix", "cluster"} & commands
         assert (vault / "Assistant/Persona.md").exists() and Path(tmp, "agent-bin/ov").exists()
         bots = [json.loads(p.read_text()) for p in (app_dir / "state/bots").glob("*.json")]
-        assert bots == [{"domain": "assistant", "state": str(app_dir / "state/assistant"), "tmp": tmp}]
+        assert bots == [{"domain": "assistant", "state": str(app_dir / "state/assistant"), "tmp": tmp,
+                         "config": str(app_dir / "assistant.yaml")}]  # (the TUI finds the bot by it)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

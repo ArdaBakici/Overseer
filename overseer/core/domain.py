@@ -151,6 +151,13 @@ class Domain:
         """The domain's last lines in the digest."""
         return []
 
+    # ------------------------------------------------------------------ the TUI (heartbeat.py, overseer tui)
+    async def status(self) -> dict:
+        """What the TUI shows of this bot besides the platform's own: {"lines": [[label, text, ok (bool or None)]],
+        "tables": [{"title", "columns": [...], "rows": [[...]], "details": [text per row]}]}. Refreshed every 30 s
+        while the bot runs (the last one stays shown when it stops)."""
+        return {"lines": [], "tables": []}
+
     # ------------------------------------------------------------------ the dashboard (dashboard.py)
     def dashboard_js(self) -> bytes:
         """The dashboard page's script: it builds the domain's tabs (nav) and renders them from dashboard_api."""

@@ -419,6 +419,30 @@ class AssistantDomain(Domain):
         from .dashboard import route
         return await route(self, parts, query)
 
+    # ------------------------------------------------------------------ the TUI
+    async def status(self) -> dict:
+        from .dashboard import today
+
+        d = await today(self)
+        hm = lambda ts: time.strftime("%H:%M", time.localtime(ts))  # noqa: E731
+        lines = [["vault", str(self.vault.root), self.vault.root.is_dir()],
+                 ["persona", d["name"] or "not set yet", None]]
+        if d["events"] is not None:
+            lines.append(["calendar", f"{len(d['events'])} event(s) today", None])
+        if d["conflicts"]:
+            lines.append(["Syncthing conflicts", str(len(d["conflicts"])), False])
+        today_rows = ([[hm(r["at"]), "⏰ " + r["kind"], r["text"]] for r in d["reminders"]]
+                      + [[hm(r["at"]), ("✓ " if r["past"] else "🔁 ") + r["kind"], r["name"]] for r in d["routines"]]
+                      + [["all day" if e["all_day"] else hm(e["start"]), "📅 " + e["calendar"], e["title"]]
+                         for e in d["events"] or []])
+        today_rows.sort(key=lambda r: (r[0] != "all day", r[0]))
+        tasks = [[t["due"] or t["scheduled"] or "", t["priority"] or "", t["text"], t["path"]] for t in d["due"]]
+        return {"lines": lines, "tables": [
+            {"title": "Today", "columns": ["when", "what", ""], "rows": today_rows},
+            {"title": "Tasks", "columns": ["due", "priority", "task", "note"], "rows": tasks},
+            {"title": "Waiting for you", "columns": ["since", "what", ""],
+             "rows": [[hm(r["at"]), r["kind"], r["text"]] for r in d["waiting"]]}]}
+
     # ------------------------------------------------------------------ search
     def search_rows(self) -> list[tuple]:
         from .search import search_rows

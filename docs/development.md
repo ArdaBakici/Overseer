@@ -9,7 +9,7 @@ OVERSEER_TEST_CLI_DIR=/path/to/node_modules/.bin uv run pytest tests/test_e2e.py
 
 - `tests/test_integration.py` covers the monitor, agent sessions, job detection, the runners' sandbox settings and the bot. It uses fake SLURM (`tests/fake_slurm/`) and fake CLIs (`tests/fake_cli/`).
 - `tests/test_assistant.py` covers the assistant: tasks, reminders, the vault's history and undo, its config and sandbox, a whole turn.
-- `tests/test_calendar.py` covers the assistant's calendars; `tests/test_hpc_vault.py` the HPC bot's Obsidian folder; `tests/test_accounts.py` several accounts per CLI, usage limits and failover.
+- `tests/test_calendar.py` covers the assistant's calendars; `tests/test_hpc_vault.py` the HPC bot's Obsidian folder; `tests/test_accounts.py` several accounts per CLI, usage limits and failover; `tests/test_tui.py` the monitor (read-only), the setup wizard's steps, and bots in the background (real processes: start, stop, the lock, restarts after a crash).
 - `tests/test_e2e.py` runs the real Claude Code and Codex against a scripted model (`tests/fake_model_server.py`) and a local sshd. It is skipped unless sshd, bubblewrap, socat and the CLIs are available.
 
 ## Architecture: a platform and its domains
@@ -45,6 +45,15 @@ domain by name.
 | `digest.py` | the morning digest: the domain's sections, the agents, tokens, what waits for you |
 | `dashboard.py`, `dashboard.html` | the Mini App's server (Telegram initData auth) and page; the domain gives its tabs |
 | `usage.py`, `projects.py`, `store.py`, `notify.py`, `richtext.py` | `/usage`; projects; the database; messages; Markdown → Telegram |
+| `heartbeat.py`, `daemon.py` | what a running bot shows the TUI (`state/status.json`); running it in the background: the single-instance lock, the log file, start/stop, the watcher that restarts it after a crash |
+
+**The TUI (`overseer/tui`)**: outside the platform, it loads nothing of a bot's - only reads its files.
+
+| module | role |
+|---|---|
+| `data.py` | the bots of a folder, their process and heartbeat, their database read-only, transcripts, logs |
+| `monitor.py` | `overseer tui`: the monitor (Textual), with start / stop / restart |
+| `steps.py`, `setup.py` | `overseer setup`: the wizard's work (checks, .env, config.yaml from the example, Telegram, sinfo) and its screens |
 
 **The HPC domain (`overseer/hpc`)**
 

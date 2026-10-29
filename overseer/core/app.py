@@ -51,7 +51,8 @@ def prepare_local_dirs(cfg: Config) -> None:
         os.chmod(d, 0o700)
     from .config import domain_module
     registry = getattr(domain_module(cfg.domain), "registry", None)  # (what the other bots should know of this one)
-    cfg.local.register(cfg.domain, registry(cfg) if registry else None)
+    extra = {**(registry(cfg) if registry else {}), "config": getattr(cfg, "source", "")}  # (the TUI finds it)
+    cfg.local.register(cfg.domain, extra)
 
 
 def domain_factory(cfg: Config):
@@ -104,6 +105,8 @@ def build(cfg: Config):
                 log.error("dashboard: can't listen on %s:%s (%s)", cfg.dashboard.host, cfg.dashboard.port, e)
             await bot.set_dashboard_button()
         await app.bot.set_my_commands([*(bot.ext.menu if bot.ext else []), *CORE_MENU])
+        heartbeat.bot_name = f"@{app.bot.username}" if app.bot.username else ""
+        tasks.append(asyncio.create_task(heartbeat.loop(), name="heartbeat"))  # what `overseer tui` shows
 
     async def post_stop(app: Application) -> None:
         agent.shutting_down = True  # runs cut off from here on are offered again at the next start
@@ -114,6 +117,7 @@ def build(cfg: Config):
     async def post_shutdown(app: Application) -> None:
         for t in tasks:
             t.cancel()
+        heartbeat.stopped()
         await ctl.stop()
         if dashboard:
             await dashboard.stop()
@@ -157,4 +161,6 @@ def build(cfg: Config):
         dashboard = Dashboard(cfg, store, cfg.telegram.token, domain)
     bot.dashboard = dashboard
     bot.register()
+    from .heartbeat import Heartbeat
+    heartbeat = Heartbeat(cfg, agent, notifier, domain)
     return app

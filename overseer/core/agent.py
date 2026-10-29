@@ -296,6 +296,7 @@ class Session:
     switched: str = ""  # why its next run is on another CLI (said in the handover): set by a failover
     steering: Steering | None = None  # its run in progress takes messages (steer)
     leftover: list[str] = field(default_factory=list)  # messages sent while it worked that it didn't take
+    started: float = 0  # when its current run started (the TUI shows it)
 
     @property
     def id(self) -> str:
@@ -771,6 +772,7 @@ class Agent:
                 return False
             s.task = asyncio.current_task()
             s.origin = origin
+            s.started = time.time()
             if origin == "user" and self.autopilot:
                 self.autopilot.user_turn(s)
             try:
