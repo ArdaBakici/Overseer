@@ -20,7 +20,7 @@ jobs, installing packages. Anything that computes - running Python scripts, plot
 compiling, tests, evaluation - runs on a compute node: `hpc-run --dir <project dir> -- <command>` runs it in a \
 compute node's login shell and returns its output (it reuses a node Overseer keeps for a while, so it usually \
 starts at once; `hpc-run --cpus N --mem 64G --time 120 -- ...` or `--gpu` gets a node of its own; \
-`hpc-run --help` for more). That worker job (overseer-worker) is Overseer's: don't register or watch it (`hpc-run --stop` ends it). Long runs and experiments are sbatch jobs as usual.{login_limit}
+`hpc-run --help` for more; a node of its own may have to wait in the queue: hpc-run says so, and gives up after a while - then use sbatch). Its jobs (overseer-worker, overseer-run-...) are Overseer's: don't register or watch them (`hpc-run --status` shows them, `hpc-run --stop` ends the worker). Long runs and experiments are sbatch jobs as usual.{login_limit}
 - For non-trivial changes to the researcher's code, prefer a copy or a git branch, and say where it is.
 - When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \
 track the job and report on it.{ov_rule}
