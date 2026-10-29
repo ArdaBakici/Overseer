@@ -50,11 +50,13 @@ UPLOAD_WAIT = 30
 ALBUM_WAIT = 2
 MAX_DOWNLOAD = 20 * 1024 * 1024  # the largest file the Bot API lets bots download
 
+STEERED_NOTE = "📨 Sent to the agent while it works: it reads it at its next step. (/after &lt;message&gt;: once it's done)"
 ACCOUNT_CLI = {"claude_code": "Claude", "codex": "Codex"}  # (short, for buttons)
 
 HELP = """<b>Overseer</b>
 
 /ask &lt;text&gt; — talk to the agent (or just send a message) · /new — a fresh conversation
+While the agent works, what you send goes into its run (it reads it at its next step) · /after &lt;text&gt; — once it's done
 /backend [claude_code|codex] · /model [name|default] · /effort [level|default] — the agent
 /account [name] — the CLIs' logins: which is in use, which are out of usage; switch
 /stop — stop the agent's current run · /compact [focus] — compact the conversation
@@ -1006,6 +1008,7 @@ class Bot:
         add = self.app.add_handler
         add(CommandHandler(["start", "help"], self.cmd_help, filters=allowed))
         add(CommandHandler("ask", self.cmd_ask, filters=allowed))
+        add(CommandHandler("after", self.cmd_after, filters=allowed))
         add(CommandHandler("new", self.cmd_new, filters=allowed))
         add(CommandHandler("backend", self.cmd_backend, filters=allowed))
         add(CommandHandler(["account", "accounts"], self.cmd_account, filters=allowed))
@@ -1150,8 +1153,12 @@ class Bot:
         task.add_done_callback(self._tasks.discard)
 
     async def _run_agent(self, chat_id: int, session: Session, text: str,
-                         files: list[tuple[str, Path]] | None = None) -> None:
+                         files: list[tuple[str, Path]] | None = None, steer: bool = True) -> None:
         if self.agent.is_running(session):
+            # Written while it works: into its run - it reads it at its next step (/after: once it's done instead).
+            if steer and await self.agent.steer(session, text, files):
+                await self.notifier.send(Outgoing(STEERED_NOTE, session_id=session.id, silent=True))
+                return
             await self.notifier.send(Outgoing("⏳ The agent is still working on the previous message in this "
                                               "conversation; yours is queued. /stop cancels the current run.",
                                               session_id=session.id, silent=True))
@@ -1185,6 +1192,15 @@ class Bot:
 
 
 
+
+    async def cmd_after(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/after <text>: for the agent once it's done with what it's working on (not into the run)."""
+        text = " ".join(ctx.args or [])
+        if not text:
+            await self.reply(update, "Usage: /after &lt;message&gt; - for the agent once it has finished what it's "
+                                     "working on (a message sent while it works goes into its run instead).")
+            return
+        await self._route(update, text, [], steer=False)
 
     async def cmd_ask(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         text = " ".join(ctx.args or [])
@@ -1461,13 +1477,14 @@ class Bot:
             "✉️ <i>From “All”:</i>" + (f"\n{shown}" if shown else "") + (f"\n📎 {names}" if names else ""),
             session_id=self.agent.general_session().id, silent=True))
 
-    async def _route(self, update: Update, text: str, files: list[tuple[str, Path]]) -> None:
+    async def _route(self, update: Update, text: str, files: list[tuple[str, Path]], steer: bool = True) -> None:
         if self._outside_topics(update):
             if not self._from_all(update):  # an existing topic Overseer doesn't know
                 await self._refuse_outside_topics(update, text, files)
                 return
             await self._all_to_general(update, text, files)
-            self._spawn(self._run_agent(update.effective_chat.id, self.agent.general_session(), text, files))
+            self._spawn(self._run_agent(update.effective_chat.id, self.agent.general_session(), text, files,
+                                        steer=steer))
             return
         session = self._replied_session(update) or self._here(update)
         if session is None:  # a thread the user just started
@@ -1485,7 +1502,7 @@ class Bot:
             return
         if self.agent.subagents:  # writing while the agent's plan is open declines it: the agent gets your message
             text = await self.agent.subagents.reject_by_reply(session, text)
-        self._spawn(self._run_agent(update.effective_chat.id, session, text, files))
+        self._spawn(self._run_agent(update.effective_chat.id, session, text, files, steer=steer))
 
     # ------------------------------------------------------------------ runs cut off by a restart
     async def offer_cut_off_runs(self) -> None:

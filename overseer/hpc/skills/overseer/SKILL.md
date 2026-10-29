@@ -373,7 +373,7 @@ ov propose plan.json
 ov spawn cosine "brief..." [--model claude-sonnet-5-5] [--backend codex]   # start a subagent (or queue it)
 ov agents                     # your subagents and their state
 ov agent show cosine          # its task and report
-ov agent send cosine "also try warmup 1k"   # it works on that and reports again
+ov agent send cosine "also try warmup 1k"   # while it works: it reads it at its next step; else it works on it and reports again
 ov agent stop cosine
 ov planner off                # the goal is reached: back to normal mode
 ```

@@ -424,7 +424,8 @@ class ControlServer:
 
     async def agent_send(self, session, args) -> str:
         w = self._subs().find(session, args.name)
-        await self._subs().send(w, " ".join(args.text))
+        if await self._subs().send(w, " ".join(args.text)):
+            return f"✓ sent to {args.name} while it works: it reads it at its next step (its report says what it did)"
         return (f"✓ sent to {args.name}" + (" (it reads it when it starts)" if w.rec.state == "queued" else
                                              ": it works on it and reports again when done"))
 

@@ -27,7 +27,8 @@ USERS_TOPICS_NOTE = ("⚠️ The general conversation is in “All” (telegram.
                      "Settings → Threaded mode → users can't create topics.")
 
 CORE_MENU = [
-    ("ask", "talk to the agent"), ("new", "fresh agent conversation"),
+    ("ask", "talk to the agent"), ("after", "a message for once the agent is done"),
+    ("new", "fresh agent conversation"),
     ("backend", "show/switch claude_code or codex"), ("account", "the CLIs' logins: show/switch"),
     ("model", "show/set the agent's model"),
     ("effort", "show/set the agent's effort"), ("stop", "stop the agent's current run"),

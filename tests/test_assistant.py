@@ -553,7 +553,7 @@ def topic_bot(aenv, monkeypatch, use_topics, topic_mode=True):
     bot = Bot(aenv.cfg, app=NS(bot=tg), store=aenv.store, agent=aenv.agent, notifier=notifier, projects=projects)
     started = []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
     return NS(tg=tg, notifier=notifier, bot=bot, projects=projects, started=started, deleted=deleted)
@@ -822,7 +822,7 @@ async def test_ov_task_add_someday_and_ov_ask(aenv):
     bot = Bot(aenv.cfg, app=None, store=aenv.store, agent=aenv.agent, notifier=aenv.notifier)
     started, edits = [], []
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         started.append((session.id, text))
     bot._run_agent = fake_run_agent
 
@@ -1081,7 +1081,7 @@ async def test_ov_react_to_the_last_message(aenv, monkeypatch):
     bot = Bot(aenv.cfg, app=None, store=aenv.store, agent=aenv.agent, notifier=aenv.notifier,
               projects=Projects(aenv.cfg, aenv.store, aenv.agent))
 
-    async def fake_run_agent(chat_id, session, text, files=None):
+    async def fake_run_agent(chat_id, session, text, files=None, steer=True):
         pass
     monkeypatch.setattr(bot, "_run_agent", fake_run_agent)
     await aenv.ctl.start()
