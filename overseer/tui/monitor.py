@@ -2,14 +2,17 @@
 and never touches their conversations, Telegram or the HPC. Its only actions start and stop the bots themselves
 (in the background: they keep running after the TUI closes).
 
-Keys: s start · x stop · r restart · 1-6 tabs · q quit.
+It's run from the keyboard: ? shows every key.
 """
 
 from __future__ import annotations
 
+import io
+import os
 import time
 from pathlib import Path
 
+from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
@@ -17,8 +20,9 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import (Button, DataTable, Footer, Header, Label, ListItem, ListView, RichLog, Static,
+from textual.reactive import Reactive
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog, Static,
                              TabbedContent, TabPane)
 
 from ..core import daemon
@@ -26,9 +30,52 @@ from ..core.live import Style, render_event
 from . import data as D
 
 REFRESH = 2.0  # seconds
+TABS = ["overview", "domain", "agents", "wakeups", "usage", "log"]
+KEYS = [  # the help screen (?)
+    ("Moving around", [
+        ("← →  or  1-6", "previous / next tab, or straight to one"),
+        ("[  ]", "previous / next bot"),
+        ("↑ ↓  j k", "move in the list, or scroll"),
+        ("PgUp PgDn  g G", "a page up / down; the top / the end"),
+        ("Tab  Shift+Tab", "the next / previous pane (the bots, the list, the transcript)"),
+        ("Enter", "open: a job's (or task's) details; a conversation's transcript"),
+        ("Esc", "back (closes what Enter opened, clears the filter)"),
+    ]),
+    ("Looking", [
+        ("/", "filter this tab's rows (Enter: keep it, Esc: clear it)"),
+        ("f", "follow the transcript or log as it grows, or stay where you are"),
+    ]),
+    ("The bot (in the background: it keeps running when you quit)", [
+        ("s", "start it"), ("x", "stop it"), ("r", "restart it"),
+    ]),
+    ("", [("?", "this help"), ("q", "quit (the bots keep running)")]),
+]
 NAMES = {"claude_code": "Claude Code", "codex": "Codex"}
 ORIGINS = {"user": "you", "wakeup": "wake-up", "checkin": "check-in", "compact": "compaction",
            "subagent": "subagent", "routine": "routine"}
+
+
+class QuietScreen(Screen):
+    """The main screen, sending the terminal only what changed. (Textual repaints the whole screen when the focus
+    moves - twice per tab switch - though the widgets that gain and lose it repaint themselves: over ssh, that's
+    ~50 KB a key.)"""
+    focused: Reactive = Reactive(None, repaint=False)
+
+
+def for_slow_links(app: App) -> None:
+    """Over ssh, no animations (each frame is sent); TEXTUAL_ANIMATIONS still decides if it's set."""
+    if (os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY")) and "TEXTUAL_ANIMATIONS" not in os.environ:
+        app.animation_level = "none"
+
+
+class SteadyTabs(TabbedContent):
+    """Tabs that only change when you change them. (Textual shows the tab of whatever gets the focus: as a tab is
+    left, the focus goes to the next widget of the pane being hidden, or to a table being redrawn - and its tab came
+    back.)"""
+
+    def _on_tab_pane_focused(self, event: TabPane.Focused) -> None:
+        event.stop()
+        event.prevent_default()
 
 
 class Confirm(ModalScreen[bool]):
@@ -59,45 +106,115 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class Help(ModalScreen[None]):
+    DEFAULT_CSS = """
+    Help { align: center middle; }
+    #help { width: 84; height: auto; max-height: 90%; border: thick $primary; background: $surface; padding: 1 2; }
+    """
+    BINDINGS = [Binding("escape,q,question_mark,f1", "dismiss", "close")]
+
+    def __init__(self, keys: list = KEYS):
+        super().__init__()
+        self.keys = keys
+
+    def compose(self) -> ComposeResult:
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="bold cyan", no_wrap=True)
+        t.add_column()
+        for title, rows in self.keys:
+            t.add_row(Text(title, style="bold") if title else "", "")
+            for key, what in rows:
+                t.add_row(key, what)
+            t.add_row("", "")
+        with VerticalScroll(id="help"):
+            yield Static(t)
+
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
+
+
+class Details(ModalScreen[None]):
+    """A row's whole text (a job's card, a task) - Enter on it; Esc closes."""
+    DEFAULT_CSS = """
+    Details { align: center middle; }
+    #details-box { width: 90%; height: auto; max-height: 85%; border: thick $primary; background: $surface;
+                   padding: 1 2; }
+    """
+    BINDINGS = [Binding("escape,q,enter", "dismiss", "close")]
+
+    def __init__(self, title: str, text: str):
+        super().__init__()
+        self.title_text, self.text = title, text
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="details-box"):
+            yield Static(Text(self.title_text, style="bold"))
+            yield Static(Text(self.text or "(nothing more to show)"))
+
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
+
+
 class Monitor(App):
     TITLE = "Overseer"
     CSS = """
     #bots { width: 30; border-right: solid $primary-background; }
     #bots ListItem { padding: 0 1; }
     #summary { height: auto; padding: 0 1; background: $boost; }
+    #tabs, #tabs > ContentSwitcher, #tabs TabPane { height: 1fr; }
     .table-title { padding: 1 1 0 1; text-style: bold; }
     #domain DataTable { height: auto; max-height: 20; }
     #details { height: auto; max-height: 14; padding: 0 1; border-top: solid $primary-background; }
     #conversations { width: 46%; }
     #transcript { border-left: solid $primary-background; }
     #overview, #usage { padding: 0 1; }
+    #filter { dock: bottom; display: none; }
+    #filter.shown { display: block; }
+    *:focus { background-tint: $primary 8%; }
     """
     BINDINGS = [
+        Binding("left", "move_tab(-1)", "tab", key_display="←→", priority=True),
+        Binding("right", "move_tab(1)", show=False, priority=True),
+        Binding("left_square_bracket", "move_bot(-1)", "bot", key_display="[ ]"),
+        Binding("right_square_bracket", "move_bot(1)", show=False),
+        *[Binding(str(i + 1), f"tab('{t}')", show=False) for i, t in enumerate(TABS)],
+        Binding("j", "move(1)", show=False), Binding("k", "move(-1)", show=False),
+        Binding("g", "ends(-1)", show=False), Binding("G", "ends(1)", show=False),
+        Binding("slash", "filter", "filter", key_display="/"),
+        Binding("f", "follow", "follow"),
+        Binding("escape", "back", show=False),
         Binding("s", "start", "start"), Binding("x", "stop", "stop"), Binding("r", "restart", "restart"),
-        Binding("1", "tab('overview')", "overview", show=False), Binding("2", "tab('domain')", show=False),
-        Binding("3", "tab('agents')", show=False), Binding("4", "tab('wakeups')", show=False),
-        Binding("5", "tab('usage')", show=False), Binding("6", "tab('log')", show=False),
+        Binding("question_mark,f1", "help", "help", key_display="?"),
         Binding("q", "quit", "quit"),
     ]
 
     def __init__(self, base: Path):
         super().__init__()
+        for_slow_links(self)
         self.base = base
         self.bots: list[D.Bot] = D.discover(base)
         self.selected = 0
         self.busy: set[str] = set()  # bots being started or stopped
         self.conversation: str | None = None
         self._shown: dict[str, object] = {}  # what each pane last showed (redrawn only when it changed)
+        self.filters: dict[str, str] = {}  # tab -> its filter (/)
+        self.follow = True  # the transcript and log scroll to new lines as they come (f)
+        self._lines: dict[str, list[str]] = {}  # what a transcript / log shows (new lines are added, not redrawn)
+        self._details: dict[str, list[str]] = {}
+        self._rows: dict[str, list[list[str]]] = {}
+
+    def get_default_screen(self) -> Screen:
+        return QuietScreen(id="_default")
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header()
         with Horizontal():
             yield ListView(*[ListItem(Label(self._bot_line(b)), id=f"bot{i}") for i, b in enumerate(self.bots)],
                            id="bots")
             with Vertical():
                 yield Static(id="summary")
-                with TabbedContent(id="tabs", initial="overview"):
+                with SteadyTabs(id="tabs", initial="overview"):
                     with TabPane("Overview", id="overview"):
                         yield VerticalScroll(Static(id="overview-body"))
                     with TabPane("Bot", id="domain"):
@@ -106,21 +223,23 @@ class Monitor(App):
                     with TabPane("Agents", id="agents"):
                         with Horizontal():
                             yield DataTable(id="conversations", cursor_type="row", zebra_stripes=True)
-                            yield RichLog(id="transcript", wrap=True, markup=False, highlight=False)
+                            yield RichLog(id="transcript", wrap=True, markup=False, highlight=False, max_lines=5000)
                     with TabPane("Wake-ups", id="wakeups"):
                         yield DataTable(id="wakeup-table", cursor_type="row", zebra_stripes=True)
                     with TabPane("Usage", id="usage"):
                         yield VerticalScroll(Static(id="usage-body"))
                     with TabPane("Log", id="log"):
-                        yield RichLog(id="log-body", wrap=False, markup=False, highlight=False)
+                        yield RichLog(id="log-body", wrap=False, markup=False, highlight=False, max_lines=5000)
+        yield Input(placeholder="filter: type to narrow this tab's rows · Enter keep · Esc clear", id="filter")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#conversations", DataTable).add_columns("", "conversation", "project", "agent", "last")
         self.query_one("#wakeup-table", DataTable).add_columns("#", "conversation", "what", "when", "repeats")
-        self.sub_title = str(self.base)
+        self.sub_title = f"{self.base}  ·  ? keys"
         self.refresh_all()
         self.set_interval(REFRESH, self.refresh_all)
+        self.call_after_refresh(self._focus_tab)
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -141,6 +260,13 @@ class Monitor(App):
         self._shown[key] = value
         return True
 
+    def _set(self, wid: str, renderable) -> None:
+        """Show it, if it's not what's shown already (every repaint goes to the terminal: over ssh too)."""
+        out = Console(file=io.StringIO(), width=200, color_system="truecolor", force_terminal=True)
+        out.print(renderable)
+        if self._changed(wid, out.file.getvalue()):
+            self.query_one(wid, Static).update(renderable)
+
     # ------------------------------------------------------------------ refresh
     def refresh_all(self) -> None:
         for i, b in enumerate(self.bots):
@@ -149,16 +275,15 @@ class Monitor(App):
                 self.query_one(f"#bot{i}", ListItem).query_one(Label).update(line)
         bot = self.bot
         if not bot:
-            self.query_one("#summary", Static).update(
-                "No bot is set up in this folder yet: run [b]uv run overseer setup[/b].")
+            self._set("#summary", "No bot is set up in this folder yet: run [b]uv run overseer setup[/b].")
             return
         h = D.health(bot)
-        self.query_one("#summary", Static).update(self._summary(bot, h))
+        self._set("#summary", self._summary(bot, h))
         con = D.connect_ro(bot.cfg.local.db_path) if bot.cfg else None
         try:
             active = self.query_one("#tabs", TabbedContent).active
             if active == "overview":
-                self.query_one("#overview-body", Static).update(self._overview(bot, h))
+                self._set("#overview-body", self._overview(bot, h))
             if active == "domain":
                 self._domain(h)
             if active == "agents":
@@ -166,7 +291,7 @@ class Monitor(App):
             if active == "wakeups":
                 self._wakeups(con)
             if active == "usage":
-                self.query_one("#usage-body", Static).update(self._usage(con))
+                self._set("#usage-body", self._usage(con))
             if active == "log":
                 self._log(bot)
             self._domain_label(h)
@@ -176,19 +301,145 @@ class Monitor(App):
 
     @on(TabbedContent.TabActivated)
     def tab_changed(self) -> None:
-        self._shown = {k: v for k, v in self._shown.items() if k.startswith("bot")}
+        self._forget()
+        self._hide_filter()
         self.refresh_all()
+        self.call_after_refresh(self._focus_tab)
 
     @on(ListView.Highlighted, "#bots")
     def bot_changed(self, event: ListView.Highlighted) -> None:
-        if event.item is not None and event.item.id:
+        if event.item is not None and event.item.id and int(event.item.id[3:]) != self.selected:
             self.selected = int(event.item.id[3:])
             self.conversation = None
-            self._shown = {k: v for k, v in self._shown.items() if k.startswith("bot")}
+            self._forget()
             self.refresh_all()
 
+    def _forget(self) -> None:
+        """Redraw the panes from scratch next time (another tab or bot)."""
+        self._shown = {k: v for k, v in self._shown.items() if k.startswith("bot") or k == "#summary"}
+        self._lines.clear()
+
+    @property
+    def tab(self) -> str:
+        return self.query_one("#tabs", TabbedContent).active
+
+    def _focus_tab(self) -> None:
+        """Focus the tab's list (or text), so the arrow keys work in it at once."""
+        target = {"overview": "#overview VerticalScroll", "domain": "#dt0", "agents": "#conversations",
+                  "wakeups": "#wakeup-table", "usage": "#usage VerticalScroll", "log": "#log-body"}[self.tab]
+        found = self.query(target)
+        (found.first() if found else self.query_one("#domain-body")).focus()
+
+    def _modal(self) -> bool:
+        return len(self.screen_stack) > 1
+
+    # ------------------------------------------------------------------ keys
     def action_tab(self, tab: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab
+
+    def action_move_tab(self, step: int) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):  # (in the filter, the arrows move its cursor)
+            (focused.action_cursor_left if step < 0 else focused.action_cursor_right)()
+            return
+        if self._modal():
+            return
+        self.action_tab(TABS[(TABS.index(self.tab) + step) % len(TABS)])
+
+    def action_move_bot(self, step: int) -> None:
+        if self.bots:
+            self.query_one("#bots", ListView).index = (self.selected + step) % len(self.bots)
+
+    def action_move(self, step: int) -> None:
+        w = self.focused
+        name = ("cursor_down" if step > 0 else "cursor_up") if hasattr(w, "action_cursor_down") else \
+            ("scroll_down" if step > 0 else "scroll_up")
+        getattr(w, f"action_{name}", lambda: None)()
+
+    def action_ends(self, end: int) -> None:
+        w = self.focused
+        if isinstance(w, ListView):
+            w.index = len(w) - 1 if end > 0 else 0
+            return
+        name = ("scroll_bottom" if end > 0 else "scroll_top") if isinstance(w, DataTable) else \
+            ("scroll_end" if end > 0 else "scroll_home")
+        getattr(w, f"action_{name}", lambda: None)()
+
+    def action_help(self) -> None:
+        if not self._modal():
+            self.push_screen(Help())
+
+    def action_follow(self) -> None:
+        self.follow = not self.follow
+        for log in self.query(RichLog):
+            log.auto_scroll = self.follow
+            if self.follow:
+                log.scroll_end(animate=False)
+        self.notify("Following new lines" if self.follow else "Staying where you are (f: follow again)",
+                    timeout=3)
+
+    def action_filter(self) -> None:
+        box = self.query_one("#filter", Input)
+        box.value = self.filters.get(self.tab, "")
+        box.add_class("shown")
+        box.focus()
+
+    def _hide_filter(self) -> None:
+        box = self.query_one("#filter", Input)
+        if box.has_class("shown"):
+            box.remove_class("shown")
+
+    @on(Input.Changed, "#filter")
+    def filter_changed(self, event: Input.Changed) -> None:
+        if not self.query_one("#filter", Input).has_class("shown"):
+            return
+        self.filters[self.tab] = event.value.strip()
+        self._forget()
+        self.refresh_all()
+
+    @on(Input.Submitted, "#filter")
+    def filter_kept(self) -> None:
+        self._hide_filter()
+        self._focus_tab()
+
+    def action_back(self) -> None:
+        box = self.query_one("#filter", Input)
+        if self.focused is box or self.filters.get(self.tab):  # clear the filter
+            self.filters.pop(self.tab, None)
+            self._hide_filter()
+            self._forget()
+            self.refresh_all()
+            self._focus_tab()
+        elif self.focused is self.query_one("#transcript", RichLog):
+            self.query_one("#conversations", DataTable).focus()
+
+    def _matches(self, *cells) -> bool:
+        words = self.filters.get(self.tab, "").lower().split()
+        blob = " ".join(str(c) for c in cells).lower()
+        return all(w in blob for w in words)
+
+    def _show_lines(self, wid: str, lines: list[Text]) -> None:
+        """A transcript or log: new lines are added (you stay where you are unless following), not redrawn."""
+        log = self.query_one(wid, RichLog)
+        log.auto_scroll = self.follow
+        plain = [t.plain for t in lines]
+        old = self._lines.get(wid)
+        # (the log is its last lines: when new ones come, the first go. What's shown carries on, if it does)
+        kept = next((len(old) - k for k in range(len(old)) if old[k] == plain[0] and plain[:len(old) - k] == old[k:]),
+                    None) if old and plain else None
+        if old is not None and kept is not None:
+            new = lines[kept:]
+        elif old is not None and not old:
+            new = lines
+        else:
+            y = log.scroll_y
+            log.clear()
+            new = lines
+            if not self.follow and old is not None:  # (the same text, redrawn: stay where you were)
+                self.call_after_refresh(lambda: log.scroll_to(y=y, animate=False))
+        for t in new:
+            log.write(t, scroll_end=self.follow)
+        self._lines[wid] = plain
 
     # ------------------------------------------------------------------ the panes
     def _summary(self, bot: D.Bot, h: D.Health) -> Text:
@@ -273,30 +524,58 @@ class Monitor(App):
 
     def _domain(self, h: D.Health) -> None:
         tables = (h.status.get("domain") or {}).get("tables") or []
-        if self._changed("domain", json_key(tables)):
+        if self._changed("domain", json_key([tables, self.filters.get("domain", "")])):
             self._build_domain(tables)
 
     @work(exclusive=True, group="domain")
     async def _build_domain(self, tables: list[dict]) -> None:
         body = self.query_one("#domain-body", VerticalScroll)
+        # (where each table's cursor was, by its row: it stays on that row)
+        was = {dt.id: (self._rows.get(dt.id) or [[]])[dt.cursor_row][:2] if dt.row_count else None
+               for dt in body.query(DataTable)}
+        focused = self.focused.id if isinstance(self.focused, DataTable) else None
         await body.remove_children()  # (before the new tables: they reuse the ids)
-        self._details: dict[str, list[str]] = {}
+        self._details, self._rows = {}, {}
         if not tables:
             await body.mount(Static("Nothing yet: the bot shows its jobs (or its day) here once it has run.",
                                     classes="table-title"))
         for i, tb in enumerate(tables):
-            dt = DataTable(id=f"dt{i}", cursor_type="row", zebra_stripes=True)
-            await body.mount(Label(f"{tb['title']} ({len(tb['rows'])})", classes="table-title"), dt)
+            tid = f"dt{i}"
+            pairs = [(row, d) for row, d in zip(tb["rows"], (tb.get("details") or []) + [""] * len(tb["rows"]))
+                     if self._matches(*row, d)]
+            dt = DataTable(id=tid, cursor_type="row", zebra_stripes=True)
+            shown = f"{len(pairs)} of {len(tb['rows'])}" if len(pairs) != len(tb["rows"]) else str(len(tb["rows"]))
+            await body.mount(Label(f"{tb['title']} ({shown})", classes="table-title"), dt)
             dt.add_columns(*tb["columns"])
-            for row in tb["rows"]:
-                dt.add_row(*[str(c) for c in row])
-            self._details[f"dt{i}"] = tb.get("details") or []
+            rows = [[str(c) for c in row] for row, _ in pairs]
+            for row in rows:
+                dt.add_row(*row)
+            self._rows[tid], self._details[tid] = rows, [d for _, d in pairs]
+            key = was.get(tid)
+            at = next((n for n, row in enumerate(rows) if key and row[:2] == key), 0)
+            if at:
+                dt.move_cursor(row=at, animate=False)
+            if self.tab == "domain" and (  # (only if you're still there: focusing it would bring its tab back)
+                    tid == focused or (focused is None and i == 0 and not isinstance(self.focused, (Input, ListView)))):
+                dt.focus()
+
+    @on(DataTable.RowSelected)
+    def opened(self, event: DataTable.RowSelected) -> None:
+        """Enter on a row: a job's (or task's) whole text; a conversation's transcript."""
+        tid = event.data_table.id or ""
+        if tid.startswith("dt"):
+            rows, details = self._rows.get(tid) or [], self._details.get(tid) or []
+            if event.cursor_row < len(rows):
+                self.push_screen(Details(" · ".join(c for c in rows[event.cursor_row] if c),
+                                         details[event.cursor_row] if event.cursor_row < len(details) else ""))
+        elif tid == "conversations":
+            self.query_one("#transcript", RichLog).focus()
 
     @on(DataTable.RowHighlighted)
     def row(self, event: DataTable.RowHighlighted) -> None:
         tid = event.data_table.id or ""
         if tid.startswith("dt"):
-            details = getattr(self, "_details", {}).get(tid) or []
+            details = self._details.get(tid) or []
             text = details[event.cursor_row] if event.cursor_row < len(details) else ""
             self.query_one("#details", Static).update(Text(text))
         elif tid == "conversations":
@@ -304,11 +583,13 @@ class Monitor(App):
             if key and key != self.conversation:
                 self.conversation = key
                 self._shown.pop("transcript", None)
+                self._lines.pop("#transcript", None)
                 self._transcript(self.bot)
 
     def _agents(self, bot: D.Bot, h: D.Health, con) -> None:
         running = {r["session"] for r in h.status.get("runs") or []} if h.running else set()
-        convs = D.conversations(con)
+        convs = [c for c in D.conversations(con)
+                 if self._matches(c["name"], c["id"], c["project"], c["backend"], c["role"])]
         convs.sort(key=lambda c: (c["id"] not in running, -c["updated"]))
         key = [(c["id"], c["updated"], c["id"] in running) for c in convs]
         if self._changed("conversations", key):
@@ -319,8 +600,11 @@ class Monitor(App):
                 kind = {"worker": "🤖 ", "reviewer": "🛠 "}.get(c["role"], "")
                 dt.add_row("▶" if c["id"] in running else "", kind + name, c["project"],
                            NAMES.get(c["backend"], c["backend"]), D.ago(c["updated"]), key=c["id"])
-            if self.conversation is None and convs:
-                self.conversation = convs[0]["id"]
+            ids = [c["id"] for c in convs]
+            if ids and self.conversation not in ids:
+                self.conversation = ids[0]
+            if self.conversation in ids:  # (the cursor stays on the conversation you were looking at)
+                dt.move_cursor(row=ids.index(self.conversation), animate=False)
         self._transcript(bot)
 
     def _transcript(self, bot: D.Bot | None) -> None:
@@ -333,31 +617,36 @@ class Monitor(App):
             stamp = None
         if not self._changed("transcript", (self.conversation, stamp)):
             return
-        log = self.query_one("#transcript", RichLog)
-        log.clear()
         if stamp is None:
-            log.write(Text("No live log for this conversation (it starts with its next request).", style="dim"))
+            self._show_lines("#transcript", [
+                Text("No live log for this conversation (it starts with its next request).", style="dim")])
             return
-        st, last_message = Style(True), None
+        st, last_message, lines = Style(True), None, [Text(f"── {self.conversation}", style="dim")]
         for ev in D.transcript_events(bot.state_dir, self.conversation):
-            for line in render_event(ev, st, last_message=last_message):
-                log.write(Text.from_ansi(line))
+            lines += [Text.from_ansi(line) for line in render_event(ev, st, last_message=last_message)]
             if ev.get("kind") in ("message", "turn"):
                 last_message = ev.get("text") if ev["kind"] == "message" else None
+        self._show_lines("#transcript", lines)
 
     def _wakeups(self, con) -> None:
-        ws = D.wakeups(con)
-        if not self._changed("wakeups", [(w["id"], w["due"]) for w in ws] + [int(time.time() // 30)]):
-            return
-        dt = self.query_one("#wakeup-table", DataTable)
-        dt.clear()
-        for w in ws:
+        rows = []
+        for w in D.wakeups(con):
             what = {"jobs": f"job(s) {w['jobs']} end", "timer": "timer"}.get(w["kind"], f"{w['kind']} {w['jobs']}".strip())
             if w["note"]:
                 what += f": {w['note']}"
             every = f"every {D.ago(time.time() - w['every'])}" if w["every"] else ""
-            dt.add_row(str(w["id"]), w["session"] or "", what[:90], D.until(w["due"]) if w["due"] else "when it ends",
-                       every)
+            row = [str(w["id"]), w["session"] or "", what[:90], D.until(w["due"]) if w["due"] else "when it ends", every]
+            if self._matches(*row):
+                rows.append(row)
+        if not self._changed("wakeups", rows):
+            return
+        dt = self.query_one("#wakeup-table", DataTable)
+        was = dt.coordinate_to_cell_key(dt.cursor_coordinate).row_key.value if dt.row_count else None
+        dt.clear()
+        for row in rows:
+            dt.add_row(*row, key=row[0])
+        if was in {r[0] for r in rows}:  # (the cursor stays on its wake-up)
+            dt.move_cursor(row=dt.get_row_index(was), animate=False)
 
     def _usage(self, con) -> Table:
         now = time.time()
@@ -398,16 +687,16 @@ class Monitor(App):
     def _log(self, bot: D.Bot) -> None:
         if not bot.state_dir:
             return
-        lines = D.log_tail(bot.state_dir)
-        if not self._changed("log", (len(lines), lines[-1] if lines else "")):
+        lines = [line for line in D.log_tail(bot.state_dir) if self._matches(line)]
+        if not self._changed("log", (len(lines), lines[-1] if lines else "", self.filters.get("log", ""))):
             return
-        log = self.query_one("#log-body", RichLog)
-        log.clear()
         if not lines:
-            log.write(Text("No log yet: it starts when the bot runs.", style="dim"))
-        for line in lines:
-            style = "red" if " ERROR " in line or "Traceback" in line else "yellow" if " WARNING " in line else ""
-            log.write(Text(line, style=style))
+            self._show_lines("#log-body", [Text("No log yet: it starts when the bot runs." if not self.filters.get("log")
+                                                else "No line matches the filter (Esc clears it).", style="dim")])
+            return
+        self._show_lines("#log-body", [
+            Text(line, style="red" if " ERROR " in line or "Traceback" in line else
+                 "yellow" if " WARNING " in line else "") for line in lines])
 
     # ------------------------------------------------------------------ start / stop
     def action_start(self) -> None:
