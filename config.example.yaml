@@ -77,7 +77,7 @@ telegram:
 agent:
   enabled: true
   backend: claude_code          # claude_code | codex  (switch any time from Telegram: /backend codex)
-  timeout_minutes: 60           # max length of one agent run (/stop ends it earlier)
+  timeout_minutes: 0            # max length of one agent run, in minutes (0: no limit; /stop ends it)
   auto_update: true             # `claude update` / `codex update` once a day while nothing runs (/update: now)
   report_commands: summary      # summary (after each request) | live (every few seconds) | off
   live_progress: true           # a self-updating "⏳ working" message: latest reasoning, running command

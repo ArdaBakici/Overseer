@@ -329,7 +329,7 @@ class Runner:
     def __init__(self, cfg: Config, sandbox: Sandbox | None = None):
         self.cfg = cfg
         self.sandbox = sandbox or Sandbox()  # what the domain adds to the sandbox
-        self.timeout = cfg.agent.timeout_minutes * 60
+        self.timeout = cfg.agent.timeout_minutes * 60  # (0: no limit)
         # Set from Telegram (/model, /effort); None = use config.yaml (where null = the CLI's default).
         self.model_override: str | None = None
         self.effort_override: str | None = None
@@ -460,7 +460,7 @@ class Runner:
                 pass
 
         try:
-            await asyncio.wait_for(pump(), timeout=self.timeout)
+            await asyncio.wait_for(pump(), timeout=self.timeout or None)
         except asyncio.TimeoutError:
             kill()
             await proc.wait()
@@ -980,7 +980,7 @@ class CodexRunner(Runner):
                         return
 
         try:
-            await asyncio.wait_for(converse(), timeout=self.cfg.agent.timeout_minutes * 60)
+            await asyncio.wait_for(converse(), timeout=(self.cfg.agent.timeout_minutes or 60) * 60)
         except asyncio.TimeoutError:
             raise AgentRunError("codex: the compaction timed out")
         finally:
