@@ -1079,6 +1079,13 @@ class CodexRunner(Runner):
         errors: list[str] = []
         done = asyncio.Event()
         turn: dict[str, str] = {}
+        ended: dict[str, dict] = {}  # turns that completed, by id
+
+        def turn_ended(t: dict) -> None:
+            if t.get("status") not in (None, "completed"):
+                err = t.get("error") or {}
+                errors.append(err.get("message") or f"the turn {t.get('status')}")
+            done.set()
 
         def notified(method: str, params: dict[str, Any]) -> None:
             item = params.get("item") or {}
@@ -1112,12 +1119,11 @@ class CodexRunner(Runner):
             elif method == "error" and not params.get("willRetry"):
                 err = params.get("error") or {}
                 errors.append(f"{err.get('message', '')} {json.dumps(err.get('codexErrorInfo') or '')}".strip())
-            elif method == "turn/completed" and (params.get("turn") or {}).get("id") == turn.get("id"):
-                t = params["turn"]
-                if t.get("status") not in (None, "completed"):
-                    err = t.get("error") or {}
-                    errors.append(err.get("message") or f"the turn {t.get('status')}")
-                done.set()
+            elif method == "turn/completed":
+                t = params.get("turn") or {}
+                ended[t.get("id", "")] = t
+                if t.get("id") == turn.get("id"):
+                    turn_ended(t)
 
         async def talk(send, close, events):
             replies: dict[int, asyncio.Future] = {}
@@ -1173,6 +1179,8 @@ class CodexRunner(Runner):
                 t = await call("turn/start", {"threadId": result.session_id,
                                               "input": [{"type": "text", "text": prompt[:MAX_PROMPT]}]})
                 turn["id"] = (t.get("turn") or {}).get("id", "")
+                if turn["id"] in ended:  # (a turn that failed at once - e.g. out of usage - can end before its id
+                    turn_ended(ended[turn["id"]])  # is back here: it ended then, not never)
 
                 async def deliver(text: str) -> bool:
                     if steering.closed or done.is_set():

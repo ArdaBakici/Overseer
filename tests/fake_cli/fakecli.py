@@ -406,15 +406,16 @@ if prog == "codex" and args[:1] == ["app-server"]:  # JSON-RPC over stdio: Overs
             stdin = params["input"][0]["text"]
             log_call(stdin)
             turn = active = str(uuid.uuid4())
-            out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
-            if limited():
+            if limited():  # (a turn that fails at once can end before Overseer has its id: the worst order, always)
                 note("error", {"threadId": tid, "turnId": turn, "willRetry": False, "error": {
                     "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), or "
                                "try again in 2 hours 5 minutes.", "codexErrorInfo": "usageLimitExceeded"}})
                 note("turn/completed", {"threadId": tid, "turn": {"id": turn, "status": "failed", "error": {
                     "message": "You've hit your usage limit."}}})
+                out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
                 active = None
                 continue
+            out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
             if "FORCE_SLEEP" in stdin:
                 time.sleep(60)
             if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):
