@@ -249,7 +249,7 @@ class AgentConfig:
     enabled: bool = True
     # claude_code or codex. Can be switched at runtime from Telegram with /backend.
     backend: str = "claude_code"
-    timeout_minutes: int = 60  # max length of one agent run
+    timeout_minutes: int = 0  # max length of one agent run (0: no limit; /stop ends it)
     # Update the agent CLIs (`claude update`, `codex update`) once a day, while no agent run is in progress.
     # New models often need a recent CLI. /update in Telegram (or `overseer update`) does it now.
     auto_update: bool = True

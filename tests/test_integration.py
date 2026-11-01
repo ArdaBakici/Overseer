@@ -661,6 +661,17 @@ async def test_stop_kills_the_run(env):
     assert json.loads(last)["status"] == "stopped"
 
 
+async def test_runs_have_no_time_limit_unless_one_is_set(env):
+    assert env.cfg.agent.timeout_minutes == 0  # (the default: a long task runs until it's done or /stop)
+    s = env.agent.general_session()
+    env.agent.runner().timeout = 0
+    assert await env.agent.handle(s, "FORCE_SLOW fix it")
+    assert env.notifier.sent[-1].text.startswith("🤖")
+    env.agent.runner().timeout = 0.1  # (a limit, if config.yaml sets agent.timeout_minutes)
+    await env.agent.handle(s, "FORCE_SLOW fix it")
+    assert any("did not finish within" in m.text for m in env.notifier.sent[-3:])
+
+
 @pytest.mark.parametrize("backend", ["claude_code", "codex"])
 async def test_live_progress_and_transcript(env, monkeypatch, backend):
     from overseer.core import live
