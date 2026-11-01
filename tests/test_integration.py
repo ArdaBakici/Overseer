@@ -2207,6 +2207,44 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     assert pending == []  # (nothing left in the queue)
 
 
+def test_hpc_run_never_hangs_the_agent(env, tmp_path):
+    """FB8: commands without --gpu hung until the agent's tool timeout with no output at all, and were lost then.
+    Now: it says where it runs; a step on the worker gets the worker's CPUs and numpy & co. as many threads; a command
+    still running after --return-after carries on in the background (its output so far, how long, and how to follow
+    it), --log gives the rest and its exit code, --cancel stops one, --status lists them."""
+    import re
+    run = hpc_run_tool(env, tmp_path, cpus=4)
+    p = run("--", "sh", "-c", "echo THREADS=$OMP_NUM_THREADS/$OPENBLAS_NUM_THREADS CPUS=$SLURM_CPUS_PER_TASK")
+    assert p.returncode == 0 and p.stdout.strip() == "THREADS=4/4 CPUS=4", (p.stdout, p.stderr)
+    assert "[hpc-run] running on" in p.stderr and "the shared worker" in p.stderr
+    step = [s for s in env.slurm()["steps"] if any(a.startswith("--jobid") for a in s)][-1]
+    assert step[step.index("-c") + 1] == "4"  # (without -c, a step gets one CPU)
+    p = run("--", "sh", "-c", "OMP_NUM_THREADS=2; export OMP_NUM_THREADS; echo $OMP_NUM_THREADS")
+    assert p.stdout.strip() == "2"  # (yours win)
+    p = run("--cpus", "2", "--", "sh", "-c", "echo T=$OMP_NUM_THREADS")
+    assert p.returncode == 0 and p.stdout.strip() == "T=2", p.stderr
+
+    # Still running after --return-after (5 s at least): it carries on, and says so.
+    t0 = time.time()
+    p = run("--return-after", "0.01", "--", "sh", "-c", "echo FIRST; sleep 8; echo SECOND", timeout=30)
+    assert p.returncode == 124 and time.time() - t0 < 8 and p.stdout.strip() == "FIRST", (p.stdout, p.stderr)
+    assert "[hpc-run] still running after 0 min" in p.stderr and "don't start it again" in p.stderr, p.stderr
+    rid = re.search(r"hpc-run --log (\S+)", p.stderr).group(1)
+    assert f"still going: {rid}" in run("--status").stdout
+    p = run("--log", rid, timeout=30)
+    assert p.returncode == 0 and p.stdout.strip() == "SECOND" and "it ended: exit code 0" in p.stderr, p.stderr
+    assert rid not in run("--status").stdout
+    p = run("--log", rid)  # (nothing new: just how it ended)
+    assert p.stdout == "" and "exit code 0" in p.stderr
+
+    p = run("--return-after", "0.01", "--", "sh", "-c", "sleep 60; echo NEVER", timeout=30)
+    rid = re.search(r"hpc-run --log (\S+)", p.stderr).group(1)
+    assert "cancelled" in run("--cancel", rid).stdout
+    p = run("--log", rid, timeout=30)
+    assert p.returncode == 143 and "NEVER" not in p.stdout
+    assert "no run nope" in run("--log", "nope").stderr
+
+
 async def test_disk_quota(env, monkeypatch, tmp_path):
     """The quota command's limits reach the agent; nearly full filesystems warn you once and the agent each time."""
     from test_parsing import QUOTA
@@ -2542,6 +2580,55 @@ async def test_agent_defined_metrics_and_alerts(env, tmp_path):
     await env.ctl.handle(token, ["metrics", "set", "601", "--command", "cat /nonexistent/metrics.json"])
     await asyncio.gather(*list(env.ctl._bg))
     assert "⚠️ metrics command: exit 1" in env.notifier.card_text("601")
+
+
+async def test_a_held_job_doesnt_block_its_watch_silently(env):
+    """FB9: a watch on 3 jobs never fired: one sat PENDING (launch failed requeued held), the others had ended hours
+    before, and nobody was told. Now you and the watching agent are told once, with the watch's other jobs; it
+    can release it, cancel it, or unwatch it and get the other results at once."""
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    job = {"name": "eval", "state": "RUNNING", "workdir": str(proj)}
+    env.set_jobs(**{"801": job, "802": job, "803": {**job, "state": "PENDING", "reason": "Priority"}})
+
+    async def poll():
+        await env.monitor.poll()
+        await env.monitor.drain()
+        await ap.drain()
+    await poll()
+    token = env.ctl.open(s.id)
+    assert (await env.ctl.handle(token, ["watch", "801", "802", "803"]))[0]
+    n = len(claude_calls(env))
+    st = env.slurm()
+    for jid in ("801", "802"):
+        st["jobs"][jid]["state"] = "COMPLETED"
+    st["jobs"]["803"]["reason"] = "launch failed requeued held"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await poll()
+    held = [m for m in env.notifier.sent if m.text.startswith("⛔")]
+    assert len(held) == 1 and "803" in held[0].text and "launch failed" in held[0].text, [m.text for m in held]
+    assert "scontrol release 803" in held[0].text and "Waking the agent" in held[0].text and held[0].jobs
+    assert "won't start by itself" in env.notifier.card_text("803")
+    calls = claude_calls(env)[n:]
+    assert len(calls) == 1 and "[A job you watch won't start] Job 803 (eval)" in calls[0]["stdin"], calls
+    assert "801 COMPLETED" in calls[0]["stdin"] and "ov unwatch 803" in calls[0]["stdin"]
+    await poll()  # still held: not again
+    assert len([m for m in env.notifier.sent if m.text.startswith("⛔")]) == 1 and len(claude_calls(env)) == n + 1
+    # Unwatched: the watch fires with the two that ended.
+    m = len(claude_calls(env))
+    assert (await env.ctl.handle(token, ["unwatch", "803"]))[0]
+    await ap.check(s.id)
+    await ap.drain()
+    calls = claude_calls(env)[m:]
+    assert len(calls) == 1 and "Job(s) you watched have finished" in calls[0]["stdin"], calls
+    assert "803" not in calls[0]["stdin"].split("finished:")[1]
+    # Released: the card loses its line.
+    st = env.slurm()
+    st["jobs"]["803"]["reason"] = "Priority"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await poll()
+    assert "won't start" not in env.notifier.card_text("803")
 
 
 async def test_idle_gpus_wake_the_watching_agent(env):

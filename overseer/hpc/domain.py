@@ -257,6 +257,7 @@ class HpcDomain(Domain):
         cpu = cfg.slurm.compute.login_cpu_seconds
         ctl = self.agent.ctl if self.agent else None
         prompt = P.SYSTEM_PROMPT.format(
+            return_after="%g" % self.cfg.slurm.compute.return_after_minutes,
             login_limit=(f" Commands run directly on the login node are stopped after {cpu} CPU seconds." if cpu else ""),
             host=cfg.ssh.host,
             setup=f"{setup}; " if setup else "",

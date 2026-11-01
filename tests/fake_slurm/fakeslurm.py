@@ -64,7 +64,7 @@ elif prog == "squeue" and "--start" in args:  # SLURM's estimated start of pendi
 elif prog == "squeue":
     for jid, j in jobs.items():
         if j["state"] in ("PENDING", "RUNNING"):
-            where = j.get("nodelist", "n1") if j["state"] == "RUNNING" else "(Priority)"
+            where = j.get("nodelist", "n1") if j["state"] == "RUNNING" else f"({j.get('reason', 'Priority')})"
             print("|".join([jid, j["name"], j["state"], j.get("partition", "gpu"), j.get("elapsed", "0:10"),
                             j.get("time_limit", "1:00:00"), "1", where, "gres/gpu:1", "2026-10-07T10:00:00", "N/A"]))
 elif prog == "sacct" and "Submit" in (opt("-o") or ""):  # jobs submitted lately (who submitted what)
@@ -165,7 +165,11 @@ elif prog == "srun":
     st.setdefault("steps", []).append(args)  # hpc-run: run the command here, as if on the node
     save(st)
     import subprocess
-    rc = subprocess.call(args[args.index("bash"):])
+    step_env = dict(os.environ, SLURM_JOB_ID=jid if opt("-J") else (opt("--jobid") or "").split("=")[-1],
+                    SLURM_STEP_ID="0")
+    if opt("-c"):
+        step_env["SLURM_CPUS_PER_TASK"] = opt("-c")
+    rc = subprocess.call(args[args.index("bash"):], env=step_env)
     if opt("-J"):
         st = load()
         st["jobs"][jid]["state"] = "COMPLETED"
@@ -174,7 +178,8 @@ elif prog == "srun":
 elif prog == "scancel":
     name = opt("-n")
     for jid in ([j for j, v in jobs.items() if v["name"] == name] if name else [args[0]]):
-        jobs[jid]["state"] = "CANCELLED"
+        if jid in jobs:  # (a job step, 123.0, isn't a job of its own here)
+            jobs[jid]["state"] = "CANCELLED"
     save(st)
 elif prog == "sinfo":
     for name, p in st.get("partitions", {}).items():

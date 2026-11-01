@@ -38,6 +38,15 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
   `hpc-run` starts and ends them (`hpc-run --status` lists them, `hpc-run --stop` ends the worker early).
   A node of its own may wait in the queue: `hpc-run` says so (the job, its state and reason) every minute,
   and cancels the request after `slurm.compute.wait_minutes` - for work that can wait, use `sbatch`.
+- `hpc-run` says which node it runs on. A command still running after `slurm.compute.return_after_minutes`
+  (8) keeps running there: `hpc-run` returns (exit code 124) with the output so far, how long it has run, the
+  CPU time it used (almost none for that long: it's waiting - on I/O, a lock - not computing) and the run's id.
+  Don't start it again: `hpc-run --log <id>` gives the rest of its output and its exit code, `hpc-run --cancel
+  <id>` stops it, `hpc-run --status` lists the runs still going. Give the tool call a timeout above 8 minutes.
+- numpy, torch & co. get as many threads as the CPUs SLURM gave (`OMP/OPENBLAS/MKL_NUM_THREADS`, unless you
+  set them): by default they'd start one per CPU of the whole node.
+- A job you watch that won't start by itself (held, its launch failed, a dependency that can't be met) wakes
+  you once: release it (`scontrol release`), cancel and resubmit it, or `ov unwatch` it to get the others' results.
 
 ## Past work: `ov history`
 

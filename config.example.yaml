@@ -52,6 +52,7 @@ slurm:
     worker_hours: 8
     idle_minutes: 45
     wait_minutes: 15            # give up if no node is free after this long
+    return_after_minutes: 8     # a command still running after this long carries on; hpc-run returns its output so far
     gpu_partition: nvidia       # for hpc-run --gpu
     gpu_gres: "gpu:1"
     sbatch_args: []             # e.g. ["--account=myproject"]

@@ -33,6 +33,26 @@ SACCT_STEP_FIELDS = ["job_id", "name", "state", "exit_code", "elapsed", "max_rss
 SACCT_STEP_FORMAT = "JobID,JobName,State,ExitCode,Elapsed,MaxRSS,ReqMem,AllocTRES,NodeList"
 
 
+# A queued job that won't start without someone acting: SLURM holds it, or it can never run as asked (FB9)
+_NEVER = [
+    (re.compile(r"launch failed", re.I), "its launch failed on a node and SLURM put it back in the queue on hold"),
+    (re.compile(r"held", re.I), "SLURM holds it"),
+    (re.compile(r"DependencyNeverSatisfied", re.I), "a job it depends on didn't succeed, so it can never start"),
+    (re.compile(r"BadConstraints|Invalid\w*|\w*PerJob\w*|Partition(Time|Node)Limit", re.I),
+     "it asks for something its partition, account or QOS doesn't allow, so it can't start as it is"),
+    (re.compile(r"PartitionDown|PartitionInactive", re.I), "its partition is down or inactive"),
+]
+
+
+def wont_start(job: Job) -> str:
+    """Why a queued job won't start by itself ("" if it may: it waits its turn, or it runs)."""
+    if job.state in ("REQUEUE_HOLD", "RESV_DEL_HOLD", "SPECIAL_EXIT"):
+        return "SLURM holds it"
+    if job.state != "PENDING":
+        return ""
+    return next((why for pattern, why in _NEVER if pattern.search(job.reason or "")), "")
+
+
 def normalize_state(state: str) -> str:
     s = state.strip().upper()
     s = s.split(" ", 1)[0]  # "CANCELLED by 1234"

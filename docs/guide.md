@@ -197,6 +197,9 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
 - **You see every one:** a watched job's card says "⏰ agent watching", with a ✖ watch button that cancels it; a timer is announced quietly in the conversation's topic, with a ✖ Cancel button. Replies end with what the agent is waiting for, and `/auto` lists everything pending.
 - **Turning it off:** `/auto off` cancels the pending wake-ups (in that thread or topic, or as a reply: that conversation), and the agent is told. `/stop` stops a run.
 - **Limits:** check-ins and repeating timers are at least 15 minutes apart, and a repeating timer ends (after 24 hours unless the agent sets `--for`). There is no limit on the number of wake-ups. `/usage` shows what they cost.
+- **A watched job that won't start:** a job held by SLURM (e.g. "launch failed requeued held"), or one that can never
+  start (a dependency that failed, a request over its partition's limits), would keep its watch from firing. You get a ⛔
+  message (and a line on its card), and the agent watching it is woken once to release, cancel or unwatch it.
 - **Pauses on problems:** a wake-up that fails or is `/stop`ped pauses that conversation's wake-ups until you write to it there.
 - **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder (or, with an
   Obsidian folder - below - `Research log.md` in the vault).
@@ -253,7 +256,12 @@ hpc-run --stop                                                     # end the sha
   the queue. `hpc-run` says so at once (the job, its state and SLURM's reason), again every minute, and when it gets the
   node. If none comes within `slurm.compute.wait_minutes` (15), it cancels the request and suggests `sbatch` instead.
   Like the worker, these jobs are never reported or registered as yours.
-- **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display.
+- **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display, and `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS` set to the CPUs SLURM gave (unless set): numpy and torch would otherwise start a thread per CPU of the whole node.
+- **Nothing hangs the agent:** `hpc-run` says which node it runs on. A command still running after
+  `slurm.compute.return_after_minutes` (8, below the agents' tool timeouts) keeps running on its node: `hpc-run` returns
+  with its output so far, how long it has run and the CPU time it used. `hpc-run --log <id>` gives the rest and its exit
+  code, `hpc-run --cancel <id>` stops it, `hpc-run --status` lists the runs still going. Each run's output is kept in
+  `~/.overseer/runs/` on the HPC for a week.
 - **Instructions:** the agent is told to use `hpc-run` for anything that computes (scripts, plots, data processing, tests) and `sbatch` for real runs. The 📈 Plot button asks for plots made this way.
 - **Guardrail:** commands the agent runs directly on the login node get 120 CPU seconds (`ulimit -t`, set by its `ssh` wrapper). A heavy script there is stopped with a message pointing to `hpc-run`.
   - **Exemptions:** commands that hand work to SLURM (`sbatch`, `srun`, `salloc`) aren't limited, because SLURM would pass the limit on to the job.
