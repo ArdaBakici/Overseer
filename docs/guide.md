@@ -4,7 +4,7 @@ The full guide to the HPC bot, once it's [set up](setup.md). For a quick overvie
 what the agent may and may not do, [security.md](security.md); for the personal assistant bot,
 [assistant.md](assistant.md).
 
-**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
+**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Stuck runs](#a-run-that-seems-stuck) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
 
 ## Commands
 
@@ -492,6 +492,25 @@ connection itself matters most:
 The setup (`overseer setup`) works the same way: `Ctrl+N` / `Ctrl+B` go to the next / previous step and into its
 first field, `Tab` moves between fields, `Enter` in a field saves the step, `Esc` goes back to the list of steps, and
 `F1` shows the keys.
+
+## A run that seems stuck
+
+An agent run has no time limit (`agent.timeout_minutes: 0`; a number sets one): it goes on until it's done or you
+`/stop` it. Instead, a watchdog follows each run. Every step the agent takes (a thought, a message, a command, its output)
+is a sign of life, and so is a running command using CPU (a compile, a copy). After `agent.stuck.quiet_minutes` (30)
+without any, Overseer acts by itself and tells you afterwards:
+
+- **A command quiet and idle** (no output, no CPU here - e.g. `ssh hpc 'python train.py'` in the foreground, a prompt
+  waiting for input): ⏹ it stops that command only. The agent gets it back as failed, with a note saying why (and to
+  run long work as a job or in the background), and carries on.
+- **The CLI gone quiet** with no command running (its connection stalled): ↻ it restarts the CLI, and the request runs
+  again from where the conversation was - once per request.
+- **The same command with the same result** 3 times (`agent.stuck.loop_repeats`): 🔁 the agent is told to try something
+  materially different or to ask you. It's never stopped for that.
+
+A command on the HPC can't be seen computing from here (ssh waits idle), so a long foreground one counts as quiet: long
+work belongs in `sbatch` or `hpc-run`, which gives control back after a few minutes. `agent.stuck.stop_command` and
+`restart_cli` turn the two actions off; `quiet_minutes: 0` turns the watchdog off.
 
 ## Restarts don't lose the agent's work
 

@@ -661,6 +661,43 @@ async def test_stop_kills_the_run(env):
     assert json.loads(last)["status"] == "stopped"
 
 
+async def test_a_stuck_run_is_unstuck_and_you_are_told(env, monkeypatch):
+    """With no time limit, the watchdog (core/stuck.py): a command quiet and idle for agent.stuck.quiet_minutes is
+    stopped (only it: the agent is told why and carries on), one that computes isn't; a CLI gone quiet is restarted
+    and the request runs again; the same command with the same result 3 times nudges the agent. You're told after."""
+    from overseer.core import stuck
+    monkeypatch.setattr(stuck, "SAMPLE_SECONDS", 0.3)
+    env.cfg.agent.stuck.quiet_minutes = 0.03  # (~2 s here; 30 min by default)
+    s = env.agent.general_session()
+
+    t0 = time.time()
+    assert await env.agent.handle(s, "FAKE_HANG run the evaluation")
+    assert time.time() - t0 < 30
+    stopped = [m.text for m in env.notifier.sent if m.text.startswith("⏹ Stopped a command")]
+    assert len(stopped) == 1 and "<code>sleep 300</code>" in stopped[0] and "carries on" in stopped[0]
+    reply = env.notifier.sent[-1].text
+    assert reply.startswith("🤖 Done.") and "Overseer stopped it" in reply and "sleep 300" in reply, reply
+
+    assert await env.agent.handle(s, "FAKE_BUSY crunch the numbers")  # (4 s of CPU, no output: working)
+    assert len([m for m in env.notifier.sent if m.text.startswith("⏹")]) == 1
+    assert "Overseer stopped it" not in env.notifier.sent[-1].text
+
+    n = len(claude_calls(env))
+    t0 = time.time()
+    assert await env.agent.handle(s, "FAKE_QUIET summarise the runs")
+    assert time.time() - t0 < 30
+    assert any(m.text.startswith("↻ The agent's CLI had gone quiet") for m in env.notifier.sent)
+    again = claude_calls(env)[n:]
+    assert len(again) == 2 and "Overseer restarted it" in again[1]["stdin"], [c["stdin"][:200] for c in again]
+    assert again[1]["stdin"].endswith("FAKE_QUIET summarise the runs") and "--resume" in again[1]["argv"]
+    assert env.notifier.sent[-1].text.startswith("🤖 Done.")
+
+    assert await env.agent.handle(s, "FAKE_REPEAT make the layer test pass")
+    nudged = [m.text for m in env.notifier.sent if m.text.startswith("🔁")]
+    assert len(nudged) == 1 and "3×" in nudged[0] and "pytest tests/test_layer.py" in nudged[0]
+    assert "3 times now with the same result" in env.notifier.sent[-1].text
+
+
 async def test_runs_have_no_time_limit_unless_one_is_set(env):
     assert env.cfg.agent.timeout_minutes == 0  # (the default: a long task runs until it's done or /stop)
     s = env.agent.general_session()

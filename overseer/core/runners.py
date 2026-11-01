@@ -34,6 +34,7 @@ from typing import Any, Callable
 
 from .accounts import LIMIT_ANSWER_RE, usage_limit
 from .config import Config, accounts_of
+from .stuck import PROCESS_STARTED
 
 log = logging.getLogger(__name__)
 
@@ -418,6 +419,9 @@ class Runner:
             preexec_fn=_die_with_overseer,
         )
         _RUNNING.add(proc.pid)
+        started = PROCESS_STARTED.get()
+        if started:  # (the run's watchdog: stuck.py)
+            started(proc.pid)
         err_task = asyncio.create_task(proc.stderr.read())
 
         async def send(text: str) -> bool:
