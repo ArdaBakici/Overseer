@@ -862,7 +862,8 @@ async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
         token = aenv.ctl.open(s.id)
         ok, text = await aenv.ctl.handle(token, ["commit", "2h", "send", "the", "report"])
         assert text.startswith("✓ r") and "again after 20m, up to 2 more times" in text, text
-        assert "🎯 I'll check in today" in aenv.notifier.texts()
+        day = "today" if time.localtime(time.time() + 7200).tm_mday == time.localtime().tm_mday else "tomorrow"
+        assert f"🎯 I'll check in {day}" in aenv.notifier.texts()  # (in 2 h: tomorrow, late in the evening)
         rid = text.split(":")[0][2:]
         c = aenv.domain.reminders.get(rid)
         assert c["kind"] == "commit" and c["text"] == "send the report"
