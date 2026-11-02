@@ -86,8 +86,12 @@ class Handbook:
                  "faster way - add it: `ov handbook add notes \"<one fact, with the conditions it holds under>\" "
                  "--why \"<the evidence>\"` (check the entries below first: change one rather than repeat it). A "
                  "script of the researcher's that agents should use: `ov handbook tool <name> --command \"<command>\" "
-                 "--about \"<what it's for, when to use it>\"`" + self.agent.domain.handbook_tool_options() + ". Fix or update an entry: `ov handbook edit H3 \"...\"`, "
-                 "drop a wrong or stale one: `ov handbook remove H3 --why \"...\"`. The researcher approves additions, "
+                 "--about \"<what it's for, when to use it>\"`" + self.agent.domain.handbook_tool_options()
+                 + ". Fix or update an entry: `ov handbook edit H3 \"...\"`, "
+                 "drop a wrong or stale one: `ov handbook remove H3 --why \"...\"`. A standing instruction the "
+                 "researcher gives you (how they want you to work, e.g. what a message prefix means) is a rule: "
+                 "`ov handbook add rules \"...\"`, so every agent follows it - you have no memory of your own between "
+                 "conversations. The researcher approves additions, "
                  "removals and changes to others' entries; your edits of your own entries apply at once. Keep entries "
                  "short and factual - project matters belong in the project's notes, results in `ov result`."]
         for key, title in SECTIONS.items():
