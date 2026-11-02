@@ -186,7 +186,7 @@ if prog == "claude" and any(m in stdin for m in ("FAKE_HANG", "FAKE_BUSY", "FAKE
         time.sleep(120)
     steps = {"FAKE_HANG": [("sleep 300", ["sleep", "300"])],
              "FAKE_BUSY": [("python3 crunch.py", [sys.executable, "-c",
-                                                  "import time\nend = time.time() + 4\nwhile time.time() < end: pass"])],
+                                                  "import time\nend = time.time() + 3\nwhile time.time() < end: pass"])],
              "FAKE_REPEAT": [("pytest tests/test_layer.py", ["sh", "-c", "echo 'E   AssertionError: shape'; exit 1"])] * 4,
              }.get(next((m for m in ("FAKE_HANG", "FAKE_BUSY", "FAKE_REPEAT") if m in stdin), ""), [])
     for i, (shown, argv) in enumerate(steps):
@@ -196,7 +196,7 @@ if prog == "claude" and any(m in stdin for m in ("FAKE_HANG", "FAKE_BUSY", "FAKE
         print(json.dumps({"type": "user", "session_id": sid, "message": {"content": [
             {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": p.returncode != 0,
              "content": (p.stdout + p.stderr).strip() or f"Exit code {p.returncode}"}]}}), flush=True)
-    while STREAM and (line := LINES.get(1.5)) is not None:  # (notes sent while it worked)
+    while STREAM and (line := LINES.get(0.5)) is not None:  # (notes sent while it worked)
         take_steer(line)
     result = "Done." + (" STEERED: " + " | ".join(STEERED) if STEERED else "")
     print(json.dumps({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,

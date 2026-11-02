@@ -678,7 +678,7 @@ async def test_a_stuck_run_is_unstuck_and_you_are_told(env, monkeypatch):
     reply = env.notifier.sent[-1].text
     assert reply.startswith("🤖 Done.") and "Overseer stopped it" in reply and "sleep 300" in reply, reply
 
-    assert await env.agent.handle(s, "FAKE_BUSY crunch the numbers")  # (4 s of CPU, no output: working)
+    assert await env.agent.handle(s, "FAKE_BUSY crunch the numbers")  # (3 s of CPU, no output: working)
     assert len([m for m in env.notifier.sent if m.text.startswith("⏹")]) == 1
     assert "Overseer stopped it" not in env.notifier.sent[-1].text
 
@@ -2219,7 +2219,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     "bash", and `hpc-run --status` said "no worker running". Now: it names the job and why it waits, gets the node or
     gives up after compute.wait_minutes (cancelling the request), and --status lists it."""
     import threading
-    run = hpc_run_tool(env, tmp_path, wait_minutes=0.1)  # (6 s here)
+    run = hpc_run_tool(env, tmp_path, wait_minutes=0.05)  # (3 s here)
     # A node right away: just the output.
     p = run("--cpus", "1", "--mem", "8G", "--time", "15", "--", "echo", "REPORT")
     assert p.returncode == 0 and p.stdout.strip() == "REPORT" and "waiting" not in p.stderr, p.stderr
@@ -2227,7 +2227,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     assert job["state"] == "COMPLETED"
     # Queued for a while: it says so (the job, its state and why), then runs.
     st = env.slurm()
-    st["srun_wait"] = 4
+    st["srun_wait"] = 2
     (tmp_path / "slurm.json").write_text(json.dumps(st))
     status = {}
 
@@ -2240,7 +2240,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     t.join()
     assert p.returncode == 0 and p.stdout.strip() == "LATE"
     assert "[hpc-run] asked SLURM for a node of its own (compute, 1 CPU(s), 8G, 15 min): job" in p.stderr
-    assert "is PENDING (Priority); waiting up to 0.1 min" in p.stderr and "got a node" in p.stderr, p.stderr
+    assert "is PENDING (Priority); waiting up to 0.05 min" in p.stderr and "got a node" in p.stderr, p.stderr
     assert "run on a node of its own:" in status["out"] and "overseer-run-" in status["out"], status
     assert "shared worker: none running" in status["out"]
     # Queued for longer than the wait: the request is cancelled, and it says what to do instead.
@@ -2249,7 +2249,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     (tmp_path / "slurm.json").write_text(json.dumps(st))
     p = run("--cpus", "1", "--", "echo", "NEVER", timeout=40)
     assert p.returncode == 75 and "NEVER" not in p.stdout
-    assert "no node within 0.1 min" in p.stderr and "the request is cancelled" in p.stderr and "sbatch" in p.stderr
+    assert "no node within 0.05 min" in p.stderr and "the request is cancelled" in p.stderr and "sbatch" in p.stderr
     pending = [j for j in env.slurm()["jobs"].values() if j["name"].startswith("overseer-run-") and
                j["state"] in ("PENDING", "RUNNING")]
     assert pending == []  # (nothing left in the queue)
@@ -2272,10 +2272,10 @@ def test_hpc_run_never_hangs_the_agent(env, tmp_path):
     p = run("--cpus", "2", "--", "sh", "-c", "echo T=$OMP_NUM_THREADS")
     assert p.returncode == 0 and p.stdout.strip() == "T=2", p.stderr
 
-    # Still running after --return-after (5 s at least): it carries on, and says so.
+    # Still running after --return-after (1 s here): it carries on, and says so.
     t0 = time.time()
-    p = run("--return-after", "0.01", "--", "sh", "-c", "echo FIRST; sleep 8; echo SECOND", timeout=30)
-    assert p.returncode == 124 and time.time() - t0 < 8 and p.stdout.strip() == "FIRST", (p.stdout, p.stderr)
+    p = run("--return-after", "0.01", "--", "sh", "-c", "echo FIRST; sleep 3; echo SECOND", timeout=30)
+    assert p.returncode == 124 and time.time() - t0 < 3 and p.stdout.strip() == "FIRST", (p.stdout, p.stderr)
     assert "[hpc-run] still running after 0 min" in p.stderr and "don't start it again" in p.stderr, p.stderr
     rid = re.search(r"hpc-run --log (\S+)", p.stderr).group(1)
     assert f"still going: {rid}" in run("--status").stdout

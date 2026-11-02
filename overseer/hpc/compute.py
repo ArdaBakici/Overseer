@@ -133,7 +133,7 @@ cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
 q = shlex.quote
 pre = SETUP.strip() + "; " if SETUP.strip() else ""
 extra = " ".join(q(x) for x in C["sbatch_args"])
-RETURN = max(5, int(a.return_after * 60))
+RETURN = max(1, int(a.return_after * 60))
 
 # Every run is a folder in ~/.overseer/runs on the HPC: its command, output (stdout and stderr together), exit code,
 # node and SLURM step. It runs detached from hpc-run (setsid), so it isn't lost when hpc-run gives back control or

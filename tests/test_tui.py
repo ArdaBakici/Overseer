@@ -168,6 +168,7 @@ async def test_the_heartbeat_and_the_read_only_monitor(env, monkeypatch):  # noq
     monkeypatch.setattr(D, "discover", lambda base: [D.Bot(Path(env.cfg.source), env.cfg)])
     before = files_digest(env.cfg.local.state())
     app = Monitor(env.tmp / "app")
+    app.animation_level = "none"  # (each key would wait out the tab's underline sliding over)
     async with app.run_test(size=(150, 45)) as pilot:
         await pilot.pause()
         assert "running" not in str(app.query_one("#summary").render())  # (its pid isn't a bot's: not running)
@@ -290,6 +291,7 @@ async def test_the_setup_wizard_writes_a_working_config(tmp_path):
     from overseer.tui.setup import Setup
     cfgp = tmp_path / "config.yaml"
     app = Setup(cfgp)
+    app.animation_level = "none"
     async with app.run_test(size=(150, 48)) as pilot:
         await pilot.pause()
         steps = app.query_one("#steps", ListView)
@@ -361,10 +363,11 @@ async def test_the_monitor_from_the_keyboard(env, monkeypatch):  # noqa: F811
     await hb.write()
     monkeypatch.setattr(D, "discover", lambda base: [D.Bot(Path(env.cfg.source), env.cfg)])
     app = Monitor(env.tmp / "app")
+    app.animation_level = "none"  # (each key would wait out the tab's underline sliding over)
     async with app.run_test(size=(150, 45)) as pilot:
         async def press(*keys):
             await pilot.press(*keys)
-            await pilot.pause(0.2)
+            await pilot.pause(0.05)  # (and what the key started in the background: a table being rebuilt)
 
         await pilot.pause()
         await press("right")  # the arrows go through the tabs, and the tab's list has the keys at once
@@ -418,10 +421,12 @@ async def test_the_monitor_from_the_keyboard(env, monkeypatch):  # noqa: F811
         app.refresh_all()
         await press("4")
         assert app.tab == "wakeups"
-        for a in TABS:  # from every tab, every other one (no tab keeps the focus)
-            for b in TABS:
-                await press(str(TABS.index(a) + 1), str(TABS.index(b) + 1))
-                assert app.tab == b, (a, b)
+        for i, a in enumerate(TABS):  # every tab can be left (none keeps the focus), by number and by arrow
+            b = TABS[(i + 1) % len(TABS)]
+            await press(str(i + 1), str(TABS.index(b) + 1))
+            assert app.tab == b, (a, b)
+            await press("left")
+            assert app.tab == a, (b, a)
         await press("q")
     assert not app.is_running
 
@@ -433,10 +438,11 @@ async def test_the_setup_wizard_from_the_keyboard(tmp_path):
     from overseer.tui.setup import Setup
     cfgp = tmp_path / "config.yaml"
     app = Setup(cfgp)
+    app.animation_level = "none"
     async with app.run_test(size=(150, 48)) as pilot:
         async def press(*keys):
             await pilot.press(*keys)
-            await pilot.pause(0.2)
+            await pilot.pause(0.05)  # (and what the key started in the background: a table being rebuilt)
 
         await pilot.pause()
         assert app.focused.id == "steps"
