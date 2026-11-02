@@ -853,6 +853,27 @@ async def test_a_wake_up_with_nothing_to_say_sends_nothing(aenv):
     assert aenv.notifier.sent[-1].text.startswith("🤖 [silent]")
 
 
+async def test_the_assistant_has_a_handbook_of_its_own(aenv):
+    """The handbook is per bot: the assistant's agents share theirs (in its own database), the HPC bot's are elsewhere.
+    Its tools are documented (no command of their own: its agent runs them itself)."""
+    from overseer.core.handbook import Handbook
+    hb = Handbook(aenv.store, aenv.agent, aenv.notifier)
+    await aenv.ctl.start()
+    try:
+        s = aenv.agent.general_session()
+        token = aenv.ctl.open(s.id)
+        ok, text = await aenv.ctl.handle(token, ["handbook", "add", "notes",
+                                                 "The vault's Daily/ notes are named YYYY-MM-DD.md."])
+        assert ok and "proposed" in text, text
+        await hb.approve(hb.pending()[0].id)
+        hb.add("tools", "today's weather for the morning digest", name="wttr", command="curl -s wttr.in/?format=3")
+        prompt = aenv.agent.system_prompt(s.id)
+        assert "## Handbook" in prompt and "Daily/ notes are named YYYY-MM-DD.md" in prompt
+        assert "`curl -s wttr.in/?format=3` (wttr): today's weather" in prompt
+    finally:
+        await aenv.ctl.stop()
+
+
 async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
     with_autopilot(aenv, monkeypatch)
     await aenv.ctl.start()
@@ -862,7 +883,8 @@ async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
         token = aenv.ctl.open(s.id)
         ok, text = await aenv.ctl.handle(token, ["commit", "2h", "send", "the", "report"])
         assert text.startswith("✓ r") and "again after 20m, up to 2 more times" in text, text
-        assert "🎯 I'll check in today" in aenv.notifier.texts()
+        day = "today" if time.localtime(time.time() + 7200).tm_mday == time.localtime().tm_mday else "tomorrow"
+        assert f"🎯 I'll check in {day}" in aenv.notifier.texts()  # (in 2 h: tomorrow, late in the evening)
         rid = text.split(":")[0][2:]
         c = aenv.domain.reminders.get(rid)
         assert c["kind"] == "commit" and c["text"] == "send the report"

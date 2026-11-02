@@ -180,6 +180,27 @@ class JobWatches(WatchKind):
                   "scancel it, fix and resubmit. Note it in the research log.")
         self.ap.wake(s, prompt)
 
+    async def held_wake(self, session_id: str, rec: JobRecord, job: Job, why: str) -> None:
+        """A job this conversation watches won't start by itself (monitor.py): its watch would never fire (FB9)."""
+        s = self.agent.get(session_id)
+        if not s or self.ap.paused(session_id):
+            return
+        lines = []
+        for w in self.store.job_watches(rec.job_id):
+            if w.session_id != session_id:
+                continue
+            others = [o for j in w.job_ids if j != rec.job_id and (o := self.store.get_job(j))]
+            states = ", ".join(f"{o.job_id} {o.state}" + ("" if o.ended_at else " (still going)") for o in others)
+            lines.append(f"w{w.id} ({self.describe(w)}" + (f"; the others: {states}" if states else "") + ")")
+        prompt = (f"[A job you watch won't start] Job {rec.job_id} ({rec.name}) is {job.state} "
+                  f"({(job.reason or '').strip('()')}): {why}. "
+                  f"SLURM won't run it until someone acts, so your watch waiting for it would never fire: "
+                  f"{'; '.join(lines) or 'its watch'}.\n\nDecide what to do: `scontrol release {rec.job_id}` if "
+                  f"it looks transient (`scontrol show job {rec.job_id}` says more), or scancel it and resubmit (and "
+                  f"watch the new job), or `ov unwatch {rec.job_id}` to get the other jobs' results now. Tell the "
+                  "researcher if it needs them (an admin hold, a limit).")
+        self.ap.wake(s, prompt)
+
     async def idle_wake(self, session_id: str, rec: JobRecord, idle_for: str, state: dict) -> None:
         """A job this conversation watches has left its GPUs idle (monitor.py): wake it to find out why."""
         s = self.agent.get(session_id)

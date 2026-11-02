@@ -94,6 +94,7 @@ its run, and it takes it into account at its next step (`/after <text>` waits un
 | `/results`, `/findings` | what each experiment showed |
 | `/backend`, `/account`, `/model`, `/effort` | which agent, which login, which model and effort |
 | `/usage`, `/digest`, `/search <text>`, `/cluster` | tokens and cost, the daily summary, past work, free GPUs |
+| `/handbook` | what the agents learned, your rules and tools: shared by every agent of the bot |
 | `/health`, `/update`, `/help` | status, update the agent CLIs, every command |
 
 The **[guide](docs/guide.md)** explains every command and feature in detail.

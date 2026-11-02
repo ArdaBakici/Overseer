@@ -44,6 +44,9 @@ class ComputeConfig:
     worker_hours: float = 8  # time limit of the worker job
     idle_minutes: int = 45  # the worker ends itself after this long unused (clusters cancel idle jobs too)
     wait_minutes: float = 15  # how long hpc-run waits for a node before giving up
+    # A command still running after this long keeps running on its node, and hpc-run gives back its output so far
+    # (below the agents' tool timeouts, ~10 min): nothing hangs the agent, nothing is lost.
+    return_after_minutes: float = 8
     gpu_partition: str = "nvidia"  # for `hpc-run --gpu`
     gpu_gres: str = "gpu:1"
     sbatch_args: list[str] = field(default_factory=list)  # extra flags for every allocation, e.g. ["--account=x"]

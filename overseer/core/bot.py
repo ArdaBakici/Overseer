@@ -63,6 +63,7 @@ While the agent works, what you send goes into its run (it reads it at its next 
 /update — update Claude Code and Codex now
 /auto &lt;goal&gt; — ask the agent to work on it on its own · /auto — pending wake-ups · /auto off — cancel them
 /feedback [all|review] — what agents reported about Overseer · /skills — installed skills
+/handbook — what the agents learned, your rules and tools (shared by this bot's agents)
 /subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents
 /usage · /digest · /search &lt;text&gt; · /dashboard · /health
 /project — projects (each gets its own topic)
@@ -1026,6 +1027,7 @@ class Bot:
         add(CommandHandler("subagents", self.cmd_subagents, filters=allowed))
         add(CommandHandler("feedback", self.cmd_feedback, filters=allowed))
         add(CommandHandler("skills", self.cmd_skills, filters=allowed))
+        add(CommandHandler("handbook", self.cmd_handbook, filters=allowed))
         add(CommandHandler(["project", "projects"], self.cmd_project, filters=allowed))
         for names, handler in (self.ext.commands() if self.ext else []):  # the domain's (e.g. /jobs)
             add(CommandHandler(names, handler, filters=allowed))
@@ -1657,6 +1659,52 @@ class Bot:
         buttons = [[(f"🗑 {k.name}" + (f" ({k.project})" if k.project else ""), f"skrm:{k.id}")] for k in installed]
         await self.notifier.send(Outgoing("\n".join(lines), buttons=buttons[:20], project=self._scope(update)))
 
+    async def cmd_handbook(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/handbook [add notes|rules <text> | tool <name> <command> -- <what for> | edit H3 <text> | remove H3]: the
+        agents' shared handbook - yours to change directly (agents propose their changes)."""
+        hb = getattr(self.agent, "handbook", None)
+        if not hb:
+            await self.reply(update, "The handbook isn't available in this Overseer.")
+            return
+        args = list(ctx.args or [])
+        sub = args[0].lower() if args else "list"
+        usage = ("/handbook · /handbook add notes|rules &lt;text&gt; · /handbook tool &lt;name&gt; [--dir D] [--compute "
+                 "[--partition P] [--gpu | --gres G] [--cpus N] [--mem M] [--time MIN] [--qos Q]] &lt;command&gt; -- "
+                 "&lt;what it's for&gt; · /handbook edit H3 &lt;text&gt; · /handbook remove H3")
+        try:
+            if sub == "list":
+                await self.reply(update, f"<b>📖 Handbook</b>\n{pre(hb.listing())}\n{usage}")
+                return
+            if sub == "add" and len(args) >= 3:
+                e = hb.add(args[1].lower(), " ".join(args[2:]))
+            elif sub == "tool" and "--" in args and args.index("--") >= 3:
+                cut = args.index("--")
+                where, i = {}, 2  # (its options first, then the command)
+                while i < cut and args[i].startswith("--"):
+                    key = args[i][2:]
+                    if key in ("gpu", "compute"):
+                        where["gpu" if key == "gpu" else "on"] = True if key == "gpu" else "compute"
+                        i += 1
+                    elif key in ("on", "dir", "partition", "gres", "cpus", "mem", "time", "qos") and i + 1 < cut:
+                        where[key], i = args[i + 1], i + 2
+                    else:
+                        raise ValueError(f"unknown option {args[i]}")
+                e = hb.add("tools", " ".join(args[cut + 1:]), name=args[1].lower(), command=" ".join(args[i:cut]),
+                           where=where)
+            elif sub == "edit" and len(args) >= 3:
+                e = hb.edit(args[1], " ".join(args[2:]))
+            elif sub in ("remove", "rm") and len(args) == 2:
+                e = hb.remove(args[1])
+                await self.reply(update, f"🗑 Removed H{e.id}: agents won't have it from their next request.")
+                return
+            else:
+                await self.reply(update, usage)
+                return
+        except ValueError as e:
+            await self.reply(update, f"✗ {esc(str(e))}")
+            return
+        await self.reply(update, f"✓ H{e.id}: every agent of this bot has it from its next request.")
+
     async def cmd_subagents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/subagents [on|off|planner <model>|workers [backend] <m1,m2>|clean]: planner mode here (a project, or the
         main chat), its models, and its subagents."""
@@ -1965,6 +2013,14 @@ class Bot:
                                      if k else "This skill isn't installed any more.")
                 else:
                     result = await (addons.approve(int(arg)) if action == "sk" else addons.decline(int(arg)))
+                    if result.startswith("This "):
+                        await self._edit(q, result)
+            elif action in ("hb", "hbx", "hbu") and getattr(self.agent, "handbook", None) and arg.isdigit():
+                hb = self.agent.handbook  # handbook proposals: ✅ Apply / ✖ No; ↩️ Undo an agent's own edit
+                if action == "hbu":
+                    await self._edit(q, await hb.undo(int(arg)))
+                else:
+                    result = await (hb.approve(int(arg)) if action == "hb" else hb.decline(int(arg)))
                     if result.startswith("This "):
                         await self._edit(q, result)
             elif action in ("subdel", "subkeep"):  # a finished subagent's thread: 🗑 Delete / Keep

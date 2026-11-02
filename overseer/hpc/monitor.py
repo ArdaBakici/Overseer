@@ -26,7 +26,7 @@ from ..core.richtext import fold_text
 from .cluster import Cluster, until
 from .slurm import (NO_VAL, STATE_EMOJI, SUCCESS_STATES, Job, array_parent, format_gpu_stats,
                     has_gpus, log_template, parse_gpu_stats, slurm_seconds, summarize_steps,
-                    task_states)
+                    task_states, wont_start)
 from .ssh import SSHError
 from ..core.store import JobRecord, Store
 
@@ -160,7 +160,7 @@ class Monitor:
         recent = await self.hpc.sacct_recent(window if not first else 60)
         recent_by_id = {j.job_id: j for j in recent}
 
-        adopted = []
+        adopted, queued = [], []
         for job in live:
             if "[" in job.job_id:  # pending array placeholder like 123_[0-9]
                 continue
@@ -191,6 +191,7 @@ class Monitor:
                 await self._maybe_status(rec, job)
             if job.state == "RUNNING":
                 self._maybe_sample_gpus(rec, job)
+            queued.append((rec, job))
             self.store.upsert_job(rec)
 
         await self._estimate_starts(live)
@@ -227,6 +228,9 @@ class Monitor:
                     await self._tell_autopilot(rec, f"Job {rec.job_id} left the queue, but SLURM accounting has no "
                                                     "final state for it. Check its log files.")
                 self.store.upsert_job(rec)
+
+        for rec, job in queued:  # (after the jobs that ended are known: a held job's watch is told about them)
+            await self._check_held(self.store.get_job(rec.job_id) or rec, job)
 
         try:
             await self.check_quota()
@@ -412,6 +416,9 @@ class Monitor:
             if idle.get("alerted") and state == "RUNNING":
                 lines.append(f"💤 <b>GPU idle</b> for {human_seconds(int(time.time() - idle['since']))} "
                              f"(≤{self.cfg.slurm.idle_gpu_percent}% busy)")
+        held = self.store.get(f"held:{rec.job_id}") if job and not final else ""
+        if held:
+            lines.append(f"⛔ <b>won't start by itself</b>: {esc(held)}")
         if problem:
             lines.append(problem)
         for a in fired_alerts(self.store, rec)[:3]:
@@ -579,6 +586,33 @@ class Monitor:
         if self.autopilot:
             for sid in sessions:
                 await self.autopilot.idle_wake(sid, rec, idle_for, state)
+
+    async def _check_held(self, rec: JobRecord, job: Job) -> None:
+        """A queued job that won't start by itself (held, its launch failed, a dependency that can't be met): you and
+        the agents watching it are told once - a watch waiting for it would never fire (FB9). Again if it changes."""
+        why, key, reason = wont_start(job), f"held:{rec.job_id}", (job.reason or "").strip("()")
+        was = self.store.get(key) or ""
+        if why == was:
+            return
+        if not why:
+            self.store.unset(key)
+            await self.refresh_card(rec, job)
+            return
+        self.store.set(key, why)
+        sessions = list(dict.fromkeys(w.session_id for w in self.store.job_watches(rec.job_id)))
+        await self.notifier.send(Outgoing(
+            f"⛔ <b>{esc(rec.job_id)}</b> {esc(rec.name)} won't start by itself: {esc(why)} "
+            f"({esc(job.state)}: {esc(reason)}). <code>scontrol release {esc(rec.job_id)}</code> lets a held job "
+            f"run again; or cancel it."
+            + (" Waking the agent watching it." if sessions and self.autopilot else ""),
+            job_id=rec.job_id, jobs=True, reply_to=self.store.card_refs(rec.job_id)))
+        await self.refresh_card(rec, job)
+        if self.autopilot:
+            for sid in sessions:
+                try:
+                    await self.autopilot.held_wake(sid, rec, job, why)
+                except Exception:
+                    log.exception("held-job wake-up failed")
 
     # ------------------------------------------------------------------ graphs (plots.py) and card order
     async def _after_end(self, rec: JobRecord) -> None:

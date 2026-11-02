@@ -661,6 +661,191 @@ async def test_stop_kills_the_run(env):
     assert json.loads(last)["status"] == "stopped"
 
 
+async def test_a_stuck_run_is_unstuck_and_you_are_told(env, monkeypatch):
+    """With no time limit, the watchdog (core/stuck.py): a command quiet and idle for agent.stuck.quiet_minutes is
+    stopped (only it: the agent is told why and carries on), one that computes isn't; a CLI gone quiet is restarted
+    and the request runs again; the same command with the same result 3 times nudges the agent. You're told after."""
+    from overseer.core import stuck
+    monkeypatch.setattr(stuck, "SAMPLE_SECONDS", 0.3)
+    env.cfg.agent.stuck.quiet_minutes = 0.03  # (~2 s here; 30 min by default)
+    s = env.agent.general_session()
+
+    t0 = time.time()
+    assert await env.agent.handle(s, "FAKE_HANG run the evaluation")
+    assert time.time() - t0 < 30
+    stopped = [m.text for m in env.notifier.sent if m.text.startswith("⏹ Stopped a command")]
+    assert len(stopped) == 1 and "<code>sleep 300</code>" in stopped[0] and "carries on" in stopped[0]
+    reply = env.notifier.sent[-1].text
+    assert reply.startswith("🤖 Done.") and "Overseer stopped it" in reply and "sleep 300" in reply, reply
+
+    assert await env.agent.handle(s, "FAKE_BUSY crunch the numbers")  # (3 s of CPU, no output: working)
+    assert len([m for m in env.notifier.sent if m.text.startswith("⏹")]) == 1
+    assert "Overseer stopped it" not in env.notifier.sent[-1].text
+
+    n = len(claude_calls(env))
+    t0 = time.time()
+    assert await env.agent.handle(s, "FAKE_QUIET summarise the runs")
+    assert time.time() - t0 < 30
+    assert any(m.text.startswith("↻ The agent's CLI had gone quiet") for m in env.notifier.sent)
+    again = claude_calls(env)[n:]
+    assert len(again) == 2 and "Overseer restarted it" in again[1]["stdin"], [c["stdin"][:200] for c in again]
+    assert again[1]["stdin"].endswith("FAKE_QUIET summarise the runs") and "--resume" in again[1]["argv"]
+    assert env.notifier.sent[-1].text.startswith("🤖 Done.")
+
+    assert await env.agent.handle(s, "FAKE_REPEAT make the layer test pass")
+    nudged = [m.text for m in env.notifier.sent if m.text.startswith("🔁")]
+    assert len(nudged) == 1 and "3×" in nudged[0] and "pytest tests/test_layer.py" in nudged[0]
+    assert "3 times now with the same result" in env.notifier.sent[-1].text
+
+
+async def test_the_handbook_what_one_agent_learns_every_agent_knows(env, tmp_path):
+    """An agent adds what it learned (a note), the researcher approves it, and it's in every conversation's
+    instructions - including ones already going (a changed section is handed over). Its own entries it edits at once
+    (you're told, with ↩️ Undo); others' entries and removals are proposals. Tools become commands of their own that
+    run on the login node."""
+    import subprocess
+    from overseer.core.agent import prompt_sections
+    from overseer.core.handbook import Handbook
+    from overseer.hpc.compute import write_handbook_tools
+    from overseer.hpc.sshlink import _write, agent_bin_dir
+    await make_autopilot(env)
+    hb = Handbook(env.store, env.agent, env.notifier)
+    a = env.agent.general_session()
+    token = env.ctl.open(a.id)
+    note = "Jobs on the preempt partition don't count toward the GPU QOS limit (but can be requeued any time)."
+    ok, text = await env.ctl.handle(token, ["handbook", "add", "notes", note, "--why", "sacct showed 12 GPUs in use"])
+    assert ok and "proposed (#" in text, text
+    card = env.notifier.sent[-1]
+    assert card.text.startswith("📖 <b>Handbook: add to what agents learned</b>") and "sacct showed" in card.text
+    pid = int(card.buttons[0][0][1].split(":")[1])
+    assert card.buttons[0] == [("✅ Apply", f"hb:{pid}"), ("✖ No", f"hbx:{pid}")]
+    assert note not in env.agent.system_prompt(a.id)  # (not before you approve it)
+    assert "Waiting for the researcher" in (await env.ctl.handle(token, ["handbook"]))[1]
+
+    assert (await hb.approve(pid)).startswith("✅")
+    e = hb.entries("notes")[0]
+    other = env.agent.general_session(reset=True)  # (any other conversation of this bot)
+    for sid in (a.id, other.id):
+        section = prompt_sections(env.agent.system_prompt(sid))["## Handbook"]
+        assert f"### What agents learned\n- {note} (H{e.id})" in section, section
+    assert any("applied your handbook change" in n for n in env.agent.take_notes(a.id))
+
+    # Its own entry: edited at once, and you're told (↩️ Undo puts it back).
+    newer = note.replace("any time", "any time; use --signal to checkpoint")
+    ok, text = await env.ctl.handle(token, ["handbook", "edit", f"H{e.id}", newer])
+    assert ok and "done; the researcher is told" in text and hb.entries("notes")[0].text == newer
+    told = env.notifier.sent[-1]
+    assert told.text.startswith(f"✏️ <b>An agent updated its handbook entry H{e.id}</b>") and "<s>" in told.text
+    assert (await hb.undo(int(told.buttons[0][0][1].split(":")[1]))).startswith("↩️")
+    assert hb.entries("notes")[0].text == note
+
+    # Your rule: another agent's edit of it, and a removal, wait for you.
+    rule = hb.add("rules", "Always submit with --account=pi_lab.")
+    token2 = env.ctl.open(other.id)
+    ok, text = await env.ctl.handle(token2, ["handbook", "edit", f"H{rule.id}", "Use --account=other."])
+    assert ok and "proposed" in text and hb.entries("rules")[0].text == rule.text
+    assert (await hb.decline(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))).startswith("✖")
+    assert hb.entries("rules")[0].text == rule.text
+    ok, text = await env.ctl.handle(token2, ["handbook", "remove", f"H{e.id}", "--why", "no longer true"])
+    assert ok and "proposed" in text and len(hb.entries("notes")) == 1
+    assert not (await env.ctl.handle(token, ["handbook", "add", "secrets", "x"]))[0]  # (no such section)
+
+    # A tool: a command of the agents' own, on the login node; gone with its entry.
+    ok, text = await env.ctl.handle(token, ["handbook", "tool", "queue-report", "--command", "~/bin/qreport.sh",
+                                            "--about", "how many of my jobs are queued per partition"])
+    assert ok and "proposed" in text
+    await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
+    wrapper = agent_bin_dir(env.cfg) / "queue-report"
+    assert wrapper.exists() and "timeout 900" in wrapper.read_text() and "~/bin/qreport.sh" in wrapper.read_text()
+    assert "`queue-report [args]`: how many of my jobs are queued per partition" in env.agent.system_prompt(a.id)
+    assert not (await env.ctl.handle(token, ["handbook", "tool", "ls", "--command", "x", "--about", "y"]))[0]
+    hb.remove(f"H{hb.entries('tools')[0].id}")
+    assert not wrapper.exists()
+    bin_dir = tmp_path / "bin"  # (and what a tool command does, through a stand-in for the agent's ssh)
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text("#!/bin/sh\nfor last; do :; done\nexec bash -c \"$last\"\n")
+    (bin_dir / "ssh").chmod(0o755)
+    write_handbook_tools(env.cfg, bin_dir, [("queue-report", "echo QUEUED", {})], _write)
+    out = subprocess.run([str(bin_dir / "queue-report"), "gpu partition"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0 and out.stdout.strip() == "QUEUED gpu partition", (out.stdout, out.stderr)
+
+
+async def test_handbook_tools_on_compute_nodes_of_any_partition(env, tmp_path):
+    """A tool runs where it's placed: the login node (in its --dir), the shared worker, or a node of its own on any
+    partition (preemptible ones too) with a GPU and resources - through hpc-run. The card shows where and with what;
+    an agent moves its own tool to a compute node at once; a preempted run says so."""
+    import subprocess
+    from overseer.core.handbook import Handbook
+    from overseer.hpc.compute import write_handbook_tools
+    from overseer.hpc.sshlink import _write, agent_bin_dir
+    await make_autopilot(env)
+    hb = Handbook(env.store, env.agent, env.notifier)
+    s = env.agent.general_session()
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, [
+        "handbook", "tool", "eval-ckpt", "--command", "uv run python eval.py", "--about", "evaluate a checkpoint",
+        "--on", "compute", "--partition", "preempt", "--gpu", "--cpus", "8", "--mem", "32G", "--time", "60",
+        "--dir", "/scratch/me/proj"])
+    assert ok, text
+    card = env.notifier.sent[-1].text
+    assert ("<b>on a compute node in /scratch/me/proj: partition preempt, 1 GPU, 8 CPUs, 32G, 60 min</b>" in card), card
+    await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
+    line = next(x for x in env.agent.system_prompt(s.id).splitlines() if "`eval-ckpt [args]`" in x)
+    assert "on a compute node in /scratch/me/proj: partition preempt" in line and "may wait in the queue" in line
+    wrapper = (agent_bin_dir(env.cfg) / "eval-ckpt").read_text()
+    assert "hpc-run" in wrapper and "'--partition', 'preempt'" in wrapper and "'--gpu'" in wrapper
+    for bad in (["--on", "login", "--partition", "gpu"], ["--mem", "lots"], ["--cpus", "0"]):
+        ok, text = await env.ctl.handle(token, ["handbook", "tool", "bad-one", "--command", "x", "--about", "y", *bad])
+        assert not ok, (bad, text)
+
+    # Its own login tool, moved to a compute node: at once, the researcher told.
+    ok, _ = await env.ctl.handle(token, ["handbook", "tool", "plot-runs", "--command", "python plot.py",
+                                         "--about", "plot the runs"])
+    await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
+    h = next(e for e in hb.entries("tools") if e.name == "plot-runs")
+    ok, text = await env.ctl.handle(token, ["handbook", "edit", f"H{h.id}", "--on", "compute", "--cpus", "4"])
+    assert ok and "done" in text, text
+    assert "on a compute node: 4 CPUs" in env.notifier.sent[-1].text and "<s>" in env.notifier.sent[-1].text
+    assert "'--cpus', '4'" in (agent_bin_dir(env.cfg) / "plot-runs").read_text()
+
+    # What they do: through the stand-in HPC (hpc-run and the fake SLURM run them here).
+    run = hpc_run_tool(env, tmp_path, cpus=8, wait_minutes=0.05)
+    bin_dir = tmp_path / "bin"
+    work = tmp_path / "work"
+    work.mkdir()
+    write_handbook_tools(env.cfg, bin_dir, [
+        ("where-am-i", "pwd", {"dir": str(work)}),
+        ("on-worker", "echo WORKER $SLURM_CPUS_PER_TASK", {"on": "compute"}),
+        ("gpu-eval", "echo EVAL", {"on": "compute", "partition": "preempt", "gpu": True, "cpus": 2})], _write)
+
+    def tool(name, *args):
+        return subprocess.run([str(bin_dir / name), *args], capture_output=True, text=True, timeout=60)
+    assert tool("where-am-i").stdout.strip() == str(work)
+    p = tool("on-worker")
+    assert p.returncode == 0 and p.stdout.strip() == "WORKER 8", (p.stdout, p.stderr)
+    p = tool("gpu-eval", "step 100")
+    assert p.returncode == 0 and p.stdout.strip() == "EVAL step 100", (p.stdout, p.stderr)
+    step = env.slurm()["steps"][-1]
+    assert step[step.index("-p") + 1] == "preempt" and "--gres=gpu:1" in step and step[step.index("-c") + 1] == "2"
+    st = env.slurm()
+    st["srun_preempt"] = True
+    (tmp_path / "slurm.json").write_text(json.dumps(st))
+    p = tool("gpu-eval")
+    assert p.returncode != 0 and "was preempted" in p.stderr and "partition preempt" in p.stderr, p.stderr
+    assert run("--status").returncode == 0
+
+
+async def test_runs_have_no_time_limit_unless_one_is_set(env):
+    assert env.cfg.agent.timeout_minutes == 0  # (the default: a long task runs until it's done or /stop)
+    s = env.agent.general_session()
+    env.agent.runner().timeout = 0
+    assert await env.agent.handle(s, "FORCE_SLOW fix it")
+    assert env.notifier.sent[-1].text.startswith("🤖")
+    env.agent.runner().timeout = 0.1  # (a limit, if config.yaml sets agent.timeout_minutes)
+    await env.agent.handle(s, "FORCE_SLOW fix it")
+    assert any("did not finish within" in m.text for m in env.notifier.sent[-3:])
+
+
 @pytest.mark.parametrize("backend", ["claude_code", "codex"])
 async def test_live_progress_and_transcript(env, monkeypatch, backend):
     from overseer.core import live
@@ -2171,7 +2356,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     "bash", and `hpc-run --status` said "no worker running". Now: it names the job and why it waits, gets the node or
     gives up after compute.wait_minutes (cancelling the request), and --status lists it."""
     import threading
-    run = hpc_run_tool(env, tmp_path, wait_minutes=0.1)  # (6 s here)
+    run = hpc_run_tool(env, tmp_path, wait_minutes=0.05)  # (3 s here)
     # A node right away: just the output.
     p = run("--cpus", "1", "--mem", "8G", "--time", "15", "--", "echo", "REPORT")
     assert p.returncode == 0 and p.stdout.strip() == "REPORT" and "waiting" not in p.stderr, p.stderr
@@ -2179,7 +2364,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     assert job["state"] == "COMPLETED"
     # Queued for a while: it says so (the job, its state and why), then runs.
     st = env.slurm()
-    st["srun_wait"] = 4
+    st["srun_wait"] = 2
     (tmp_path / "slurm.json").write_text(json.dumps(st))
     status = {}
 
@@ -2192,7 +2377,7 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     t.join()
     assert p.returncode == 0 and p.stdout.strip() == "LATE"
     assert "[hpc-run] asked SLURM for a node of its own (compute, 1 CPU(s), 8G, 15 min): job" in p.stderr
-    assert "is PENDING (Priority); waiting up to 0.1 min" in p.stderr and "got a node" in p.stderr, p.stderr
+    assert "is PENDING (Priority); waiting up to 0.05 min" in p.stderr and "got a node" in p.stderr, p.stderr
     assert "run on a node of its own:" in status["out"] and "overseer-run-" in status["out"], status
     assert "shared worker: none running" in status["out"]
     # Queued for longer than the wait: the request is cancelled, and it says what to do instead.
@@ -2201,10 +2386,48 @@ def test_hpc_run_on_a_node_of_its_own_says_what_it_waits_for(env, tmp_path):
     (tmp_path / "slurm.json").write_text(json.dumps(st))
     p = run("--cpus", "1", "--", "echo", "NEVER", timeout=40)
     assert p.returncode == 75 and "NEVER" not in p.stdout
-    assert "no node within 0.1 min" in p.stderr and "the request is cancelled" in p.stderr and "sbatch" in p.stderr
+    assert "no node within 0.05 min" in p.stderr and "the request is cancelled" in p.stderr and "sbatch" in p.stderr
     pending = [j for j in env.slurm()["jobs"].values() if j["name"].startswith("overseer-run-") and
                j["state"] in ("PENDING", "RUNNING")]
     assert pending == []  # (nothing left in the queue)
+
+
+def test_hpc_run_never_hangs_the_agent(env, tmp_path):
+    """FB8: commands without --gpu hung until the agent's tool timeout with no output at all, and were lost then.
+    Now: it says where it runs; a step on the worker gets the worker's CPUs and numpy & co. as many threads; a command
+    still running after --return-after carries on in the background (its output so far, how long, and how to follow
+    it), --log gives the rest and its exit code, --cancel stops one, --status lists them."""
+    import re
+    run = hpc_run_tool(env, tmp_path, cpus=4)
+    p = run("--", "sh", "-c", "echo THREADS=$OMP_NUM_THREADS/$OPENBLAS_NUM_THREADS CPUS=$SLURM_CPUS_PER_TASK")
+    assert p.returncode == 0 and p.stdout.strip() == "THREADS=4/4 CPUS=4", (p.stdout, p.stderr)
+    assert "[hpc-run] running on" in p.stderr and "the shared worker" in p.stderr
+    step = [s for s in env.slurm()["steps"] if any(a.startswith("--jobid") for a in s)][-1]
+    assert step[step.index("-c") + 1] == "4"  # (without -c, a step gets one CPU)
+    p = run("--", "sh", "-c", "OMP_NUM_THREADS=2; export OMP_NUM_THREADS; echo $OMP_NUM_THREADS")
+    assert p.stdout.strip() == "2"  # (yours win)
+    p = run("--cpus", "2", "--", "sh", "-c", "echo T=$OMP_NUM_THREADS")
+    assert p.returncode == 0 and p.stdout.strip() == "T=2", p.stderr
+
+    # Still running after --return-after (1 s here): it carries on, and says so.
+    t0 = time.time()
+    p = run("--return-after", "0.01", "--", "sh", "-c", "echo FIRST; sleep 3; echo SECOND", timeout=30)
+    assert p.returncode == 124 and time.time() - t0 < 3 and p.stdout.strip() == "FIRST", (p.stdout, p.stderr)
+    assert "[hpc-run] still running after 0 min" in p.stderr and "don't start it again" in p.stderr, p.stderr
+    rid = re.search(r"hpc-run --log (\S+)", p.stderr).group(1)
+    assert f"still going: {rid}" in run("--status").stdout
+    p = run("--log", rid, timeout=30)
+    assert p.returncode == 0 and p.stdout.strip() == "SECOND" and "it ended: exit code 0" in p.stderr, p.stderr
+    assert rid not in run("--status").stdout
+    p = run("--log", rid)  # (nothing new: just how it ended)
+    assert p.stdout == "" and "exit code 0" in p.stderr
+
+    p = run("--return-after", "0.01", "--", "sh", "-c", "sleep 60; echo NEVER", timeout=30)
+    rid = re.search(r"hpc-run --log (\S+)", p.stderr).group(1)
+    assert "cancelled" in run("--cancel", rid).stdout
+    p = run("--log", rid, timeout=30)
+    assert p.returncode == 143 and "NEVER" not in p.stdout
+    assert "no run nope" in run("--log", "nope").stderr
 
 
 async def test_disk_quota(env, monkeypatch, tmp_path):
@@ -2544,6 +2767,55 @@ async def test_agent_defined_metrics_and_alerts(env, tmp_path):
     assert "⚠️ metrics command: exit 1" in env.notifier.card_text("601")
 
 
+async def test_a_held_job_doesnt_block_its_watch_silently(env):
+    """FB9: a watch on 3 jobs never fired: one sat PENDING (launch failed requeued held), the others had ended hours
+    before, and nobody was told. Now you and the watching agent are told once, with the watch's other jobs; it
+    can release it, cancel it, or unwatch it and get the other results at once."""
+    ap = await make_autopilot(env)
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    job = {"name": "eval", "state": "RUNNING", "workdir": str(proj)}
+    env.set_jobs(**{"801": job, "802": job, "803": {**job, "state": "PENDING", "reason": "Priority"}})
+
+    async def poll():
+        await env.monitor.poll()
+        await env.monitor.drain()
+        await ap.drain()
+    await poll()
+    token = env.ctl.open(s.id)
+    assert (await env.ctl.handle(token, ["watch", "801", "802", "803"]))[0]
+    n = len(claude_calls(env))
+    st = env.slurm()
+    for jid in ("801", "802"):
+        st["jobs"][jid]["state"] = "COMPLETED"
+    st["jobs"]["803"]["reason"] = "launch failed requeued held"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await poll()
+    held = [m for m in env.notifier.sent if m.text.startswith("⛔")]
+    assert len(held) == 1 and "803" in held[0].text and "launch failed" in held[0].text, [m.text for m in held]
+    assert "scontrol release 803" in held[0].text and "Waking the agent" in held[0].text and held[0].jobs
+    assert "won't start by itself" in env.notifier.card_text("803")
+    calls = claude_calls(env)[n:]
+    assert len(calls) == 1 and "[A job you watch won't start] Job 803 (eval)" in calls[0]["stdin"], calls
+    assert "801 COMPLETED" in calls[0]["stdin"] and "ov unwatch 803" in calls[0]["stdin"]
+    await poll()  # still held: not again
+    assert len([m for m in env.notifier.sent if m.text.startswith("⛔")]) == 1 and len(claude_calls(env)) == n + 1
+    # Unwatched: the watch fires with the two that ended.
+    m = len(claude_calls(env))
+    assert (await env.ctl.handle(token, ["unwatch", "803"]))[0]
+    await ap.check(s.id)
+    await ap.drain()
+    calls = claude_calls(env)[m:]
+    assert len(calls) == 1 and "Job(s) you watched have finished" in calls[0]["stdin"], calls
+    assert "803" not in calls[0]["stdin"].split("finished:")[1]
+    # Released: the card loses its line.
+    st = env.slurm()
+    st["jobs"]["803"]["reason"] = "Priority"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await poll()
+    assert "won't start" not in env.notifier.card_text("803")
+
+
 async def test_a_queued_job_card_has_no_metrics_or_graphs_yet(env):
     """A job still in the queue has no log, metrics or graphs: its card showed "score ?" lines, the metrics command's
     error and a 📈 Plot button. Now it shows none of those until it starts (and reads nothing from the HPC for them)."""
@@ -2561,7 +2833,7 @@ async def test_a_queued_job_card_has_no_metrics_or_graphs_yet(env):
     await asyncio.gather(*list(env.ctl._bg))
     await env.monitor.poll()
     card, buttons = env.notifier.cards["901"][-1]
-    assert "pending" in card and "agent watching" in card, card
+    assert "pending" in card and "Dependency" in card and "agent watching" in card, card
     assert "Crafter score" not in card and "metrics command" not in card and "🎯" not in card, card
     labels = [b[0] for row in buttons for b in row]
     assert "📈 Plot" not in labels and "📜 Log" not in labels and "📊 Status" in labels, labels

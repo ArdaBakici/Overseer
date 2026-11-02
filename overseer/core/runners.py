@@ -34,6 +34,7 @@ from typing import Any, Callable
 
 from .accounts import LIMIT_ANSWER_RE, usage_limit
 from .config import Config, accounts_of
+from .stuck import PROCESS_STARTED
 
 log = logging.getLogger(__name__)
 
@@ -329,7 +330,7 @@ class Runner:
     def __init__(self, cfg: Config, sandbox: Sandbox | None = None):
         self.cfg = cfg
         self.sandbox = sandbox or Sandbox()  # what the domain adds to the sandbox
-        self.timeout = cfg.agent.timeout_minutes * 60
+        self.timeout = cfg.agent.timeout_minutes * 60  # (0: no limit)
         # Set from Telegram (/model, /effort); None = use config.yaml (where null = the CLI's default).
         self.model_override: str | None = None
         self.effort_override: str | None = None
@@ -418,6 +419,9 @@ class Runner:
             preexec_fn=_die_with_overseer,
         )
         _RUNNING.add(proc.pid)
+        started = PROCESS_STARTED.get()
+        if started:  # (the run's watchdog: stuck.py)
+            started(proc.pid)
         err_task = asyncio.create_task(proc.stderr.read())
 
         async def send(text: str) -> bool:
@@ -460,7 +464,7 @@ class Runner:
                 pass
 
         try:
-            await asyncio.wait_for(pump(), timeout=self.timeout)
+            await asyncio.wait_for(pump(), timeout=self.timeout or None)
         except asyncio.TimeoutError:
             kill()
             await proc.wait()
@@ -980,7 +984,7 @@ class CodexRunner(Runner):
                         return
 
         try:
-            await asyncio.wait_for(converse(), timeout=self.cfg.agent.timeout_minutes * 60)
+            await asyncio.wait_for(converse(), timeout=(self.cfg.agent.timeout_minutes or 60) * 60)
         except asyncio.TimeoutError:
             raise AgentRunError("codex: the compaction timed out")
         finally:
@@ -1079,6 +1083,13 @@ class CodexRunner(Runner):
         errors: list[str] = []
         done = asyncio.Event()
         turn: dict[str, str] = {}
+        ended: dict[str, dict] = {}  # turns that completed, by id
+
+        def turn_ended(t: dict) -> None:
+            if t.get("status") not in (None, "completed"):
+                err = t.get("error") or {}
+                errors.append(err.get("message") or f"the turn {t.get('status')}")
+            done.set()
 
         def notified(method: str, params: dict[str, Any]) -> None:
             item = params.get("item") or {}
@@ -1112,12 +1123,11 @@ class CodexRunner(Runner):
             elif method == "error" and not params.get("willRetry"):
                 err = params.get("error") or {}
                 errors.append(f"{err.get('message', '')} {json.dumps(err.get('codexErrorInfo') or '')}".strip())
-            elif method == "turn/completed" and (params.get("turn") or {}).get("id") == turn.get("id"):
-                t = params["turn"]
-                if t.get("status") not in (None, "completed"):
-                    err = t.get("error") or {}
-                    errors.append(err.get("message") or f"the turn {t.get('status')}")
-                done.set()
+            elif method == "turn/completed":
+                t = params.get("turn") or {}
+                ended[t.get("id", "")] = t
+                if t.get("id") == turn.get("id"):
+                    turn_ended(t)
 
         async def talk(send, close, events):
             replies: dict[int, asyncio.Future] = {}
@@ -1173,6 +1183,8 @@ class CodexRunner(Runner):
                 t = await call("turn/start", {"threadId": result.session_id,
                                               "input": [{"type": "text", "text": prompt[:MAX_PROMPT]}]})
                 turn["id"] = (t.get("turn") or {}).get("id", "")
+                if turn["id"] in ended:  # (a turn that failed at once - e.g. out of usage - can end before its id
+                    turn_ended(ended[turn["id"]])  # is back here: it ended then, not never)
 
                 async def deliver(text: str) -> bool:
                     if steering.closed or done.is_set():

@@ -173,6 +173,35 @@ if prog == "claude" and "FORCE_APIERROR" in stdin:  # an API error, reported as 
     sys.exit(1)
 if "FORCE_SLEEP" in stdin:
     time.sleep(60)
+if prog == "claude" and any(m in stdin for m in ("FAKE_HANG", "FAKE_BUSY", "FAKE_QUIET", "FAKE_REPEAT")):
+    # For the stuck check (core/stuck.py): a command that hangs (a real child process, quiet and idle), one that
+    # computes without output, a CLI that goes quiet once (its connection stalled), the same failing command again.
+    import subprocess
+    sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "model": "claude-fake-default"}),
+          flush=True)
+    quiet_mark = os.environ["FAKE_CLI_LOG"] + ".quiet-once"
+    if "FAKE_QUIET" in stdin and not os.path.exists(quiet_mark):
+        open(quiet_mark, "w").close()
+        time.sleep(120)
+    steps = {"FAKE_HANG": [("sleep 300", ["sleep", "300"])],
+             "FAKE_BUSY": [("python3 crunch.py", [sys.executable, "-c",
+                                                  "import time\nend = time.time() + 3\nwhile time.time() < end: pass"])],
+             "FAKE_REPEAT": [("pytest tests/test_layer.py", ["sh", "-c", "echo 'E   AssertionError: shape'; exit 1"])] * 4,
+             }.get(next((m for m in ("FAKE_HANG", "FAKE_BUSY", "FAKE_REPEAT") if m in stdin), ""), [])
+    for i, (shown, argv) in enumerate(steps):
+        print(json.dumps({"type": "assistant", "session_id": sid, "message": {"content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": shown}}]}}), flush=True)
+        p = subprocess.run(argv, capture_output=True, text=True)
+        print(json.dumps({"type": "user", "session_id": sid, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": p.returncode != 0,
+             "content": (p.stdout + p.stderr).strip() or f"Exit code {p.returncode}"}]}}), flush=True)
+    while STREAM and (line := LINES.get(0.5)) is not None:  # (notes sent while it worked)
+        take_steer(line)
+    result = "Done." + (" STEERED: " + " | ".join(STEERED) if STEERED else "")
+    print(json.dumps({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
+                      "result": result}), flush=True)
+    sys.exit(0)
 if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):
     print("boom: model unavailable", file=sys.stderr)
     sys.exit(3)
@@ -406,15 +435,16 @@ if prog == "codex" and args[:1] == ["app-server"]:  # JSON-RPC over stdio: Overs
             stdin = params["input"][0]["text"]
             log_call(stdin)
             turn = active = str(uuid.uuid4())
-            out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
-            if limited():
+            if limited():  # (a turn that fails at once can end before Overseer has its id: the worst order, always)
                 note("error", {"threadId": tid, "turnId": turn, "willRetry": False, "error": {
                     "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), or "
                                "try again in 2 hours 5 minutes.", "codexErrorInfo": "usageLimitExceeded"}})
                 note("turn/completed", {"threadId": tid, "turn": {"id": turn, "status": "failed", "error": {
                     "message": "You've hit your usage limit."}}})
+                out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
                 active = None
                 continue
+            out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
             if "FORCE_SLEEP" in stdin:
                 time.sleep(60)
             if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):

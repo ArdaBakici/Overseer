@@ -52,6 +52,7 @@ slurm:
     worker_hours: 8
     idle_minutes: 45
     wait_minutes: 15            # give up if no node is free after this long
+    return_after_minutes: 8     # a command still running after this long carries on; hpc-run returns its output so far
     gpu_partition: nvidia       # for hpc-run --gpu
     gpu_gres: "gpu:1"
     sbatch_args: []             # e.g. ["--account=myproject"]
@@ -77,7 +78,7 @@ telegram:
 agent:
   enabled: true
   backend: claude_code          # claude_code | codex  (switch any time from Telegram: /backend codex)
-  timeout_minutes: 60           # max length of one agent run (/stop ends it earlier)
+  timeout_minutes: 0            # max length of one agent run, in minutes (0: no limit; /stop ends it)
   auto_update: true             # `claude update` / `codex update` once a day while nothing runs (/update: now)
   report_commands: summary      # summary (after each request) | live (every few seconds) | off
   live_progress: true           # a self-updating "⏳ working" message: latest reasoning, running command
@@ -111,6 +112,12 @@ agent:
     web_search: live            # the model's own web search (OpenAI's side): live | cached | disabled
     extra_config: []            # extra `-c key=value` overrides
 
+  # A run that seems stuck: Overseer acts by itself, and tells you afterwards.
+  stuck:
+    quiet_minutes: 30           # no sign of life this long (no output, no thought, no CPU in its command): act. 0: off
+    stop_command: true          # stop a quiet, idle command (the agent gets it back as failed, and carries on)
+    restart_cli: true           # restart a CLI gone quiet with no command running; the request runs again (once)
+    loop_repeats: 3             # the same command with the same result this many times: the agent is nudged
   # Wake-ups: the agent watches jobs (ov watch) and sets timers (ov wake) on its own, no approval needed.
   autopilot:
     min_checkin_minutes: 15     # check-ins on running jobs and repeating timers: at least this far apart

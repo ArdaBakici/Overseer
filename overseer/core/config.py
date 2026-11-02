@@ -245,11 +245,20 @@ class SubagentsConfig:
 
 
 @dataclass
+class StuckConfig:
+    """A run that seems stuck (core/stuck.py): it acts by itself, and tells you afterwards."""
+    quiet_minutes: float = 30  # no sign of life this long (no event from the CLI, no CPU in its command): act. 0: off
+    stop_command: bool = True  # stop a command that's quiet and idle; the agent carries on, told why
+    restart_cli: bool = True  # restart a CLI gone quiet with no command running (once per request)
+    loop_repeats: int = 3  # the same command with the same result this many times: the agent is nudged (0: off)
+
+
+@dataclass
 class AgentConfig:
     enabled: bool = True
     # claude_code or codex. Can be switched at runtime from Telegram with /backend.
     backend: str = "claude_code"
-    timeout_minutes: int = 60  # max length of one agent run
+    timeout_minutes: int = 0  # max length of one agent run (0: no limit; /stop ends it)
     # Update the agent CLIs (`claude update`, `codex update`) once a day, while no agent run is in progress.
     # New models often need a recent CLI. /update in Telegram (or `overseer update`) does it now.
     auto_update: bool = True
@@ -272,6 +281,7 @@ class AgentConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
     autopilot: AutopilotConfig = field(default_factory=AutopilotConfig)
+    stuck: StuckConfig = field(default_factory=StuckConfig)
     subagents: SubagentsConfig = field(default_factory=SubagentsConfig)
 
 

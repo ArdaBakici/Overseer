@@ -38,6 +38,15 @@ ov job delete 18746955           # stop tracking it. The job keeps running: `sca
   `hpc-run` starts and ends them (`hpc-run --status` lists them, `hpc-run --stop` ends the worker early).
   A node of its own may wait in the queue: `hpc-run` says so (the job, its state and reason) every minute,
   and cancels the request after `slurm.compute.wait_minutes` - for work that can wait, use `sbatch`.
+- `hpc-run` says which node it runs on. A command still running after `slurm.compute.return_after_minutes`
+  (8) keeps running there: `hpc-run` returns (exit code 124) with the output so far, how long it has run, the
+  CPU time it used (almost none for that long: it's waiting - on I/O, a lock - not computing) and the run's id.
+  Don't start it again: `hpc-run --log <id>` gives the rest of its output and its exit code, `hpc-run --cancel
+  <id>` stops it, `hpc-run --status` lists the runs still going. Give the tool call a timeout above 8 minutes.
+- numpy, torch & co. get as many threads as the CPUs SLURM gave (`OMP/OPENBLAS/MKL_NUM_THREADS`, unless you
+  set them): by default they'd start one per CPU of the whole node.
+- A job you watch that won't start by itself (held, its launch failed, a dependency that can't be met) wakes
+  you once: release it (`scontrol release`), cancel and resubmit it, or `ov unwatch` it to get the others' results.
 
 ## Past work: `ov history`
 
@@ -199,6 +208,28 @@ ov skill propose skill.md        # this project's agents; --all: every agent
 ov skill list                    # installed skills, and proposals waiting for the researcher
 ov skill show cluster-long-jobs
 ```
+
+A skill is for know-how worth a page. A single fact every agent should know - how a partition, a limit or a tool on
+this cluster behaves - goes in the handbook (`## Handbook` in your instructions), which every agent of this bot has
+in its instructions:
+
+```bash
+ov handbook add notes "<one fact, and when it holds>" --why "<the command output that shows it>"
+ov handbook tool <name> --command "~/bin/<script>.sh" --about "<what it's for, when to use it>"     # login node
+ov handbook tool <name> --command "uv run python <script>.py" --about "..." --dir <project folder> \
+    --on compute [--partition <any, preemptible too>] [--gpu | --gres gpu:<type>:1] [--cpus N] [--mem 32G] [--time 60]
+ov handbook edit H3 "..."        # your own entry: at once (the researcher is told); someone else's: a proposal
+ov handbook edit H3 --on compute --cpus 8    # move a tool, or change its resources (text stays)
+ov handbook remove H3 --why "<why it's wrong or stale>"
+ov handbook                      # the entries, and what waits for the researcher
+```
+
+Propose a tool when you come across a script of the researcher's that other agents should use (look in their bin
+folders and project folders). Once approved it's a command of yours, `<name> [args]`:
+- **on the login node** (the default): a login shell, in `--dir` if given, 15 minutes at most - quick queries;
+- **on a compute node** (`--on compute`): through `hpc-run` - the shared worker, or with a partition or resources a
+  node of its own (it may wait in the queue; past 8 minutes it gives back the output so far, `hpc-run --log <id>` for
+  the rest; on a preemptible partition it can be preempted, and says so). Work of hours is an sbatch job, not a tool.
 
 - **The frontmatter holds only `name` and `description`.** Any other field is refused, because it could change what
   agents may do.

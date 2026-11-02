@@ -36,7 +36,7 @@ def test_an_old_assistant_config(tmp_path, capsys):
     old.chmod(0o640)
     assert main(["config", "-c", str(old)]) == 0
     out = capsys.readouterr().out
-    assert "agent.timeout_minutes: 45   (default: 60)" in out and "vault.path: /home/me/Vault" in out
+    assert "agent.timeout_minutes: 45   (default: 0)" in out and "vault.path: /home/me/Vault" in out
     assert "local.timezone: \"\"   [Asia/Dubai]" in out and "media.fetch: true" in out
     assert "agent.job_reports: true" in out.split("not used any more")[1]
     new = tmp_path / "assistant.yaml.new"

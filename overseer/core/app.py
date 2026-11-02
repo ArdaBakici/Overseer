@@ -37,6 +37,7 @@ CORE_MENU = [
     ("digest", "what happened since the last digest"), ("search", "search past work"),
     ("dashboard", "the dashboard Mini App"), ("subagents", "planner mode: on/off, models, threads"),
     ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"),
+    ("handbook", "what agents learned, your rules and tools"),
     ("project", "projects: list, new, context, notes"), ("health", "connection status"), ("help", "help"),
 ]
 
@@ -64,6 +65,7 @@ def build(cfg: Config):
     from telegram.ext import Application
 
     from .addons import Addons
+    from .handbook import Handbook
     from .agent import Agent
     from .autopilot import Autopilot
     from .bot import Bot, TelegramNotifier
@@ -148,6 +150,7 @@ def build(cfg: Config):
     subagents = Subagents(cfg, store, agent, notifier)  # planner mode (off unless turned on or approved)
     Feedback(cfg, store, agent, notifier)  # agents' feedback about Overseer, in the 🛠 feedback topic
     Addons(store, agent, notifier)  # skills agents proposed and the researcher approved
+    Handbook(store, agent, notifier)  # what the bot's agents learned, the researcher's rules and tools
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)

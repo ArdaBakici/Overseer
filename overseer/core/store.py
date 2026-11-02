@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS feedback (
     kind TEXT, text TEXT, context TEXT DEFAULT '', status TEXT DEFAULT 'open',
     voters TEXT DEFAULT '[]', refs TEXT DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS handbook (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    section TEXT, text TEXT, name TEXT DEFAULT '', command TEXT DEFAULT '', status TEXT, action TEXT DEFAULT '',
+    target INTEGER DEFAULT 0, old TEXT DEFAULT '', why TEXT DEFAULT '', session_id TEXT, refs TEXT DEFAULT '{}',
+    created REAL, updated REAL, place TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS skills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT, project TEXT DEFAULT '', description TEXT, content TEXT,
@@ -321,6 +327,27 @@ class FeedbackRecord:
             return list(json.loads(self.voters or "[]"))
         except ValueError:
             return []
+
+
+@dataclass
+class HandbookRecord:
+    """The agents' handbook (handbook.py): an entry (status active), or an agent's proposal to add, change or remove
+    one (proposed, then applied or declined)."""
+    section: str  # notes | rules | tools
+    text: str  # a tool: what it's for (and when to use it)
+    name: str = ""  # a tool's command name
+    command: str = ""  # a tool: what it runs
+    place: str = ""  # a tool: where it runs (JSON: on, dir, partition, gpu, gres, cpus, mem, time, qos); "" = default
+    status: str = "active"  # entries: active | removed; proposals: proposed | applied | declined | undone
+    action: str = ""  # a proposal: add | edit | remove
+    target: int = 0  # edit / remove: the entry
+    old: str = ""  # an applied edit: the text before (↩️ Undo)
+    why: str = ""  # the agent's evidence
+    session_id: str | None = None  # who wrote it
+    refs: str = "{}"  # its card's messages
+    created: float = 0.0
+    updated: float = 0.0
+    id: int | None = None
 
 
 @dataclass
@@ -685,6 +712,22 @@ class Store:
         if statuses:
             q, args = q + f" WHERE status IN ({','.join('?' * len(statuses))})", list(statuses)
         return [_row(FeedbackRecord, r) for r in self.db.execute(q + " ORDER BY id", args).fetchall()]
+
+    def add_handbook(self, h: HandbookRecord) -> HandbookRecord:
+        self._insert("handbook", h)
+        return h
+
+    def save_handbook(self, h: HandbookRecord) -> None:
+        h.updated = time.time()
+        self._upsert("handbook", "id", h)
+
+    def get_handbook(self, hid: int) -> HandbookRecord | None:
+        row = self.db.execute("SELECT * FROM handbook WHERE id=?", (hid,)).fetchone()
+        return _row(HandbookRecord, row) if row else None
+
+    def handbook(self, statuses: tuple[str, ...] = ("active",)) -> list[HandbookRecord]:
+        q = f"SELECT * FROM handbook WHERE status IN ({','.join('?' * len(statuses))}) ORDER BY id"
+        return [_row(HandbookRecord, r) for r in self.db.execute(q, statuses).fetchall()]
 
     def add_skill(self, k: SkillRecord) -> SkillRecord:
         self._insert("skills", k)

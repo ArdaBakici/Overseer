@@ -4,7 +4,7 @@ The full guide to the HPC bot, once it's [set up](setup.md). For a quick overvie
 what the agent may and may not do, [security.md](security.md); for the personal assistant bot,
 [assistant.md](assistant.md).
 
-**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
+**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [The handbook](#the-handbook-what-one-agent-learns-every-agent-knows) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Stuck runs](#a-run-that-seems-stuck) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
 
 ## Commands
 
@@ -197,6 +197,9 @@ This is how it runs experiments over many hours: submit, watch, end its reply. W
 - **You see every one:** a watched job's card says "⏰ agent watching", with a ✖ watch button that cancels it; a timer is announced quietly in the conversation's topic, with a ✖ Cancel button. Replies end with what the agent is waiting for, and `/auto` lists everything pending.
 - **Turning it off:** `/auto off` cancels the pending wake-ups (in that thread or topic, or as a reply: that conversation), and the agent is told. `/stop` stops a run.
 - **Limits:** check-ins and repeating timers are at least 15 minutes apart, and a repeating timer ends (after 24 hours unless the agent sets `--for`). There is no limit on the number of wake-ups. `/usage` shows what they cost.
+- **A watched job that won't start:** a job held by SLURM (e.g. "launch failed requeued held"), or one that can never
+  start (a dependency that failed, a request over its partition's limits), would keep its watch from firing. You get a ⛔
+  message (and a line on its card), and the agent watching it is woken once to release, cancel or unwatch it.
 - **Pauses on problems:** a wake-up that fails or is `/stop`ped pauses that conversation's wake-ups until you write to it there.
 - **Research log:** in every project, the agent keeps `RESEARCH_LOG.md` in the project folder (or, with an
   Obsidian folder - below - `Research log.md` in the vault).
@@ -243,6 +246,7 @@ The agent has `hpc-run`, which runs a command on a compute node and returns its 
 hpc-run --dir /scratch/me/rf-dreamer -- python plot_rewards.py      # on the shared worker node
 hpc-run --cpus 32 --mem 128G --time 120 -- python preprocess.py    # on a node of its own
 hpc-run --gpu -- python eval.py                                    # on a GPU node of its own
+hpc-run --partition preempt --gres gpu:a100:1 -- python eval.py     # any partition, GPU type, --qos
 hpc-run --status                                                   # the shared worker, and runs on nodes of their own
 hpc-run --stop                                                     # end the shared worker
 ```
@@ -252,8 +256,14 @@ hpc-run --stop                                                     # end the sha
 - **A node of its own** (`--cpus`, `--mem`, `--time`, `--gpu`): a job named `overseer-run-…`, which may have to wait in
   the queue. `hpc-run` says so at once (the job, its state and SLURM's reason), again every minute, and when it gets the
   node. If none comes within `slurm.compute.wait_minutes` (15), it cancels the request and suggests `sbatch` instead.
-  Like the worker, these jobs are never reported or registered as yours.
-- **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display.
+  Like the worker, these jobs are never reported or registered as yours. Any partition works (`--partition`, with
+  `--gres` and `--qos`); on a preemptible one, a run SLURM takes back says it was preempted.
+- **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display, and `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS` set to the CPUs SLURM gave (unless set): numpy and torch would otherwise start a thread per CPU of the whole node.
+- **Nothing hangs the agent:** `hpc-run` says which node it runs on. A command still running after
+  `slurm.compute.return_after_minutes` (8, below the agents' tool timeouts) keeps running on its node: `hpc-run` returns
+  with its output so far, how long it has run and the CPU time it used. `hpc-run --log <id>` gives the rest and its exit
+  code, `hpc-run --cancel <id>` stops it, `hpc-run --status` lists the runs still going. Each run's output is kept in
+  `~/.overseer/runs/` on the HPC for a week.
 - **Instructions:** the agent is told to use `hpc-run` for anything that computes (scripts, plots, data processing, tests) and `sbatch` for real runs. The 📈 Plot button asks for plots made this way.
 - **Guardrail:** commands the agent runs directly on the login node get 120 CPU seconds (`ulimit -t`, set by its `ssh` wrapper). A heavy script there is stopped with a message pointing to `hpc-run`.
   - **Exemptions:** commands that hand work to SLURM (`sbatch`, `srun`, `salloc`) aren't limited, because SLURM would pass the limit on to the job.
@@ -368,6 +378,31 @@ When a conversation's context fills up, the CLIs compact it on their own: older 
   - **Claude Code** runs its own `/compact` in the same session and takes a focus: `/compact keep the lr sweep results and the baseline numbers`.
   - **Codex** compacts through its app server (`thread/compact/start` on the same thread). It doesn't take a focus.
 - **What survives:** the summary is lossy, so the important facts are kept in files the agent re-reads: `OVERSEER.md` for project notes and `RESEARCH_LOG.md` for the experiments. `/new` starts a clean conversation instead.
+
+## The handbook: what one agent learns, every agent knows
+
+Each bot keeps a short handbook in every one of its agents' instructions (the HPC bot's and the assistant's are
+separate: what an HPC agent adds stays with the HPC bot). It has three parts:
+- **What agents learned:** facts about where they work, e.g. "jobs on the preempt partition don't count toward the
+  GPU QOS limit, but can be requeued any time". An agent that finds one out adds it, so the next agent doesn't have to.
+- **Your rules:** e.g. "always submit with `--account=pi_lab`", "prefer h100 over a100 when both are free".
+- **Tools:** your scripts, with what they're for. Agents propose the ones they come across. On the HPC bot each
+  becomes a command of the agents' own, `<name> [args]`, that runs where its entry says:
+  - **the login node** (the default): a login shell, in its folder (`--dir`), 15 minutes at most - quick queries;
+  - **a compute node** (`--on compute`), through `hpc-run`: the shared worker, or a node of its own on any partition
+    (preemptible ones too) with a GPU and resources (`--partition`, `--gpu` / `--gres`, `--cpus`, `--mem`, `--time`,
+    `--qos`). The card shows where and with what before you approve it.
+
+**How it changes:**
+- **Agents propose** (`ov handbook add`, `tool`, `edit`, `remove`, with the evidence): you get a 📖 card with ✅ Apply / ✖ No,
+  and the agent is told your answer.
+- **An agent's edit of its own entry** applies at once; you're told, with ↩️ Undo.
+- **You change it directly** with `/handbook`: `/handbook add rules <text>`, `/handbook tool <name> [--dir D]
+  [--compute --partition P --gpu --cpus N ...] <command> -- <what it's for>`, `/handbook edit H3 <text>`,
+  `/handbook remove H3`; `/handbook` shows it.
+- **Conversations already going** get the change with their next request. Entries stay short (it's in every prompt):
+  past 8 KB, agents are asked to condense it. Project matters stay in the project's `OVERSEER.md`, results in
+  `ov result`, long how-tos in skills.
 
 ## Feedback about Overseer, its review, and skills as addons
 
@@ -484,6 +519,25 @@ connection itself matters most:
 The setup (`overseer setup`) works the same way: `Ctrl+N` / `Ctrl+B` go to the next / previous step and into its
 first field, `Tab` moves between fields, `Enter` in a field saves the step, `Esc` goes back to the list of steps, and
 `F1` shows the keys.
+
+## A run that seems stuck
+
+An agent run has no time limit (`agent.timeout_minutes: 0`; a number sets one): it goes on until it's done or you
+`/stop` it. Instead, a watchdog follows each run. Every step the agent takes (a thought, a message, a command, its output)
+is a sign of life, and so is a running command using CPU (a compile, a copy). After `agent.stuck.quiet_minutes` (30)
+without any, Overseer acts by itself and tells you afterwards:
+
+- **A command quiet and idle** (no output, no CPU here - e.g. `ssh hpc 'python train.py'` in the foreground, a prompt
+  waiting for input): ⏹ it stops that command only. The agent gets it back as failed, with a note saying why (and to
+  run long work as a job or in the background), and carries on.
+- **The CLI gone quiet** with no command running (its connection stalled): ↻ it restarts the CLI, and the request runs
+  again from where the conversation was - once per request.
+- **The same command with the same result** 3 times (`agent.stuck.loop_repeats`): 🔁 the agent is told to try something
+  materially different or to ask you. It's never stopped for that.
+
+A command on the HPC can't be seen computing from here (ssh waits idle), so a long foreground one counts as quiet: long
+work belongs in `sbatch` or `hpc-run`, which gives control back after a few minutes. `agent.stuck.stop_command` and
+`restart_cli` turn the two actions off; `quiet_minutes: 0` turns the watchdog off.
 
 ## Restarts don't lose the agent's work
 

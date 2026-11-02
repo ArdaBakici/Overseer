@@ -250,6 +250,78 @@ class HpcDomain(Domain):
         return hpc_sandbox(self.cfg)
 
     # ------------------------------------------------------------------ instructions
+    # ------------------------------------------------------------------ the handbook's tools (core/handbook.py)
+    def handbook_tool(self, name: str, command: str, about: str, place: dict) -> str:
+        where = self.handbook_place_text(place)
+        line = f"`{name} [args]`: {about} (a command of yours here: runs `{command}` {where}, args passed on"
+        if place.get("on") == "compute":
+            return line + (f"; it may wait in the queue, and past {self.cfg.slurm.compute.return_after_minutes:g} min "
+                           "it gives back the output so far and carries on - `hpc-run --log <id>` for the rest)")
+        return line + ")"
+
+    def handbook_place(self, opts: dict) -> dict:
+        """--on login|compute, --dir, and for a compute node: --partition (any: preemptible ones too), --gpu / --gres,
+        --cpus, --mem, --time (minutes), --qos. A resource or partition means a compute node."""
+        allowed = {"on", "dir", "partition", "gpu", "gres", "cpus", "mem", "time", "qos"}
+        if set(opts) - allowed:
+            raise ValueError(f"unknown: {', '.join(sorted(set(opts) - allowed))}")
+        out = dict(opts)
+        compute = set(out) - {"on", "dir"}
+        if out.get("on") == "login" and compute:
+            raise ValueError("--on login takes no partition or resources: those are for --on compute")
+        if out.get("on") not in (None, "login", "compute"):
+            raise ValueError("--on login | compute")
+        if compute:
+            out["on"] = "compute"
+        word = re.compile(r"^[A-Za-z0-9_.:+-]{1,64}$")
+        for k in ("partition", "gres", "qos"):
+            if k in out and not word.match(str(out[k])):
+                raise ValueError(f"--{k}: a name like gpu, preempt or gpu:a100:1")
+        if "mem" in out and not re.match(r"^\d+[KMGT]?$", str(out["mem"])):
+            raise ValueError("--mem: e.g. 32G")
+        for k in ("cpus", "time"):
+            if k in out and (not str(out[k]).isdigit() or int(out[k]) < 1):
+                raise ValueError(f"--{k}: a whole number ({'minutes' if k == 'time' else 'CPUs'})")
+            if k in out:
+                out[k] = int(out[k])
+        if "dir" in out and ("\n" in str(out["dir"]) or not str(out["dir"]).strip()):
+            raise ValueError("--dir: a folder on the HPC")
+        if out.get("on") == "login":
+            del out["on"]  # (the default)
+        return out
+
+    def handbook_place_text(self, place: dict) -> str:
+        where = f" in {place['dir']}" if place.get("dir") else ""
+        if place.get("on") != "compute":
+            return "on the HPC's login node" + where + " (15 min at most)"
+        res = [f"partition {place['partition']}" if place.get("partition") else "",
+               place.get("gres") or ("1 GPU" if place.get("gpu") else ""),
+               f"{place['cpus']} CPUs" if place.get("cpus") else "", place.get("mem", ""),
+               f"{place['time']} min" if place.get("time") else "", f"qos {place['qos']}" if place.get("qos") else ""]
+        res = [r for r in res if r]
+        return "on a compute node" + where + (": " + ", ".join(res) if res else " (the shared worker)")
+
+    def handbook_tool_options(self) -> str:
+        return (" - it runs on the login node (15 min at most), or with `--on compute` on a compute node through "
+                "hpc-run (the shared worker; or a node of its own with `--partition <any, preemptible too>`, `--gpu` "
+                "or `--gres gpu:<type>:1`, `--cpus N`, `--mem 32G`, `--time <min>`, `--qos Q`), `--dir <folder>` "
+                "where it runs. Work of hours is a job (sbatch), not a tool")
+
+    def handbook_tools(self, tools: list[tuple[str, str, dict]]) -> None:
+        from .compute import write_handbook_tools
+        from .sshlink import _write, agent_bin_dir
+        write_handbook_tools(self.cfg, agent_bin_dir(self.cfg), tools, _write)
+
+    def command_taken(self, name: str) -> bool:
+        import shutil
+        from .compute import TOOL_MARK
+        from .sshlink import agent_bin_dir
+        mine = agent_bin_dir(self.cfg) / name  # (a tool's own command, from before: not taken)
+        if mine.is_file() and TOOL_MARK in mine.read_text(errors="replace")[:200]:
+            return False
+        return name in {"hpc", "sbatch", "squeue", "srun", "scancel", "sacct", "sinfo", "scontrol", "salloc"} \
+            or mine.exists() or shutil.which(name) is not None
+
     def system_prompt(self, s: Session | None) -> str:
         cfg = self.cfg
         domains = cfg.agent.allowed_domains
@@ -257,6 +329,7 @@ class HpcDomain(Domain):
         cpu = cfg.slurm.compute.login_cpu_seconds
         ctl = self.agent.ctl if self.agent else None
         prompt = P.SYSTEM_PROMPT.format(
+            return_after="%g" % self.cfg.slurm.compute.return_after_minutes,
             login_limit=(f" Commands run directly on the login node are stopped after {cpu} CPU seconds." if cpu else ""),
             host=cfg.ssh.host,
             setup=f"{setup}; " if setup else "",

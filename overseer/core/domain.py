@@ -112,6 +112,33 @@ class Domain:
         return ("Look at what woke you and decide the next step. If you need the researcher's decision, ask; if "
                 "nothing is left to do, say so and set no more wake-ups.")
 
+    # ------------------------------------------------------------------ the handbook (handbook.py)
+    def handbook_tool(self, name: str, command: str, about: str, place: dict) -> str:
+        """A tool's line in the agents' handbook."""
+        return f"`{command}` ({name}): {about}" + (f" (in `{place['dir']}`)" if place.get("dir") else "")
+
+    def handbook_tools(self, tools: list[tuple[str, str, dict]]) -> None:
+        """The handbook's tools (name, command, where) changed: e.g. make them commands of their own."""
+
+    def handbook_place(self, opts: dict) -> dict:
+        """Where a tool runs, from `ov handbook tool`'s options (checked; ValueError if this bot can't). Here: only a
+        folder - the agent runs its tools itself."""
+        if set(opts) - {"dir"}:
+            raise ValueError("this bot's tools run where its agent does: only --dir applies")
+        return opts
+
+    def handbook_place_text(self, place: dict) -> str:
+        return f"in {place['dir']}" if place.get("dir") else ""
+
+    def handbook_tool_options(self) -> str:
+        """The placement options, for the agents' instructions."""
+        return " (`--dir <folder>`: where it runs)"
+
+    def command_taken(self, name: str) -> bool:
+        """A handbook tool can't take this name (a command that exists)."""
+        import shutil
+        return name == "ov" or shutil.which(name) is not None
+
     def ledger_context(self, project: str | None, session_id: str | None = None) -> str:
         """What the domain keeps about a project's progress (e.g. the HPC's results and findings), for prompts."""
         return ""

@@ -28,6 +28,7 @@ from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import SILENT, Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, Steering, UsageLimitError, make_runner
+from .stuck import PROCESS_STARTED, Watchdog
 from .store import SessionRecord, Store
 
 if TYPE_CHECKING:
@@ -108,8 +109,13 @@ CONTINUE_PROMPT = (
     "`ov job list`, `squeue`), then finish it.]\n\n")
 # A message sent while the agent works goes into its run (Agent.steer): it reads it at its next step.
 STEER_NOTE = {"user": "[The researcher, while you work - take this into account from here on:]\n",
-              "planner": "[Message from your planner while you work - take it into account from here on:]\n"}
+              "planner": "[Message from your planner while you work - take it into account from here on:]\n",
+              "overseer": "[Overseer, while you work:]\n"}
 LATE_NOTE = "[Sent while you were finishing your last reply:]\n"
+
+
+class RunRestarted(AgentRunError):
+    """The watchdog restarted the run's CLI (it had gone quiet): the request runs again."""
 
 
 def unnote(message: str) -> str:
@@ -322,6 +328,7 @@ class Agent:
         self.subagents = None  # set by Subagents(...): planner mode
         self.feedback = None  # set by Feedback(...): agents' feedback about Overseer, and its review
         self.addons = None  # set by Addons(...): skills agents proposed and the researcher approved
+        self.handbook = None  # set by Handbook(...): what agents learned, the researcher's rules and tools
         self.ctl = None  # set by ControlServer(...): the agent's `ov` command
         self.updating = False  # the CLIs are being updated (update_clis)
         self.shutting_down = False  # Overseer is stopping: runs cut off now are offered again at the next start
@@ -733,6 +740,8 @@ class Agent:
     def system_prompt(self, session_id: str | None = None) -> str:
         sess = self.get(session_id)
         prompt = self.domain.system_prompt(sess)
+        if self.handbook and self.ctl:  # (shared by the bot's agents: every conversation)
+            prompt += self.handbook.section()
         if self.ctl and self.subagents and sess and sess.rec.role != "reviewer" and self.domain.planner:
             prompt += self._subagent_section(sess)
         if sess and sess.rec.role == "reviewer":
@@ -834,11 +843,16 @@ class Agent:
     async def _turn_on_any_account(self, s: Session, user_text: str, quiet: bool) -> bool:
         """The turn; if the account runs out of usage, again on the next one (the CLI's next account, then the other
         CLI), up to MAX_FAILOVERS times. False if it stopped there (the researcher can ▶️ Continue it later)."""
-        text = user_text
+        text, restarted = user_text, False
         for attempt in range(MAX_FAILOVERS + 1):
             try:
                 await self._turn(s, text, quiet)
                 return True
+            except RunRestarted:  # (its CLI had gone quiet, and the watchdog restarted it: once per request)
+                if restarted:
+                    raise
+                restarted = True
+                text = RERUN_PROMPT.format(why="its CLI had gone quiet and Overseer restarted it", where="") + user_text
             except UsageLimitError as e:
                 place = await self._fail_over(s, e)
                 if place is None or attempt == MAX_FAILOVERS:
@@ -1027,12 +1041,20 @@ class Agent:
                 self.store.upsert_session(s.rec)
 
         activity.on_progress = on_progress
+        steering = s.steering = Steering()  # (messages sent while it works go into this run)
+        stuck = self.cfg.agent.stuck
+        watchdog = Watchdog(stuck.quiet_minutes, stuck.stop_command, stuck.restart_cli, stuck.loop_repeats,
+                            running=lambda: dict(activity._started),
+                            note=lambda text: steering.send(STEER_NOTE["overseer"] + text),
+                            tell=lambda text: self.notifier.send(Outgoing(text, session_id=s.id, job_id=s.job_id)))
+        activity.on_progress = lambda ev: (watchdog.event(ev), on_progress(ev))
         token = self.ctl.open(s.id) if self.ctl else None
         if token:
             activity.env = {TOKEN_ENV: token}
         if progress:
             progress.start()
-        steering = s.steering = Steering()  # (messages sent while it works go into this run)
+        hook = PROCESS_STARTED.set(watchdog.started)
+        watchdog.start()
         try:
             state = await self.domain.before_run(s)
             res = await runner.run(prompt, system=system, session_id=resume, key=s.id, activity=activity,
@@ -1042,8 +1064,12 @@ class Agent:
             raise
         except Exception as e:
             transcript.write({"kind": "end", "status": "error", "text": str(e)[:2000]})
+            if watchdog.restarted and isinstance(e, AgentRunError):
+                raise RunRestarted(str(e)) from e
             raise
         finally:
+            watchdog.stop()
+            PROCESS_STARTED.reset(hook)
             steering.close()
             s.steering = None
             s.leftover += steering.untaken()
