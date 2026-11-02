@@ -7,7 +7,7 @@ own, in its own database):
   that doesn't apply where you'd think);
 * rules - the researcher's own (e.g. "always --account=pi_lab");
 * tools - the researcher's scripts, with what they're for. The domain may make them commands of their own (the HPC
-  bot: `numqueued` runs ~/bin/numqueued.sh on the login node).
+  bot: a script of the researcher's becomes a command, on the login node or a compute node).
 
 Agents add, change and remove entries with `ov handbook`; the researcher approves each change on a card (✅ / ✖) - except
 an agent's edit of its own entry, which applies at once (the researcher is told, with ↩️ Undo). The researcher changes
@@ -31,6 +31,14 @@ MAX_CHARS = 8000  # the whole handbook (it's in every prompt): past this, agents
 
 class HandbookError(ValueError):
     pass
+
+
+def place(h: HandbookRecord) -> dict:
+    """Where a tool runs: {} for the default (the HPC bot: the login node)."""
+    try:
+        return json.loads(h.place) if h.place else {}
+    except ValueError:
+        return {}
 
 
 def ref(h: HandbookRecord) -> str:
@@ -64,8 +72,12 @@ class Handbook:
 
     def _line(self, h: HandbookRecord) -> str:
         if h.section == "tools":
-            return f"- {self.agent.domain.handbook_tool(h.name, h.command, h.text)} ({ref(h)})"
+            return f"- {self.agent.domain.handbook_tool(h.name, h.command, h.text, place(h))} ({ref(h)})"
         return f"- {h.text} ({ref(h)})"
+
+    def _tool(self, h: HandbookRecord) -> str:
+        where = self.agent.domain.handbook_place_text(place(h))
+        return f"{h.name}: {h.command}" + (f" ({where})" if where else "") + f" - {h.text}"
 
     def section(self) -> str:
         """The system prompt's part: how to use the handbook, and what's in it."""
@@ -74,7 +86,7 @@ class Handbook:
                  "faster way - add it: `ov handbook add notes \"<one fact, with the conditions it holds under>\" "
                  "--why \"<the evidence>\"` (check the entries below first: change one rather than repeat it). A "
                  "script of the researcher's that agents should use: `ov handbook tool <name> --command \"<command>\" "
-                 "--about \"<what it's for, when to use it>\"`. Fix or update an entry: `ov handbook edit H3 \"...\"`, "
+                 "--about \"<what it's for, when to use it>\"`" + self.agent.domain.handbook_tool_options() + ". Fix or update an entry: `ov handbook edit H3 \"...\"`, "
                  "drop a wrong or stale one: `ov handbook remove H3 --why \"...\"`. The researcher approves additions, "
                  "removals and changes to others' entries; your edits of your own entries apply at once. Keep entries "
                  "short and factual - project matters belong in the project's notes, results in `ov result`."]
@@ -94,8 +106,7 @@ class Handbook:
             items = self.entries(key)
             if items:
                 out.append(f"{title}:")
-                out += [f"  {ref(h)} " + (f"{h.name}: {h.command} - {h.text}" if key == "tools" else h.text)
-                        for h in items]
+                out += [f"  {ref(h)} " + (self._tool(h) if key == "tools" else h.text) for h in items]
         pending = self.pending()
         if pending:
             out.append("Waiting for the researcher:")
@@ -105,7 +116,7 @@ class Handbook:
     def _describe(self, p: HandbookRecord) -> str:
         if p.action == "remove":
             return f"remove {ref(p)}"
-        what = f"{p.name}: {p.command} - {p.text}" if p.section == "tools" else p.text
+        what = self._tool(p) if p.section == "tools" else p.text
         return f"{'change ' + ref(p) if p.action == 'edit' else 'add to ' + p.section}: {what}"
 
     # ------------------------------------------------------------------ an agent's changes
@@ -119,35 +130,55 @@ class Handbook:
                                 "or rule per entry")
         if section == "tools":
             if not NAME_RE.match(name or ""):
-                raise HandbookError("a tool's name: lowercase letters, digits, - or _ (e.g. numqueued)")
+                raise HandbookError("a tool's name: lowercase letters, digits, - or _ (e.g. queue-report)")
             if not command.strip():
-                raise HandbookError("--command: what the tool runs (e.g. ~/bin/numqueued.sh)")
+                raise HandbookError("--command: what the tool runs (e.g. ~/bin/<script>.sh)")
             if self.agent.domain.command_taken(name):
                 raise HandbookError(f"{name!r} is already a command here: name the tool differently")
             if any(h.name == name for h in self.entries("tools")):
                 raise HandbookError(f"there's a tool {name} already: ov handbook edit its entry")
 
+    def _place(self, section: str, opts: dict | None, before: dict | None = None) -> str:
+        """Where a tool runs (JSON), from the options given (an edit: over what it had); the domain checks them."""
+        opts = {k: v for k, v in (opts or {}).items() if v not in (None, False, "")}
+        if section != "tools":
+            if opts:
+                raise HandbookError("--on, --dir and the resources are for tools")
+            return ""
+        merged = dict(before or {})
+        if opts.get("on") == "login":  # (back to the login node: its compute options go)
+            merged = {k: v for k, v in merged.items() if k == "dir"}
+        merged.update(opts)
+        return json.dumps(self.agent.domain.handbook_place(merged)) if merged else ""
+
     async def propose(self, s, action: str, section: str = "", text: str = "", name: str = "", command: str = "",
-                      target: str = "", why: str = "") -> str:
-        """An agent's addition, change or removal: a card for the researcher - or, its edit of its own entry, done."""
+                      target: str = "", why: str = "", where: dict | None = None) -> str:
+        """An agent's addition, change or removal: a card for the researcher - or, its edit of its own entry, done.
+        `where`: a tool's placement options (on, dir, partition, gpu, gres, cpus, mem, time, qos)."""
         text, why = text.strip(), why.strip()
         old = self.entry(target) if action in ("edit", "remove") else None
         if old:
             section, name = old.section, old.name
         if action == "add":
             self._check(section, text, name, command)
+            spot = self._place(section, where)
         elif action == "edit":
-            command = command or old.command
+            text, command = text or old.text, command or old.command
             self._check_text(text)
+            spot = self._place(section, where, place(old)) if where and any(where.values()) else old.place
+            if (text, command, spot) == (old.text, old.command, old.place):
+                raise HandbookError("that's what it says already: give the new text, --command or placement")
         else:
-            text, command = old.text, old.command  # (what goes)
+            text, command, spot = old.text, old.command, old.place  # (what goes)
         p = self.store.add_handbook(HandbookRecord(section=section, text=text, name=name, command=command,
-                                                   status="proposed", action=action, target=old.id if old else 0,
-                                                   why=why, session_id=s.id))
+                                                   place=spot, status="proposed", action=action,
+                                                   target=old.id if old else 0, why=why, session_id=s.id))
         if action == "edit" and old.session_id == s.id:  # (its own entry: done, and the researcher is told)
+            before = self._tool(old) if section == "tools" else old.text
             self._apply(p)
+            after = self._tool(p) if section == "tools" else text
             await self._post(p, f"✏️ <b>An agent updated its handbook entry {ref(p)}</b> ({esc(SECTIONS[section])})"
-                                f"\n<s>{esc(p.old)}</s>\n{esc(text)}" + (f"\n<i>why: {esc(why)}</i>" if why else ""),
+                                f"\n<s>{esc(before)}</s>\n{esc(after)}" + (f"\n<i>why: {esc(why)}</i>" if why else ""),
                              [[("↩️ Undo", f"hbu:{p.id}")]])
             return f"✓ {ref(p)} updated (your own entry: done; the researcher is told)."
         await self._post(p, self.card_text(p), [[("✅ Apply", f"hb:{p.id}"), ("✖ No", f"hbx:{p.id}")]])
@@ -164,15 +195,18 @@ class Handbook:
         head = {"add": f"add to {SECTIONS[p.section].lower()}", "edit": f"change {ref(p)}",
                 "remove": f"remove {ref(p)}"}[p.action]
         old = self.store.get_handbook(p.target) if p.target else None
-        body = (f"<code>{esc(p.name)}</code> runs <code>{esc(p.command)}</code>: " if p.section == "tools" else "") \
-            + esc(p.text)
         lines = [f"📖 <b>Handbook: {esc(head)}</b> · from an agent"]
-        if old and p.action == "edit":
-            lines.append(f"<s>{esc(old.text)}</s>")
-        if p.action == "remove" and old:
-            lines.append(f"<s>{esc(old.text)}</s>")
-        else:
-            lines.append(body)
+
+        def shown(h: HandbookRecord) -> str:
+            if h.section != "tools":
+                return esc(h.text)
+            where = self.agent.domain.handbook_place_text(place(h))
+            return (f"<code>{esc(h.name)}</code> runs <code>{esc(h.command)}</code>"
+                    + (f" <b>{esc(where)}</b>" if where else "") + f": {esc(h.text)}")
+        if old and p.action in ("edit", "remove"):
+            lines.append(f"<s>{shown(old)}</s>")
+        if p.action != "remove":
+            lines.append(shown(p))
         if p.why:
             lines.append(f"<i>why: {esc(p.why)}</i>")
         return "\n".join(lines)
@@ -193,13 +227,13 @@ class Handbook:
     def _apply(self, p: HandbookRecord) -> HandbookRecord:
         if p.action == "add":
             e = self.store.add_handbook(HandbookRecord(section=p.section, text=p.text, name=p.name,
-                                                       command=p.command, session_id=p.session_id))
+                                                       command=p.command, place=p.place, session_id=p.session_id))
             p.target = e.id
         else:
             e = self.store.get_handbook(p.target)
             if p.action == "edit":
-                p.old = e.text
-                e.text, e.command = p.text, p.command or e.command
+                p.old = json.dumps({"text": e.text, "command": e.command, "place": e.place})
+                e.text, e.command, e.place = p.text, p.command or e.command, p.place
             else:
                 e.status = "removed"
             self.store.save_handbook(e)
@@ -246,8 +280,11 @@ class Handbook:
         e = self.store.get_handbook(p.target) if p and p.status == "applied" and p.action == "edit" else None
         if not e or e.status != "active":
             return "This change can't be undone any more."
-        e.text = p.old
+        before = json.loads(p.old)
+        e.text, e.command, e.place = before["text"], before["command"], before["place"]
         self.store.save_handbook(e)
+        if e.section == "tools":
+            self._tools_changed()
         p.status = "undone"
         self.store.save_handbook(p)
         if p.session_id:
@@ -255,10 +292,11 @@ class Handbook:
         return f"↩️ {ref(p)} is back to: {esc(e.text)}"
 
     # ------------------------------------------------------------------ the researcher's changes (/handbook)
-    def add(self, section: str, text: str, name: str = "", command: str = "") -> HandbookRecord:
+    def add(self, section: str, text: str, name: str = "", command: str = "",
+            where: dict | None = None) -> HandbookRecord:
         self._check(section, text.strip(), name, command.strip())
         e = self.store.add_handbook(HandbookRecord(section=section, text=text.strip(), name=name,
-                                                   command=command.strip()))
+                                                   command=command.strip(), place=self._place(section, where)))
         if section == "tools":
             self._tools_changed()
         return e
@@ -280,4 +318,4 @@ class Handbook:
 
     def _tools_changed(self) -> None:
         """The domain makes the tools commands of their own, if it can (the HPC bot: on the login node)."""
-        self.agent.domain.handbook_tools([(h.name, h.command) for h in self.entries("tools")])
+        self.agent.domain.handbook_tools([(h.name, h.command, place(h)) for h in self.entries("tools")])

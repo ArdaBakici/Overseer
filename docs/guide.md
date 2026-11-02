@@ -246,6 +246,7 @@ The agent has `hpc-run`, which runs a command on a compute node and returns its 
 hpc-run --dir /scratch/me/rf-dreamer -- python plot_rewards.py      # on the shared worker node
 hpc-run --cpus 32 --mem 128G --time 120 -- python preprocess.py    # on a node of its own
 hpc-run --gpu -- python eval.py                                    # on a GPU node of its own
+hpc-run --partition preempt --gres gpu:a100:1 -- python eval.py     # any partition, GPU type, --qos
 hpc-run --status                                                   # the shared worker, and runs on nodes of their own
 hpc-run --stop                                                     # end the shared worker
 ```
@@ -255,7 +256,8 @@ hpc-run --stop                                                     # end the sha
 - **A node of its own** (`--cpus`, `--mem`, `--time`, `--gpu`): a job named `overseer-run-…`, which may have to wait in
   the queue. `hpc-run` says so at once (the job, its state and SLURM's reason), again every minute, and when it gets the
   node. If none comes within `slurm.compute.wait_minutes` (15), it cancels the request and suggests `sbatch` instead.
-  Like the worker, these jobs are never reported or registered as yours.
+  Like the worker, these jobs are never reported or registered as yours. Any partition works (`--partition`, with
+  `--gres` and `--qos`); on a preemptible one, a run SLURM takes back says it was preempted.
 - **Environment:** commands run in a login shell (modules and PATH as usual, plus `slurm.setup`), with `MPLBACKEND=Agg` so plots save without a display, and `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS` set to the CPUs SLURM gave (unless set): numpy and torch would otherwise start a thread per CPU of the whole node.
 - **Nothing hangs the agent:** `hpc-run` says which node it runs on. A command still running after
   `slurm.compute.return_after_minutes` (8, below the agents' tool timeouts) keeps running on its node: `hpc-run` returns
@@ -384,16 +386,20 @@ separate: what an HPC agent adds stays with the HPC bot). It has three parts:
 - **What agents learned:** facts about where they work, e.g. "jobs on the preempt partition don't count toward the
   GPU QOS limit, but can be requeued any time". An agent that finds one out adds it, so the next agent doesn't have to.
 - **Your rules:** e.g. "always submit with `--account=pi_lab`", "prefer h100 over a100 when both are free".
-- **Tools:** your scripts, with what they're for. On the HPC bot each becomes a command of the agents' own:
-  `numqueued [args]` runs `~/bin/numqueued.sh` on the login node (a login shell, 15 minutes at most - for quick
-  queries).
+- **Tools:** your scripts, with what they're for. Agents propose the ones they come across. On the HPC bot each
+  becomes a command of the agents' own, `<name> [args]`, that runs where its entry says:
+  - **the login node** (the default): a login shell, in its folder (`--dir`), 15 minutes at most - quick queries;
+  - **a compute node** (`--on compute`), through `hpc-run`: the shared worker, or a node of its own on any partition
+    (preemptible ones too) with a GPU and resources (`--partition`, `--gpu` / `--gres`, `--cpus`, `--mem`, `--time`,
+    `--qos`). The card shows where and with what before you approve it.
 
 **How it changes:**
 - **Agents propose** (`ov handbook add`, `tool`, `edit`, `remove`, with the evidence): you get a 📖 card with ✅ Apply / ✖ No,
   and the agent is told your answer.
 - **An agent's edit of its own entry** applies at once; you're told, with ↩️ Undo.
-- **You change it directly** with `/handbook`: `/handbook add rules <text>`, `/handbook tool numqueued ~/bin/numqueued.sh
-  -- my queued jobs per partition`, `/handbook edit H3 <text>`, `/handbook remove H3`; `/handbook` shows it.
+- **You change it directly** with `/handbook`: `/handbook add rules <text>`, `/handbook tool <name> [--dir D]
+  [--compute --partition P --gpu --cpus N ...] <command> -- <what it's for>`, `/handbook edit H3 <text>`,
+  `/handbook remove H3`; `/handbook` shows it.
 - **Conversations already going** get the change with their next request. Entries stay short (it's in every prompt):
   past 8 KB, agents are asked to condense it. Project matters stay in the project's `OVERSEER.md`, results in
   `ov result`, long how-tos in skills.

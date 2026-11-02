@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS handbook (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     section TEXT, text TEXT, name TEXT DEFAULT '', command TEXT DEFAULT '', status TEXT, action TEXT DEFAULT '',
     target INTEGER DEFAULT 0, old TEXT DEFAULT '', why TEXT DEFAULT '', session_id TEXT, refs TEXT DEFAULT '{}',
-    created REAL, updated REAL
+    created REAL, updated REAL, place TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS skills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -337,6 +337,7 @@ class HandbookRecord:
     text: str  # a tool: what it's for (and when to use it)
     name: str = ""  # a tool's command name
     command: str = ""  # a tool: what it runs
+    place: str = ""  # a tool: where it runs (JSON: on, dir, partition, gpu, gres, cpus, mem, time, qos); "" = default
     status: str = "active"  # entries: active | removed; proposals: proposed | applied | declined | undone
     action: str = ""  # a proposal: add | edit | remove
     target: int = 0  # edit / remove: the entry

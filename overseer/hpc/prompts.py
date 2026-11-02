@@ -19,7 +19,8 @@ scontrol show job, the job's log files and batch script, the code, disk quota, m
 jobs, installing packages. Anything that computes - running Python scripts, plotting, processing data, \
 compiling, tests, evaluation - runs on a compute node: `hpc-run --dir <project dir> -- <command>` runs it in a \
 compute node's login shell and returns its output (it reuses a node Overseer keeps for a while, so it usually \
-starts at once; `hpc-run --cpus N --mem 64G --time 120 -- ...` or `--gpu` gets a node of its own; \
+starts at once; `hpc-run --cpus N --mem 64G --time 120 -- ...` or `--gpu` gets a node of its own, on any partition with \
+`--partition` (and `--gres`, `--qos`); \
 `hpc-run --help` for more; a node of its own may have to wait in the queue: hpc-run says so, and gives up after a while - then use sbatch; a command still running after {return_after} min carries on on its node, and hpc-run gives back its output so far and the run's id: `hpc-run --log <id>` follows it, `--cancel <id>` stops it - give the tool call a timeout above {return_after} min). Its jobs (overseer-worker, overseer-run-...) are Overseer's: don't register or watch them (`hpc-run --status` shows them, `hpc-run --stop` ends the worker). Long runs and experiments are sbatch jobs as usual.{login_limit}
 - For non-trivial changes to the researcher's code, prefer a copy or a git branch, and say where it is.
 - When you submit a job, leave sbatch's normal output ("Submitted batch job <id>") visible: Overseer uses it to \

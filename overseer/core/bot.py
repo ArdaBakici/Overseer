@@ -1668,7 +1668,8 @@ class Bot:
             return
         args = list(ctx.args or [])
         sub = args[0].lower() if args else "list"
-        usage = ("/handbook · /handbook add notes|rules &lt;text&gt; · /handbook tool &lt;name&gt; &lt;command&gt; -- "
+        usage = ("/handbook · /handbook add notes|rules &lt;text&gt; · /handbook tool &lt;name&gt; [--dir D] [--compute "
+                 "[--partition P] [--gpu | --gres G] [--cpus N] [--mem M] [--time MIN] [--qos Q]] &lt;command&gt; -- "
                  "&lt;what it's for&gt; · /handbook edit H3 &lt;text&gt; · /handbook remove H3")
         try:
             if sub == "list":
@@ -1678,7 +1679,18 @@ class Bot:
                 e = hb.add(args[1].lower(), " ".join(args[2:]))
             elif sub == "tool" and "--" in args and args.index("--") >= 3:
                 cut = args.index("--")
-                e = hb.add("tools", " ".join(args[cut + 1:]), name=args[1].lower(), command=" ".join(args[2:cut]))
+                where, i = {}, 2  # (its options first, then the command)
+                while i < cut and args[i].startswith("--"):
+                    key = args[i][2:]
+                    if key in ("gpu", "compute"):
+                        where["gpu" if key == "gpu" else "on"] = True if key == "gpu" else "compute"
+                        i += 1
+                    elif key in ("on", "dir", "partition", "gres", "cpus", "mem", "time", "qos") and i + 1 < cut:
+                        where[key], i = args[i + 1], i + 2
+                    else:
+                        raise ValueError(f"unknown option {args[i]}")
+                e = hb.add("tools", " ".join(args[cut + 1:]), name=args[1].lower(), command=" ".join(args[i:cut]),
+                           where=where)
             elif sub == "edit" and len(args) >= 3:
                 e = hb.edit(args[1], " ".join(args[2:]))
             elif sub in ("remove", "rm") and len(args) == 2:

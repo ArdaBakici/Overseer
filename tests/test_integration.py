@@ -751,13 +751,13 @@ async def test_the_handbook_what_one_agent_learns_every_agent_knows(env, tmp_pat
     assert not (await env.ctl.handle(token, ["handbook", "add", "secrets", "x"]))[0]  # (no such section)
 
     # A tool: a command of the agents' own, on the login node; gone with its entry.
-    ok, text = await env.ctl.handle(token, ["handbook", "tool", "numqueued", "--command", "~/bin/numqueued.sh",
+    ok, text = await env.ctl.handle(token, ["handbook", "tool", "queue-report", "--command", "~/bin/qreport.sh",
                                             "--about", "how many of my jobs are queued per partition"])
     assert ok and "proposed" in text
     await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
-    wrapper = agent_bin_dir(env.cfg) / "numqueued"
-    assert wrapper.exists() and "timeout 900" in wrapper.read_text() and "~/bin/numqueued.sh" in wrapper.read_text()
-    assert "`numqueued [args]`: how many of my jobs are queued per partition" in env.agent.system_prompt(a.id)
+    wrapper = agent_bin_dir(env.cfg) / "queue-report"
+    assert wrapper.exists() and "timeout 900" in wrapper.read_text() and "~/bin/qreport.sh" in wrapper.read_text()
+    assert "`queue-report [args]`: how many of my jobs are queued per partition" in env.agent.system_prompt(a.id)
     assert not (await env.ctl.handle(token, ["handbook", "tool", "ls", "--command", "x", "--about", "y"]))[0]
     hb.remove(f"H{hb.entries('tools')[0].id}")
     assert not wrapper.exists()
@@ -765,9 +765,74 @@ async def test_the_handbook_what_one_agent_learns_every_agent_knows(env, tmp_pat
     bin_dir.mkdir()
     (bin_dir / "ssh").write_text("#!/bin/sh\nfor last; do :; done\nexec bash -c \"$last\"\n")
     (bin_dir / "ssh").chmod(0o755)
-    write_handbook_tools(env.cfg, bin_dir, [("numqueued", "echo QUEUED")], _write)
-    out = subprocess.run([str(bin_dir / "numqueued"), "gpu partition"], capture_output=True, text=True, timeout=30)
+    write_handbook_tools(env.cfg, bin_dir, [("queue-report", "echo QUEUED", {})], _write)
+    out = subprocess.run([str(bin_dir / "queue-report"), "gpu partition"], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0 and out.stdout.strip() == "QUEUED gpu partition", (out.stdout, out.stderr)
+
+
+async def test_handbook_tools_on_compute_nodes_of_any_partition(env, tmp_path):
+    """A tool runs where it's placed: the login node (in its --dir), the shared worker, or a node of its own on any
+    partition (preemptible ones too) with a GPU and resources - through hpc-run. The card shows where and with what;
+    an agent moves its own tool to a compute node at once; a preempted run says so."""
+    import subprocess
+    from overseer.core.handbook import Handbook
+    from overseer.hpc.compute import write_handbook_tools
+    from overseer.hpc.sshlink import _write, agent_bin_dir
+    await make_autopilot(env)
+    hb = Handbook(env.store, env.agent, env.notifier)
+    s = env.agent.general_session()
+    token = env.ctl.open(s.id)
+    ok, text = await env.ctl.handle(token, [
+        "handbook", "tool", "eval-ckpt", "--command", "uv run python eval.py", "--about", "evaluate a checkpoint",
+        "--on", "compute", "--partition", "preempt", "--gpu", "--cpus", "8", "--mem", "32G", "--time", "60",
+        "--dir", "/scratch/me/proj"])
+    assert ok, text
+    card = env.notifier.sent[-1].text
+    assert ("<b>on a compute node in /scratch/me/proj: partition preempt, 1 GPU, 8 CPUs, 32G, 60 min</b>" in card), card
+    await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
+    line = next(x for x in env.agent.system_prompt(s.id).splitlines() if "`eval-ckpt [args]`" in x)
+    assert "on a compute node in /scratch/me/proj: partition preempt" in line and "may wait in the queue" in line
+    wrapper = (agent_bin_dir(env.cfg) / "eval-ckpt").read_text()
+    assert "hpc-run" in wrapper and "'--partition', 'preempt'" in wrapper and "'--gpu'" in wrapper
+    for bad in (["--on", "login", "--partition", "gpu"], ["--mem", "lots"], ["--cpus", "0"]):
+        ok, text = await env.ctl.handle(token, ["handbook", "tool", "bad-one", "--command", "x", "--about", "y", *bad])
+        assert not ok, (bad, text)
+
+    # Its own login tool, moved to a compute node: at once, the researcher told.
+    ok, _ = await env.ctl.handle(token, ["handbook", "tool", "plot-runs", "--command", "python plot.py",
+                                         "--about", "plot the runs"])
+    await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
+    h = next(e for e in hb.entries("tools") if e.name == "plot-runs")
+    ok, text = await env.ctl.handle(token, ["handbook", "edit", f"H{h.id}", "--on", "compute", "--cpus", "4"])
+    assert ok and "done" in text, text
+    assert "on a compute node: 4 CPUs" in env.notifier.sent[-1].text and "<s>" in env.notifier.sent[-1].text
+    assert "'--cpus', '4'" in (agent_bin_dir(env.cfg) / "plot-runs").read_text()
+
+    # What they do: through the stand-in HPC (hpc-run and the fake SLURM run them here).
+    run = hpc_run_tool(env, tmp_path, cpus=8, wait_minutes=0.05)
+    bin_dir = tmp_path / "bin"
+    work = tmp_path / "work"
+    work.mkdir()
+    write_handbook_tools(env.cfg, bin_dir, [
+        ("where-am-i", "pwd", {"dir": str(work)}),
+        ("on-worker", "echo WORKER $SLURM_CPUS_PER_TASK", {"on": "compute"}),
+        ("gpu-eval", "echo EVAL", {"on": "compute", "partition": "preempt", "gpu": True, "cpus": 2})], _write)
+
+    def tool(name, *args):
+        return subprocess.run([str(bin_dir / name), *args], capture_output=True, text=True, timeout=60)
+    assert tool("where-am-i").stdout.strip() == str(work)
+    p = tool("on-worker")
+    assert p.returncode == 0 and p.stdout.strip() == "WORKER 8", (p.stdout, p.stderr)
+    p = tool("gpu-eval", "step 100")
+    assert p.returncode == 0 and p.stdout.strip() == "EVAL step 100", (p.stdout, p.stderr)
+    step = env.slurm()["steps"][-1]
+    assert step[step.index("-p") + 1] == "preempt" and "--gres=gpu:1" in step and step[step.index("-c") + 1] == "2"
+    st = env.slurm()
+    st["srun_preempt"] = True
+    (tmp_path / "slurm.json").write_text(json.dumps(st))
+    p = tool("gpu-eval")
+    assert p.returncode != 0 and "was preempted" in p.stderr and "partition preempt" in p.stderr, p.stderr
+    assert run("--status").returncode == 0
 
 
 async def test_runs_have_no_time_limit_unless_one_is_set(env):

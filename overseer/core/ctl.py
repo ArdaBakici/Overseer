@@ -118,11 +118,13 @@ def _parser(ext=None) -> _Parser:
     a.add_argument("--command", required=True)
     a.add_argument("--about", required=True)
     a.add_argument("--why", default="")
+    _placement(a)
     a = hb.add_parser("edit", add_help=False)
     a.add_argument("ref")
-    a.add_argument("text", nargs="+")
+    a.add_argument("text", nargs="*")
     a.add_argument("--command", default="")
     a.add_argument("--why", default="")
+    _placement(a)
     a = hb.add_parser("remove", add_help=False)
     a.add_argument("ref")
     a.add_argument("--why", default="")
@@ -162,6 +164,22 @@ def _parser(ext=None) -> _Parser:
     return p
 
 
+PLACEMENT = ("on", "dir", "partition", "gpu", "gres", "cpus", "mem", "time", "qos")
+
+
+def _placement(a) -> None:
+    """Where a handbook tool runs (the domain says what it accepts)."""
+    a.add_argument("--on", choices=["login", "compute"])
+    a.add_argument("--dir")
+    a.add_argument("--partition")
+    a.add_argument("--gpu", action="store_true")
+    a.add_argument("--gres")
+    a.add_argument("--cpus")
+    a.add_argument("--mem")
+    a.add_argument("--time")
+    a.add_argument("--qos")
+
+
 HELP = """ov - talk to Overseer (the system that runs you and reports to the researcher on Telegram)
 
   ov project list | new <name> --dir <folder> [--about "..."] [--move-here] | set <name> ... | archive <name>
@@ -180,7 +198,8 @@ Feedback about Overseer itself (what limited you; shown in the researcher's 🛠
   ov feedback list [--all]         ov feedback +1 FB7
 The handbook (shared by every agent of this bot; the researcher approves changes, except edits of your own entries):
   ov handbook [list]               ov handbook add notes|rules "<text>" [--why "<evidence>"]
-  ov handbook tool <name> --command "<command>" --about "<what for, when>"
+  ov handbook tool <name> --command "<command>" --about "<what for, when>" [--dir <folder>]
+      [--on compute [--partition P] [--gpu | --gres gpu:<type>:1] [--cpus N] [--mem 32G] [--time <min>] [--qos Q]]
   ov handbook edit H3 "<text>" [--why ...]       ov handbook remove H3 --why "..."
 Skills (know-how for agents, installed once the researcher approves):
   ov skill propose skill.md [--all]   ov skill list | show <name>
@@ -372,12 +391,13 @@ class ControlServer:
         if action == "add":
             return await hb.propose(session, "add", section=args.section.lower(), text=" ".join(args.text),
                                     why=args.why)
+        where = {k: getattr(args, k, None) for k in PLACEMENT}
         if action == "tool":
             return await hb.propose(session, "add", section="tools", text=args.about, name=args.name.lower(),
-                                    command=args.command, why=args.why)
+                                    command=args.command, why=args.why, where=where)
         if action == "edit":
             return await hb.propose(session, "edit", text=" ".join(args.text), command=args.command,
-                                    target=args.ref, why=args.why)
+                                    target=args.ref, why=args.why, where=where)
         return await hb.propose(session, "remove", target=args.ref, why=args.why)
 
     def _addons(self):

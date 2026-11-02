@@ -96,6 +96,8 @@ USAGE = """
   hpc-run [--dir DIR] -- COMMAND...                 on the shared worker node (started if needed)
   hpc-run --cpus 32 --mem 128G --time 120 -- ...    on a node of its own with these resources
   hpc-run --gpu [--time 60] -- ...                  on a GPU node of its own
+  hpc-run --partition preempt [--gres gpu:a100:1] [--qos Q] [--cpus/--mem/--time] -- ...
+                                                    on a node of any partition (preemptible ones too)
   hpc-run --status                                  the shared worker, and runs waiting for or on a node
   hpc-run --log ID / --cancel ID                    a run that was still going: the rest of its output / stop it
   hpc-run --stop                                    end the shared worker
@@ -119,6 +121,9 @@ p.add_argument("--cpus", type=int)
 p.add_argument("--mem", help="e.g. 64G")
 p.add_argument("--time", type=int, help="minutes")
 p.add_argument("--gpu", action="store_true")
+p.add_argument("--partition", help="any partition (default: slurm.compute's, or its GPU one with --gpu)")
+p.add_argument("--gres", help="e.g. gpu:a100:1 (with --gpu: slurm.compute.gpu_gres)")
+p.add_argument("--qos")
 p.add_argument("--status", action="store_true", help="show the shared worker and the runs waiting or running")
 p.add_argument("--stop", action="store_true", help="end the shared worker")
 p.add_argument("--log", metavar="ID", help="a run that was still going: its output since you last looked, and its end")
@@ -219,15 +224,19 @@ LAUNCH = ('setsid bash -c \'D=$1; F=$2; shift 2; echo $$ > "$D/pid"; '
           '"$@" > "$D/out" 2>&1 < /dev/null; echo $? > "$D/rc"; [ -n "$HB" ] && kill $HB\' _ "$D" ')
 
 WAIT = int(C["wait_minutes"] * 60)
-if a.gpu or a.cpus or a.mem or a.time:  # an allocation of its own
+if a.gpu or a.cpus or a.mem or a.time or a.partition or a.gres or a.qos:  # an allocation of its own
     # srun waits for it without a word while it's queued: say what SLURM says (the job, its state and why it waits)
     # until the node is there - or give up after the wait, cancelling the request.
-    part = C["gpu_partition"] if a.gpu else C["partition"]
+    part = a.partition or (C["gpu_partition"] if a.gpu or a.gres else C["partition"])
+    gres = a.gres or (C["gpu_gres"] if a.gpu else "")
     opts = ["-p", q(part), "-c", str(a.cpus or C["cpus"]), "--mem", q(a.mem or C["mem"]), "-t", str(a.time or 60),
             "--ntasks=1", "--quiet", extra]
-    if a.gpu:
-        opts.append("--gres=" + q(C["gpu_gres"]))
-    what = "%s, %s CPU(s), %s, %s min" % (part, a.cpus or C["cpus"], a.mem or C["mem"], a.time or 60)
+    if gres:
+        opts.append("--gres=" + q(gres))
+    if a.qos:
+        opts.append("--qos=" + q(a.qos))
+    what = "%s%s, %s CPU(s), %s, %s min" % (part, ", " + gres if gres else "", a.cpus or C["cpus"],
+                                           a.mem or C["mem"], a.time or 60)
     script = RUNS + """
 new_run
 NAME=@@RUN-$ID; echo "$NAME" > "$D/name"
@@ -260,6 +269,12 @@ EOF_
 done
 trap - INT TERM HUP
 follow "$D"; rc=$?
+[ $rc -ne 0 ] && [ -z "$JOB" ] && JOB=$(sacct -n -X -P --name "$NAME" -o JobID 2>/dev/null | head -n1 | cut -d"|" -f1)
+if [ $rc -ne 0 ] && [ $rc -ne 124 ] && [ -n "$JOB" ] \
+    && sacct -n -X -P -j "$JOB" -o State 2>/dev/null | grep -qE "PREEMPT|REQUEUE"; then
+  echo "[hpc-run] job $JOB was preempted: SLURM took its node back (partition @@PART). Run it again, or on a partition that isn't preemptible." >&2
+  exit $rc
+fi
 if [ -n "$said" ] && [ -z "$got" ] && [ $rc -ne 124 ]; then  # (it got its node and finished between two looks)
   [ $rc -eq 0 ] && echo "[hpc-run] got a node after $((SECONDS / 60)) min (job $JOB)" >&2 \
     || echo "[hpc-run] job $JOB ended with exit code $rc" >&2
@@ -268,7 +283,7 @@ exit $rc
 """
     for key, value in [("RUN", RUN_NAME), ("OPTS", " ".join(x for x in opts if x)), ("INNER", q(inner)),
                        ("WAIT_MIN", "%g" % C["wait_minutes"]), ("WAIT", str(WAIT)), ("WHAT", what),
-                       ("LAUNCH", LAUNCH)]:
+                       ("LAUNCH", LAUNCH), ("PART", part)]:
         script = script.replace("@@" + key, value)
     sys.exit(remote(script))
 
@@ -314,21 +329,37 @@ sys.exit(remote(script))
 
 TOOL_MARK = "# overseer handbook tool"  # (in each tool command: the ones gone from the handbook are removed)
 TOOL = r'''#!@PYTHON@ -I
-@MARK@: @NAME@ - the researcher's tool, run on the HPC's login node (at most 15 minutes)
+@MARK@: @NAME@ - the researcher's tool, @WHERE@
 import shlex, subprocess, sys
 cmd = @COMMAND@ + "".join(" " + shlex.quote(a) for a in sys.argv[1:])
-sys.exit(subprocess.call([@SSH@, @HOST@, "bash -lc " + shlex.quote(@SETUP@ + "timeout 900 bash -c " + shlex.quote(cmd))]))
+DIR, HPC_RUN = @DIR@, @HPC_RUN@
+if HPC_RUN:  # a compute node: through hpc-run (its queue, resources and give-back-after)
+    sys.exit(subprocess.call(HPC_RUN + (["--dir", DIR] if DIR else []) + ["--", "bash", "-c", cmd]))
+here = ("cd " + shlex.quote(DIR) + " && ") if DIR else ""
+sys.exit(subprocess.call([@SSH@, @HOST@, "bash -lc " + shlex.quote(@SETUP@ + here + "timeout 900 bash -c "
+                                                                  + shlex.quote(cmd))]))
 '''
 
 
-def write_handbook_tools(cfg: Config, bin_dir: Path, tools: list[tuple[str, str]], write) -> None:
+def write_handbook_tools(cfg: Config, bin_dir: Path, tools: list[tuple[str, str, dict]], write) -> None:
     """The handbook's tools as commands of the agent's: each runs its command on the login node through the agent's
-    ssh (so in a login shell, with slurm.setup). The ones no longer in the handbook are removed."""
+    ssh (a login shell, with slurm.setup, 15 minutes at most) - or, placed on a compute node, through hpc-run, with
+    its partition and resources. The ones no longer in the handbook are removed."""
     setup = cfg.slurm.setup.strip()
     names = set()
-    for name, command in tools:
+    for name, command, place in tools:
         names.add(name)
+        hpc_run = None
+        if place.get("on") == "compute":
+            hpc_run = [str(bin_dir / "hpc-run")]
+            for key in ("partition", "gres", "cpus", "mem", "time", "qos"):
+                if place.get(key):
+                    hpc_run += [f"--{key}", str(place[key])]
+            if place.get("gpu") and not place.get("gres"):
+                hpc_run.append("--gpu")
         write(bin_dir / name, _fill(TOOL, python=sys.executable, mark=TOOL_MARK, name=name, command=repr(command),
+                                    where="on a compute node (hpc-run)" if hpc_run else "on the HPC's login node",
+                                    dir=repr(place.get("dir") or ""), hpc_run=repr(hpc_run),
                                     ssh=repr(str(bin_dir / "ssh")), host=repr(cfg.ssh.host),
                                     setup=repr(f"{setup}; " if setup else "")), 0o700)
     for f in bin_dir.iterdir() if bin_dir.is_dir() else []:

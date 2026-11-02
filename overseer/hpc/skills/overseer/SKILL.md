@@ -214,15 +214,22 @@ this cluster behaves - goes in the handbook (`## Handbook` in your instructions)
 in its instructions:
 
 ```bash
-ov handbook add notes "Jobs on the preempt partition don't count toward the GPU QOS limit; they can be requeued any time." --why "sacct: 12 GPUs in use, limit 8"
-ov handbook tool numqueued --command "~/bin/numqueued.sh" --about "my queued jobs per partition: before submitting many"
+ov handbook add notes "<one fact, and when it holds>" --why "<the command output that shows it>"
+ov handbook tool <name> --command "~/bin/<script>.sh" --about "<what it's for, when to use it>"     # login node
+ov handbook tool <name> --command "uv run python <script>.py" --about "..." --dir <project folder> \
+    --on compute [--partition <any, preemptible too>] [--gpu | --gres gpu:<type>:1] [--cpus N] [--mem 32G] [--time 60]
 ov handbook edit H3 "..."        # your own entry: at once (the researcher is told); someone else's: a proposal
-ov handbook remove H3 --why "the limit changed in March"
+ov handbook edit H3 --on compute --cpus 8    # move a tool, or change its resources (text stays)
+ov handbook remove H3 --why "<why it's wrong or stale>"
 ov handbook                      # the entries, and what waits for the researcher
 ```
 
-An approved tool is a command of yours (`numqueued [args]`): it runs on the HPC's login node, in a login shell, for
-15 minutes at most - for quick queries, not computation.
+Propose a tool when you come across a script of the researcher's that other agents should use (look in their bin
+folders and project folders). Once approved it's a command of yours, `<name> [args]`:
+- **on the login node** (the default): a login shell, in `--dir` if given, 15 minutes at most - quick queries;
+- **on a compute node** (`--on compute`): through `hpc-run` - the shared worker, or with a partition or resources a
+  node of its own (it may wait in the queue; past 8 minutes it gives back the output so far, `hpc-run --log <id>` for
+  the rest; on a preemptible partition it can be preempted, and says so). Work of hours is an sbatch job, not a tool.
 
 - **The frontmatter holds only `name` and `description`.** Any other field is refused, because it could change what
   agents may do.

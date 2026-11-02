@@ -75,6 +75,8 @@ elif prog == "sacct":
     for jid, j in jobs.items():
         if sel and jid != sel and jid.split("_")[0] != sel:  # like sacct: an array's id lists its tasks
             continue
+        if opt("--name") and j.get("name") != opt("--name"):
+            continue
         if not sel and j.get("ended_long_ago"):  # outside `sacct -S now-N`'s window
             continue
         if "-X" in args:
@@ -160,6 +162,12 @@ elif prog == "srun":
                 sys.exit(1)
         st = load()
         st["jobs"][jid]["state"] = "RUNNING"
+        st["jobs"][jid]["partition"] = opt("-p") or ""
+        if st.get("srun_preempt"):  # (a preemptible partition: SLURM takes the node back)
+            st["jobs"][jid]["state"] = "PREEMPTED"
+            save(st)
+            print(f"srun: error: job {jid} preempted", file=sys.stderr)
+            sys.exit(1)
         save(st)
         jobs = st["jobs"]
     st.setdefault("steps", []).append(args)  # hpc-run: run the command here, as if on the node

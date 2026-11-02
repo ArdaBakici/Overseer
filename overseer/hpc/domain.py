@@ -251,11 +251,63 @@ class HpcDomain(Domain):
 
     # ------------------------------------------------------------------ instructions
     # ------------------------------------------------------------------ the handbook's tools (core/handbook.py)
-    def handbook_tool(self, name: str, command: str, about: str) -> str:
-        return (f"`{name} [args]`: {about} (a command of yours here: runs `{command}` on the HPC's login node, "
-                "args passed on, 15 min at most)")
+    def handbook_tool(self, name: str, command: str, about: str, place: dict) -> str:
+        where = self.handbook_place_text(place)
+        line = f"`{name} [args]`: {about} (a command of yours here: runs `{command}` {where}, args passed on"
+        if place.get("on") == "compute":
+            return line + (f"; it may wait in the queue, and past {self.cfg.slurm.compute.return_after_minutes:g} min "
+                           "it gives back the output so far and carries on - `hpc-run --log <id>` for the rest)")
+        return line + ")"
 
-    def handbook_tools(self, tools: list[tuple[str, str]]) -> None:
+    def handbook_place(self, opts: dict) -> dict:
+        """--on login|compute, --dir, and for a compute node: --partition (any: preemptible ones too), --gpu / --gres,
+        --cpus, --mem, --time (minutes), --qos. A resource or partition means a compute node."""
+        allowed = {"on", "dir", "partition", "gpu", "gres", "cpus", "mem", "time", "qos"}
+        if set(opts) - allowed:
+            raise ValueError(f"unknown: {', '.join(sorted(set(opts) - allowed))}")
+        out = dict(opts)
+        compute = set(out) - {"on", "dir"}
+        if out.get("on") == "login" and compute:
+            raise ValueError("--on login takes no partition or resources: those are for --on compute")
+        if out.get("on") not in (None, "login", "compute"):
+            raise ValueError("--on login | compute")
+        if compute:
+            out["on"] = "compute"
+        word = re.compile(r"^[A-Za-z0-9_.:+-]{1,64}$")
+        for k in ("partition", "gres", "qos"):
+            if k in out and not word.match(str(out[k])):
+                raise ValueError(f"--{k}: a name like gpu, preempt or gpu:a100:1")
+        if "mem" in out and not re.match(r"^\d+[KMGT]?$", str(out["mem"])):
+            raise ValueError("--mem: e.g. 32G")
+        for k in ("cpus", "time"):
+            if k in out and (not str(out[k]).isdigit() or int(out[k]) < 1):
+                raise ValueError(f"--{k}: a whole number ({'minutes' if k == 'time' else 'CPUs'})")
+            if k in out:
+                out[k] = int(out[k])
+        if "dir" in out and ("\n" in str(out["dir"]) or not str(out["dir"]).strip()):
+            raise ValueError("--dir: a folder on the HPC")
+        if out.get("on") == "login":
+            del out["on"]  # (the default)
+        return out
+
+    def handbook_place_text(self, place: dict) -> str:
+        where = f" in {place['dir']}" if place.get("dir") else ""
+        if place.get("on") != "compute":
+            return "on the HPC's login node" + where + " (15 min at most)"
+        res = [f"partition {place['partition']}" if place.get("partition") else "",
+               place.get("gres") or ("1 GPU" if place.get("gpu") else ""),
+               f"{place['cpus']} CPUs" if place.get("cpus") else "", place.get("mem", ""),
+               f"{place['time']} min" if place.get("time") else "", f"qos {place['qos']}" if place.get("qos") else ""]
+        res = [r for r in res if r]
+        return "on a compute node" + where + (": " + ", ".join(res) if res else " (the shared worker)")
+
+    def handbook_tool_options(self) -> str:
+        return (" - it runs on the login node (15 min at most), or with `--on compute` on a compute node through "
+                "hpc-run (the shared worker; or a node of its own with `--partition <any, preemptible too>`, `--gpu` "
+                "or `--gres gpu:<type>:1`, `--cpus N`, `--mem 32G`, `--time <min>`, `--qos Q`), `--dir <folder>` "
+                "where it runs. Work of hours is a job (sbatch), not a tool")
+
+    def handbook_tools(self, tools: list[tuple[str, str, dict]]) -> None:
         from .compute import write_handbook_tools
         from .sshlink import _write, agent_bin_dir
         write_handbook_tools(self.cfg, agent_bin_dir(self.cfg), tools, _write)
