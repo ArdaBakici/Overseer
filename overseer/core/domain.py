@@ -112,6 +112,19 @@ class Domain:
         return ("Look at what woke you and decide the next step. If you need the researcher's decision, ask; if "
                 "nothing is left to do, say so and set no more wake-ups.")
 
+    # ------------------------------------------------------------------ the handbook (handbook.py)
+    def handbook_tool(self, name: str, command: str, about: str) -> str:
+        """A tool's line in the agents' handbook."""
+        return f"`{command}` ({name}): {about}"
+
+    def handbook_tools(self, tools: list[tuple[str, str]]) -> None:
+        """The handbook's tools (name, command) changed: e.g. make them commands of their own."""
+
+    def command_taken(self, name: str) -> bool:
+        """A handbook tool can't take this name (a command that exists)."""
+        import shutil
+        return name == "ov" or shutil.which(name) is not None
+
     def ledger_context(self, project: str | None, session_id: str | None = None) -> str:
         """What the domain keeps about a project's progress (e.g. the HPC's results and findings), for prompts."""
         return ""

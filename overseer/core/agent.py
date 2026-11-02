@@ -328,6 +328,7 @@ class Agent:
         self.subagents = None  # set by Subagents(...): planner mode
         self.feedback = None  # set by Feedback(...): agents' feedback about Overseer, and its review
         self.addons = None  # set by Addons(...): skills agents proposed and the researcher approved
+        self.handbook = None  # set by Handbook(...): what agents learned, the researcher's rules and tools
         self.ctl = None  # set by ControlServer(...): the agent's `ov` command
         self.updating = False  # the CLIs are being updated (update_clis)
         self.shutting_down = False  # Overseer is stopping: runs cut off now are offered again at the next start
@@ -739,6 +740,8 @@ class Agent:
     def system_prompt(self, session_id: str | None = None) -> str:
         sess = self.get(session_id)
         prompt = self.domain.system_prompt(sess)
+        if self.handbook and self.ctl:  # (shared by the bot's agents: every conversation)
+            prompt += self.handbook.section()
         if self.ctl and self.subagents and sess and sess.rec.role != "reviewer" and self.domain.planner:
             prompt += self._subagent_section(sess)
         if sess and sess.rec.role == "reviewer":

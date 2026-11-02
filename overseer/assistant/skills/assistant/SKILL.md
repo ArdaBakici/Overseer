@@ -219,4 +219,7 @@ ov history day                         # every conversation of today, condensed 
 ov history search "flight to Berlin"   # past conversations (and notes)
 ov notify "text"                       # a message to the user now, before your reply
 ov feedback "what limited you"         # about Overseer itself
+ov handbook add notes "<a fact every agent of this bot should know>" --why "..."   # shared, once approved
+ov handbook tool <name> --command "<command>" --about "<what for>"   # the researcher's tools
+ov handbook edit H3 "..." | remove H3 --why "..." | ov handbook        # (## Handbook in your instructions)
 ```

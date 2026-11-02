@@ -209,6 +209,21 @@ ov skill list                    # installed skills, and proposals waiting for t
 ov skill show cluster-long-jobs
 ```
 
+A skill is for know-how worth a page. A single fact every agent should know - how a partition, a limit or a tool on
+this cluster behaves - goes in the handbook (`## Handbook` in your instructions), which every agent of this bot has
+in its instructions:
+
+```bash
+ov handbook add notes "Jobs on the preempt partition don't count toward the GPU QOS limit; they can be requeued any time." --why "sacct: 12 GPUs in use, limit 8"
+ov handbook tool numqueued --command "~/bin/numqueued.sh" --about "my queued jobs per partition: before submitting many"
+ov handbook edit H3 "..."        # your own entry: at once (the researcher is told); someone else's: a proposal
+ov handbook remove H3 --why "the limit changed in March"
+ov handbook                      # the entries, and what waits for the researcher
+```
+
+An approved tool is a command of yours (`numqueued [args]`): it runs on the HPC's login node, in a login shell, for
+15 minutes at most - for quick queries, not computation.
+
 - **The frontmatter holds only `name` and `description`.** Any other field is refused, because it could change what
   agents may do.
 - **Keep it focused:** one subject, under 30 KB, written for an agent that has never seen this cluster.

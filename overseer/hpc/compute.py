@@ -312,6 +312,34 @@ sys.exit(remote(script))
 '''
 
 
+TOOL_MARK = "# overseer handbook tool"  # (in each tool command: the ones gone from the handbook are removed)
+TOOL = r'''#!@PYTHON@ -I
+@MARK@: @NAME@ - the researcher's tool, run on the HPC's login node (at most 15 minutes)
+import shlex, subprocess, sys
+cmd = @COMMAND@ + "".join(" " + shlex.quote(a) for a in sys.argv[1:])
+sys.exit(subprocess.call([@SSH@, @HOST@, "bash -lc " + shlex.quote(@SETUP@ + "timeout 900 bash -c " + shlex.quote(cmd))]))
+'''
+
+
+def write_handbook_tools(cfg: Config, bin_dir: Path, tools: list[tuple[str, str]], write) -> None:
+    """The handbook's tools as commands of the agent's: each runs its command on the login node through the agent's
+    ssh (so in a login shell, with slurm.setup). The ones no longer in the handbook are removed."""
+    setup = cfg.slurm.setup.strip()
+    names = set()
+    for name, command in tools:
+        names.add(name)
+        write(bin_dir / name, _fill(TOOL, python=sys.executable, mark=TOOL_MARK, name=name, command=repr(command),
+                                    ssh=repr(str(bin_dir / "ssh")), host=repr(cfg.ssh.host),
+                                    setup=repr(f"{setup}; " if setup else "")), 0o700)
+    for f in bin_dir.iterdir() if bin_dir.is_dir() else []:
+        if f.name not in names and f.is_file():
+            try:
+                if TOOL_MARK in f.read_text(errors="replace")[:200]:
+                    f.unlink()
+            except OSError:
+                pass
+
+
 def write_agent_tools(cfg: Config, bin_dir: Path, real_ssh: str, write) -> None:
     """Write the agent's ssh wrapper (with the login-node CPU limit) and hpc-run."""
     c = cfg.slurm.compute

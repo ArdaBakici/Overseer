@@ -4,7 +4,7 @@ The full guide to the HPC bot, once it's [set up](setup.md). For a quick overvie
 what the agent may and may not do, [security.md](security.md); for the personal assistant bot,
 [assistant.md](assistant.md).
 
-**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Stuck runs](#a-run-that-seems-stuck) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
+**Contents:** [Commands](#commands) · [Writing while it works](#writing-while-the-agent-works) · [Reply footer](#the-reply-footer-tokens-model-and-cost) · [Monitoring jobs](#monitoring-jobs) · [Job cards](#job-cards-and-the-jobs-topics) · [Metrics and alerts](#what-matters-in-a-job-the-agent-decides-and-sets-alerts) · [Projects](#projects-separate-contexts-each-in-its-own-topic) · [The general topic](#the-general-topic-anything-that-isnt-about-a-project) · [Messages in "All"](#writing-outside-the-topics-all-goes-to--general) · [Threads](#threads-each-one-is-a-conversation-with-telegramnew_threads-true) · [Rich messages](#rich-messages) · [Working on its own](#working-on-its-own-watches-and-wake-ups) · [The agent's tools](#the-agents-tools-ov-and-hpc-run) · [Results and findings](#results-and-findings-what-each-experiment-showed) · [Obsidian](#research-notes-in-obsidian-optional) · [Planner mode](#planner-mode-subagents-off-by-default) · [Several accounts per CLI](#several-accounts-per-cli) · [Compaction](#long-conversations-context-compaction) · [The handbook](#the-handbook-what-one-agent-learns-every-agent-knows) · [Feedback and skills](#feedback-about-overseer-its-review-and-skills-as-addons) · [ADHD replies](#replies-shaped-for-adhd-optional) · [overseer watch](#watching-the-agent-live-from-the-homelab) · [overseer open](#opening-a-conversation-in-the-cli-itself) · [The terminal monitor](#the-terminal-monitor-overseer-tui) · [Stuck runs](#a-run-that-seems-stuck) · [Restarts](#restarts-dont-lose-the-agents-work) · [Configuration notes](#configuration-notes)
 
 ## Commands
 
@@ -376,6 +376,27 @@ When a conversation's context fills up, the CLIs compact it on their own: older 
   - **Claude Code** runs its own `/compact` in the same session and takes a focus: `/compact keep the lr sweep results and the baseline numbers`.
   - **Codex** compacts through its app server (`thread/compact/start` on the same thread). It doesn't take a focus.
 - **What survives:** the summary is lossy, so the important facts are kept in files the agent re-reads: `OVERSEER.md` for project notes and `RESEARCH_LOG.md` for the experiments. `/new` starts a clean conversation instead.
+
+## The handbook: what one agent learns, every agent knows
+
+Each bot keeps a short handbook in every one of its agents' instructions (the HPC bot's and the assistant's are
+separate: what an HPC agent adds stays with the HPC bot). It has three parts:
+- **What agents learned:** facts about where they work, e.g. "jobs on the preempt partition don't count toward the
+  GPU QOS limit, but can be requeued any time". An agent that finds one out adds it, so the next agent doesn't have to.
+- **Your rules:** e.g. "always submit with `--account=pi_lab`", "prefer h100 over a100 when both are free".
+- **Tools:** your scripts, with what they're for. On the HPC bot each becomes a command of the agents' own:
+  `numqueued [args]` runs `~/bin/numqueued.sh` on the login node (a login shell, 15 minutes at most - for quick
+  queries).
+
+**How it changes:**
+- **Agents propose** (`ov handbook add`, `tool`, `edit`, `remove`, with the evidence): you get a 📖 card with ✅ Apply / ✖ No,
+  and the agent is told your answer.
+- **An agent's edit of its own entry** applies at once; you're told, with ↩️ Undo.
+- **You change it directly** with `/handbook`: `/handbook add rules <text>`, `/handbook tool numqueued ~/bin/numqueued.sh
+  -- my queued jobs per partition`, `/handbook edit H3 <text>`, `/handbook remove H3`; `/handbook` shows it.
+- **Conversations already going** get the change with their next request. Entries stay short (it's in every prompt):
+  past 8 KB, agents are asked to condense it. Project matters stay in the project's `OVERSEER.md`, results in
+  `ov result`, long how-tos in skills.
 
 ## Feedback about Overseer, its review, and skills as addons
 

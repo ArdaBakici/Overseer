@@ -250,6 +250,26 @@ class HpcDomain(Domain):
         return hpc_sandbox(self.cfg)
 
     # ------------------------------------------------------------------ instructions
+    # ------------------------------------------------------------------ the handbook's tools (core/handbook.py)
+    def handbook_tool(self, name: str, command: str, about: str) -> str:
+        return (f"`{name} [args]`: {about} (a command of yours here: runs `{command}` on the HPC's login node, "
+                "args passed on, 15 min at most)")
+
+    def handbook_tools(self, tools: list[tuple[str, str]]) -> None:
+        from .compute import write_handbook_tools
+        from .sshlink import _write, agent_bin_dir
+        write_handbook_tools(self.cfg, agent_bin_dir(self.cfg), tools, _write)
+
+    def command_taken(self, name: str) -> bool:
+        import shutil
+        from .compute import TOOL_MARK
+        from .sshlink import agent_bin_dir
+        mine = agent_bin_dir(self.cfg) / name  # (a tool's own command, from before: not taken)
+        if mine.is_file() and TOOL_MARK in mine.read_text(errors="replace")[:200]:
+            return False
+        return name in {"hpc", "sbatch", "squeue", "srun", "scancel", "sacct", "sinfo", "scontrol", "salloc"} \
+            or mine.exists() or shutil.which(name) is not None
+
     def system_prompt(self, s: Session | None) -> str:
         cfg = self.cfg
         domains = cfg.agent.allowed_domains

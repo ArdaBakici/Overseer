@@ -698,6 +698,78 @@ async def test_a_stuck_run_is_unstuck_and_you_are_told(env, monkeypatch):
     assert "3 times now with the same result" in env.notifier.sent[-1].text
 
 
+async def test_the_handbook_what_one_agent_learns_every_agent_knows(env, tmp_path):
+    """An agent adds what it learned (a note), the researcher approves it, and it's in every conversation's
+    instructions - including ones already going (a changed section is handed over). Its own entries it edits at once
+    (you're told, with ↩️ Undo); others' entries and removals are proposals. Tools become commands of their own that
+    run on the login node."""
+    import subprocess
+    from overseer.core.agent import prompt_sections
+    from overseer.core.handbook import Handbook
+    from overseer.hpc.compute import write_handbook_tools
+    from overseer.hpc.sshlink import _write, agent_bin_dir
+    await make_autopilot(env)
+    hb = Handbook(env.store, env.agent, env.notifier)
+    a = env.agent.general_session()
+    token = env.ctl.open(a.id)
+    note = "Jobs on the preempt partition don't count toward the GPU QOS limit (but can be requeued any time)."
+    ok, text = await env.ctl.handle(token, ["handbook", "add", "notes", note, "--why", "sacct showed 12 GPUs in use"])
+    assert ok and "proposed (#" in text, text
+    card = env.notifier.sent[-1]
+    assert card.text.startswith("📖 <b>Handbook: add to what agents learned</b>") and "sacct showed" in card.text
+    pid = int(card.buttons[0][0][1].split(":")[1])
+    assert card.buttons[0] == [("✅ Apply", f"hb:{pid}"), ("✖ No", f"hbx:{pid}")]
+    assert note not in env.agent.system_prompt(a.id)  # (not before you approve it)
+    assert "Waiting for the researcher" in (await env.ctl.handle(token, ["handbook"]))[1]
+
+    assert (await hb.approve(pid)).startswith("✅")
+    e = hb.entries("notes")[0]
+    other = env.agent.general_session(reset=True)  # (any other conversation of this bot)
+    for sid in (a.id, other.id):
+        section = prompt_sections(env.agent.system_prompt(sid))["## Handbook"]
+        assert f"### What agents learned\n- {note} (H{e.id})" in section, section
+    assert any("applied your handbook change" in n for n in env.agent.take_notes(a.id))
+
+    # Its own entry: edited at once, and you're told (↩️ Undo puts it back).
+    newer = note.replace("any time", "any time; use --signal to checkpoint")
+    ok, text = await env.ctl.handle(token, ["handbook", "edit", f"H{e.id}", newer])
+    assert ok and "done; the researcher is told" in text and hb.entries("notes")[0].text == newer
+    told = env.notifier.sent[-1]
+    assert told.text.startswith(f"✏️ <b>An agent updated its handbook entry H{e.id}</b>") and "<s>" in told.text
+    assert (await hb.undo(int(told.buttons[0][0][1].split(":")[1]))).startswith("↩️")
+    assert hb.entries("notes")[0].text == note
+
+    # Your rule: another agent's edit of it, and a removal, wait for you.
+    rule = hb.add("rules", "Always submit with --account=pi_lab.")
+    token2 = env.ctl.open(other.id)
+    ok, text = await env.ctl.handle(token2, ["handbook", "edit", f"H{rule.id}", "Use --account=other."])
+    assert ok and "proposed" in text and hb.entries("rules")[0].text == rule.text
+    assert (await hb.decline(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))).startswith("✖")
+    assert hb.entries("rules")[0].text == rule.text
+    ok, text = await env.ctl.handle(token2, ["handbook", "remove", f"H{e.id}", "--why", "no longer true"])
+    assert ok and "proposed" in text and len(hb.entries("notes")) == 1
+    assert not (await env.ctl.handle(token, ["handbook", "add", "secrets", "x"]))[0]  # (no such section)
+
+    # A tool: a command of the agents' own, on the login node; gone with its entry.
+    ok, text = await env.ctl.handle(token, ["handbook", "tool", "numqueued", "--command", "~/bin/numqueued.sh",
+                                            "--about", "how many of my jobs are queued per partition"])
+    assert ok and "proposed" in text
+    await hb.approve(int(env.notifier.sent[-1].buttons[0][0][1].split(":")[1]))
+    wrapper = agent_bin_dir(env.cfg) / "numqueued"
+    assert wrapper.exists() and "timeout 900" in wrapper.read_text() and "~/bin/numqueued.sh" in wrapper.read_text()
+    assert "`numqueued [args]`: how many of my jobs are queued per partition" in env.agent.system_prompt(a.id)
+    assert not (await env.ctl.handle(token, ["handbook", "tool", "ls", "--command", "x", "--about", "y"]))[0]
+    hb.remove(f"H{hb.entries('tools')[0].id}")
+    assert not wrapper.exists()
+    bin_dir = tmp_path / "bin"  # (and what a tool command does, through a stand-in for the agent's ssh)
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text("#!/bin/sh\nfor last; do :; done\nexec bash -c \"$last\"\n")
+    (bin_dir / "ssh").chmod(0o755)
+    write_handbook_tools(env.cfg, bin_dir, [("numqueued", "echo QUEUED")], _write)
+    out = subprocess.run([str(bin_dir / "numqueued"), "gpu partition"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0 and out.stdout.strip() == "QUEUED gpu partition", (out.stdout, out.stderr)
+
+
 async def test_runs_have_no_time_limit_unless_one_is_set(env):
     assert env.cfg.agent.timeout_minutes == 0  # (the default: a long task runs until it's done or /stop)
     s = env.agent.general_session()

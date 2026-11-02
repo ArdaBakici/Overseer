@@ -107,6 +107,25 @@ def _parser(ext=None) -> _Parser:
     a.add_argument("--all", action="store_true")
     sk.add_parser("list", add_help=False)
     sk.add_parser("show", add_help=False).add_argument("name")
+    hb = sub.add_parser("handbook", add_help=False).add_subparsers(dest="action")
+    hb.add_parser("list", add_help=False)
+    a = hb.add_parser("add", add_help=False)
+    a.add_argument("section")
+    a.add_argument("text", nargs="+")
+    a.add_argument("--why", default="")
+    a = hb.add_parser("tool", add_help=False)
+    a.add_argument("name")
+    a.add_argument("--command", required=True)
+    a.add_argument("--about", required=True)
+    a.add_argument("--why", default="")
+    a = hb.add_parser("edit", add_help=False)
+    a.add_argument("ref")
+    a.add_argument("text", nargs="+")
+    a.add_argument("--command", default="")
+    a.add_argument("--why", default="")
+    a = hb.add_parser("remove", add_help=False)
+    a.add_argument("ref")
+    a.add_argument("--why", default="")
     sub.add_parser("propose", add_help=False).add_argument("plan")
     a = sub.add_parser("spawn", add_help=False)
     a.add_argument("name")
@@ -159,6 +178,10 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
 Feedback about Overseer itself (what limited you; shown in the researcher's 🛠 feedback topic):
   ov feedback "<what limited you>" [--kind limitation|bug|idea] [--context "what you were doing"]
   ov feedback list [--all]         ov feedback +1 FB7
+The handbook (shared by every agent of this bot; the researcher approves changes, except edits of your own entries):
+  ov handbook [list]               ov handbook add notes|rules "<text>" [--why "<evidence>"]
+  ov handbook tool <name> --command "<command>" --about "<what for, when>"
+  ov handbook edit H3 "<text>" [--why ...]       ov handbook remove H3 --why "..."
 Skills (know-how for agents, installed once the researcher approves):
   ov skill propose skill.md [--all]   ov skill list | show <name>
 
@@ -259,6 +282,8 @@ class ControlServer:
                                "unwatch all) and say so; to ask the researcher, ask in your reply or ov notify.")
             if area == "feedback":
                 return True, await self.feedback_cmd(session, args)
+            if area == "handbook":
+                return True, await self.handbook_cmd(session, args)
             if area == "skill" and args.action:
                 return True, await getattr(self, f"skill_{args.action}")(session, args)
             if area in ("propose", "spawn", "agents", "planner"):
@@ -336,6 +361,24 @@ class ControlServer:
         f = await fb.report(session, " ".join(words), args.kind, args.context)
         return (f"✓ FB{f.id} sent to the researcher's 🛠 feedback topic. You're told if they fix it or decide not "
                 "to. Carry on with your task meanwhile: work around the limitation if you can.")
+
+    async def handbook_cmd(self, session, args) -> str:
+        hb = getattr(self.agent, "handbook", None)
+        if not hb:
+            raise CtlError("the handbook isn't available in this Overseer")
+        action = args.action or "list"
+        if action == "list":
+            return hb.listing()
+        if action == "add":
+            return await hb.propose(session, "add", section=args.section.lower(), text=" ".join(args.text),
+                                    why=args.why)
+        if action == "tool":
+            return await hb.propose(session, "add", section="tools", text=args.about, name=args.name.lower(),
+                                    command=args.command, why=args.why)
+        if action == "edit":
+            return await hb.propose(session, "edit", text=" ".join(args.text), command=args.command,
+                                    target=args.ref, why=args.why)
+        return await hb.propose(session, "remove", target=args.ref, why=args.why)
 
     def _addons(self):
         addons = getattr(self.agent, "addons", None)

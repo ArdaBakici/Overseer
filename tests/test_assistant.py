@@ -853,6 +853,27 @@ async def test_a_wake_up_with_nothing_to_say_sends_nothing(aenv):
     assert aenv.notifier.sent[-1].text.startswith("🤖 [silent]")
 
 
+async def test_the_assistant_has_a_handbook_of_its_own(aenv):
+    """The handbook is per bot: the assistant's agents share theirs (in its own database), the HPC bot's are elsewhere.
+    Its tools are documented (no command of their own: its agent runs them itself)."""
+    from overseer.core.handbook import Handbook
+    hb = Handbook(aenv.store, aenv.agent, aenv.notifier)
+    await aenv.ctl.start()
+    try:
+        s = aenv.agent.general_session()
+        token = aenv.ctl.open(s.id)
+        ok, text = await aenv.ctl.handle(token, ["handbook", "add", "notes",
+                                                 "The vault's Daily/ notes are named YYYY-MM-DD.md."])
+        assert ok and "proposed" in text, text
+        await hb.approve(hb.pending()[0].id)
+        hb.add("tools", "today's weather for the morning digest", name="wttr", command="curl -s wttr.in/?format=3")
+        prompt = aenv.agent.system_prompt(s.id)
+        assert "## Handbook" in prompt and "Daily/ notes are named YYYY-MM-DD.md" in prompt
+        assert "`curl -s wttr.in/?format=3` (wttr): today's weather" in prompt
+    finally:
+        await aenv.ctl.stop()
+
+
 async def test_ov_commit_focus_followup_and_routine(aenv, monkeypatch):
     with_autopilot(aenv, monkeypatch)
     await aenv.ctl.start()
