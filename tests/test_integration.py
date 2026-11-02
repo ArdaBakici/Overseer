@@ -70,7 +70,7 @@ class FakeNotifier:
         self.sent.append(msg)
         return {"1": len(self.sent)}
 
-    async def edit(self, refs, text):
+    async def edit(self, refs, text, buttons=None):
         self.edits = getattr(self, "edits", []) + [(refs, text)]
 
     async def open_thread(self, session_id, name):
@@ -835,6 +835,50 @@ async def test_handbook_tools_on_compute_nodes_of_any_partition(env, tmp_path):
     p = tool("gpu-eval")
     assert p.returncode != 0 and "was preempted" in p.stderr and "partition preempt" in p.stderr, p.stderr
     assert run("--status").returncode == 0
+
+
+async def test_your_shell_on_the_hpc_with_your_aliases(env, monkeypatch):
+    """/x <command> (or /bash): run as you in an interactive bash, so ~/.bashrc's aliases work (past the usual "not
+    interactive: stop here" guard); in a project's folder; the output as it comes, then its end with the exit code - all
+    of it as a file when it's long; ⏹ Stop and the time limit end it. (Here the "HPC" is this machine.)"""
+    import shlex
+    from overseer.hpc import shell as S
+    from overseer.hpc.telegram import HpcBot
+    assert (["x", "bash"], HpcBot.cmd_x) in [(n, getattr(h, "__func__", h)) for n, h in
+                                              HpcBot(None, env.agent.domain).commands()]
+    monkeypatch.setattr(S, "UPDATE_SECONDS", 0.2)
+    (env.home / ".bashrc").write_text("[[ $- != *i* ]] && return\nalias jstat='echo JSTAT-ALIAS for $USER'\n")
+    sh = S.Shell(env.cfg, env.notifier)
+    monkeypatch.setattr(sh, "argv", lambda remote: ["bash", "-c", remote])
+
+    def last():
+        return env.notifier.edits[-1][1]
+    assert await sh.run("jstat") == 0
+    assert "JSTAT-ALIAS for" in last() and "✓ exit code 0" in last() and "bash: no job control" not in last()
+    assert env.notifier.sent[-1].buttons == [[("⏹ Stop", "xstop:1")]] and "<b>$</b> <code>jstat</code>" in last()
+    proj = env.home / "proj"
+    assert await sh.run("pwd && exit 3", folder=str(proj)) == 3
+    assert f"{proj}\n" in last() and "✗ exit code 3" in last() and f"in {proj}" in last()
+    assert await sh.run("printf '\\033[31mred\\033[0m\\n'") == 0 and "\x1b" not in last() and "red" in last()
+
+    assert await sh.run("seq 1 3000") == 0  # (long: the end in the message, all of it as a file)
+    assert "3000" in last() and "the whole output is attached" in last()
+    name, content = env.notifier.sent[-1].files[0]
+    assert name == "output.txt" and content.decode().splitlines()[0] == "1" and content.decode().count("\n") >= 2999
+
+    task = asyncio.create_task(sh.run("echo started; sleep 30"))
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if sh.running and "started" in last():
+            break
+    assert "running for" in last() and sh.stop(next(iter(sh.running)))
+    assert await asyncio.wait_for(task, 10) == -1 and "⏹ stopped after" in last()
+    assert not sh.stop(99)
+    env.cfg.ssh.shell_timeout_minutes = 0.02  # (1.2 s)
+    assert await asyncio.wait_for(sh.run("sleep 30"), 15) == -1 and "ran past 0.02 min" in last()
+    audit = [json.loads(line) for line in env.cfg.local.audit_log.read_text().splitlines()]
+    assert any(a["argv"] == ["/x", "jstat"] and a["rc"] == 0 for a in audit)  # (with Overseer's other commands)
+    assert sh.remote("ls", "/a b").startswith("bash -ic ") and "cd '/a b' || exit 1" in shlex.split(sh.remote("ls", "/a b"))[2]
 
 
 async def test_runs_have_no_time_limit_unless_one_is_set(env):

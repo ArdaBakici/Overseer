@@ -27,6 +27,7 @@ ssh:
   port: 22
   proxy_jump: null          # e.g. your-netid@gateway.cluster.edu (uses the same key)
   extra_options: {}         # extra ssh_config options for the host, e.g. {Compression: "yes"}
+  shell_timeout_minutes: 10 # /x (your shell from Telegram): a command still running then is stopped
 
 slurm:
   poll_interval: 60             # seconds

@@ -43,6 +43,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /search &lt;text&gt; — past conversations, results, findings and jobs
 /dashboard — jobs, results, findings and a timeline in a Mini App (on your tailnet)
 /health — connection status
+/x &lt;command&gt; (or /bash) — run it on the HPC as you, with your aliases (~/.bashrc); in a project's topic, in its folder
 
 <b>Projects</b> (each gets its own topic; commands in a topic apply to that project)
 /project — list · /project new &lt;name&gt; &lt;dir on HPC&gt; [what it's about]
@@ -61,7 +62,7 @@ tell me. Ask me when you need a decision."""
 MENU = [("jobs", "active and recent jobs"), ("job", "status of a job"), ("log", "tail a job's log"),
         ("fix", "ask the agent to fix a job"), ("results", "experiments and what each showed"),
         ("findings", "insights and dead ends"), ("cluster", "free GPUs, when queued jobs start"),
-        ("assign", "move a job to a project")]
+        ("assign", "move a job to a project"), ("x", "run a shell command on the HPC (your aliases too)")]
 
 
 class HpcBot:
@@ -75,6 +76,7 @@ class HpcBot:
     def __init__(self, bot, domain):
         self.bot = bot
         self.domain = domain
+        self._shell = None
 
     def __getattr__(self, name):  # reply, _scope, _thread, _where, store, agent, notifier, cfg, _run_agent, ...
         return getattr(self.bot, name)
@@ -90,7 +92,29 @@ class HpcBot:
     def commands(self) -> list[tuple[str | list[str], object]]:
         return [("jobs", self.cmd_jobs), ("job", self.cmd_job), ("log", self.cmd_log), ("fix", self.cmd_fix),
                 ("results", self.cmd_results), ("findings", self.cmd_findings), ("assign", self.cmd_assign),
-                ("cluster", self.cmd_cluster)]
+                ("cluster", self.cmd_cluster), (["x", "bash"], self.cmd_x)]
+
+    @property
+    def shell(self):
+        if self._shell is None:
+            from .shell import Shell
+            self._shell = Shell(self.cfg, self.notifier)
+        return self._shell
+
+    async def cmd_x(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/x <command> (or /bash): your shell on the HPC - in a project's topic, in the project's folder."""
+        text = (update.message.text or "") if update.message else ""
+        parts = text.split(None, 1)  # (the whole message after /x: newlines and quoting as you typed them)
+        command = parts[1].strip() if len(parts) > 1 else ""
+        if not command:
+            await self.reply(update, "/x &lt;command&gt; runs it on the HPC as you, in a shell with your ~/.bashrc "
+                                     "(your aliases too), e.g. <code>/x squeue -u $USER</code>. In a project's topic it "
+                                     f"starts in the project's folder; it's stopped after "
+                                     f"{self.cfg.ssh.shell_timeout_minutes} min.")
+            return
+        scope = self._scope(update)
+        proj = self.store.get_project(scope) if scope else None
+        self._spawn(self.shell.run(command, proj.dir if proj and proj.dir else "", project=scope))
 
     async def on_button(self, update: Update, q, chat_id: int, action: str, arg: str) -> bool:
         """A button of the HPC's (on job cards); False when it isn't one."""
@@ -113,6 +137,9 @@ class HpcBot:
         elif action == "assign":
             job_id, _, name = arg.partition(":")
             await self._assign(job_id, name or None, update)
+        elif action == "xstop":  # ⏹ on a /x command's message
+            if not (arg.isdigit() and self.shell.stop(int(arg))):
+                await self._edit(q, "This command had already ended.")
         else:
             return False
         return True

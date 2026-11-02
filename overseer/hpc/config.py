@@ -28,6 +28,7 @@ class SSHConfig:
     connect_timeout: int = 15
     command_timeout: int = 90
     max_concurrent: int = 4
+    shell_timeout_minutes: int = 10  # /x (your shell from Telegram): a command still running then is stopped
 
 
 @dataclass
