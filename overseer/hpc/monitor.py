@@ -66,6 +66,14 @@ async def progress_log(hpc: HPC, rec: JobRecord) -> str:
     return paths[0]
 
 
+
+QUEUED_STATES = ("PENDING", "CONFIGURING", "REQUEUE_HOLD", "RESV_DEL_HOLD", "REQUEUED")
+
+
+def _queued(job: Job | None) -> bool:
+    """Still waiting in the queue (pending, held): it hasn't started, so it has no log, metrics or graphs yet."""
+    return job is not None and job.state in QUEUED_STATES
+
 class Monitor:
     def __init__(self, cfg: Config, hpc: HPC, store: Store, notifier: Notifier, reporter: Reporter):
         self.cfg = cfg
@@ -365,6 +373,9 @@ class Monitor:
         return {"text": text, "log_path": log_path, "auto": auto, "spec": spec, "values": {**found, **values},
                 "err": err}
 
+    def _no_view(self, rec: JobRecord) -> dict:
+        return {"text": "", "log_path": "", "auto": {}, "spec": resolve(self.store, rec), "values": {}, "err": ""}
+
     def _card_text(self, rec: JobRecord, job: Job | None, view: dict, final: Job | None = None,
                    problem: str = "") -> str:
         state = final.state if final else (job.state if job else rec.state)
@@ -379,7 +390,8 @@ class Monitor:
         lines = [head]
         if job and not final and state == "PENDING" and self.store.get(f"eststart:{rec.job_id}"):
             lines.append(f"🕐 {esc(self.store.get(f'eststart:{rec.job_id}'))} (SLURM's estimate)")
-        critical, important, progress = metric_lines(view["spec"], view["values"], view["auto"])
+        critical, important, progress = (("", "", "") if state in QUEUED_STATES and not final else
+                                         metric_lines(view["spec"], view["values"], view["auto"]))
         if job and not final and state == "RUNNING":
             elapsed, limit = slurm_seconds(job.elapsed), slurm_seconds(job.time_limit)
             timing = f"⏱ {esc(job.elapsed)} / {esc(job.time_limit)}"
@@ -413,8 +425,10 @@ class Monitor:
             lines.append(f"🚨 {esc(a)}")
         return "\n".join(lines)
 
-    def _card_buttons(self, rec: JobRecord, ended: bool = False, failed: bool = False) -> list[list[tuple[str, str]]]:
-        row = [("📜 Log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]
+    def _card_buttons(self, rec: JobRecord, ended: bool = False, failed: bool = False,
+                      queued: bool = False) -> list[list[tuple[str, str]]]:
+        # (a job still in the queue has no log, metrics or graphs yet: only what can be done about it)
+        row = [] if queued else [("📜 Log", f"log:{rec.job_id}"), ("📈 Plot", f"plot:{rec.job_id}")]
         if failed:
             row.insert(0, ("🔧 Ask agent to fix", f"fix:{rec.job_id}"))
         if not ended:
@@ -426,18 +440,19 @@ class Monitor:
 
     async def refresh_card(self, rec: JobRecord, job: Job | None = None) -> None:
         """Update the job's live card (in its jobs topic, silently), and act on the agent's alerts."""
+        queued = _queued(job)
         try:
-            view = await self._view(rec)
+            view = self._no_view(rec) if queued else await self._view(rec)  # (nothing to read before it starts)
         except (SSHError, OSError) as e:
             log.warning("job %s: could not read its logs for the card (%s)", rec.job_id, e)
-            view = {"text": "", "log_path": "", "auto": {}, "spec": resolve(self.store, rec), "values": {}, "err": ""}
+            view = self._no_view(rec)
         if job and job.state == "RUNNING":
             await self._check_alerts(rec, job, view)
         text = self._card_text(rec, job, view)
         if self.cfg.slurm.gpu_stats and job and job.state == "RUNNING":
             stats = await self.hpc.gpu_stats(rec.job_id)
             text += "".join(f"\n🎮 {esc(g)}" for g in format_gpu_stats(stats))
-        await self._show_card(rec, text, self._card_buttons(rec))
+        await self._show_card(rec, text, self._card_buttons(rec, queued=queued))
 
     async def refresh_card_by_id(self, job_id: str) -> None:
         """After something outside the poll changed what the card shows (a watch was set or cancelled)."""
@@ -656,9 +671,9 @@ class Monitor:
     async def status_message(self, rec: JobRecord, job: Job | None = None, gpu: bool | None = None) -> Outgoing:
         """On request (/job): the card's content plus the last lines of the (training) log. `gpu`: query
         nvidia-smi on the node (default: slurm.gpu_stats)."""
-        view = await self._view(rec)
-        text = view["text"]
         state = job.state if job else rec.state
+        view = self._no_view(rec) if state in QUEUED_STATES and not rec.ended_at else await self._view(rec)
+        text = view["text"]
         parts = [self._card_text(rec, job, view)]
         if (self.cfg.slurm.gpu_stats if gpu is None else gpu) and state == "RUNNING":
             stats = await self.hpc.gpu_stats(rec.job_id)
