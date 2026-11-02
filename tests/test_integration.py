@@ -2544,6 +2544,38 @@ async def test_agent_defined_metrics_and_alerts(env, tmp_path):
     assert "⚠️ metrics command: exit 1" in env.notifier.card_text("601")
 
 
+async def test_a_queued_job_card_has_no_metrics_or_graphs_yet(env):
+    """A job still in the queue has no log, metrics or graphs: its card showed "score ?" lines, the metrics command's
+    error and a 📈 Plot button. Now it shows none of those until it starts (and reads nothing from the HPC for them)."""
+    await make_autopilot(env)
+    env.cfg.slurm.notify_queued = True
+    s = env.agent.general_session()
+    proj = env.home / "proj"
+    env.set_jobs(**{"901": {"name": "rfv4-evalim-t3-s0", "state": "PENDING", "reason": "Dependency",
+                            "workdir": str(proj), "stdout": str(proj / "slurm-901.out")}})
+    await env.monitor.poll()
+    token = env.ctl.open(s.id)
+    assert (await env.ctl.handle(token, ["metrics", "set", "901", "--critical", "score=Crafter score %",
+                                         "--command", "cat {workdir}/eval/metrics.json"]))[0]
+    assert (await env.ctl.handle(token, ["watch", "901"]))[0]
+    await asyncio.gather(*list(env.ctl._bg))
+    await env.monitor.poll()
+    card, buttons = env.notifier.cards["901"][-1]
+    assert "pending" in card and "agent watching" in card, card
+    assert "Crafter score" not in card and "metrics command" not in card and "🎯" not in card, card
+    labels = [b[0] for row in buttons for b in row]
+    assert "📈 Plot" not in labels and "📜 Log" not in labels and "📊 Status" in labels, labels
+    status = await env.monitor.status_message(env.store.get_job("901"))
+    assert "metrics command" not in status.text and "Crafter score" not in status.text
+
+    st = env.slurm()  # it starts: now its metrics and graphs
+    st["jobs"]["901"]["state"] = "RUNNING"
+    (env.tmp / "slurm.json").write_text(json.dumps(st))
+    await env.monitor.poll()
+    card, buttons = env.notifier.cards["901"][-1]
+    assert "Crafter score" in card and "📈 Plot" in [b[0] for row in buttons for b in row], card
+
+
 async def test_idle_gpus_wake_the_watching_agent(env):
     """A running GPU job whose GPUs stay idle for idle_gpu_minutes: a 💤 line on its card, a message, and the
     conversation watching it woken - once, until the GPUs are busy and then idle again."""
