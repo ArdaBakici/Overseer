@@ -564,11 +564,15 @@ class ClaudeCodeRunner(Runner):
         # Subagents and commands run in the foreground; follow-ups go through Overseer (`ov wake`, `ov watch`).
         env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
         env["CLAUDE_CODE_DISABLE_CRON"] = "1"
+        # Claude Code's own memory would be kept in its home (the logins: denied to the agent, FB10), and per scratch
+        # folder (a new one each conversation). What lasts goes through Overseer: the handbook, project notes.
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         return env
 
     def settings(self, workdir: Path) -> dict[str, Any]:
         deny = self.deny_read()
         enforced = {
+            "autoMemoryEnabled": False,  # (see env: CLAUDE_CODE_DISABLE_AUTO_MEMORY)
             "sandbox": {
                 "enabled": True,
                 "failIfUnavailable": True,  # never run commands unsandboxed

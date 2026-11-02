@@ -427,6 +427,8 @@ async def test_claude_runner_sandbox_and_parsing(env):
     assert e["PATH"].split(":")[0] == str(env.cfg.local.tmp("agent-bin"))
     assert e["CLAUDE_CONFIG_DIR"] == str(env.cfg.local.resolve(env.cfg.agent.claude_code.home))
     assert e["HOME"].startswith(workdir)
+    # FB10: no memory of the CLI's own (it would be in its home, denied to the agent): the handbook keeps what lasts.
+    assert e["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and settings["autoMemoryEnabled"] is False
 
     # extra_settings can't loosen the sandbox.
     env.cfg.agent.claude_code.extra_settings = {"sandbox": {"allowUnsandboxedCommands": True, "excludedCommands": ["ssh *"]},
