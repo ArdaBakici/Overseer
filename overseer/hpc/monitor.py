@@ -76,6 +76,7 @@ def _queued(job: Job | None) -> bool:
 
 class Monitor:
     def __init__(self, cfg: Config, hpc: HPC, store: Store, notifier: Notifier, reporter: Reporter):
+        self._live: dict[str, Job] = {}  # the queue at the last poll
         self.cfg = cfg
         self.hpc = hpc
         self.store = store
@@ -153,7 +154,7 @@ class Monitor:
         await self.hpc.ensure_connected()
         self._merge_array_tasks()
         live = await self.hpc.squeue()
-        live_by_id = {j.job_id: j for j in live}
+        live_by_id = self._live = {j.job_id: j for j in live}
         self.worker = None
         # Jobs that started and finished between polls never show up in squeue; sacct catches them.
         window = max(10, int(self.cfg.slurm.poll_interval * 3 / 60) + 10)
@@ -191,6 +192,10 @@ class Monitor:
                 await self._maybe_status(rec, job)
             if job.state == "RUNNING":
                 self._maybe_sample_gpus(rec, job)
+            elif first and _queued(job) and self.store.card_refs(rec.job_id):
+                # (a queued job's card is drawn only when something happens to it: one drawn by an older Overseer
+                # - with metrics and graphs it can't have yet - is redrawn at the start)
+                await self.refresh_card(rec, job)
             queued.append((rec, job))
             self.store.upsert_job(rec)
 
@@ -666,6 +671,9 @@ class Monitor:
         for r in running:
             refs = self.store.card_refs(r.job_id)
             if any(chat in last and mid < last[chat] for chat, mid in refs.items()):
+                job = self._live.get(r.job_id)
+                if _queued(job):  # (moved as it is now, not as it was last drawn)
+                    await self.refresh_card(r, job)
                 await self.notifier.move_card(r.job_id, self.cached_plots(r.job_id))
 
     async def status_message(self, rec: JobRecord, job: Job | None = None, gpu: bool | None = None) -> Outgoing:

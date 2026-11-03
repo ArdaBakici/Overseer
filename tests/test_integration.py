@@ -2894,6 +2894,42 @@ async def test_a_queued_job_card_has_no_metrics_or_graphs_yet(env):
     assert "Crafter score" in card and "📈 Plot" in [b[0] for row in buttons for b in row], card
 
 
+async def test_a_queued_card_drawn_before_is_redrawn(env):
+    """A queued job's card is drawn only when something happens to it, and moving running cards to the bottom
+    re-posts each card as last drawn: one drawn by an older Overseer (metrics, the metrics command's error, 📈 Plot)
+    stayed so. It's redrawn at the first poll after a start, and before it's moved."""
+    env.cfg.slurm.notify_queued = True
+    proj = env.home / "proj"
+    env.set_jobs(**{"911": {"name": "rfv4-evalim-r0-s3", "state": "PENDING", "reason": "Dependency",
+                            "workdir": str(proj)}})
+    await env.monitor.poll()
+    stale = ("⏳ <b>911</b> rfv4-evalim-r0-s3\n🎯 <b>Crafter score % ?</b>\n⚠️ metrics command: exit 1",
+             [[("📊 Status", "status:911"), ("📜 Log", "log:911"), ("📈 Plot", "plot:911")]])
+    env.notifier.cards["911"].append(stale)  # (as an older Overseer drew it)
+    env.store.set_card_refs("911", {"1": 5})
+
+    def fresh():
+        text, buttons = env.notifier.cards["911"][-1]
+        labels = [b[0] for row in buttons for b in row]
+        return "Crafter" not in text and "metrics command" not in text and "📈 Plot" not in labels
+    await env.monitor.poll()  # (a poll like any: nothing happened to it)
+    assert not fresh()
+    await env.monitor.poll(first=True)  # (Overseer started: it's redrawn)
+    assert fresh(), env.notifier.cards["911"][-1]
+
+    env.notifier.cards["911"].append(stale)  # moved down after another job ended: redrawn first
+    moved = []
+
+    async def move_card(job_id, images=None):
+        moved.append((job_id, fresh()))
+    env.notifier.move_card = move_card
+    env.notifier.last_message_ids = lambda job_id: {"1": 10}
+    done = env.store.get_job("911")
+    other = type(done)(job_id="912", name="ended", state="COMPLETED", project=done.project)
+    await env.monitor._restack(other)
+    assert moved == [("911", True)]
+
+
 async def test_idle_gpus_wake_the_watching_agent(env):
     """A running GPU job whose GPUs stay idle for idle_gpu_minutes: a 💤 line on its card, a message, and the
     conversation watching it woken - once, until the GPUs are busy and then idle again."""
