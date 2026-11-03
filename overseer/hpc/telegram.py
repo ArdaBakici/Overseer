@@ -37,7 +37,7 @@ HELP = """<b>Overseer</b> — your SLURM jobs, from Telegram.
 /results [project] [sort] [N] [csv] — experiments and what each showed · /findings — insights and dead ends
 /feedback [all|review] — what agents reported about Overseer; review: an agent designs fixes · /skills — installed skills
 /subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents, each in a thread
-/usage [today|yesterday|week] — tokens and cost of the agent's runs
+/usage — how much of each account's usage limits (5-hour, weekly) is used · /usage tokens [today|week] — tokens and cost
 /cluster [partition] — free GPUs and CPUs per partition, when your queued jobs should start, your fairshare
 /digest — what happened since the last digest (one comes every morning)
 /search &lt;text&gt; — past conversations, results, findings and jobs

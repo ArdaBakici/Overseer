@@ -34,6 +34,7 @@ from typing import Any, Callable
 
 from .accounts import LIMIT_ANSWER_RE, usage_limit
 from .config import Config, accounts_of
+from .limits import from_claude, from_codex
 from .stuck import PROCESS_STARTED
 
 log = logging.getLogger(__name__)
@@ -214,6 +215,7 @@ class Activity:
     env: dict[str, str] = field(default_factory=dict)  # extra environment for this run (e.g. the ov token)
     on_command: Callable[[str], None] | None = None
     on_progress: Callable[[dict[str, Any]], None] | None = None
+    limits: dict | None = None  # the subscription limits the CLI reported during the run (limits.py)
 
     # ---- what a domain's subclass watches
     def shell_command(self, cmd: str) -> None:
@@ -663,6 +665,8 @@ class ClaudeCodeRunner(Runner):
                         if block.get("is_error") and PERMISSION_DENIED_RE.search(text):
                             activity.block(cmd, text)
                         activity.output(cmd, text)
+            elif t == "rate_limit_event":  # the subscription's windows: how much is used, when they reset
+                activity.limits = from_claude(ev.get("rate_limit_info") or {}, activity.limits)
             elif t == "result":
                 result.is_error = bool(ev.get("is_error"))
                 if ev.get("result"):
@@ -1119,6 +1123,8 @@ class CodexRunner(Runner):
                     info = {"trigger": "auto", "pre_tokens": None, "post_tokens": None}
                     result.compactions.append(info)
                     activity.compacted(info)
+            elif method == "account/rateLimits/updated":  # the subscription's windows (limits.py)
+                activity.limits = from_codex(params.get("rateLimits") or {}, before=activity.limits)
             elif method == "thread/tokenUsage/updated":
                 total = (params.get("tokenUsage") or {}).get("total") or {}
                 result.input_tokens = int(total.get("inputTokens") or 0)  # includes the cached part

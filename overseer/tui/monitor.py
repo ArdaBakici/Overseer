@@ -648,11 +648,31 @@ class Monitor(App):
         if was in {r[0] for r in rows}:  # (the cursor stays on its wake-up)
             dt.move_cursor(row=dt.get_row_index(was), animate=False)
 
-    def _usage(self, con) -> Table:
+    def _usage(self, con):
+        """The accounts' usage limits (what their last runs reported), then tokens and cost."""
+        from rich.console import Group
+        from ..core.limits import ago, bar
+        lim = Table(show_edge=False, pad_edge=False, expand=False, title="Usage limits", title_justify="left")
+        lim.add_column("account", style="bold")
+        lim.add_column("windows")
+        lim.add_column("as of", style="dim")
+        for x in D.limits(con):
+            order = {"5h": 0, "week": 1}
+            wins = sorted(x["windows"], key=lambda w: order.get(w["name"], 2))
+            lim.add_row(f"{NAMES.get(x['backend'], x['backend'])} ({x['account']})",
+                        "\n".join(f"{bar(w['used'])} {w['name']} {w['used']:.0f}%"
+                                   + (f" · resets {time.strftime('%a %H:%M', time.localtime(w['resets']))}"
+                                      if w.get("resets") else "") for w in wins),
+                        ago(time.time() - x["seen"]))
+        if not lim.row_count:
+            lim.add_row("-", "no account has reported its limits yet (they come with its runs)", "")
+        return Group(lim, Text(""), self._tokens(con))
+
+    def _tokens(self, con) -> Table:
         now = time.time()
         lt = time.localtime(now)
         midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
-        out = Table(show_edge=False, pad_edge=False, expand=False)
+        out = Table(show_edge=False, pad_edge=False, expand=False, title="Tokens and cost", title_justify="left")
         out.add_column("", style="bold")
         periods = [("today", midnight), ("7 days", now - 7 * 86400), ("30 days", now - 30 * 86400)]
         rows = {name: D.usage(con, since) for name, since in periods}

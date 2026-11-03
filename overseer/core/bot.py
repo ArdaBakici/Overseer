@@ -35,6 +35,7 @@ from .agent import Agent, Session
 from .projects import ProjectError, Projects
 from .richtext import RICH_LIMIT, strip_html
 from .config import BACKENDS, Config
+from .limits import report as limits_report
 from .notify import SIDE_TOPICS, TG_LIMIT, Outgoing, code, esc, pre, split_message
 from .store import ProjectRecord, Store
 from .subagents import ENDED
@@ -1263,7 +1264,7 @@ class Bot:
                 if several else "One login per CLI: add more with <code>agent.claude_code.accounts</code> / "
                 "<code>agent.codex.accounts</code> in the config (then <code>overseer login &lt;cli&gt; --account "
                 "&lt;name&gt;</code>).")
-        return f"<b>Accounts</b>\n{acc.describe()}\n\n{hint}", rows
+        return f"<b>Accounts</b>\n{acc.describe(self.agent.limits.line)}\n\n{hint}", rows
 
     async def cmd_account(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not ctx.args:
@@ -1396,8 +1397,13 @@ class Bot:
         await self.reply(update, await self.digest.build(since, now))
 
     async def cmd_usage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        period = (ctx.args or ["today"])[0].lower()
-        await self.reply(update, usage_report(self.store, period))
+        args = [a.lower() for a in ctx.args or []]
+        if args[:1] in (["tokens"], ["cost"]):  # (the tokens and cost of the runs: still kept)
+            await self.reply(update, usage_report(self.store, args[1] if len(args) > 1 else "today"))
+        elif args and args[0] in ("today", "yesterday", "week", "month"):
+            await self.reply(update, usage_report(self.store, args[0]))
+        else:
+            await self.reply(update, limits_report(self.agent.accounts, self.agent.limits))
 
     async def cmd_update(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self.agent.running_sessions():

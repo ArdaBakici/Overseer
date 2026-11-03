@@ -28,6 +28,7 @@ from .live import Progress, Transcript
 from .richtext import fold, fold_long, md_to_html, rich_code, rich_details, rich_markdown
 from .notify import SILENT, Notifier, Outgoing, code, esc, pre
 from .runners import Activity, AgentRunError, Runner, Steering, UsageLimitError, make_runner
+from .limits import SWITCH, Limits
 from .stuck import PROCESS_STARTED, Watchdog
 from .store import SessionRecord, Store
 
@@ -335,6 +336,7 @@ class Agent:
         self.sessions: dict[str, Session] = {}
         self._runners: dict[str, Runner] = {}
         self.accounts = Accounts(cfg, store)  # the CLIs' logins: the one in use, those out of usage
+        self.limits = Limits(store)  # their subscription windows, as the runs report them
 
     # ------------------------------------------------------------------ backend, model, effort
     # Stored per scope: the main chat ("backend", "model:<backend>", ...) and each project
@@ -507,6 +509,9 @@ class Agent:
         r = runner or self.runner(backend, project)
         name = f"{backend} ({account})" if account and self.accounts.several(backend) else backend
         parts = [name, res.model or r.model or "default model", f"effort {res.effort or r.effort or 'default'}"]
+        limits = self.limits.line(backend, account or self.accounts.active(backend))
+        if limits:  # (a subscription: how much of its windows is used says more than tokens and dollars)
+            return " · ".join(parts + [limits])
         tokens = res.input_tokens + res.output_tokens
         if tokens:
             cached = f" ({_human(res.cached_tokens)} cached)" if res.cached_tokens else ""
@@ -864,11 +869,41 @@ class Agent:
                                            where=f", on {place}") + user_text
         return False
 
+    async def _move_off_full(self, s: Session, backend: str) -> None:
+        """Before a run: an account at SWITCH % of a window gives way to another of the same CLI that has room (the
+        conversation carries over, as in a failover). With none, it stays: at 100% the failover takes over."""
+        account = self.accounts.active(backend)
+        full = self.limits.nearly_out(backend, account)
+        if not full:
+            return
+        for n in self.accounts.names(backend):
+            if n != account and not self.accounts.out_until(backend, n) and not self.limits.nearly_out(backend, n):
+                self.accounts.switch(backend, n)
+                log.info("%s account %s at %s%% of %s: switched to %s", backend, account, full["used"], full["name"], n)
+                await self.notifier.send(Outgoing(
+                    f"🔄 {esc(self.accounts.label(backend, account))} is at {full['used']:.0f}% of its "
+                    f"{esc(full['name'])} limit" + (f" (resets {esc(when(full['resets']))})" if full["resets"] else "")
+                    + f": the bot uses <b>{esc(n)}</b> now. /account switches.", session_id=s.id, job_id=s.job_id))
+                return
+
+    def _limits_reported(self, s: Session, backend: str, account: str, report: dict | None) -> None:
+        """A run's report of the subscription limits: kept; past WARN % of a window, you're told (once)."""
+        if not report:
+            return
+        for w in self.limits.record(backend, account, report):
+            resets = f", resets {when(w['resets'])}" if w.get("resets") else ""
+            msg = Outgoing(f"⚠️ {esc(self.accounts.label(backend, account))}: {w['used']:.0f}% of its {esc(w['name'])} "
+                           f"limit used{esc(resets)}." + (f" At {SWITCH}% the bot moves to another account."
+                                                         if self.accounts.several(backend) else ""),
+                           session_id=s.id, job_id=s.job_id)
+            asyncio.get_running_loop().create_task(self.notifier.send(msg))
+
     async def _fail_over(self, s: Session, e: UsageLimitError) -> str | None:
         """The account the run was on is out of usage: mark it out, and move the whole bot on (the CLI's next account
         that isn't out, then the other CLI). Where the run goes now, or None if every account is out."""
         backend, account = s.ran_on
-        until = self.accounts.mark_out(backend, account, e.until)
+        full = self.limits.fullest(backend, account)  # (the CLI said when its window resets, if it reported it)
+        until = self.accounts.mark_out(backend, account, e.until or (full or {}).get("resets") or None)
         log.warning("%s account %s is out of usage until %s: %s", backend, account, when(until), str(e)[:300])
         now = self.session_backend(s)
         if (now, self.accounts.active(now)) != (backend, account) and not self.accounts.out_until(
@@ -1000,6 +1035,7 @@ class Agent:
     async def _turn(self, s: Session, user_text: str, quiet: bool = False) -> None:
         backend = self.session_backend(s)
         runner = self.session_runner(s)
+        await self._move_off_full(s, backend)
         account = self.accounts.active(backend)
         s.ran_on = (backend, account)
         resume, history = self._resume(s, backend)
@@ -1070,6 +1106,7 @@ class Agent:
         finally:
             watchdog.stop()
             PROCESS_STARTED.reset(hook)
+            self._limits_reported(s, backend, account, activity.limits)
             steering.close()
             s.steering = None
             s.leftover += steering.untaken()
