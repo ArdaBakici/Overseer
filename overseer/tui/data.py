@@ -134,6 +134,22 @@ def wakeups(con) -> list[dict]:
             for r in rows]
 
 
+def limits(con) -> list[dict]:
+    """The subscription windows each CLI account reported (core/limits.py): backend, account, seen, windows."""
+    import json
+    out = []
+    for r in _rows(con, "SELECT key, value FROM kv WHERE key LIKE 'limits:%'"):
+        try:
+            v = json.loads(r["value"])
+        except ValueError:
+            continue
+        _, backend, account = (r["key"].split(":", 2) + ["", ""])[:3]
+        now = time.time()
+        windows = [{**w, "used": 0.0} if w.get("resets") and w["resets"] <= now else w for w in v.get("windows", [])]
+        out.append({"backend": backend, "account": account, "seen": float(v.get("seen") or 0), "windows": windows})
+    return sorted(out, key=lambda x: (x["backend"], x["account"]))
+
+
 def usage(con, since: float) -> list[dict]:
     return [dict(r) for r in _rows(con, "SELECT * FROM usage WHERE ts >= ?", (since,))]
 

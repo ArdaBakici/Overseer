@@ -2,6 +2,7 @@
 account, then the other CLI), conversations carried across accounts (the CLI session copied) and across CLIs (a
 handover from Overseer's transcripts), /account, logins, and every account's home kept out of the agents' reach."""
 
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -311,3 +312,63 @@ async def test_the_account_command(env, monkeypatch):  # noqa: F811
     q = NS(data="acct:claude_code:personal", answer=answer, message=NS(message_id=5))
     await bot.on_button(NS(callback_query=q, effective_chat=NS(id=1)), None)
     assert acc.active("claude_code") == "personal" and "Claude Code (personal)" in edits[-1]
+
+
+# ----------------------------------------------------------------------------- subscription limits (limits.py)
+async def test_usage_limits_from_the_runs_replace_tokens_and_cost(env):  # noqa: F811
+    """What the CLIs report about their subscription windows (Claude: rate_limit_event; Codex:
+    account/rateLimits/updated) is kept per account and shown instead of tokens and dollars: in the footer, /usage and
+    /account. At 80% of a window you're told once; at 95% the next run moves to another account of the same CLI."""
+    from overseer.core.limits import report
+    acc = with_accounts(env, CLAUDE)
+    table = env.tmp / "cli.jsonl.ratelimits"
+
+    def report_as(**homes):
+        table.write_text(json.dumps(homes))
+    s = env.agent.general_session()
+    report_as(**{"claude-personal": {"five_hour": 0.42, "seven_day": 0.18}})
+    assert await env.agent.handle(s, "first")
+    footer = env.notifier.sent[-1].text
+    assert "5h 42% · week 18%" in footer and "tokens" not in footer and "$" not in footer, footer
+    text = report(acc, env.agent.limits)
+    assert "<b>Claude Code (personal) ▶</b> · 0m ago" in text and "5h 42%" in text and "▓▓▓▓░░░░░░" in text
+    assert "Claude Code (work)</b>: nothing reported yet" in text and "/usage tokens" in text
+    assert "(5h 42% · week 18%)" in acc.describe(env.agent.limits.line)
+
+    # 80%: told once (not again at the next run with the same window).
+    report_as(**{"claude-personal": {"five_hour": 0.86, "seven_day": 0.2}})
+    assert await env.agent.handle(s, "second")
+    await asyncio.sleep(0)
+    warned = [m.text for m in env.notifier.sent if m.text.startswith("⚠️")]
+    assert len(warned) == 1 and "Claude Code (personal): 86% of its 5h limit used, resets" in warned[0], warned
+    assert await env.agent.handle(s, "third")
+    await asyncio.sleep(0)
+    assert len([m for m in env.notifier.sent if m.text.startswith("⚠️")]) == 1
+
+    # 95%: the next run is on work, the conversation carried over.
+    report_as(**{"claude-personal": {"five_hour": 0.96}, "claude-work": {"five_hour": 0.1}})
+    assert await env.agent.handle(s, "fourth")
+    assert acc.active("claude_code") == "personal" and home_of(runs(env)[-1]).endswith("claude-personal")
+    assert await env.agent.handle(s, "fifth")
+    moved = next(m.text for m in env.notifier.sent if m.text.startswith("🔄"))
+    assert "Claude Code (personal) is at 96% of its 5h limit" in moved and "<b>work</b>" in moved
+    assert acc.active("claude_code") == "work" and home_of(runs(env)[-1]).endswith("claude-work")
+    assert "5h 10%" in env.notifier.sent[-1].text
+
+    # Codex: through its app server; an account with nothing reported (an API key) keeps tokens and cost.
+    env.agent.set_backend("codex")
+    s2 = env.agent.general_session(reset=True)
+    assert await env.agent.handle(s2, "hello")
+    assert "tokens" in env.notifier.sent[-1].text and "5h" not in env.notifier.sent[-1].text
+    report_as(**{"*": {"primary": 30, "secondary": 70}})
+    assert await env.agent.handle(s2, "again")
+    assert "5h 30% · week 70%" in env.notifier.sent[-1].text, env.notifier.sent[-1].text
+    # The digest and the TUI (which reads the database read-only) show them too.
+    from overseer.core.digest import Digest
+    from overseer.tui import data as D
+    line = Digest(env.cfg, env.store, env.notifier, env.agent)._usage(0)
+    assert line.startswith("📊 <b>Limits</b>: Claude Code (personal) 5h 96%") and "Codex 5h 30% · week 70%" in line
+    con = D.connect_ro(env.cfg.local.db_path)
+    seen = {(x["backend"], x["account"]): x["windows"] for x in D.limits(con)}
+    con.close()
+    assert {w["name"]: w["used"] for w in seen[("codex", "default")]} == {"5h": 30.0, "week": 70.0}, seen

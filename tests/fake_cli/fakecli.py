@@ -148,9 +148,26 @@ def limited():
     return bool(CLI_HOME) and os.path.exists(path) and CLI_HOME in open(path).read().split("\n")
 
 
+def rate_limits():
+    """$FAKE_CLI_LOG.ratelimits: {home's folder name or "*": {"five_hour": 0.42, ...} (claude: fractions) or
+    {"primary": 42, "secondary": 18} (codex: percent)} - what the account reports about its subscription windows."""
+    path = os.environ["FAKE_CLI_LOG"] + ".ratelimits"
+    if not CLI_HOME or not os.path.exists(path):
+        return None
+    table = json.load(open(path))
+    return table.get(os.path.basename(CLI_HOME.rstrip("/"))) or table.get("*")
+
+
 def claude_session_file(sid):
     return os.path.join(CLI_HOME, "projects", re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()), f"{sid}.jsonl")
 
+
+if prog == "claude" and args[:1] == ["-p"] and rate_limits():  # (like the real one: per window, as it learns them)
+    resets = int(time.time()) + 3 * 3600
+    for kind, used in rate_limits().items():
+        print(json.dumps({"type": "rate_limit_event", "session_id": "", "rate_limit_info": {
+            "status": "allowed_warning" if used >= 0.8 else "allowed", "rateLimitType": kind, "utilization": used,
+            "resetsAt": resets if kind == "five_hour" else resets + 4 * 86400}}), flush=True)
 
 if prog == "claude" and limited():
     sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
@@ -445,6 +462,11 @@ if prog == "codex" and args[:1] == ["app-server"]:  # JSON-RPC over stdio: Overs
                 active = None
                 continue
             out({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
+            if rate_limits():
+                win = {k: {"usedPercent": v, "windowDurationMins": 300 if k == "primary" else 10080,
+                           "resetsAt": int(time.time()) + (3 if k == "primary" else 100) * 3600}
+                       for k, v in rate_limits().items()}
+                note("account/rateLimits/updated", {"rateLimits": {"limitId": "codex", "planType": "pro", **win}})
             if "FORCE_SLEEP" in stdin:
                 time.sleep(60)
             if "FORCE_FAIL" in stdin or os.path.exists(os.environ["FAKE_CLI_LOG"] + ".fail"):

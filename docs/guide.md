@@ -36,12 +36,23 @@ what the agent may and may not do, [security.md](security.md); for the personal 
 | `/search <text>` | past conversations, results, findings and jobs (in a project's topic: that project's). `"a phrase"`, `OR`, the last word as a prefix |
 | `/dashboard` | the Mini App: jobs, results, findings, timeline (read-only) |
 | `/cluster [partition]` | free GPUs, CPUs and RAM per partition, time limits, when your queued jobs should start (SLURM's estimate), your fairshare |
-| `/usage [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
+| `/usage` | how much of each account's usage limits is used: the 5-hour and weekly windows (and a model's own, where the plan has one), with when they reset - as each account's last run reported them, and how long ago that was |
+| `/usage tokens [today\|yesterday\|week\|month]` | tokens and cost of the agent's runs: total, runs from you, wake-ups and check-ins, by backend, the top conversations |
 | `/health` | SSH connection, last poll, agents with their model and effort |
 
-## The reply footer: tokens, model and cost
+## The reply footer: model and usage limits
 
-Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 14.2k tokens (11.8k cached) · $0.04`.
+Every agent reply ends with a footer such as `claude_code · claude-opus-5-5 · effort high · 5h 42% · week 18%`: how much
+of the account's 5-hour and weekly usage windows is used, as the CLI reported it during this run.
+
+- **Usage limits:** Claude Code and Codex report the windows of a subscription (Claude Pro/Max, ChatGPT Plus/Pro) as
+  they run: Overseer keeps the latest per account. `/usage` shows them all with when each resets, and `/account` next
+  to each account. The numbers are as fresh as the account's last run (`/usage` says how long ago).
+  - **At 80%** of a window you're told, once per window.
+  - **At 95%** the next run moves to another account of the same CLI that still has room (the conversation carries on
+    there, as in a failover). With no such account it stays; at 100% the usual failover takes over.
+- **An API key** has no such windows: its footer shows tokens and cost instead, e.g. `14.2k tokens (11.8k cached) ·
+  $0.04`. Tokens and cost of every run are still recorded: `/usage tokens`, the TUI's Usage tab.
 
 - **Tokens:** every model call re-sends the CLI's instructions, its tool definitions and the conversation so far, so the total grows with each command the agent runs. Most of that is served from the provider's prompt cache, which costs roughly a tenth of fresh input.
   - **Codex counts:** Codex reports a running total for the whole conversation, so Overseer subtracts the previous total and shows this request's share. A conversation started with an older Overseer shows its total once, labelled "in this conversation so far".
@@ -362,7 +373,8 @@ Log each one in: `uv run overseer login claude_code --account work` (`overseer c
 - **Out of usage.** When a run hits the account's usage limit (a subscription's 5-hour or weekly limit, or an API key out of credit), Overseer marks the account out until it resets (when the CLI says; otherwise an hour) and moves the whole bot on: to the CLI's next account that isn't out, then to the other CLI. You get a 🔄 message, and the interrupted request runs again there; the agent is told to check what was already done before redoing anything. After 3 switches in a row, or once every account is out, it stops and keeps the request for **▶️ Continue**.
 - **It doesn't switch back by itself.** When the account resets, the bot stays where it is until you switch (`/account`, or `/backend` after a move to the other CLI).
 - **Conversations keep their history.** Moving between accounts of a CLI, the conversation's session is copied into the new account's folder and resumed there, so nothing is lost. Moving to the other CLI (a failover or `/backend`), the new agent starts with what was said and done so far: the latest turns in full, older ones a line each, from Overseer's own transcripts.
-- `/usage` splits tokens and cost by account, and a reply's footer names the account when a CLI has several.
+- `/usage` shows each account's usage limits (`/usage tokens` splits tokens and cost by account), and a reply's footer
+  names the account when a CLI has several.
 - The accounts' folders hold logins: like `./state`, the agents can never read them, wherever you put them.
 
 ## Long conversations: context compaction

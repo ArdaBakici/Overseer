@@ -136,8 +136,8 @@ class Accounts:
         name = name or self.active(backend)
         return f"{NAMES[backend]} ({name})" if self.several(backend) else NAMES[backend]
 
-    def describe(self) -> str:
-        """The /account overview (HTML)."""
+    def describe(self, limits=None) -> str:
+        """The /account overview (HTML); `limits(backend, name)`: an account's usage line (limits.py)."""
         from .notify import esc
 
         lines = []
@@ -149,6 +149,8 @@ class Accounts:
                 items.append(f"{mark}<b>{esc(n)}</b>" if mark else esc(n))
                 if out:
                     items[-1] += f" (out of usage until {esc(when(out))})"
+                elif limits and limits(b, n):
+                    items[-1] += f" ({esc(limits(b, n))})"
             lines.append(f"{NAMES[b]}: " + " · ".join(items))
         if self.forced:
             lines.append(f"\nEvery conversation runs on <b>{NAMES[self.forced]}</b> for now (it took over when the "

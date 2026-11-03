@@ -141,6 +141,14 @@ class Digest:
         return "\n".join(lines)
 
     def _usage(self, since: float) -> str:
+        """The accounts' usage limits (as their last runs reported them); without any, tokens and cost."""
+        acc, lim = getattr(self.agent, "accounts", None), getattr(self.agent, "limits", None)
+        if acc and lim:
+            from .config import BACKENDS
+            parts = [f"{esc(acc.label(b, n))} {esc(lim.line(b, n, stale_after=3600))}"
+                     for b in BACKENDS for n in acc.names(b) if lim.line(b, n)]
+            if parts:
+                return "📊 <b>Limits</b>: " + "; ".join(parts) + " (/usage)"
         rows = self.store.usage_rows(since)
         if not rows:
             return ""
