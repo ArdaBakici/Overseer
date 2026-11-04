@@ -222,4 +222,5 @@ ov feedback "what limited you"         # about Overseer itself
 ov handbook add notes "<a fact every agent of this bot should know>" --why "..."   # shared, once approved
 ov handbook tool <name> --command "<command>" --about "<what for>"   # the researcher's tools
 ov handbook edit H3 "..." | remove H3 --why "..." | ov handbook        # (## Handbook in your instructions)
+ov pending                       # everything waiting for their answer; --send "<why now>": post it to them
 ```

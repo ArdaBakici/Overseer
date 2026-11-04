@@ -38,6 +38,7 @@ CORE_MENU = [
     ("dashboard", "the dashboard Mini App"), ("subagents", "planner mode: on/off, models, threads"),
     ("feedback", "agents' feedback about Overseer; review"), ("skills", "skills agents added"),
     ("handbook", "what agents learned, your rules and tools"),
+    ("pending", "what waits for your answer: approve or decline"),
     ("project", "projects: list, new, context, notes"), ("health", "connection status"), ("help", "help"),
 ]
 
@@ -66,6 +67,7 @@ def build(cfg: Config):
 
     from .addons import Addons
     from .handbook import Handbook
+    from .pending import HandbookKind, Pending, PlanKind, SkillKind
     from .agent import Agent
     from .autopilot import Autopilot
     from .bot import Bot, TelegramNotifier
@@ -100,6 +102,7 @@ def build(cfg: Config):
         tasks.append(asyncio.create_task(agent.update_loop(), name="cli-updates"))
         tasks.append(asyncio.create_task(digest.loop(), name="digest"))
         tasks.append(asyncio.create_task(autopilot.loop(), name="timers"))
+        tasks.append(asyncio.create_task(pending.loop(), name="pending-expiry"))
         if dashboard:
             try:
                 await dashboard.start()
@@ -151,6 +154,12 @@ def build(cfg: Config):
     Feedback(cfg, store, agent, notifier)  # agents' feedback about Overseer, in the 🛠 feedback topic
     Addons(store, agent, notifier)  # skills agents proposed and the researcher approved
     Handbook(store, agent, notifier)  # what the bot's agents learned, the researcher's rules and tools
+    pending = Pending(store, agent, notifier)  # /pending: what waits for the researcher's answer (questions: bot.py)
+    pending.register(HandbookKind(agent.handbook))
+    pending.register(SkillKind(store, agent.addons))
+    pending.register(PlanKind(store, subagents))
+    for kind in domain.pending_kinds():
+        pending.register(kind)
     projects = Projects(cfg, store, agent)
     for name in projects.sync_config():
         log.info("project %s created from config.yaml", name)

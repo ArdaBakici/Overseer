@@ -143,6 +143,9 @@ def _parser(ext=None) -> _Parser:
     a.add_argument("text", nargs="+")
     sub.add_parser("planner", add_help=False).add_argument("mode", choices=["off"])
     sub.add_parser("notify", add_help=False).add_argument("text", nargs="+")
+    a = sub.add_parser("pending", add_help=False)
+    a.add_argument("--send", action="store_true")
+    a.add_argument("note", nargs="*")
     sub.add_parser("react", add_help=False).add_argument("emoji")
     a = sub.add_parser("ask", add_help=False)
     a.add_argument("question", nargs="+")
@@ -185,6 +188,8 @@ HELP = """ov - talk to Overseer (the system that runs you and reports to the res
   ov project list | new <name> --dir <folder> [--about "..."] [--move-here] | set <name> ... | archive <name>
   ov conversation move <project|main>
   ov notify <text>                 send the researcher a message now
+  ov pending [--send ["note"]]     what waits for the researcher's answer (proposals, questions); --send: the list,
+                                   with its approve / decline buttons, to them (at most every 30 minutes)
   ov react <emoji>                 react to the researcher's last message here (👍 ❤ 🔥 🎉 👏 🙏 👀 ...)
   ov ask "<question>" [--options "Yes|No"]   a question with tap buttons; the tap comes back to you (choices:
                                    a few words each, at most 32 characters - the detail goes in the question)
@@ -309,6 +314,8 @@ class ControlServer:
                 return True, await getattr(self, area)(session, args)
             if area == "agent" and args.action:
                 return True, await getattr(self, f"agent_{args.action}")(session, args)
+            if area == "pending":
+                return True, await self.pending_cmd(session, args)
             if area == "notify":
                 return True, await self.notify(session, " ".join(args.text))
             if area == "react":
@@ -583,11 +590,31 @@ class ControlServer:
             raise CtlError(f"--options: each choice at most {ASK_OPTION_MAX} characters (longer ones are cut off on "
                            f"the button): shorten {long[0]!r} - put the detail in the question")
         qid = secrets.token_hex(4)
-        self.store.set(f"ask:{qid}", json.dumps({"session": session.id, "question": question[:1000],
-                                                  "options": opts, "at": time.time()}))
-        await self.notifier.send(Outgoing(f"❓ {esc(question[:1000])}", session_id=session.id, buttons=[
-            [(opts[i], f"ask:{qid}:{i}") for i in row] for row in button_rows(opts)]))
+        rec = {"session": session.id, "question": question[:1000], "options": opts, "at": time.time()}
+        self.store.set(f"ask:{qid}", json.dumps(rec))
+        msg = Outgoing(f"❓ {esc(question[:1000])}", session_id=session.id, buttons=[
+            [(opts[i], f"ask:{qid}:{i}") for i in row] for row in button_rows(opts)])
+        if hasattr(self.notifier, "post"):  # (its message: answered from /pending, it says so too)
+            self.store.set(f"ask:{qid}", json.dumps({**rec, "refs": await self.notifier.post(msg)}))
+        else:
+            await self.notifier.send(msg)
         return "✓ asked: their tap comes back to you as a message (or they may answer in words)"
+
+    async def pending_cmd(self, session, args) -> str:
+        """`ov pending`: what waits for the researcher; --send: the list, with its buttons, to them."""
+        pd = getattr(self.agent, "pending", None)
+        if not pd:
+            raise CtlError("this Overseer has no list of requests")
+        if not args.send:
+            return pd.text(plain=True)
+        if not pd.count():
+            return "Nothing waits for their answer: nothing sent."
+        key = f"pending_sent:{session.id}"
+        if time.time() - float(self.store.get(key) or 0) < 1800:
+            raise CtlError("you sent them the list less than 30 minutes ago: it's still there (or /pending)")
+        self.store.set(key, str(time.time()))
+        await pd.send(session.id, " ".join(args.note))
+        return f"✓ sent them the list ({pd.count()} waiting), with its approve / decline buttons"
 
     async def react(self, session, emoji: str) -> str:
         """A reaction on the researcher's last message in this conversation (instead of a message)."""

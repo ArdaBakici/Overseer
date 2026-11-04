@@ -222,6 +222,8 @@ ov handbook edit H3 "..."        # your own entry: at once (the researcher is to
 ov handbook edit H3 --on compute --cpus 8    # move a tool, or change its resources (text stays)
 ov handbook remove H3 --why "<why it's wrong or stale>"
 ov handbook                      # the entries, and what waits for the researcher
+ov pending                       # everything waiting for the researcher's answer (all agents' requests)
+ov pending --send "<why now>"    # post that list, with its buttons, in your topic (at most every 30 min)
 ```
 
 Propose a tool when you come across a script of the researcher's that other agents should use (look in their bin

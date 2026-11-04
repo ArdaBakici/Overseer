@@ -162,7 +162,12 @@ class Digest:
         fb = self.store.feedback(("open",))
         if fb:
             bits.append(f"🛠 {len(fb)} open feedback item(s) (/feedback)")
-        sk = self.store.skills(("proposed",))
-        if sk:
-            bits.append(f"🧩 {len(sk)} skill proposal(s) to answer")
+        pd = getattr(self.agent, "pending", None)
+        n = pd.count() if pd else 0
+        if n:
+            bits.append(f"⏳ {n} request(s) waiting for your answer (/pending)")
+        else:
+            sk = self.store.skills(("proposed",))
+            if sk:
+                bits.append(f"🧩 {len(sk)} skill proposal(s) to answer")
         return " · ".join(bits)

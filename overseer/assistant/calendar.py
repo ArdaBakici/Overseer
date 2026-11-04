@@ -892,8 +892,12 @@ class Calendar:
         ok = f"✅ {self._verb(items[0])}" if single else "✅ Apply all"
         text = (f"📅 <b>{self._verb(items[0])}?</b> {self.describe(items[0])}" if single else
                 f"📅 <b>Apply these?</b> {self._summary(rec)}")
-        await self.domain.notifier.send(Outgoing(text, session_id=rec["session"],
-                                                 buttons=[[(ok, f"cal:{pid}:ok"), ("✖ No", f"cal:{pid}:no")]]))
+        msg = Outgoing(text, session_id=rec["session"], buttons=[[(ok, f"cal:{pid}:ok"), ("✖ No", f"cal:{pid}:no")]])
+        notifier = self.domain.notifier
+        if hasattr(notifier, "post"):  # (its message, to update when it's answered from /pending)
+            self.store.set(KEY + pid, json.dumps({**rec, "state": "asked", "refs": await notifier.post(msg)}))
+        else:
+            await notifier.send(msg)
         return (f"⏳ asked them (one card: {ok} / ✖ No): nothing changes until they tap; their answer reaches you in "
                 "your next turn. If they answer in words instead, change it and send a new proposal.")
 
@@ -1095,3 +1099,35 @@ def _span(body: dict) -> tuple[tuple, bool]:
     start, all_day = _parse_time(body["start"])
     end, _ = _parse_time(body.get("end") or body["start"])
     return (start, end), all_day
+
+
+class CalendarKind:
+    """/pending: calendar changes waiting for ✅ / ✖ (core/pending.py)."""
+    key, emoji, title, noun = "cal", "📅", "Calendar changes", "calendar change"
+
+    def __init__(self, calendar):
+        self.cal = calendar
+
+    def items(self):
+        from ..core.pending import Item
+        out = []
+        for key in self.cal.store.keys(KEY):
+            rec = self.cal._load(key[len(KEY):])
+            if rec and rec.get("state") == "asked" and time.time() - rec.get("at", 0) <= KEEP_SECONDS:
+                out.append(Item(self.key, key[len(KEY):], self.cal._summary(rec, html=False), rec.get("session"),
+                                float(rec.get("at") or 0)))
+        return out
+
+    async def answer(self, item_id: str, ok: bool) -> str:
+        rec = self.cal._load(item_id) or {}
+        text, buttons = await self.cal.answer(item_id, ok)
+        notifier = self.cal.domain.notifier
+        if rec.get("refs") and hasattr(notifier, "edit"):  # (its own card shows the answer too)
+            await notifier.edit(rec["refs"], text, buttons or None)
+        return text
+
+    async def choose(self, item_id: str, choice: int) -> str:
+        return ""
+
+    async def expire(self, item) -> None:
+        await self.answer(item.id, False)

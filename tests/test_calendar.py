@@ -713,3 +713,39 @@ async def test_free_time_over_days_with_a_buffer(cenv):
         assert lines[1].endswith("0 event(s); free: 09:00–12:00 (3h)") and "15m away from events" in lines[2]
     finally:
         await cenv.ctl.stop()
+
+
+async def test_calendar_changes_in_pending(cenv):
+    """/pending lists a calendar change waiting for ✅, answers it, and updates its own card."""
+    from overseer.assistant.calendar import CalendarKind
+    from overseer.core.pending import Pending
+    posted, edits = [], []
+
+    async def post(msg):
+        posted.append(msg)
+        return {"1": len(posted)}
+
+    async def edit(refs, text, buttons=None):
+        edits.append((refs, text))
+    cenv.notifier.post, cenv.notifier.edit = post, edit
+    pd = Pending(cenv.store, cenv.agent, cenv.notifier)
+    pd.register(CalendarKind(cenv.cal))
+    await cenv.cal.sync()
+    await cenv.ctl.start()
+    try:
+        s = cenv.agent.general_session()
+        token = cenv.ctl.open(s.id)
+        ok, text = await cenv.ctl.handle(token, ["cal", "propose", json.dumps(
+            {"title": "Focus", "changes": [{"action": "add", "title": "Reading", "start": "tomorrow 07:00",
+                                            "length": "1h"}]})])
+        assert text.startswith("⏳ asked them"), text
+        assert posted and posted[0].buttons[0][0][0].startswith("✅")
+        [item] = pd.items()
+        assert item.kind == "cal" and "Reading" in item.title and item.session == s.id
+        assert "📅 <b>Calendar changes</b> (1)" in pd.text()
+        await pd.answer("cal", item.id, "y")
+        assert any(e["summary"] == "Reading" for e in cenv.google.events["me@gmail.com"].values())
+        assert edits and edits[0][0] == {"1": 1} and "Reading" in edits[0][1]
+        assert pd.items() == []
+    finally:
+        await cenv.ctl.stop()

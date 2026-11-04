@@ -6,6 +6,7 @@ being rewritten, or whose process is gone, means the bot isn't running.
     {"pid", "started", "updated", "version", "domain", "config", "bot", "telegram": {"ok", "waiting"},
      "runs": [{"session", "project", "backend", "account", "origin", "started"}],
      "accounts": {backend: {"active", "names", "out": {name: until}}}, "forced", "clis": {backend: version},
+     "pending": n (requests waiting for the researcher's answer: /pending),
      "domain": {"lines": [[label, text, ok]], "tables": [{"title", "columns", "rows", "details"}]}}
 """
 
@@ -88,8 +89,16 @@ class Heartbeat:
                              "out": {n: acc.out_until(b, n) for n in acc.names(b) if acc.out_until(b, n)}}
                          for b in BACKENDS},
             "forced": acc.forced, "backend": self.agent.backend, "clis": self._clis,
+            "pending": self._pending(),
             "domain": self._domain,
         }
+
+    def _pending(self) -> int:
+        pd = getattr(self.agent, "pending", None)
+        try:
+            return pd.count() if pd else 0
+        except Exception:
+            return 0
 
     async def write(self) -> None:
         data = await self.snapshot()

@@ -498,6 +498,9 @@ class Monitor(App):
                               + f" · {who} · for {ORIGINS.get(r['origin'], r['origin'])} · {D.ago(r['started'])}")
             else:
                 t.add_row("working", "no agent run in progress")
+            if st.get("pending"):
+                t.add_row("waiting", Text(f"⏳ {st['pending']} request(s) for your answer: /pending in Telegram",
+                                          style="yellow"))
             backend = st.get("forced") or st.get("backend") or ""
             t.add_row("agent", NAMES.get(backend, backend) + (" (the other CLI ran out of usage)"
                                                                if st.get("forced") else ""))

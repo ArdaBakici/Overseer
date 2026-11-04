@@ -65,6 +65,7 @@ While the agent works, what you send goes into its run (it reads it at its next 
 /auto &lt;goal&gt; — ask the agent to work on it on its own · /auto — pending wake-ups · /auto off — cancel them
 /feedback [all|review] — what agents reported about Overseer · /skills — installed skills
 /handbook — what the agents learned, your rules and tools (shared by this bot's agents)
+/pending — everything the agents asked of you and you haven't answered: approve or decline, one by one or all
 /subagents [on|off] — planner mode: the agent plans and delegates to cheaper subagents
 /usage · /digest · /search &lt;text&gt; · /dashboard · /health
 /project — projects (each gets its own topic)
@@ -979,6 +980,9 @@ class Bot:
         self.digest = None  # digest.Digest (the morning digest), set by the app
         self._searcher = None  # search.Search (/search), made on first use
         self.dashboard = None  # dashboard.Dashboard (the Mini App), when dashboard.enabled
+        if getattr(agent, "pending", None):  # (questions are answered by running the agent: the bot's to do)
+            from .pending import QuestionKind
+            agent.pending.register(QuestionKind(store, self._answer_question))
         # The domain's commands and buttons (help, menu, commands(), on_button, watch_cancelled, health_lines, errors)
         self.ext = agent.domain.bot_commands(self)
         self.help = getattr(self.ext, "help", None) or HELP
@@ -1029,6 +1033,7 @@ class Bot:
         add(CommandHandler("feedback", self.cmd_feedback, filters=allowed))
         add(CommandHandler("skills", self.cmd_skills, filters=allowed))
         add(CommandHandler("handbook", self.cmd_handbook, filters=allowed))
+        add(CommandHandler("pending", self.cmd_pending, filters=allowed))
         add(CommandHandler(["project", "projects"], self.cmd_project, filters=allowed))
         for names, handler in (self.ext.commands() if self.ext else []):  # the domain's (e.g. /jobs)
             add(CommandHandler(names, handler, filters=allowed))
@@ -1665,6 +1670,31 @@ class Bot:
         buttons = [[(f"🗑 {k.name}" + (f" ({k.project})" if k.project else ""), f"skrm:{k.id}")] for k in installed]
         await self.notifier.send(Outgoing("\n".join(lines), buttons=buttons[:20], project=self._scope(update)))
 
+    async def cmd_pending(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/pending: everything the agents asked of you, unanswered - approve or decline, one by one or all."""
+        pd = getattr(self.agent, "pending", None)
+        if not pd:
+            await self.reply(update, "This Overseer has nothing like that to answer.")
+            return
+        await self.reply(update, pd.text(), pd.buttons())
+
+    async def _pending_button(self, q, action: str, arg: str) -> None:
+        pd = self.agent.pending
+        result = ""
+        if action == "pd":  # one request: ✅ / ✖, or a question's choice
+            kind, _, rest = arg.partition(":")
+            item_id, _, what = rest.rpartition(":")
+            result = await pd.answer(kind, item_id, what)
+        elif action == "pdkind":  # every request of a kind
+            kind, _, what = arg.partition(":")
+            result = await pd.answer_all(what == "y", kind)
+        elif action == "pdask":  # everything: first say what that is
+            await self._edit(q, f"{pd.text()}\n\n<b>{esc(pd.summary(arg == 'y'))}</b>", pd.buttons(confirm=arg))
+            return
+        elif action == "pdall":
+            result = await pd.answer_all(arg == "y")
+        await self._edit(q, (f"{result}\n\n" if result else "") + pd.text(), pd.buttons())
+
     async def cmd_handbook(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/handbook [add notes|rules <text> | tool <name> <command> -- <what for> | edit H3 <text> | remove H3]: the
         agents' shared handbook - yours to change directly (agents propose their changes)."""
@@ -1947,16 +1977,23 @@ class Bot:
 
     async def _answer_ask(self, q, chat_id: int, arg: str) -> None:
         qid, _, i = arg.partition(":")
+        await self._edit(q, await self._answer_question(qid, int(i) if i.isdigit() else -1))
+
+    async def _answer_question(self, qid: str, i: int) -> str:
+        """A choice on an agent's question (its card, or /pending): the agent runs with it."""
         raw = self.store.get(f"ask:{qid}")
         rec = json.loads(raw) if raw else None
-        if not rec or not i.isdigit() or int(i) >= len(rec["options"]):
-            await self._edit(q, "This question was already answered.")
-            return
+        if not rec or not 0 <= i < len(rec["options"]):
+            return "This question was already answered."
         self.store.unset(f"ask:{qid}")
-        choice = rec["options"][int(i)]
-        await self._edit(q, f"❓ {esc(rec['question'])}\n→ <b>{esc(choice)}</b>")
+        choice = rec["options"][i]
+        text = f"❓ {esc(rec['question'])}\n→ <b>{esc(choice)}</b>"
+        if rec.get("refs") and hasattr(self.notifier, "edit"):  # (answered from /pending: its card says so too)
+            await self.notifier.edit(rec["refs"], text)
         session = self.agent.get(rec.get("session")) or self.agent.general_session()
-        self._spawn(self._run_agent(chat_id, session, f"[They tapped “{choice}” on your question: {rec['question']}]"))
+        self._spawn(self._run_agent(self.cfg.telegram.allowed_chat_ids[0], session,
+                                    f"[They tapped “{choice}” on your question: {rec['question']}]"))
+        return text
 
     async def on_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -2021,6 +2058,8 @@ class Bot:
                     result = await (addons.approve(int(arg)) if action == "sk" else addons.decline(int(arg)))
                     if result.startswith("This "):
                         await self._edit(q, result)
+            elif action.startswith("pd") and getattr(self.agent, "pending", None):  # /pending's buttons
+                await self._pending_button(q, action, arg)
             elif action in ("hb", "hbx", "hbu") and getattr(self.agent, "handbook", None) and arg.isdigit():
                 hb = self.agent.handbook  # handbook proposals: ✅ Apply / ✖ No; ↩️ Undo an agent's own edit
                 if action == "hbu":

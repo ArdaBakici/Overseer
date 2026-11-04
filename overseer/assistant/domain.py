@@ -88,6 +88,10 @@ class AssistantDomain(Domain):
         write_ov_tool(self.cfg, agent_bin_dir(self.cfg), _write)
         write_skills(self.cfg, skills())
 
+    def pending_kinds(self) -> list:
+        from .calendar import CalendarKind
+        return [CalendarKind(self.calendar)] if self.calendar.enabled else []
+
     def services(self) -> list[tuple[str, object]]:
         out = [("follow-ups", self.reminders.loop()), ("routines", self.scheduler.loop())]
         if self.calendar.enabled:

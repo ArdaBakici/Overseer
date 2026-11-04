@@ -30,6 +30,7 @@ what the agent may and may not do, [security.md](security.md); for the personal 
 | `/compact [focus]` | compact the conversation now ([more](#long-conversations-context-compaction)). As a reply to a message, it applies to that conversation |
 | `/results [project] [sort] [N] [csv]`, `/findings` | each experiment's outcome and what it showed, sorted as you like; the project's insights and dead ends ([more](#results-and-findings-what-each-experiment-showed)) |
 | `/feedback [all\|review [focus]]`, `/skills` | what agents reported about Overseer (in the 🛠 feedback topic); review: an agent groups it and designs fixes. Skills agents proposed and you installed ([more](#feedback-about-overseer-its-review-and-skills-as-addons)) |
+| `/pending` | everything the agents asked of you and you haven't answered, in one place: approve or decline one by one, per kind, or all ([more](#pending-what-waits-for-your-answer)) |
 | `/subagents [on\|off]` | planner mode in this project: the agent plans and delegates to subagents on cheaper models ([more](#planner-mode-subagents-off-by-default)). The agent can also propose it for one conversation, and you approve or decline |
 | `/auto <goal>` | ask the agent to work on a goal on its own ([more](#working-on-its-own-watches-and-wake-ups)). As a reply to a message, it applies to that conversation. `/auto` lists pending wake-ups, `/auto off` cancels them (in this thread, topic, or replied-to conversation) |
 | `/digest` | what happened since the last digest (one comes every morning, `digest.time`) |
@@ -416,6 +417,22 @@ separate: what an HPC agent adds stays with the HPC bot). It has three parts:
 - **Conversations already going** get the change with their next request. Entries stay short (it's in every prompt):
   past 8 KB, agents are asked to condense it. Project matters stay in the project's `OVERSEER.md`, results in
   `ov result`, long how-tos in skills.
+
+## Pending: what waits for your answer
+
+Agents ask you things on cards scattered across topics: handbook changes, skills, planner-mode plans, questions
+(`ov ask`), and on the assistant, calendar changes. `/pending` lists every one you haven't answered yet, grouped by
+kind, with where it came from and how long it has waited.
+- **One by one:** ✅ / ✖ next to each (a question: its choices). It's the same as answering on the request's own card,
+  which is updated too, and the agent is told.
+- **Several at once:** ✅ All / ✖ All per kind, and ✅ Approve all / ✖ Decline all. Doing everything asks first, saying
+  what it covers (e.g. "2 handbook changes, 1 skill"); questions are never answered in bulk, since they need your
+  choice.
+- **Agents can send it to you:** `ov pending` lists it for them, and `ov pending --send "<why now>"` posts it (with
+  its buttons) in their topic - at most every 30 minutes per conversation, and only when something waits.
+- **Nothing waits forever:** after 14 days unanswered, a request is declined (a question is dropped), and the agent
+  that asked is told.
+- **Elsewhere:** the morning digest and the TUI's overview show how many wait.
 
 ## Feedback about Overseer, its review, and skills as addons
 

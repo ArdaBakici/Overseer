@@ -4421,3 +4421,72 @@ async def test_general_in_all(env, monkeypatch):
     env.cfg.telegram.general = "everywhere"
     with pytest.raises(ConfigError, match="telegram.general"):
         env.cfg.validate()
+
+
+async def test_pending_everything_waiting_for_you_in_one_place(env):
+    """/pending lists every request waiting for your answer - handbook changes, skills, plans, questions - with
+    ✅ / ✖ each (a question: its choices), per kind and for all (after saying what that covers); answering here
+    updates the request's own card and tells the agent. Agents list it (ov pending) or send it to you (--send, not
+    more than every 30 minutes). After 14 days a request is declined (a question dropped), and its agent told."""
+    from overseer.core.addons import Addons
+    from overseer.core.bot import Bot
+    from overseer.core.handbook import Handbook
+    from overseer.core.pending import HandbookKind, Pending, PlanKind, SkillKind
+    subs, _ = await make_subagents(env)
+    hb, addons = Handbook(env.store, env.agent, env.notifier), Addons(env.store, env.agent, env.notifier)
+    pd = Pending(env.store, env.agent, env.notifier)
+    for kind in (HandbookKind(hb), SkillKind(env.store, addons), PlanKind(env.store, subs)):
+        pd.register(kind)
+    bot = Bot(env.cfg, app=None, store=env.store, agent=env.agent, notifier=env.notifier)
+    assert "q" in pd.kinds  # (questions: the bot answers them, by running the agent)
+    s = env.agent.general_session()
+    token = env.ctl.open(s.id)
+    assert pd.text().startswith("✅ <b>Nothing waits")
+    assert (await env.ctl.handle(token, ["handbook", "add", "notes", "preempt jobs skip the GPU QOS limit"]))[0]
+    assert (await env.ctl.handle(token, ["handbook", "add", "rules", "always --account=pi_lab"]))[0]
+    assert (await env.ctl.handle(token, ["skill", "propose", SKILL_TEXT]))[0]
+    plan = await subs.propose(s, PLAN)
+    assert (await env.ctl.handle(token, ["ask", "Resubmit seed 3 on preempt?", "--options", "Yes|No"]))[0]
+
+    text, buttons = pd.text(), pd.buttons()
+    assert "⏳ <b>5 waiting for your answer</b>" in text and "📖 <b>Handbook changes</b> (2)" in text
+    assert "🧩 <b>Skills</b> (1)" in text and "🗺 <b>Plans (planner mode)</b> (1)" in text and "❓ <b>Questions</b>" in text
+    flat = [b for row in buttons for b in row]
+    assert ("✅ All handbook changes (2)", "pdkind:hb:y") in flat and ("✅ Approve all (4)", "pdask:y") in flat
+    assert [b[0] for b in flat if b[1].startswith("pd:q:")] == ["Yes", "No"]  # (a question: its choices)
+    from overseer.core.digest import Digest
+    assert "⏳ 5 request(s) waiting for your answer (/pending)" in Digest(env.cfg, env.store, env.notifier,
+                                                                          env.agent)._waiting()
+    plain = (await env.ctl.handle(token, ["pending"]))[1]
+    assert "Handbook changes (2)" in plain and "Resubmit seed 3" in plain
+
+    # One by one: the request's own card says so, and the agent is told.
+    first = hb.pending()[0]
+    assert (await pd.answer("hb", str(first.id), "y")).startswith("✅ <b>Applied</b>")
+    assert any("Applied" in t for _, t in env.notifier.edits) and len(hb.entries()) == 1
+    assert (await pd.answer("pl", plan["id"], "n")).startswith("✖")
+    qid = pd.items("q")[0].id
+    assert "→ <b>Yes</b>" in await pd.answer("q", qid, "0") and not pd.items("q")
+    await asyncio.gather(*list(bot._tasks))  # (the agent runs with the choice)
+    assert "[They tapped “Yes” on your question: Resubmit seed 3 on preempt?]" in claude_calls(env)[-1]["stdin"]
+    # Everything else at once, after saying what that covers.
+    assert pd.summary(True) == ("Approve all of them: 1 handbook change, 1 skill? (Questions aren't included: they "
+                                "need your choice.)")
+    assert pd.buttons(confirm="y") == [[("✅ Yes, approve all 2", "pdall:y"), ("Cancel", "pdlist:")]]
+    assert await pd.answer_all(True) == "✅ Approved 2 requests." and pd.count() == 0
+    assert len(hb.entries()) == 2 and env.store.skills()[0].name == "cluster-long-jobs"
+
+    # Sent to you by an agent, not more than every 30 minutes; and after 14 days, declined.
+    assert (await env.ctl.handle(token, ["handbook", "add", "notes", "the a100 nodes reboot on Sundays"]))[0]
+    ok, text = await env.ctl.handle(token, ["pending", "--send", "Two things wait for you"])
+    assert ok and "sent them the list (1 waiting)" in text
+    sent = env.notifier.sent[-1]
+    assert sent.text.startswith("Two things wait for you") and sent.buttons and sent.session_id == s.id
+    assert not (await env.ctl.handle(token, ["pending", "--send"]))[0]
+    old = hb.pending()[0]
+    old.created -= 15 * 86400
+    env.store.save_handbook(old)
+    assert await pd.expire() == 1 and pd.count() == 0 and hb.pending() == []
+    notes = env.agent.take_notes(s.id)
+    assert any("waited 14 days without an answer" in n for n in notes) and any("declined" in n for n in notes)
+    del bot

@@ -112,6 +112,10 @@ class Domain:
         return ("Look at what woke you and decide the next step. If you need the researcher's decision, ask; if "
                 "nothing is left to do, say so and set no more wake-ups.")
 
+    def pending_kinds(self) -> list:
+        """The domain's kinds of requests waiting for the researcher (pending.py), e.g. calendar changes."""
+        return []
+
     # ------------------------------------------------------------------ the handbook (handbook.py)
     def handbook_tool(self, name: str, command: str, about: str, place: dict) -> str:
         """A tool's line in the agents' handbook."""

@@ -95,6 +95,7 @@ its run, and it takes it into account at its next step (`/after <text>` waits un
 | `/backend`, `/account`, `/model`, `/effort` | which agent, which login, which model and effort |
 | `/usage`, `/digest`, `/search <text>`, `/cluster` | how much of each account's usage limits is used, the daily summary, past work, free GPUs |
 | `/handbook` | what the agents learned, your rules and tools: shared by every agent of the bot |
+| `/pending` | everything the agents asked of you and you haven't answered, in one place: ✅ / ✖ each, or all at once |
 | `/x <command>` (or `/bash`) | run it on the HPC yourself, with your `~/.bashrc` aliases: `/x jstat` |
 | `/health`, `/update`, `/help` | status, update the agent CLIs, every command |
 
