@@ -563,7 +563,8 @@ without any, Overseer acts by itself and tells you afterwards:
 - **The CLI gone quiet** with no command running (its connection stalled): ↻ it restarts the CLI, and the request runs
   again from where the conversation was - once per request.
 - **The same command with the same result** 3 times (`agent.stuck.loop_repeats`): 🔁 the agent is told to try something
-  materially different or to ask you. It's never stopped for that.
+  materially different or to ask you. It's never stopped for that. A file it edits in between starts the count over,
+  and a command that worked without printing anything (an upload, a copy) isn't counted.
 
 A command on the HPC can't be seen computing from here (ssh waits idle), so a long foreground one counts as quiet: long
 work belongs in `sbatch` or `hpc-run`, which gives control back after a few minutes. `agent.stuck.stop_command` and

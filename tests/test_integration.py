@@ -700,6 +700,30 @@ async def test_a_stuck_run_is_unstuck_and_you_are_told(env, monkeypatch):
     assert "3 times now with the same result" in env.notifier.sent[-1].text
 
 
+def test_repeats_that_arent_a_loop_arent_flagged():
+    """FB13: the same upload of a script revised in between isn't a loop - a successful command that printed nothing
+    isn't counted, and an edit starts the count over. The same failure 3 times in a row still is."""
+    from overseer.core.stuck import Watchdog
+
+    async def nothing(*a):
+        return True
+    w = Watchdog(30, True, True, 3, running=dict, note=nothing, tell=nothing)
+    flagged = []
+    w._spawn = lambda coro: (flagged.append(coro), coro.close())
+    up = {"kind": "output", "command": "scp run.sh hpc:rfv4/", "output": "", "exit_code": 0}
+    for _ in range(4):
+        w.event(up)
+        w.event({**up, "output": "(Bash completed with no output)", "exit_code": None})  # (Claude Code's way)
+    assert not flagged
+    fail = {"kind": "output", "command": "bash rfv4/run.sh", "output": "ModuleNotFoundError: rfv4", "exit_code": 1}
+    w.event(fail), w.event(fail)
+    w.event({"kind": "file", "path": "run.sh"})  # (the launcher fixed)
+    w.event(fail), w.event(fail)
+    assert not flagged
+    w.event(fail)
+    assert len(flagged) == 1
+
+
 async def test_the_handbook_what_one_agent_learns_every_agent_knows(env, tmp_path):
     """An agent adds what it learned (a note), the researcher approves it, and it's in every conversation's
     instructions - including ones already going (a changed section is handed over). Its own entries it edits at once

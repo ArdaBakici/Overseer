@@ -10,7 +10,8 @@ any, it acts - and tells you afterwards:
 * a CLI gone quiet with no command running (its connection stalled) is restarted: the request runs again, resuming
   the conversation (once per request);
 * the same command with the same result again and again (agent.stuck.loop_repeats): the agent gets a note to try
-  something else or ask you. It's never stopped for that.
+  something else or ask you. It's never stopped for that. A file the agent edits in between starts the count over,
+  and a command that worked without printing anything (an upload, a copy) isn't counted: its "result" shows nothing.
 
 A remote command's own CPU isn't seen (ssh's is ~0 here): a long foreground command on the HPC counts as idle - long
 work belongs in sbatch or hpc-run, which returns after a few minutes.
@@ -83,6 +84,13 @@ def _since_boot() -> float:
     return time.clock_gettime(time.CLOCK_BOOTTIME) if hasattr(time, "CLOCK_BOOTTIME") else time.monotonic()
 
 
+def _silent_success(ev: dict) -> bool:
+    """A command that worked and printed nothing (an upload, a copy, mkdir): the same "result" again says nothing
+    about being stuck - what it acted on may have changed (FB13: a script revised between uploads)."""
+    out = (ev.get("output") or "").strip().lower()
+    return ev.get("exit_code") in (0, None) and (not out or out in ("(no output)", "(bash completed with no output)"))
+
+
 @dataclass
 class Watchdog:
     quiet_minutes: float
@@ -107,7 +115,9 @@ class Watchdog:
 
     def event(self, ev: dict) -> None:
         self.last_life = time.monotonic()
-        if ev.get("kind") == "output" and self.loop_repeats:
+        if ev.get("kind") == "file":  # (it changed something: what follows isn't the same attempt again)
+            self._results.clear()
+        elif ev.get("kind") == "output" and self.loop_repeats and not _silent_success(ev):
             key = hashlib.sha1(f"{ev.get('command')}\0{ev.get('exit_code')}\0{ev.get('output', '')[-4000:]}"
                                .encode(errors="replace")).hexdigest()
             self._results[key] = n = self._results.get(key, 0) + 1
@@ -190,8 +200,9 @@ class Watchdog:
                     await asyncio.sleep(0.1)
 
     async def _looping(self, cmd: str, n: int) -> None:
-        await self.note(f"You've run `{cmd[:300]}` {n} times now with the same result. Try something materially "
-                        "different, or ask the researcher (`ov ask`) if you're stuck.")
+        await self.note(f"You've run `{cmd[:300]}` {n} times now with the same result. If you're stuck, try "
+                        "something materially different, or ask the researcher (`ov ask`); if something it depends on "
+                        "changed in between, carry on.")
         await self.tell(f"🔁 The agent ran <code>{esc(cmd[:300])}</code> {n}× with the same result: it was asked to "
                         "try something else.")
 
